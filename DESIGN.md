@@ -91,6 +91,9 @@ Workspace layout, package names prefixed `gardenbed-` (dirs stay short):
 
 ## First 90 days
 
+Detailed v0.1 plan with per-milestone verification criteria:
+[docs/v0.1.md](docs/v0.1.md).
+
 | Weeks | Milestone |
 |---|---|
 | 1–2 | model + canonical encoding + store traits (fs/sqlite), changeset CRUD |
@@ -113,8 +116,8 @@ and push to GitHub, agent does blame over MCP with no checkout.
 
 ## Open questions
 
-- Canonical encoding: hand-rolled (postcard-style, explicit field order) vs
-  canonical CBOR — must be byte-stable across implementations.
+- Canonical encoding: ~~open~~ decided for v0.1 — hand-rolled byte format,
+  spec in [docs/v0.1.md](docs/v0.1.md) §4 (cross-language-checked).
 - Hash: SHA-256 everywhere; git SHA ⇄ changeset mapping table in metadata.
 - Blame semantics under the first-parent convention + cuttings detection.
 - Storage economics: standalone zstd objects vs background delta compaction

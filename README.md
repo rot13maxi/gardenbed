@@ -14,7 +14,9 @@ interoperate with git rather than replace it wholesale.
 
 ## Status
 
-Pre-alpha. Design lives in [DESIGN.md](DESIGN.md). The Rust workspace is
+Pre-alpha. Design lives in [DESIGN.md](DESIGN.md); the v0.1 plan —
+milestones with verification criteria — is in
+[docs/v0.1.md](docs/v0.1.md). The Rust workspace is
 scaffolded: the `bed` CLI, the `scarecrow` daemon, the `arboretum` server,
 and the `rootstock` git bridge are stubs awaiting their first real code.
 
