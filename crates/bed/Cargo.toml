@@ -4,6 +4,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+name = "gardenbed"
+path = "src/lib.rs"
+
 [[bin]]
 name = "bed"
 path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+gardenbed-model.workspace = true
+# Not in `[workspace.dependencies]` yet; path until the orchestrator adds it.
+gardenbed-store = { path = "../store" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "1"
+
+[dev-dependencies]
+tempfile = "3"
