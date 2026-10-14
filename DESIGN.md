@@ -1,7 +1,7 @@
-# garden — design notes
+# gardenbed — design notes
 
-Working name: **garden** (client: `gdn`). Brainstorm in progress — git does
-not care what the directory is called, so nothing here is name-dependent.
+Name locked (Oct 2026): project **gardenbed**, CLI **bed**, daemon
+**scarecrow**, sparse checkout paths **plot**.
 
 Ancestry: Anthropic's
 [Scion](https://www.anthropic.com/engineering/redesigning-source-control)
@@ -23,7 +23,7 @@ for the architecture; Sapling/Mononoke and Jujutsu as prior art.
    mainline, lazy elsewhere, invisible to clients.
 4. **Want-list negotiation.** Clients fetch specific content-addressed
    objects. No packfiles, no serve-time delta compression; every tier
-   (daemon → cache → server) answers identical RPCs.
+   (scarecrow → nursery → arboretum) answers identical RPCs.
 5. **Sparse, optional working copies.** Diff, blame, merge-base are APIs; a
    job that needs no files on disk needs no checkout.
 6. **Lock-free writes.** Ref updates are compare-and-swap on one row.
@@ -59,10 +59,10 @@ Extends git's existing botanical vocabulary:
 | Land to main | **harvest** |
 | Rebase onto main | **graft** |
 | Stack of changes | **trellis** — the structure that supports growing stacks |
-| Sparse checkout paths | **bed** (`bed add src/...`) |
+| Sparse checkout paths | **plot** (`bed plot add src/...`) |
 | Authoritative server | the **arboretum** — the complete collection |
 | Regional object cache | the **nursery** — raises plants near where they'll be planted |
-| Node-local daemon | **dryad** — the spirit living with your working copy |
+| Node-local daemon | **scarecrow** — stands in the bed and watches (fs watcher + cache) |
 | Blob store | **loam** — the good earth everything grows from |
 | Metadata DB | the **seedbed** |
 | Derived data framework | **compost** — history recycled into nutrition for queries |
@@ -75,11 +75,19 @@ Extends git's existing botanical vocabulary:
 | Agent sandbox | **cloche** |
 | CI fleet | the **apiary** |
 
-## Crates (planned)
+Naming decisions on record:
 
-`model`, `store`, `derive`, `protocol`, `server`, `daemon` (dryad),
-`cli`, `rootstock` (git bridge), `mcp`. Rust, workspace layout to be
-scaffolded once the name is picked.
+- `gardenbed` is free on crates.io; it also publishes the `bed` binary.
+- `brew install bed` is taken (itchyny's hex editor), so the Homebrew
+  formula is `gardenbed`, installing the `bed` binary.
+- `gdn` stays a free fallback alias if we ever want a second binary name.
+
+## Crates
+
+Workspace layout, package names prefixed `gardenbed-` (dirs stay short):
+`model`, `store`, `derive` (compost), `protocol`, `server` (arboretum),
+`scarecrow` (daemon), `bed` (CLI — package name is `gardenbed`, bin `bed`),
+`rootstock` (git bridge), `mcp`.
 
 ## First 90 days
 
@@ -87,7 +95,7 @@ scaffolded once the name is picked.
 |---|---|
 | 1–2 | model + canonical encoding + store traits (fs/sqlite), changeset CRUD |
 | 3–4 | tree derivation + object API + diff |
-| 5–6 | git import (gitoxide) + differential-vs-git test harness |
+| 5–6 | git import via gitoxide + differential-vs-git test harness |
 | 7–8 | gRPC server + thin CLI read path (sparse checkout, log, diff) |
 | 9–10 | server-side commit + CAS refs + git export → the full loop works |
 | 11–12 | blame/path-history + ancestry skip lists, MCP server, v0.1 demo |
@@ -105,7 +113,6 @@ and push to GitHub, agent does blame over MCP with no checkout.
 
 ## Open questions
 
-- Final name 🙂
 - Canonical encoding: hand-rolled (postcard-style, explicit field order) vs
   canonical CBOR — must be byte-stable across implementations.
 - Hash: SHA-256 everywhere; git SHA ⇄ changeset mapping table in metadata.
@@ -113,3 +120,5 @@ and push to GitHub, agent does blame over MCP with no checkout.
 - Storage economics: standalone zstd objects vs background delta compaction
   as an optional, rebuildable optimization layer.
 - Offline commit queue: how far do we take it?
+- Confirm Homebrew tolerance for a `gardenbed` formula installing a `bed`
+  binary (formula/binaries differing is allowed; worth verifying policy).
