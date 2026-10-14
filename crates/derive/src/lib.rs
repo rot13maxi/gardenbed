@@ -7,15 +7,29 @@
 //! On top of trees sit the recursive tree diff and the segmented-ancestry
 //! skip list backing `merge_base` / `is_ancestor`.
 //!
+//! On top of the trees sit first-parent lineage **blame** (D7): the walk
+//! from the queried changeset down the first-parent chain, following
+//! renames through `src_path`, attributing each line to the last changeset
+//! that changed it. Blame is accelerated by the segmented-ancestry skip
+//! list plus per-changeset **path summaries**: a bounded touched-path set
+//! and a cumulative segment Bloom filter prove whole linear segments
+//! unchanged in one derived-data read (a false positive costs a step,
+//! never a wrong answer).
+//!
 //! Everything derived is a **cache**: a missing or unreadable entry costs a
 //! recompute, never a wrong answer, and every derivation is deterministic
 //! (content addressing makes identical inputs converge on identical ids).
 
 mod ancestry;
 mod apply;
+mod blame;
 mod diff;
+mod pathsummary;
+mod xdiff;
 
 pub use ancestry::SegmentEntry;
+pub use blame::BlameRange;
+pub use pathsummary::{BLOOM_BITS, MAX_SUMMARY_PATHS, PathSummary};
 
 use std::sync::Arc;
 
@@ -28,6 +42,9 @@ use apply::codec_err;
 pub const DERIVED_TREE: &str = "tree";
 /// Derived-data kind tag for the segmented-ancestry skip list.
 pub const DERIVED_SKIPLIST: &str = "skiplist";
+/// Derived-data kind tag for the per-changeset path summary (blame's
+/// segment-skip data: bounded touched-path set + segment bloom).
+pub const DERIVED_PATHSUMMARY: &str = "pathsummary";
 
 /// The compost engine over one repository's stores.
 ///

@@ -573,7 +573,7 @@ impl Engine {
     }
 
     /// Eagerly derives what should exist as soon as a changeset is created
-    /// (D3): its tree and its skip-list entry.
+    /// (D3): its tree, its skip-list entry and its path summary.
     ///
     /// Idempotent and crash-safe: every step writes a deterministically
     /// recomputable cache value. Callers store the changeset first; a
@@ -582,6 +582,7 @@ impl Engine {
     pub fn on_changeset_created(&self, cs_id: Id) -> Result<(), StoreError> {
         self.derive_tree(cs_id)?;
         self.skiplist_entry(cs_id)?;
+        self.pathsummary_entry(cs_id)?;
         Ok(())
     }
 }
