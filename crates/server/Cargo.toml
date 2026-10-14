@@ -18,6 +18,7 @@ gardenbed-model.workspace = true
 # Path deps until the orchestrator adds them to `[workspace.dependencies]`.
 gardenbed-store = { path = "../store" }
 gardenbed-derive = { path = "../derive" }
+gardenbed-rootstock = { path = "../rootstock" }
 gardenbed-protocol = { path = "../protocol" }
 log = "0.4"
 prost = "0.14"

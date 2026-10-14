@@ -1,20 +1,30 @@
 //! The arboretum: the authoritative gardenbed server binary.
 //!
-//! Serves the `Gardenbed` gRPC API (v0.1.md §5) over TCP. Flags:
+//! Two modes:
 //!
-//! * `--addr` — listen address, default `127.0.0.1:9418` (`:0` binds an
-//!   ephemeral port; the bound address is printed to stdout).
-//! * `--root` — repository directory (required): holds `<root>/loam/` and
-//!   `<root>/seedbed.sqlite3`, created if missing.
+//! * `gardenbed-server [--addr ADDR] --root DIR` (or `serve`, the default
+//!   subcommand) — serves the `Gardenbed` gRPC API (v0.1.md §5) over TCP.
+//!   Flags:
+//!
+//!     * `--addr` — listen address, default `127.0.0.1:9418` (`:0` binds an
+//!       ephemeral port; the bound address is printed to stdout).
+//!     * `--root` — repository directory (required): holds `<root>/loam/`
+//!       and `<root>/seedbed.sqlite3`, created if missing.
+//!
+//! * `gardenbed-server import --from <repo> --root DIR [--limit N]
+//!   [--renames on|off] [--ref <pattern>...]` — ingests a git repository
+//!   into the same stores (rootstock). `--from` may be a local path or a
+//!   URL; URLs are cloned/refreshed into a mirror under the gardenbed
+//!   root first. Prints the import report on success.
 //!
 //! Logging goes to stderr via `env_logger` (control with `RUST_LOG`,
-//! default `info`). The process serves until SIGINT/SIGTERM, then drains.
+//! default `info`). The server runs until SIGINT/SIGTERM, then drains.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use gardenbed_server::{GardenbedService, Repo};
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
@@ -28,6 +38,46 @@ struct Args {
     /// Repository directory; must be a non-empty path.
     #[arg(long)]
     root: Option<PathBuf>,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Serve the gRPC API. This is the default when no subcommand is
+    /// given (then the top-level `--addr`/`--root` flags apply).
+    Serve {
+        /// Listen address (`host:port`; `:0` picks an ephemeral port).
+        #[arg(long, default_value = "127.0.0.1:9418")]
+        addr: String,
+        /// Repository directory; holds `<root>/loam` and
+        /// `<root>/seedbed.sqlite3`.
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+    /// Import a git repository's history into the gardenbed stores.
+    Import {
+        /// Git repository: a local path (bare or working tree) or a URL.
+        /// URLs are cloned (mirror) into `<root>/rootstock-mirror.git`
+        /// and refreshed on re-use.
+        #[arg(long)]
+        from: String,
+        /// Gardenbed repository directory (created if missing).
+        #[arg(long)]
+        root: PathBuf,
+        /// Ingest only the newest N commits (topological suffix; slice
+        /// boundaries are re-rooted as full-tree root changesets).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Detect renames with `git diff-tree -M` (`on`, default) or
+        /// import them as delete+add pairs (`off`).
+        #[arg(long, default_value = "on")]
+        renames: String,
+        /// Only import branches matching this glob (e.g. `refs/heads/*`);
+        /// repeatable, empty means every branch.
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -38,7 +88,65 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
-    let Some(root) = args.root.filter(|p| !p.as_os_str().is_empty()) else {
+    match args.command {
+        Some(Command::Import {
+            from,
+            root,
+            limit,
+            renames,
+            refs,
+        }) => {
+            let detect_renames = match renames.as_str() {
+                "on" => true,
+                "off" => false,
+                other => {
+                    eprintln!("error: --renames must be `on` or `off`, got {other:?}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(e) = run_import(&from, &root, detect_renames, limit, refs) {
+                eprintln!("error: import failed: {e}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        Some(Command::Serve { addr, root }) => serve(addr, root).await,
+        None => serve(args.addr, args.root).await,
+    }
+}
+
+/// One-shot git import into the stores under `root`.
+fn run_import(
+    from: &str,
+    root: &Path,
+    detect_renames: bool,
+    limit: Option<usize>,
+    refs: Vec<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
+    use gardenbed_rootstock as rootstock;
+
+    let objects = Arc::new(FsObjectStore::open(&root.join("loam"))?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3"))?);
+    let engine = gardenbed_derive::Engine::new(objects.clone(), metadata.clone());
+    let opts = rootstock::ImportOptions {
+        detect_renames,
+        limit,
+        refs,
+    };
+    let report = if from.contains("://") {
+        let mirror = root.join("rootstock-mirror.git");
+        rootstock::import_from_url(from, &mirror, objects, metadata, engine, &opts)?
+    } else {
+        rootstock::import_from_path(Path::new(from), objects, metadata, engine, &opts)?
+    };
+    // Machine- and human-readable one-line report on stdout.
+    println!("{report}");
+    Ok(())
+}
+
+async fn serve(addr_arg: String, root_arg: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(root) = root_arg.filter(|p| !p.as_os_str().is_empty()) else {
         eprintln!("error: --root is required (the repository directory)");
         std::process::exit(2);
     };
@@ -49,10 +157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?);
     log::info!("repository opened root={}", root.display());
 
-    let addr: SocketAddr = args
-        .addr
+    let addr: SocketAddr = addr_arg
         .parse()
-        .map_err(|e| format!("invalid --addr {}: {e}", args.addr))?;
+        .map_err(|e| format!("invalid --addr {addr_arg}: {e}"))?;
     let incoming = TcpIncoming::bind(addr)?;
     let bound = incoming.local_addr()?;
     // The bound address goes to stdout: it is the contract for tests and

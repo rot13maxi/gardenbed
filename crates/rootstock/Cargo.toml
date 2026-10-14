@@ -3,3 +3,16 @@ name = "gardenbed-rootstock"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+gardenbed-model.workspace = true
+gardenbed-store = { path = "../store" }
+gardenbed-derive = { path = "../derive" }
+gix = "0.89.0"
+log = "0.4"
+thiserror = "2"
+
+[dev-dependencies]
+gardenbed-harness = { path = "../harness" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tempfile = "3"
