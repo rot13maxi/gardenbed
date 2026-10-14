@@ -1,10 +1,11 @@
 //! rootstock — the git import/export bridge.
 //!
-//! This half of the crate **imports** git history into gardenbed's
-//! changeset stores; the export direction (changesets → git) arrives in a
-//! later milestone. The trust anchor is differential verification: the
-//! harness (part 2 of this milestone) replays imported changesets against
-//! git's own answers.
+//! The **import** direction mirrors a git repository into gardenbed's
+//! changeset stores. The **export** direction ([`export_to_path`]) renders
+//! those stores back into a real git repository via one `git fast-import`
+//! stream. The trust anchor is differential verification: the harness
+//! replays imported changesets against git's own answers, and the export
+//! roundtrip reproduces byte-identical git SHAs for unsigned histories.
 //!
 //! # Semantics
 //!
@@ -55,9 +56,11 @@
 //! # Non-goals / documented divergences (v0.1)
 //!
 //! * SHA-256 object-format repositories and shallow clones are rejected
-//!   with [`ImportError::Unsupported`].
+//!   with [`ImportError::Unsupported`]; an exported repository in sha256
+//!   format is rejected with [`ExportError::Git`].
 //! * Non-UTF-8 commit bytes (names, emails, messages, tree entry names)
-//!   are decoded lossily; gardenbed stores `String`s.
+//!   are decoded lossily; gardenbed stores `String`s (and export writes
+//!   those `String`s verbatim, so such commits do not round-trip).
 //! * Annotated tags are never read; tags-reachable-only commits are not
 //!   imported.
 //! * Negative (pre-1970) commit timestamps are rejected (the model stores
@@ -65,16 +68,23 @@
 //! * Concurrent imports of the same repository into the same stores race
 //!   on the mapping table (a lost bijection insert aborts the import);
 //!   ref updates themselves are CAS-atomic.
+//! * **Signed commits** are exported unsigned — fast-import cannot emit a
+//!   `gpgsig` header — so their git SHAs differ from the originals
+//!   (counted in [`ExportReport::signed_dropped`]; see
+//!   `docs/divergences.md`).
+//! * Extra commit headers (`encoding`, `mergetag`, `gpgsig-sha256`, …)
+//!   are not modeled on either side of the bridge.
 //!
 //! # Errors
 //!
 //! Nothing panics on bad input: malformed git data surfaces as
-//! [`ImportError`] with the offending object named.
+//! [`ImportError`] or [`ExportError`] with the offending object named.
 
 mod commit;
 mod counting;
 mod difftree;
 mod error;
+mod export;
 mod graph;
 mod gtree;
 mod import;
@@ -84,7 +94,8 @@ mod report;
 mod resolve;
 mod transform;
 
-pub use error::ImportError;
+pub use error::{ExportError, ImportError};
+pub use export::{export_to_path, ExportOptions, ExportReport};
 pub use import::import_from_path;
 pub use options::ImportOptions;
 pub use report::ImportReport;

@@ -19,11 +19,13 @@
 //! - tracked but missing on disk → **deleted**;
 //! - present in the plot but unknown to the treestate → **untracked**.
 //!
-//! [`scan_status`] is the pure core: `(root, plot, treestate) →
-//! StatusReport`, with no CLI and no server in sight. Its only side effect
-//! is the deliberate one: refreshing hint metadata on files that hash
-//! clean — never their blob ids (content addresses change only through
-//! `sow`/`goto`, later waves).
+//! [`scan_paths`] is the pure core: `(root, plot, treestate) → a per-path
+//! classification carrying blob ids, modes and hint metadata` — the shape
+//! `sow` consumes. [`scan_status`] wraps it, collapsing the classification
+//! into the three-bucket report the CLI prints. Their only side effect is
+//! the deliberate one: refreshing hint metadata on files that hash clean —
+//! never their blob ids (content addresses change only through
+//! `sow`/`goto`).
 
 use std::collections::HashSet;
 use std::fs;
@@ -33,13 +35,61 @@ use std::path::Path;
 use std::time::UNIX_EPOCH;
 
 use gardenbed_model::blob_id;
+use gardenbed_model::Id;
 
 use crate::error::BedError;
 use crate::plot::dir_may_hold_plotted;
 use crate::plot::in_plot;
 use crate::treestate::Treestate;
+use crate::treestate::HINT_UNVERIFIED;
 use crate::treestate::MODE_GITLINK;
 use crate::treestate::MODE_SYMLINK;
+
+/// What the scan decided about one path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanDelta {
+    /// Tracked and unchanged — content and mode match the treestate row
+    /// (hint metadata may have been refreshed).
+    Clean,
+    /// Tracked, on disk, but content or mode differs from the row. Carries
+    /// the file's *current* blob id (recomputed from the working bytes —
+    /// identical to the row's for a mode-only change), mode, and the
+    /// stat metadata `sow` needs to refresh the row.
+    Modified {
+        /// SHA-256 of the working bytes.
+        blob_id: Id,
+        /// §4 mode code observed on disk (0 regular · 1 exec · 2 symlink).
+        mode: i64,
+        /// Working file's size in bytes.
+        size: i64,
+        /// Working file's mtime, ns since the epoch.
+        mtime_ns: i64,
+    },
+    /// Tracked as a file but gone from disk — or replaced by a directory,
+    /// which is the same outcome: the path no longer holds a file.
+    Deleted,
+    /// In the plot but unknown to the treestate. Carries the same metadata
+    /// as [`ScanDelta::Modified`] (the path has no row yet).
+    Untracked {
+        /// SHA-256 of the working bytes.
+        blob_id: Id,
+        /// §4 mode code observed on disk.
+        mode: i64,
+        /// Working file's size in bytes.
+        size: i64,
+        /// Working file's mtime, ns since the epoch.
+        mtime_ns: i64,
+    },
+}
+
+/// One classified path of the scan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanItem {
+    /// Repo-relative, forward-slash path.
+    pub path: String,
+    /// What the scan found.
+    pub delta: ScanDelta,
+}
 
 /// What `bed status` found under the plot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -83,17 +133,23 @@ impl StatusReport {
 }
 
 /// Compares the working files under `plot` against `treestate`, relative to
-/// the working-copy root `root`. See the module docs for the semantics.
+/// the working-copy root `root`, classifying every path the scan touches.
+/// See the module docs for the semantics; [`scan_status`] renders the same
+/// walk as a `StatusReport`.
 ///
 /// `full_scan` (the `--full-scan` flag) forces the correctness path: every
 /// tracked file is hashed regardless of hints.
-pub fn scan_status(
+///
+/// Only modified/untracked entries carry metadata; the walk order is
+/// deterministic (sorted per directory) but the returned list is not sorted
+/// globally — callers that print sort their own buckets.
+pub fn scan_paths(
     root: &Path,
     plot: &[String],
     treestate: &Treestate,
     full_scan: bool,
-) -> Result<StatusReport, BedError> {
-    let mut report = StatusReport::default();
+) -> Result<Vec<ScanItem>, BedError> {
+    let mut items: Vec<ScanItem> = Vec::new();
 
     let tracked_paths = treestate.all_paths()?;
     let tracked: HashSet<String> = tracked_paths.iter().cloned().collect();
@@ -115,10 +171,14 @@ pub fn scan_status(
         }
         match fs::symlink_metadata(root.join(path)) {
             Ok(m) if m.is_file() || m.is_symlink() => {}
-            Ok(_) => report.deleted.push(path.clone()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                report.deleted.push(path.clone())
-            }
+            Ok(_) => items.push(ScanItem {
+                path: path.clone(),
+                delta: ScanDelta::Deleted,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => items.push(ScanItem {
+                path: path.clone(),
+                delta: ScanDelta::Deleted,
+            }),
             Err(e) => return Err(e.into()),
         }
     }
@@ -158,19 +218,64 @@ pub fn scan_status(
                 }
             } else if in_plot(&rel, plot) {
                 if !tracked.contains(&rel) {
-                    report.untracked.push(rel);
+                    items.push(ScanItem {
+                        path: rel.clone(),
+                        delta: classify_untracked(root, &rel)?,
+                    });
                 } else {
-                    check_tracked(root, &rel, full_scan, treestate, &mut report)?;
+                    let delta = classify_tracked(root, &rel, full_scan, treestate)?;
+                    items.push(ScanItem { path: rel, delta });
                 }
             }
         }
     }
 
+    Ok(items)
+}
+
+/// `bed status`: the same walk as [`scan_paths`], collapsed into the three
+/// buckets the CLI prints. `full_scan` (the `--full-scan` flag) forces the
+/// correctness path: every tracked file is hashed regardless of hints.
+pub fn scan_status(
+    root: &Path,
+    plot: &[String],
+    treestate: &Treestate,
+    full_scan: bool,
+) -> Result<StatusReport, BedError> {
+    let mut report = StatusReport::default();
+    for item in scan_paths(root, plot, treestate, full_scan)? {
+        match item.delta {
+            ScanDelta::Clean => {}
+            ScanDelta::Modified { .. } => report.modified.push(item.path),
+            ScanDelta::Deleted => report.deleted.push(item.path),
+            ScanDelta::Untracked { .. } => report.untracked.push(item.path),
+        }
+    }
     // Deterministic output regardless of walk order.
     report.modified.sort();
     report.deleted.sort();
     report.untracked.sort();
     Ok(report)
+}
+
+/// Classifies a path the treestate has never seen: stat it and hash its
+/// bytes (for a symlink, the link-target bytes).
+fn classify_untracked(root: &Path, rel: &str) -> Result<ScanDelta, BedError> {
+    let observed = observe(root, rel)?.ok_or_else(|| {
+        // The walk listed the entry moments ago; it cannot have vanished
+        // through a race bed cares about. Classify it deleted-of-nothing:
+        // there is no row to delete, so the path is simply absent.
+        BedError::ConfigInvalid(format!(
+            "{rel:?} appeared and vanished while scanning — the garden is \
+             being changed concurrently"
+        ))
+    })?;
+    Ok(ScanDelta::Untracked {
+        blob_id: observed.blob_id,
+        mode: observed.mode,
+        size: observed.size,
+        mtime_ns: observed.mtime_ns,
+    })
 }
 
 /// Classifies one tracked, on-disk file: hint-pass clean, or hash and
@@ -179,72 +284,102 @@ pub fn scan_status(
 /// Symlinks are checked as the link itself (`symlink_metadata`, never
 /// following): the "content" is the link-target bytes, the mode is
 /// [`MODE_SYMLINK`], and a broken target is still a faithful symlink.
-fn check_tracked(
+fn classify_tracked(
     root: &Path,
     rel: &str,
     full_scan: bool,
     treestate: &Treestate,
-    report: &mut StatusReport,
-) -> Result<(), BedError> {
+) -> Result<ScanDelta, BedError> {
     let entry = match treestate.lookup(rel)? {
         Some(entry) => entry,
         // The tracked set was loaded a moment ago; a row vanishing mid-scan
         // is not a state bed reports on — treat it as untouched.
-        None => return Ok(()),
+        None => return Ok(ScanDelta::Clean),
     };
     // A gitlink row never has a file on disk; nothing to check here.
     if entry.mode == MODE_GITLINK {
-        return Ok(());
+        return Ok(ScanDelta::Clean);
     }
 
-    let meta = match fs::symlink_metadata(root.join(rel)) {
-        Ok(m) => m,
+    let observed = match observe(root, rel)? {
+        Some(observed) => observed,
         // Vanished between pass 1 and here: pass 1 already called it.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
+        None => return Ok(ScanDelta::Clean),
     };
-    if meta.is_dir() {
-        return Ok(()); // replaced by a directory — already reported deleted
-    }
-
-    let is_symlink = meta.is_symlink();
-    let size = meta.len() as i64;
-    let mtime_ns = mtime_ns(&meta);
-    let mode = if is_symlink { MODE_SYMLINK } else { mode_of(&meta) };
 
     // Hint pass: size+mtime+mode unchanged on a verified row → untouched,
     // without reading the file. `--full-scan` skips this entirely.
     if !full_scan
-        && entry.hint != crate::treestate::HINT_UNVERIFIED
-        && size == entry.size
-        && mtime_ns == entry.mtime_ns
-        && mode == entry.mode
+        && entry.hint != HINT_UNVERIFIED
+        && observed.size == entry.size
+        && observed.mtime_ns == entry.mtime_ns
+        && observed.mode == entry.mode
     {
-        return Ok(());
+        return Ok(ScanDelta::Clean);
     }
 
-    // Suspect: hash it and let content decide. A symlink's content is its
-    // target; everything else is the file's bytes.
+    // Suspect: let content decide (the bytes are already read). A symlink's
+    // content is its target; everything else is the file's bytes.
+    if observed.blob_id == entry.blob_id {
+        if observed.mode != entry.mode {
+            // Content is unchanged but the mode moved (e.g. the exec bit or
+            // a file↔symlink swap): a real modification until the
+            // treestate catches up.
+            Ok(ScanDelta::Modified {
+                blob_id: observed.blob_id,
+                mode: observed.mode,
+                size: observed.size,
+                mtime_ns: observed.mtime_ns,
+            })
+        } else {
+            // Touch-without-change (mtime or hint metadata moved): refresh
+            // the hints so the next scan skips this file again.
+            treestate.refresh_hint(rel, observed.size, observed.mtime_ns)?;
+            Ok(ScanDelta::Clean)
+        }
+    } else {
+        Ok(ScanDelta::Modified {
+            blob_id: observed.blob_id,
+            mode: observed.mode,
+            size: observed.size,
+            mtime_ns: observed.mtime_ns,
+        })
+    }
+}
+
+/// One file's working-copy state as the scan sees it: bytes hashed, mode
+/// decoded, stat metadata captured in one pass.
+struct Observed {
+    blob_id: Id,
+    mode: i64,
+    size: i64,
+    mtime_ns: i64,
+}
+
+/// Reads and hashes the working entry at `root/rel`. A symlink's content is
+/// its link-target bytes. `Ok(None)` when the entry vanished (or was
+/// replaced by a directory) between the walk and this read.
+fn observe(root: &Path, rel: &str) -> Result<Option<Observed>, BedError> {
+    let meta = match fs::symlink_metadata(root.join(rel)) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.is_dir() {
+        return Ok(None); // replaced by a directory
+    }
+    let is_symlink = meta.is_symlink();
     let content: Vec<u8> = if is_symlink {
         fs::read_link(root.join(rel))?.as_os_str().as_bytes().to_vec()
     } else {
         fs::read(root.join(rel))?
     };
-    if blob_id(&content) == entry.blob_id {
-        if mode != entry.mode {
-            // Content is unchanged but the mode moved (e.g. the exec bit or
-            // a file↔symlink swap): a real modification until the
-            // treestate catches up.
-            report.modified.push(rel.to_owned());
-        } else {
-            // Touch-without-change (mtime or hint metadata moved): refresh
-            // the hints so the next scan skips this file again.
-            treestate.refresh_hint(rel, size, mtime_ns)?;
-        }
-    } else {
-        report.modified.push(rel.to_owned());
-    }
-    Ok(())
+    Ok(Some(Observed {
+        blob_id: blob_id(&content),
+        mode: if is_symlink { MODE_SYMLINK } else { mode_of(&meta) },
+        size: meta.len() as i64,
+        mtime_ns: mtime_ns(&meta),
+    }))
 }
 
 /// The treestate's clock: file mtime as nanoseconds since the Unix epoch
@@ -482,5 +617,85 @@ mod tests {
             "modified:\n    src/b.rs\ndeleted:\n    src/a.rs\nuntracked:\n    src/c.rs\n"
         );
         assert_eq!(StatusReport::default().render(), "");
+    }
+
+    /// The sow-facing core reports the same walk with metadata attached.
+    #[test]
+    fn scan_paths_carries_blob_ids_modes_and_stat_metadata() {
+        let g = Garden::planted(&[("src/a.rs", b"hello"), ("src/gone.txt", b"bye")]);
+        fs::write(g.dir.path().join("src/a.rs"), b"changed").unwrap();
+        fs::remove_file(g.dir.path().join("src/gone.txt")).unwrap();
+        fs::write(g.dir.path().join("src/new.txt"), b"fresh").unwrap();
+
+        let items = scan_paths(
+            &g.bed.garden_root(),
+            &g.bed.config().plot,
+            &g.bed.treestate().unwrap(),
+            false,
+        )
+        .unwrap();
+        let by_path: std::collections::BTreeMap<_, _> = items
+            .into_iter()
+            .map(|i| (i.path, i.delta))
+            .collect();
+
+        let meta = fs::metadata(g.dir.path().join("src/a.rs")).unwrap();
+        assert_eq!(
+            by_path.get("src/a.rs"),
+            Some(&ScanDelta::Modified {
+                blob_id: blob_id(b"changed"),
+                mode: 0,
+                size: b"changed".len() as i64,
+                mtime_ns: mtime_ns(&meta),
+            })
+        );
+        assert_eq!(by_path.get("src/gone.txt"), Some(&ScanDelta::Deleted));
+        let meta = fs::metadata(g.dir.path().join("src/new.txt")).unwrap();
+        assert_eq!(
+            by_path.get("src/new.txt"),
+            Some(&ScanDelta::Untracked {
+                blob_id: blob_id(b"fresh"),
+                mode: 0,
+                size: b"fresh".len() as i64,
+                mtime_ns: mtime_ns(&meta),
+            })
+        );
+        // Everything tracked and untouched is Clean — the planted fixture
+        // has no other files.
+        assert_eq!(by_path.len(), 3);
+    }
+
+    /// A mode-only change reports the SAME blob id (content re-hashed
+    /// unchanged) with the new mode — the shape sow turns into a `Modify`
+    /// that reuses the old blob.
+    #[test]
+    fn mode_only_change_keeps_the_blob_id() {
+        let g = Garden::planted(&[("src/run.sh", b"#!/bin/sh\n")]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let path = g.dir.path().join("src/run.sh");
+            let mut perms = fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            fs::set_permissions(&path, perms).unwrap();
+            let items = scan_paths(
+                &g.bed.garden_root(),
+                &g.bed.config().plot,
+                &g.bed.treestate().unwrap(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0].path, "src/run.sh");
+            match &items[0].delta {
+                ScanDelta::Modified {
+                    blob_id: got, mode, ..
+                } => {
+                    assert_eq!(*got, gardenbed_model::blob_id(b"#!/bin/sh\n"));
+                    assert_eq!(*mode, crate::treestate::MODE_EXEC);
+                }
+                other => panic!("expected Modified, got {other:?}"),
+            }
+        }
     }
 }

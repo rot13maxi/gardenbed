@@ -1,11 +1,10 @@
 //! `bed` — the binary. Parses the CLI and dispatches; all behavior lives
-//! in the `gardenbed` library so later waves (write path, MCP) reuse it
-//! unchanged.
+//! in the `gardenbed` library so later waves (MCP) reuse it unchanged.
 //!
 //! The read-path commands (`clone`, `plot add`, `goto`, `file`, `log`,
-//! `diff`) run against the arboretum. `sow`, `graft`, `harvest` and
-//! `blame` (M5/M6) still stop at [`todo_rpc`] — exit 2, after full local
-//! validation.
+//! `diff`) and the write path (`sow`, `graft`, `harvest`) run against the
+//! arboretum. Only `blame` (M6) still stops at [`todo_rpc`] — exit 2,
+//! after full local validation.
 
 use clap::Parser as _;
 
@@ -34,21 +33,20 @@ fn main() {
 }
 
 /// Exit code for "everything is parsed, but this command is a later
-/// milestone" — distinct from errors (1).
+/// milestone" — distinct from errors (1). After M5 only `blame` (M6)
+/// still lands here.
 const NOT_WIRED: i32 = 2;
 
-/// The stub for the write-path commands (`sow`, `graft`, `harvest`) and
-/// `blame` (M6). Argument parsing and local validation are complete; the
-/// RPC call itself is a later wave.
+/// The stub for `blame` (M6). Argument parsing and local validation are
+/// complete; the lineage walk is a later wave.
 fn todo_rpc(command: &str) -> ! {
     eprintln!(
-        "bed {command}: requires a running arboretum — not wired yet."
+        "bed {command}: not wired yet — it lands with the blame milestone."
     );
     eprintln!(
-        "This command lands in a later wave. The local bed state \
-         (.bed/config.toml, .bed/treestate, .bed/objects, .bed/heads) is in \
-         place, and `bed status`, `bed plot`, `bed clone`, `bed goto`, \
-         `bed file`, `bed log` and `bed diff` work today."
+        "Everything else works today: `bed status`, `bed plot`, `bed clone`, \
+         `bed goto`, `bed file`, `bed log`, `bed diff`, `bed sow`, \
+         `bed graft` and `bed harvest`."
     );
     std::process::exit(NOT_WIRED);
 }
@@ -133,33 +131,29 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
         }
 
         Command::Sow { message, author } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
             if message.trim().is_empty() {
                 return Err(BedError::ConfigInvalid(
                     "the message is empty — sow with -m <message>".into(),
                 ));
             }
-            if let Some(name_email) = author {
-                for field in name_email {
-                    if field.trim().is_empty() {
-                        return Err(BedError::ConfigInvalid(
-                            "--author needs a name and an email, both non-empty".into(),
-                        ));
-                    }
-                }
-            }
-            todo_rpc("sow")
+            let outcome = gardenbed::sow::sow(&cli.bed_dir, message, author.as_deref()).await?;
+            print!("{}", gardenbed::sow::render_outcome(&outcome));
+            Ok(0)
         }
 
         Command::Graft { new_parent } => {
             let _bed = Bed::open(&cli.bed_dir)?;
             CsOrRef::parse(new_parent)?;
-            todo_rpc("graft")
+            let out = gardenbed::ops::graft(&cli.bed_dir, new_parent).await?;
+            print!("{out}");
+            Ok(0)
         }
 
         Command::Harvest => {
             let _bed = Bed::open(&cli.bed_dir)?;
-            todo_rpc("harvest")
+            let out = gardenbed::ops::harvest(&cli.bed_dir).await?;
+            print!("{out}");
+            Ok(0)
         }
 
         Command::Blame { path } => {

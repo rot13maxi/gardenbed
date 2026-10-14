@@ -216,23 +216,49 @@ fn clone_fails_cleanly_without_an_arboretum_and_leaves_no_bed() {
 }
 
 #[test]
-fn write_path_commands_ask_for_a_later_wave() {
+fn write_path_is_wired_but_blame_still_asks_for_a_later_wave() {
+    // -- sow never contacts the arboretum for a clean plot: the local
+    //    NothingToSow error comes first (exit 1, no stub code involved).
     let dir = planted_bed();
-    let cases: &[&[&str]] = &[
-        &["sow", "-m", "tend the rows"],
-        &["graft", "main"],
-        &["harvest"],
-        &["blame", "src/a.rs"],
-    ];
-    for args in cases {
+    let (code, stdout, stderr) = bed(&dir, &["sow", "-m", "tend the rows"]);
+    assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(stderr.contains("the plot is clean"), "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+
+    // -- with something to sow, the (deliberately unreachable) arboretum
+    //    connection is what fails — nothing was uploaded, no half-state.
+    let dir = planted_bed();
+    plot(&dir, &["src"]);
+    fs::create_dir_all(dir.path().join("src")).unwrap();
+    fs::write(dir.path().join("src/new.txt"), b"fresh\n").unwrap();
+    let (code, stdout, stderr) = bed(&dir, &["sow", "-m", "tend the rows"]);
+    assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(
+        stderr.contains("cannot reach the arboretum"),
+        "stderr: {stderr}"
+    );
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+
+    // -- graft and harvest are wired too: the connection fails before any
+    //    local state is touched.
+    for args in [&["graft", "main"][..], &["harvest"][..]] {
+        let dir = planted_bed();
         let (code, stdout, stderr) = bed(&dir, args);
-        assert_eq!(code, 2, "args {args:?}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(code, 1, "args {args:?}: stdout {stdout:?} stderr {stderr:?}");
         assert!(
-            stderr.contains("requires a running arboretum — not wired yet"),
+            stderr.contains("cannot reach the arboretum"),
             "args {args:?}: stderr {stderr:?}"
         );
         assert!(stdout.is_empty(), "args {args:?}: stdout {stdout:?}");
     }
+
+    // -- blame (M6) is still the stub: distinct milestone code, distinct
+    //    message.
+    let dir = planted_bed();
+    let (code, stdout, stderr) = bed(&dir, &["blame", "src/a.rs"]);
+    assert_eq!(code, 2, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(stderr.contains("not wired yet"), "stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
 }
 
 #[test]

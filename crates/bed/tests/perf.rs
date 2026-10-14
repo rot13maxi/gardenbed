@@ -11,7 +11,10 @@
 //! * a warm `bed status` over a 10k-file plot answers in under 500 ms
 //!   (hint-guided: nothing is hashed);
 //! * a cold `bed file` (fresh process, warm cache, live arboretum) has a
-//!   p95 under 50 ms across 20 runs.
+//!   p95 under 50 ms across 20 runs;
+//! * **M5**: sowing the same 100-file change is size-independent — the
+//!   p50 sow on a 1M-file arboretum is at most twice the p50 sow on a
+//!   10k-file one (the write path costs the change, not the repository).
 //!
 //! Each test asserts its budget and prints its numbers.
 //!
@@ -239,4 +242,171 @@ async fn cold_file_p95_under_50ms() {
     println!("cold file p95: {p:.1?} (slowest {slowest:.1?})");
     assert_budget("cold bed file p95 of 20 runs", p, Duration::from_millis(50));
     w.server.shutdown().await;
+}
+
+/// Ingests `total_files` bulk files (in chunks of `per_cs` adds per
+/// changeset, spread over per-changeset directories so each tree apply
+/// touches a handful of nodes — real repositories grow breadth-wise, and
+/// the fixture must not smuggle an O(repo) shape into the *fixture* build)
+/// plus a 100-file `small/` plot directory, and points `main` at the head.
+/// Runs through the server library in-process, so no request counters move.
+///
+/// The 2^20-changes-per-changeset codec bound caps `per_cs`; 10k keeps
+/// every changeset far under it while the 1M-file repo takes ~100
+/// changesets. The fixture lives on tmpfs (see [`temp_root`]), where the
+/// object store's fsyncs are cheap; no durability toggles are touched.
+fn build_sized_repo(root: &Path, total_files: usize, per_cs: usize) -> gardenbed_model::Id {
+    use gardenbed_model::{Change, Changeset, Identity, Mode, Op};
+    use gardenbed_server::Repo;
+
+    let repo = Repo::open(root).expect("repo opens");
+    let ident = |secs: u64| Identity {
+        name: "Seeder".into(),
+        email: "seed@bed.example".into(),
+        time_secs: secs,
+        tz_min: 0,
+    };
+    let mut parent: Option<gardenbed_model::Id> = None;
+    let mut made = 0usize;
+    let mut cs_no = 0usize;
+    while made < total_files {
+        let n = per_cs.min(total_files - made);
+        let mut changes = Vec::with_capacity(n + if cs_no == 0 { 100 } else { 0 });
+        let mut inline = std::collections::BTreeMap::new();
+        for k in 0..n {
+            let path = format!("bulk/d{cs_no:03}/f{k:05}.txt");
+            let content = format!("row {} of the bulk fixture\n", made + k);
+            let blob = blob_id(content.as_bytes());
+            changes.push(Change {
+                path,
+                op: Op::Add,
+                blob: Some(blob),
+                src_path: None,
+                mode: Mode::Regular,
+            });
+            inline.insert(blob.to_hex(), content.into_bytes());
+        }
+        if cs_no == 0 {
+            for k in 0..100 {
+                let path = format!("small/f{k:02}.txt");
+                let content = format!("small file {k}\n");
+                let blob = blob_id(content.as_bytes());
+                changes.push(Change {
+                    path,
+                    op: Op::Add,
+                    blob: Some(blob),
+                    src_path: None,
+                    mode: Mode::Regular,
+                });
+                inline.insert(blob.to_hex(), content.into_bytes());
+            }
+        }
+        let cs = Changeset {
+            parents: parent.into_iter().collect(),
+            changes,
+            message: format!("bulk seed {cs_no}"),
+            author: ident(1_700_000_000 + cs_no as u64),
+            committer: ident(1_700_000_000 + cs_no as u64),
+            signature: None,
+        };
+        let id = repo
+            .create_changeset(&cs, &inline)
+            .expect("bulk changeset ingests");
+        parent = Some(id);
+        made += n;
+        cs_no += 1;
+    }
+    let head = parent.expect("at least one changeset");
+    repo.cas_ref("main", None, head).expect("main created");
+    head
+}
+
+/// M5 perf: sow latency is independent of repository size. Two synthetic
+/// arboreta (10k and 1M files) are ingested in-process and served; on
+/// each, seven fresh beds sow the identical 100-file change (the `small/`
+/// plot only — nothing else is ever materialized). The p50 of the 1M sows
+/// must stay within 2× the p50 of the 10k sows.
+#[tokio::test]
+#[ignore = "size-independence budget; run in release: cargo test -p gardenbed --release -- --ignored"]
+async fn sow_p50_is_size_independent_10k_vs_1m() {
+    assert_release();
+    const REPS: usize = 7;
+    const SMALL_FILES: usize = 100;
+
+    let dir = temp_root();
+    let small_repo = dir.path().join("arboretum-10k");
+    let big_repo = dir.path().join("arboretum-1m");
+
+    // Fixture ingest (uncounted, in-process). 1M files arrive as ~100
+    // changesets of 10k adds each.
+    let t0 = Instant::now();
+    build_sized_repo(&small_repo, 10_000, 10_000);
+    build_sized_repo(&big_repo, 1_000_000, 10_000);
+    println!(
+        "fixtures ingested in {:.1?} (10k + 1M files)",
+        t0.elapsed()
+    );
+
+    let mut small_server = Arboretum::spawn(&small_repo).await;
+    let mut big_server = Arboretum::spawn(&big_repo).await;
+
+    // One fresh bed per rep: clone, plot the small/ subtree, rewrite its
+    // 100 files, sow. Only the sow is timed.
+    let sow_once = |server_http: &str, garden: &Path, rep: usize| -> Duration {
+        fs::create_dir_all(garden).expect("garden dir");
+        let (code, _, stderr) = bed(garden, &["clone", server_http]);
+        assert_eq!(code, 0, "clone: {stderr}");
+        let (code, _, stderr) = bed(garden, &["plot", "add", "small"]);
+        assert_eq!(code, 0, "plot add: {stderr}");
+        for k in 0..SMALL_FILES {
+            fs::write(
+                garden.join(format!("small/f{k:02}.txt")),
+                format!("small file {k} — sown by rep {rep}\n"),
+            )
+            .expect("working file");
+        }
+        let start = Instant::now();
+        let (code, out, stderr) = bed(garden, &["sow", "-m", &format!("rep {rep}")]);
+        let elapsed = start.elapsed();
+        assert_eq!(code, 0, "sow: {stderr}\n{out}");
+        elapsed
+    };
+
+    // One untimed warm-up per size (page cache, code paths), then the
+    // measured reps.
+    let _ = sow_once(
+        &small_server.http(),
+        &dir.path().join("garden-warm-10k"),
+        100,
+    );
+    let _ = sow_once(&big_server.http(), &dir.path().join("garden-warm-1m"), 100);
+    let mut small_samples = Vec::new();
+    let mut big_samples = Vec::new();
+    for rep in 0..REPS {
+        small_samples.push(sow_once(
+            &small_server.http(),
+            &dir.path().join(format!("garden-10k-{rep}")),
+            rep,
+        ));
+        big_samples.push(sow_once(
+            &big_server.http(),
+            &dir.path().join(format!("garden-1m-{rep}")),
+            rep,
+        ));
+    }
+    small_server.shutdown().await;
+    big_server.shutdown().await;
+
+    small_samples.sort();
+    big_samples.sort();
+    let p50_small = small_samples[REPS / 2];
+    let p50_big = big_samples[REPS / 2];
+    println!("p50 sow over 10k files: {p50_small:.1?}");
+    println!("p50 sow over 1M files:  {p50_big:.1?}");
+    let ratio = p50_big.as_secs_f64() / p50_small.as_secs_f64();
+    println!("ratio: {ratio:.2} (budget 2.00)");
+    assert!(
+        p50_big <= p50_small * 2,
+        "sow is not size-independent: 1M p50 {p50_big:.1?} vs 10k p50 {p50_small:.1?}"
+    );
 }

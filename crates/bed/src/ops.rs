@@ -291,6 +291,118 @@ pub async fn file(
     Ok(())
 }
 
+/// `bed graft <new-parent>` — replay the current changeset onto a new
+/// parent (the server-side linearized rebase, v0.1.md D5) and move the bed
+/// onto the replayed changeset.
+///
+/// The server returns the grafted changeset's id, or refuses with
+/// `FAILED_PRECONDITION` naming the conflicting paths (same path written
+/// on both sides, delete of a missing path, …) — surfaced as
+/// [`BedError::Rpc`], verbatim. On success the bed treats the result like
+/// a `goto`: the plot is re-planned and re-synced at the grafted changeset
+/// (which usually changes nothing — the replay carries this bed's own
+/// changes — but the new parent may differ elsewhere under the plot), the
+/// config moves, and the heads stack is re-pointed from the old changeset
+/// to the grafted one.
+pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError> {
+    let mut bed = Bed::open(bed_dir)?;
+    let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
+    let session = Session::open(&bed).await?;
+    let current = session.resolve_current_cs(&bed, "graft").await?;
+    let parent = session.resolve(&parsed, "graft").await?;
+
+    // The replay is the arboretum's decision; conflicts come back as a
+    // FAILED_PRECONDITION whose message lists every conflicting path.
+    let grafted = match session.client.graft(&bed.config().repo, current, parent).await {
+        Ok(id) => id,
+        Err(status) => {
+            return Err(BedError::Rpc {
+                command: "graft",
+                code: status.code(),
+                message: status.message().to_owned(),
+            })
+        }
+    };
+
+    // Move the bed like `goto` does: plan the plot at the grafted
+    // changeset, then fetch + sync.
+    let root = session.root_tree(grafted, "graft").await?;
+    let prefixes = bed.config().plot.clone();
+    let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
+    bed.config_mut().current_cs = Some(grafted.to_hex());
+    bed.save_config()?;
+
+    let treestate = bed.treestate()?;
+    let outcome = sync::sync_plot(
+        &bed.garden_root(),
+        &prefixes,
+        plan,
+        session.fetcher(),
+        &treestate,
+    )
+    .await?;
+    bed.heads().repoint(current, grafted)?;
+
+    Ok(format!(
+        "grafted {} onto {} as {}\n\
+         fetched {} tree(s), {} blob(s)\n{}\n",
+        current.short(),
+        parent.short(),
+        grafted.short(),
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        outcome.summarize(),
+    ))
+}
+
+/// `bed harvest` — fast-forward `main` to the bed's current changeset.
+///
+/// The arboretum enforces the ancestry precondition with a
+/// compare-and-swap: exactly one harvester wins a race, everyone else
+/// receives [`BedError::HarvestNotFastForward`] with the fix spelled out.
+/// Success appends the harvested changeset to the heads stack; the bed
+/// stays where it is — harvesting publishes, it does not move.
+pub async fn harvest(bed_dir: &Path) -> Result<String, BedError> {
+    let bed = Bed::open(bed_dir)?;
+    let session = Session::open(&bed).await?;
+    let repo = bed.config().repo.clone();
+    let current = session.resolve_current_cs(&bed, "harvest").await?;
+
+    match session.client.harvest(&repo, current).await {
+        // The returned tip is `main`'s value after the fast-forward —
+        // the changeset itself for a conforming arboretum.
+        Ok(_tip) => {
+            bed.heads().append(current)?;
+            Ok(format!(
+                "harvested {} — `main` now grows from it\n",
+                current.short()
+            ))
+        }
+        Err(status) if status.code() == Code::FailedPrecondition => {
+            // The ref moved under us (a concurrent harvest, or history
+            // landing from elsewhere). Name the new tip when the arboretum
+            // will say it, so the fix is one command away.
+            let tip = session
+                .client
+                .get_ref(&repo, DEFAULT_REF)
+                .await
+                .ok()
+                .flatten()
+                .map(|id| format!(", which now grows from {}", id.short()))
+                .unwrap_or_default();
+            Err(BedError::HarvestNotFastForward {
+                cs: current.short(),
+                tip,
+            })
+        }
+        Err(status) => Err(BedError::Rpc {
+            command: "harvest",
+            code: status.code(),
+            message: status.message().to_owned(),
+        }),
+    }
+}
+
 /// Resolves the changeset a read command should answer at: an explicit
 /// `<cs-or-ref>` when given, else the bed's current changeset. A missing
 /// current changeset is reported before any connection is attempted (the

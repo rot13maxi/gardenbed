@@ -72,6 +72,34 @@ impl Heads {
         writeln!(f, "{}", id.to_hex())?;
         Ok(())
     }
+
+    /// Re-points the stack: the LAST occurrence of `old` becomes `new`.
+    ///
+    /// `graft` replaces a sown changeset with its replayed copy; the tip
+    /// that named the old changeset must name the new one instead of
+    /// growing a stale second tip. When `old` is not on the stack (e.g. the
+    /// bed moved with `goto` after sowing, so heads never recorded it),
+    /// this degrades to [`Heads::append`] — the grafted changeset simply
+    /// becomes a tip.
+    pub fn repoint(&self, old: Id, new: Id) -> Result<(), BedError> {
+        let mut tips = self.read()?;
+        match tips.iter_mut().rposition(|t| *t == old) {
+            Some(i) => {
+                tips[i] = new;
+                if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut body = String::with_capacity(tips.len() * 65);
+                for tip in &tips {
+                    body.push_str(&tip.to_hex());
+                    body.push('\n');
+                }
+                fs::write(&self.path, body)?;
+                Ok(())
+            }
+            None => self.append(new),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -120,5 +148,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let heads = Heads::open(dir.path().join("never-created"));
         assert_eq!(heads.read().unwrap(), Vec::<Id>::new());
+    }
+
+    #[test]
+    fn repoint_replaces_the_last_occurrence_and_keeps_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let heads = Heads::open(dir.path().join("heads"));
+        heads.append(id(1)).unwrap();
+        heads.append(id(2)).unwrap();
+        heads.append(id(3)).unwrap();
+        heads.append(id(2)).unwrap();
+
+        heads.repoint(id(2), id(9)).unwrap();
+        assert_eq!(heads.read().unwrap(), vec![id(1), id(2), id(3), id(9)]);
+        // The second occurrence (the last) was the one replaced.
+    }
+
+    #[test]
+    fn repoint_of_an_unknown_tip_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let heads = Heads::open(dir.path().join("heads"));
+        heads.append(id(1)).unwrap();
+        heads.append(id(2)).unwrap();
+
+        // `old` (7) never made it onto the stack — the grafted changeset
+        // becomes a new tip instead.
+        heads.repoint(id(7), id(8)).unwrap();
+        assert_eq!(heads.read().unwrap(), vec![id(1), id(2), id(8)]);
+    }
+
+    #[test]
+    fn repoint_is_idempotent_when_old_equals_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let heads = Heads::open(dir.path().join("heads"));
+        heads.append(id(1)).unwrap();
+        heads.repoint(id(1), id(1)).unwrap();
+        assert_eq!(heads.read().unwrap(), vec![id(1)]);
     }
 }

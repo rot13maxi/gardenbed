@@ -103,9 +103,10 @@ pub enum Command {
         /// The changeset's message.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: String,
-        /// Author as `--author NAME EMAIL`.
-        #[arg(long, value_names = ["NAME", "EMAIL"], num_args = 2)]
-        author: Option<Vec<String>>,
+        /// Author as one `Name <email>` identity (default: the
+        /// GARDENBED_AUTHOR environment variable, else the bed's own).
+        #[arg(long, value_name = "NAME <EMAIL>")]
+        author: Option<String>,
     },
 
     /// Replay the current changeset onto a new parent (server-side rebase).
@@ -274,11 +275,18 @@ mod tests {
             }
             other => panic!("expected Diff, got {other:?}"),
         }
-        match parsed(&["sow", "-m", "tend the rows", "--author", "G. Gardener", "g@bed.dev"]).command {
+        match parsed(&["sow", "-m", "tend the rows", "--author", "G. Gardener <g@bed.dev>"])
+            .command
+        {
             Command::Sow { message, author } => {
                 assert_eq!(message, "tend the rows");
-                assert_eq!(author.unwrap(), vec!["G. Gardener", "g@bed.dev"]);
+                assert_eq!(author.as_deref(), Some("G. Gardener <g@bed.dev>"));
             }
+            other => panic!("expected Sow, got {other:?}"),
+        }
+        // The author is optional (env var / bed default fill in).
+        match parsed(&["sow", "-m", "tend the rows"]).command {
+            Command::Sow { author, .. } => assert!(author.is_none()),
             other => panic!("expected Sow, got {other:?}"),
         }
         match parsed(&["graft", "main"]).command {
@@ -295,8 +303,8 @@ mod tests {
         }
         // `-m` is required.
         assert!(Cli::try_parse_from(["bed", "sow"]).is_err());
-        // `--author` takes exactly two values.
-        assert!(Cli::try_parse_from(["bed", "sow", "-m", "x", "--author", "only-name"]).is_err());
+        // `--author` takes exactly one value.
+        assert!(Cli::try_parse_from(["bed", "sow", "-m", "x", "--author"]).is_err());
     }
 
     #[test]

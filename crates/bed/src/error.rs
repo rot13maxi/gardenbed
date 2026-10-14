@@ -177,4 +177,43 @@ pub enum BedError {
     /// they were asked for. A cache or tier is lying; refuse the bytes.
     #[error("the arboretum sent blob {0} with content that does not match its address")]
     BlobHashMismatch(Id),
+
+    // ------------------------------------------------- write path (M5)
+    /// An `--author` (or `GARDENBED_AUTHOR`) value is not a usable
+    /// `Name <email>` identity, or carries characters git's ident format
+    /// cannot carry (which would make the changeset unexportable).
+    #[error(
+        "bad author {raw:?}: {reason}\n  \
+         sow with --author \"Name <email>\""
+    )]
+    Author {
+        /// The value as given.
+        raw: String,
+        /// Why it was rejected.
+        reason: String,
+    },
+
+    /// The scan found nothing to sow: the plot is clean.
+    #[error(
+        "the plot is clean — nothing modified, deleted, or untracked to sow"
+    )]
+    NothingToSow,
+
+    /// A working file changed between the scan and the read that sows it.
+    /// Harmless and rare; sowing again simply re-scans.
+    #[error("{0:?} keeps changing while sowing — rerun `bed sow`")]
+    FileChanged(String),
+
+    /// `harvest` was refused because `main` is no longer where this bed's
+    /// changeset grew from — a fast-forward CAS lost to a moved ref.
+    #[error(
+        "`main` moved while harvesting — {cs} is not its tip anymore{tip}\n  \
+         graft this changeset onto the new main (`bed graft main`) and harvest again"
+    )]
+    HarvestNotFastForward {
+        /// The changeset that was being harvested (short form).
+        cs: String,
+        /// `main`'s current tip (short form), when the arboretum said.
+        tip: String,
+    },
 }

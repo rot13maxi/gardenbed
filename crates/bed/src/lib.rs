@@ -33,6 +33,7 @@ pub mod plot;
 pub mod render;
 pub mod revspec;
 pub mod rpc;
+pub mod sow;
 pub mod status;
 pub mod sync;
 pub mod treestate;
