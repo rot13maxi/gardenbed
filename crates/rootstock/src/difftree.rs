@@ -16,9 +16,14 @@
 //! One git quirk this module owns: **a commit whose diff is empty produces
 //! no output at all — not even its id token** (verified: redundant merges
 //! print zero bytes). Absence of a token therefore means "empty diff",
-//! which is safe *and verified by the caller*: the caller cross-checks that
-//! every token-less commit's tree equals its first parent's tree (or, for
-//! root commits, that its tree is empty). The token stream itself stays
+//! which is safe *and verified by the caller*: the caller cross-checks
+//! that every token-less commit's tree equals its first parent's tree —
+//! except for commits git's diff machinery cannot see (mode-only
+//! normalizations of pre-canonical tree entry modes, which `canon_mode`
+//! collapses before comparing; early-2005 `100664` → `100644` fixups are
+//! the real-world case), which the caller classifies with a raw,
+//! mode-aware tree comparison (`import` owns it), and, for root
+//! commits, that its tree is empty. The token stream itself stays
 //! unambiguous because status tokens are never 40-hex and paths never
 //! directly follow an id.
 

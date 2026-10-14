@@ -6,7 +6,7 @@ clone time; re-clone with the commands below and record the new pin.
 
 | Corpus | Location (outside the repo) | Pinned HEAD | Commits (all refs) | Size (packed) | Notes |
 |---|---|---|---|---|---|
-| linux | `/home/user/.corpora/linux.git` | `0fcb05b72344f40806cbe810de8872f1698bf053` | 1,725,150 | 8.6 GiB | master tip 1,485,163 commits. Flagship corpus (user-directed, Oct 2026): merge/octopus-dense, symlinks, exec-bit churn, ~90k files. |
+| linux | `/home/user/.corpora/linux.git` | `0fcb05b72344f40806cbe810de8872f1698bf053` | 1,725,150 | 8.6 GiB | master tip 1,485,163 commits. Flagship corpus (user-directed, Oct 2026): merge/octopus-dense, symlinks, exec-bit churn, ~90k files. Early history (Apr 2005, "new git world order") contains mode-normalization commits (`100664` → `100644`) that git's diff-tree cannot see; the importer's raw tree-diff fallback classifies them and their derived tree ids differ from git's raw tree shas (see `docs/divergences.md` §4). |
 
 Fetch recipe (as executed):
 

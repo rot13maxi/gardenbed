@@ -90,6 +90,51 @@ commit carrying both headers is counted once for its SHA-1 signature.
 `git hash-object -t commit -w --stdin`, import, export: the exported
 commit has no `encoding` header.
 
+## 4. Pre-canonical git tree modes (`100664`) import canonicalized
+
+**What:** very old git (April 2005, around the "new git world order"
+re-import of the linux history) wrote regular-file tree entries with the
+group-writable mode `100664`. gardenbed's mode table has no `664`: the
+importer canonicalizes any `100xxxx` blob entry by its exec bit —
+`100664` and `100644` both import as `Mode::Regular` (the rule the tree
+parser has always applied). Commits that **only** normalize such modes
+(identical blob ids, differing raw tree bytes) are invisible to git's
+own diff machinery: `canon_mode` collapses `100664` ≡ `100644` before
+comparing, so `git diff-tree -r --name-status` — and even `--raw` —
+prints nothing for them. The importer therefore classifies these commits
+with a raw, mode-aware tree comparison (`rootstock`'s
+`raw_first_parent_diff`): a pure mode fixup becomes a **zero-change
+changeset** inheriting the parent tree; content changes under those
+modes and structural changes come out exactly as git would shape them;
+no renames are invented.
+
+**Cost:** for pre-canonical history, gardenbed's derived tree ids differ
+from git's raw tree SHAs **by construction** — ours are canonical, git's
+carry the historical mode bytes. Tree-level comparisons for such commits
+(`git cat-file` on tree objects, non-recursive raw diffs) must normalize
+`100664` ≡ `100644` first. Path/mode/content comparisons via
+`git ls-tree -r` are unaffected: ls-tree displays canonicalized modes.
+This **will** matter for the linux verification sweep: the early history
+contains such commits (e.g. `ce1dc02f7643`, "Fix up some file mode
+differences due to the new git world order.", whose tree differs from
+its first parent's only by three `100664` entries). The same collapse
+covers permission-bit variants of every other entry kind (`100775` ≡
+`100755`, `120777` ≡ `120000`, `160123` ≡ `160000`, dir `040750` ≡
+`040000`); exotic variants outside the file-mode table are rejected
+loudly by the tree parser, as before.
+
+**Why not fixed:** re-canonicalizing historical trees would rewrite git
+object identity (the raw tree SHAs are what corpus pins record), and
+carrying a non-canonical mode column through the changeset model would
+change the wire format for a mode that disappeared from git twenty years
+ago. Documented and handled explicitly (fallback, never a silent skip).
+
+**Repro:** `pre_canonical_100664_mode_fixups_import_via_raw_fallback` in
+`crates/rootstock/tests/edgecases.rs` — hand-crafted trees via
+`git hash-object -t tree -w --stdin --literally` (modern git fsck-checks
+fresh tree objects and refuses `100664` without the flag; objects that
+already contain the mode are accepted by plain `git fsck`, warning only).
+
 ---
 
 ## Explicitly *not* divergences

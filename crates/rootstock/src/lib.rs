@@ -25,7 +25,14 @@
 //!   D8) — 256 commits per spawn, attributed by 40-hex commit-id tokens.
 //!   A commit whose diff is empty emits no output at all (verified git
 //!   behavior); absence of a token is treated as an empty diff and
-//!   cross-checked against the trees. Rename detection is git's own
+//!   cross-checked against the trees. Commits the diff machinery cannot
+//!   see — git canonicalizes tree entry modes before comparing
+//!   (`canon_mode`), so pre-canonical-mode fixups such as the early-2005
+//!   `100664` → `100644` normalizations report nothing although the raw
+//!   trees differ — are classified by a raw, mode-aware tree comparison:
+//!   pure normalizations become zero-change changesets (the derived tree
+//!   is canonical and differs from git's raw tree sha by construction),
+//!   never invented renames. Rename detection is git's own
 //!   (`-M`, default 50% similarity): a rename whose content changed
 //!   below that threshold is imported as the add+delete pair git reports,
 //!   which yields the identical tree under a different (valid) change

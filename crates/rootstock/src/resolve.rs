@@ -29,7 +29,8 @@ const TREE_CACHE_CAP: usize = 100_000;
 /// Maximum cached git-blob → gardenbed-Id mappings.
 const BLOB_CACHE_CAP: usize = 4_000_000;
 /// Maximum path nesting when walking trees (matches the apply/diff guard).
-const MAX_TREE_DEPTH: usize = 4096;
+/// Shared with the raw tree-diff fallback in `import`.
+pub(crate) const MAX_TREE_DEPTH: usize = 4096;
 
 /// Reads git objects through gix and mirrors blobs into the loam.
 pub(crate) struct GitObjects<'r> {
