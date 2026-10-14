@@ -47,7 +47,10 @@ fn check_against_replay(h: &GeneratedHistory, ids: &[Id], engine: &Engine, i: us
         .collect();
     assert_eq!(got, expected, "tree(cs {i}) disagrees with the replay");
     if let Some(id) = tree_id {
-        let tree = engine.tree(id).expect("tree readable").expect("tree present");
+        let tree = engine
+            .tree(id)
+            .expect("tree readable")
+            .expect("tree present");
         assert_eq!(tree.id().expect("tree id"), id, "tree id is its own hash");
     }
 }
@@ -74,7 +77,9 @@ fn check_against_git(
             }
             // <mode> SP <type> SP <sha40> TAB <path>
             let sp1 = record.iter().position(|b| *b == b' ').expect("mode sep");
-            let mode = std::str::from_utf8(&record[..sp1]).expect("mode utf8").to_owned();
+            let mode = std::str::from_utf8(&record[..sp1])
+                .expect("mode utf8")
+                .to_owned();
             let rest = &record[sp1 + 1..];
             let sp2 = rest.iter().position(|b| *b == b' ').expect("type sep");
             let tab = rest.iter().position(|b| *b == b'\t').expect("path sep");
@@ -84,7 +89,9 @@ fn check_against_git(
             for k in 0..20 {
                 sha20[k] = u8::from_str_radix(&sha_hex[2 * k..2 * k + 2], 16).expect("hex digit");
             }
-            let path = std::str::from_utf8(&rest[tab + 1..]).expect("path utf8").to_owned();
+            let path = std::str::from_utf8(&rest[tab + 1..])
+                .expect("path utf8")
+                .to_owned();
             m.insert(path, (mode, sha20.to_vec()));
         }
         m
@@ -192,7 +199,7 @@ fn tree_equality_seed41_memory_eager() {
 /// (a tree id is SHA-256 over canonical tree content, never over history).
 #[test]
 fn identical_working_sets_hash_to_identical_tree_ids() {
-    use gardenbed_model::{blob_id, Change, Changeset, Identity, Op};
+    use gardenbed_model::{Change, Changeset, Identity, Op, blob_id};
 
     let mk_id = |name: &str| Identity {
         name: name.into(),
@@ -214,7 +221,10 @@ fn identical_working_sets_hash_to_identical_tree_ids() {
     // History A: the working set in one root changeset.
     let cs_a = Changeset {
         parents: vec![],
-        changes: vec![add("shared/x.txt", b"shared content one\n"), add("sub/y.txt", b"shared content two\n")],
+        changes: vec![
+            add("shared/x.txt", b"shared content one\n"),
+            add("sub/y.txt", b"shared content two\n"),
+        ],
         message: "A".into(),
         author: mk_id("a"),
         committer: mk_id("a"),
@@ -289,5 +299,8 @@ fn identical_working_sets_hash_to_identical_tree_ids() {
         .get_tree(ta.expect("tree present"))
         .expect("read tree")
         .expect("tree present");
-    assert_eq!(Tree::decode(&payload).expect("decodes").id().expect("id"), ta.unwrap());
+    assert_eq!(
+        Tree::decode(&payload).expect("decodes").id().expect("id"),
+        ta.unwrap()
+    );
 }

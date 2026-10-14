@@ -8,23 +8,26 @@
 use std::fmt;
 
 /// A 20-byte git object id.
+///
+/// Public for the fuzz target that builds plausible commit ids
+/// (`fuzz_difftree_parse`); not part of the stabilized surface.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct GitOid([u8; 20]);
+pub struct GitOid([u8; 20]);
 
 impl GitOid {
     /// Wraps raw bytes.
-    pub(crate) const fn from_bytes(bytes: [u8; 20]) -> Self {
+    pub const fn from_bytes(bytes: [u8; 20]) -> Self {
         GitOid(bytes)
     }
 
     /// The raw bytes.
-    pub(crate) const fn as_bytes(&self) -> &[u8; 20] {
+    pub const fn as_bytes(&self) -> &[u8; 20] {
         &self.0
     }
 
     /// Parses exactly-40 lowercase/uppercase hex characters; anything else
     /// is rejected (zero-assumption parsing of git output).
-    pub(crate) fn from_hex(s: &str) -> Option<Self> {
+    pub fn from_hex(s: &str) -> Option<Self> {
         let b = s.as_bytes();
         if b.len() != 40 {
             return None;
@@ -39,7 +42,7 @@ impl GitOid {
     }
 
     /// Lowercase hex, 40 characters.
-    pub(crate) fn to_hex(&self) -> String {
+    pub fn to_hex(&self) -> String {
         let mut s = String::with_capacity(40);
         for b in self.0 {
             s.push_str(&format!("{b:02x}"));

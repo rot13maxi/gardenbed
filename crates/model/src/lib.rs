@@ -191,7 +191,9 @@ impl Changeset {
 
     /// SHA-256 over the canonical bytes.
     pub fn id(&self) -> Result<Id, CodecError> {
-        Ok(Id::from_bytes(Sha256::digest(self.canonical_bytes()?).into()))
+        Ok(Id::from_bytes(
+            Sha256::digest(self.canonical_bytes()?).into(),
+        ))
     }
 
     /// Decodes canonical bytes. Accepts only canonical payloads.
@@ -250,7 +252,9 @@ impl Tree {
 
     /// SHA-256 over the canonical bytes.
     pub fn id(&self) -> Result<Id, CodecError> {
-        Ok(Id::from_bytes(Sha256::digest(self.canonical_bytes()?).into()))
+        Ok(Id::from_bytes(
+            Sha256::digest(self.canonical_bytes()?).into(),
+        ))
     }
 
     /// Decodes canonical bytes. Accepts only canonical payloads.

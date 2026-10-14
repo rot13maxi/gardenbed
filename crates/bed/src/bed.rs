@@ -50,7 +50,8 @@ impl Bed {
         std::fs::create_dir_all(bed_dir)?;
 
         config.save(&bed_dir.join("config.toml"))?;
-        FsObjectStore::open(&bed_dir.join("objects"))?;
+        // FsObjectStore::open takes the store ROOT and creates `<root>/objects`.
+        FsObjectStore::open(bed_dir)?;
         Treestate::open(&bed_dir.join("treestate"))?;
         std::fs::write(bed_dir.join("heads"), b"")?;
 
@@ -108,9 +109,11 @@ impl Bed {
     }
 
     /// Opens the local CAS cache (`.bed/objects`) — loam's
-    /// `FsObjectStore`, reused as-is.
+    /// `FsObjectStore`, reused as-is. The store root is `.bed` itself
+    /// (`FsObjectStore::open` appends `objects/`), so objects live at the
+    /// documented `.bed/objects/<2 hex>/<62 hex>` layout.
     pub fn objects(&self) -> Result<FsObjectStore, BedError> {
-        Ok(FsObjectStore::open(&self.bed_dir.join("objects"))?)
+        Ok(FsObjectStore::open(&self.bed_dir)?)
     }
 
     /// A handle on the heads file (`.bed/heads`).
@@ -190,13 +193,16 @@ mod tests {
         assert_eq!(ts.count().unwrap(), 0);
         // The cache is a real FsObjectStore: trait methods work on it.
         use gardenbed_store::ObjectStore as _;
-        assert!(!bed
-            .objects()
-            .unwrap()
-            .has(gardenbed_model::Id::from_bytes([0; 32]))
-            .unwrap());
+        assert!(
+            !bed.objects()
+                .unwrap()
+                .has(gardenbed_model::Id::from_bytes([0; 32]))
+                .unwrap()
+        );
 
-        bed.heads().append(gardenbed_model::Id::from_bytes([7; 32])).unwrap();
+        bed.heads()
+            .append(gardenbed_model::Id::from_bytes([7; 32]))
+            .unwrap();
         assert_eq!(bed.heads().read().unwrap().len(), 1);
 
         // plot add → save_config → reopen sees it.

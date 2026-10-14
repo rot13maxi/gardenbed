@@ -35,7 +35,7 @@ use std::collections::{HashMap, VecDeque};
 use gardenbed_model::Id;
 use gardenbed_store::MetadataStore;
 
-use crate::commit::{parse_commit, RawCommit};
+use crate::commit::{RawCommit, parse_commit};
 use crate::error::ImportError;
 use crate::oid::GitOid;
 

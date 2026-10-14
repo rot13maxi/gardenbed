@@ -84,7 +84,9 @@ pub(crate) fn parse_commit(data: &[u8]) -> ParseResult<RawCommit> {
                     tree = Some(parse_oid_header(value, "tree")?);
                 }
                 "parent" => parents.push(parse_oid_header(value, "parent")?),
-                "author" => author = Some(parse_identity(value).map_err(|e| format!("author: {e}"))?),
+                "author" => {
+                    author = Some(parse_identity(value).map_err(|e| format!("author: {e}"))?)
+                }
                 "committer" => {
                     committer = Some(parse_identity(value).map_err(|e| format!("committer: {e}"))?)
                 }
@@ -217,10 +219,7 @@ mod tests {
                     \n\
                     subject line\n\nbody\n";
         let cs = parse_commit(raw).expect("parses");
-        assert_eq!(
-            cs.tree.to_hex(),
-            "0123456789abcdef0123456789abcdef01234567"
-        );
+        assert_eq!(cs.tree.to_hex(), "0123456789abcdef0123456789abcdef01234567");
         assert_eq!(cs.parents.len(), 2);
         assert_eq!(
             cs.author,

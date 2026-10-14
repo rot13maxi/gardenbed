@@ -59,15 +59,11 @@ impl SqliteMetadataStore {
     /// process kill; power-loss durability comes from the WAL), a 5 s busy
     /// timeout, and creates the schema if absent.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-        {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::Io(e.to_string()))?;
         }
         let conn = Connection::open(path).map_err(db_err)?;
-        conn.busy_timeout(Duration::from_secs(5))
-            .map_err(db_err)?;
+        conn.busy_timeout(Duration::from_secs(5)).map_err(db_err)?;
         // journal_mode returns the resulting mode as a row, hence query_row.
         let _: String = conn
             .query_row("PRAGMA journal_mode=WAL", [], |r| r.get(0))
@@ -161,11 +157,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         check_ref_name(name)?;
         let conn = self.lock()?;
         let cs: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT cs FROM refs WHERE name = ?1",
-                params![name],
-                |r| r.get(0),
-            )
+            .query_row("SELECT cs FROM refs WHERE name = ?1", params![name], |r| {
+                r.get(0)
+            })
             .optional()
             .map_err(db_err)?;
         cs.map(|b| id_from_blob(&b)).transpose()
@@ -177,7 +171,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .prepare("SELECT name, cs FROM refs ORDER BY name")
             .map_err(db_err)?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?)))
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+            })
             .map_err(db_err)?;
         let mut out = Vec::new();
         for row in rows {
@@ -187,18 +183,21 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         Ok(out)
     }
 
-    fn cas_ref(&self, name: &str, expected: Option<Id>, new: Id) -> Result<crate::traits::RefCas, StoreError> {
+    fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<Id>,
+        new: Id,
+    ) -> Result<crate::traits::RefCas, StoreError> {
         check_ref_name(name)?;
         // Single atomic compare-and-swap: the read of the current value and
         // the conditional write happen inside one BEGIN IMMEDIATE
         // transaction, which holds the database write lock throughout.
         self.in_tx(|tx| {
             let current: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT cs FROM refs WHERE name = ?1",
-                    params![name],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT cs FROM refs WHERE name = ?1", params![name], |r| {
+                    r.get(0)
+                })
                 .optional()
                 .map_err(db_err)?;
             match (expected, current) {

@@ -34,16 +34,16 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
-use gardenbed_model::blob_id;
 use gardenbed_model::Id;
+use gardenbed_model::blob_id;
 
 use crate::error::BedError;
 use crate::plot::dir_may_hold_plotted;
 use crate::plot::in_plot;
-use crate::treestate::Treestate;
 use crate::treestate::HINT_UNVERIFIED;
 use crate::treestate::MODE_GITLINK;
 use crate::treestate::MODE_SYMLINK;
+use crate::treestate::Treestate;
 
 /// What the scan decided about one path.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,8 +192,7 @@ pub fn scan_paths(
         } else {
             root.join(&dir)
         };
-        let mut entries: Vec<_> = fs::read_dir(&abs_dir)?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut entries: Vec<_> = fs::read_dir(&abs_dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
 
         for entry in entries {
@@ -370,13 +369,20 @@ fn observe(root: &Path, rel: &str) -> Result<Option<Observed>, BedError> {
     }
     let is_symlink = meta.is_symlink();
     let content: Vec<u8> = if is_symlink {
-        fs::read_link(root.join(rel))?.as_os_str().as_bytes().to_vec()
+        fs::read_link(root.join(rel))?
+            .as_os_str()
+            .as_bytes()
+            .to_vec()
     } else {
         fs::read(root.join(rel))?
     };
     Ok(Some(Observed {
         blob_id: blob_id(&content),
-        mode: if is_symlink { MODE_SYMLINK } else { mode_of(&meta) },
+        mode: if is_symlink {
+            MODE_SYMLINK
+        } else {
+            mode_of(&meta)
+        },
         size: meta.len() as i64,
         mtime_ns: mtime_ns(&meta),
     }))
@@ -402,11 +408,7 @@ fn mode_of(meta: &Metadata) -> i64 {
     #[cfg(unix)]
     {
         let bits = std::os::unix::fs::PermissionsExt::mode(&meta.permissions());
-        if bits & 0o111 != 0 {
-            1
-        } else {
-            0
-        }
+        if bits & 0o111 != 0 { 1 } else { 0 }
     }
     #[cfg(not(unix))]
     {
@@ -418,9 +420,9 @@ fn mode_of(meta: &Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::treestate::TreestateEntry;
     use crate::treestate::HINT_UNVERIFIED;
     use crate::treestate::HINT_VERIFIED;
+    use crate::treestate::TreestateEntry;
 
     struct Garden {
         dir: tempfile::TempDir,
@@ -432,12 +434,9 @@ mod tests {
         /// files on disk (as a completed materialization would leave it).
         fn planted(files: &[(&str, &[u8])]) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let mut bed = crate::bed::Bed::init(
-                &dir.path().join(".bed"),
-                "http://127.0.0.1:1",
-                "garden",
-            )
-            .unwrap();
+            let mut bed =
+                crate::bed::Bed::init(&dir.path().join(".bed"), "http://127.0.0.1:1", "garden")
+                    .unwrap();
             bed.config_mut().plot.push("src".to_owned());
             bed.save_config().unwrap();
 
@@ -634,10 +633,8 @@ mod tests {
             false,
         )
         .unwrap();
-        let by_path: std::collections::BTreeMap<_, _> = items
-            .into_iter()
-            .map(|i| (i.path, i.delta))
-            .collect();
+        let by_path: std::collections::BTreeMap<_, _> =
+            items.into_iter().map(|i| (i.path, i.delta)).collect();
 
         let meta = fs::metadata(g.dir.path().join("src/a.rs")).unwrap();
         assert_eq!(

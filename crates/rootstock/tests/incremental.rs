@@ -4,7 +4,9 @@ mod common;
 
 use std::io::Write as _;
 
-use common::{git_map_rows, import, object_set, open_stores, ref_rows, sql_scalar, try_import, Fixture};
+use common::{
+    Fixture, git_map_rows, import, object_set, open_stores, ref_rows, sql_scalar, try_import,
+};
 use gardenbed_harness::GenOptions;
 use gardenbed_rootstock::{ImportError, ImportOptions};
 use gardenbed_store::{FsObjectStore, MetadataStore};
@@ -27,7 +29,10 @@ fn append_commits(repo: &std::path::Path, n: usize) -> String {
         hermetic(&mut cmd);
         let out = cmd.args(args).output().expect("git runs");
         assert!(out.status.success(), "git {:?} failed", args);
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
     };
 
     let mut parent = git(&["rev-parse", "refs/heads/main"]);
@@ -49,9 +54,17 @@ fn append_commits(repo: &std::path::Path, n: usize) -> String {
                 .write_all(content.as_bytes())
                 .expect("write blob");
             let out = child.wait_with_output().expect("hash-object output");
-            String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .trim()
+                .to_owned()
         };
-        git(&["update-index", "--add", "--cacheinfo", &format!("100644,{blob},{name}")]);
+        git(&[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{blob},{name}"),
+        ]);
         let tree = git(&["write-tree"]);
         // commit-tree with the message on stdin (verbatim, like the
         // harness materializer) and a fixed identity — the hermetic env
@@ -75,8 +88,15 @@ fn append_commits(repo: &std::path::Path, n: usize) -> String {
                 .write_all(format!("appended commit {i}\n").as_bytes())
                 .expect("write message");
             let out = child.wait_with_output().expect("commit-tree output");
-            assert!(out.status.success(), "commit-tree failed: {}", String::from_utf8_lossy(&out.stderr));
-            String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+            assert!(
+                out.status.success(),
+                "commit-tree failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .trim()
+                .to_owned()
         };
         git(&["update-ref", "refs/heads/main", &parent]);
     }
@@ -95,8 +115,14 @@ fn unchanged_reimport_is_free() {
     // The walk prunes at the mapped frontier: it reaches only the tip.
     assert_eq!(second.commits_total, 1);
     assert_eq!(second.commits_new, 0, "no commit should be re-ingested");
-    assert_eq!(second.commits_skipped, 1, "the tip is skipped at the frontier");
-    assert_eq!(second.commits_total, second.commits_new + second.commits_skipped);
+    assert_eq!(
+        second.commits_skipped, 1,
+        "the tip is skipped at the frontier"
+    );
+    assert_eq!(
+        second.commits_total,
+        second.commits_new + second.commits_skipped
+    );
     assert_eq!(second.objects_written, 0, "no object should be rewritten");
     assert!(second.refs_updated.is_empty(), "refs must not move");
     assert_eq!(object_set(&fixture.garden), objects_after_first);
@@ -118,13 +144,22 @@ fn incremental_extension_matches_full_import() {
     append_commits(&fixture.repo, 5);
     let second = import(&fixture.repo, &fixture.garden, &Default::default());
     assert_eq!(second.commits_new, 5, "exactly the new commits");
-    assert_eq!(second.commits_skipped, 1, "the mapped parent is the frontier");
+    assert_eq!(
+        second.commits_skipped, 1,
+        "the mapped parent is the frontier"
+    );
     assert_eq!(second.commits_total, 6, "new commits plus the frontier");
-    assert_eq!(second.commits_total, second.commits_new + second.commits_skipped);
+    assert_eq!(
+        second.commits_total,
+        second.commits_new + second.commits_skipped
+    );
     // Exact accounting: the report equals the on-disk loam delta.
     let objects_after = object_set(&fixture.garden);
     let delta = (objects_after.len() - objects_before.len()) as u64;
-    assert_eq!(delta, second.objects_written, "objects_written == loam delta");
+    assert_eq!(
+        delta, second.objects_written,
+        "objects_written == loam delta"
+    );
     // Something must have been written (blobs + trees), and it must be
     // far fewer objects than a full re-import would touch.
     assert!(delta > 0);
@@ -133,7 +168,11 @@ fn incremental_extension_matches_full_import() {
     // must converge on exactly the same store contents.
     let fresh_garden = fixture.dir.path().join("garden-fresh");
     import(&fixture.repo, &fresh_garden, &Default::default());
-    assert_eq!(object_set(&fresh_garden), objects_after, "object sets identical");
+    assert_eq!(
+        object_set(&fresh_garden),
+        objects_after,
+        "object sets identical"
+    );
     assert_eq!(git_map_rows(&fresh_garden), git_map_rows(&fixture.garden));
     assert_eq!(ref_rows(&fresh_garden), ref_rows(&fixture.garden));
 
@@ -168,8 +207,16 @@ fn force_push_reimports_cleanly() {
         cmd.current_dir(&fixture.repo);
         hermetic(&mut cmd);
         let out = cmd.args(args).output().expect("git runs");
-        assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
     };
     let tree = git_out(&["rev-parse", &format!("{old_tip}^{{tree}}")]);
     let parent = git_out(&["rev-parse", &format!("{old_tip}^")]);
@@ -185,10 +232,22 @@ fn force_push_reimports_cleanly() {
             .env("GIT_COMMITTER_NAME", "Force Pusher")
             .env("GIT_COMMITTER_EMAIL", "force@example.com");
         let mut child = cmd.spawn().expect("commit-tree");
-        child.stdin.as_mut().expect("stdin").write_all(b"rewritten by the force-push test\n").expect("message");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(b"rewritten by the force-push test\n")
+            .expect("message");
         let out = child.wait_with_output().expect("output");
-        assert!(out.status.success(), "commit-tree failed: {}", String::from_utf8_lossy(&out.stderr));
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+        assert!(
+            out.status.success(),
+            "commit-tree failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
     };
     assert_ne!(old_tip, new_tip);
     git_out(&["update-ref", "refs/heads/main", &new_tip, &old_tip]);
@@ -199,14 +258,23 @@ fn force_push_reimports_cleanly() {
         report.commits_skipped, 1,
         "the walk stops at the rewritten tip's mapped parent"
     );
-    assert_eq!(report.commits_total, report.commits_new + report.commits_skipped);
+    assert_eq!(
+        report.commits_total,
+        report.commits_new + report.commits_skipped
+    );
     assert_eq!(report.refs_updated.len(), 1, "refs/heads/main moved");
     assert_eq!(report.refs_updated[0].0, "refs/heads/main");
 
     // The ref now points at the new tip's changeset.
     let (_, metadata, engine) = open_stores(&fixture.garden);
-    let new_cs = metadata.cs_for_git(&new_tip).expect("query").expect("new tip mapped");
-    assert_eq!(report.refs_updated[0].1, new_cs, "ref moved onto the new tip");
+    let new_cs = metadata
+        .cs_for_git(&new_tip)
+        .expect("query")
+        .expect("new tip mapped");
+    assert_eq!(
+        report.refs_updated[0].1, new_cs,
+        "ref moved onto the new tip"
+    );
 
     // Old objects remain (harmless), and the mapping keeps its bijection:
     // distinct shas ↔ distinct changesets, every changeset present.
@@ -222,7 +290,10 @@ fn force_push_reimports_cleanly() {
     assert_eq!(css.len(), rows.len(), "no duplicate changesets");
 
     // The new tip's derived tree matches git's.
-    let tree_id = engine.derive_tree(new_cs).expect("derive").expect("non-empty tree");
+    let tree_id = engine
+        .derive_tree(new_cs)
+        .expect("derive")
+        .expect("non-empty tree");
     let flat = engine.flatten_tree(Some(tree_id)).expect("flatten");
     let ls = gardenbed_harness::git_ls_tree_r(&fixture.repo, &new_tip).expect("ls-tree");
     assert_eq!(flat.len(), ls.len(), "rewritten tip tree matches git");
@@ -253,7 +324,11 @@ fn sha256_repos_are_unsupported() {
         eprintln!("skipping: git lacks --object-format=sha256");
         return;
     }
-    let err = try_import(&dir, &fixture.dir.path().join("g256"), &ImportOptions::default());
+    let err = try_import(
+        &dir,
+        &fixture.dir.path().join("g256"),
+        &ImportOptions::default(),
+    );
     assert!(
         matches!(err, Err(ImportError::Unsupported(_))),
         "expected Unsupported, got {err:?}"
@@ -280,7 +355,10 @@ fn ref_glob_selects_branches() {
         ..Default::default()
     };
     let report = import(&fixture.repo, &fixture.garden, &opts);
-    assert_eq!(report.commits_new as usize, fixture.history.changesets.len());
+    assert_eq!(
+        report.commits_new as usize,
+        fixture.history.changesets.len()
+    );
     assert_eq!(report.refs_updated.len(), 1, "only main is recorded");
     assert_eq!(report.refs_updated[0].0, "refs/heads/main");
 
@@ -299,12 +377,21 @@ fn mapping_is_a_bijection() {
     let fixture = Fixture::generate(777, &GenOptions::default());
     import(&fixture.repo, &fixture.garden, &Default::default());
     let commits = fixture.history.changesets.len() as u64;
-    assert_eq!(sql_scalar(&fixture.garden, "SELECT COUNT(*) FROM git_map"), commits);
     assert_eq!(
-        sql_scalar(&fixture.garden, "SELECT COUNT(DISTINCT git_sha) FROM git_map"),
+        sql_scalar(&fixture.garden, "SELECT COUNT(*) FROM git_map"),
         commits
     );
-    assert_eq!(sql_scalar(&fixture.garden, "SELECT COUNT(DISTINCT cs) FROM git_map"), commits);
+    assert_eq!(
+        sql_scalar(
+            &fixture.garden,
+            "SELECT COUNT(DISTINCT git_sha) FROM git_map"
+        ),
+        commits
+    );
+    assert_eq!(
+        sql_scalar(&fixture.garden, "SELECT COUNT(DISTINCT cs) FROM git_map"),
+        commits
+    );
     assert_eq!(
         sql_scalar(&fixture.garden, "SELECT COUNT(*) FROM changesets"),
         commits

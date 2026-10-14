@@ -25,9 +25,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use gardenbed_model::Id;
-use rusqlite::params;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::params;
 
 use crate::error::BedError;
 
@@ -167,12 +167,10 @@ impl Treestate {
         match row {
             None => Ok(None),
             Some((blob, mode, size, mtime_ns, hint)) => {
-                let blob_id = Id::from_bytes(
-                    blob.try_into().map_err(|_| BedError::Treestate {
-                        path: self.path.clone(),
-                        message: format!("blob_id for {path:?} is not 32 bytes"),
-                    })?,
-                );
+                let blob_id = Id::from_bytes(blob.try_into().map_err(|_| BedError::Treestate {
+                    path: self.path.clone(),
+                    message: format!("blob_id for {path:?} is not 32 bytes"),
+                })?);
                 Ok(Some(TreestateEntry {
                     path: path.to_owned(),
                     blob_id,
@@ -320,10 +318,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(matches!(
-            t.lookup("f"),
-            Err(BedError::Treestate { .. })
-        ));
+        assert!(matches!(t.lookup("f"), Err(BedError::Treestate { .. })));
     }
 
     #[test]

@@ -24,22 +24,22 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::PermissionsExt as _;
 
-use gardenbed_model::blob_id;
 use gardenbed_model::Mode;
+use gardenbed_model::blob_id;
 
 use crate::error::BedError;
 use crate::plot::in_plot;
 use crate::rpc::PlanFile;
 use crate::status::mtime_ns;
-use crate::treestate::Treestate;
-use crate::treestate::TreestateEntry;
 use crate::treestate::HINT_UNVERIFIED;
 use crate::treestate::HINT_VERIFIED;
 use crate::treestate::MODE_GITLINK;
 use crate::treestate::MODE_SYMLINK;
+use crate::treestate::Treestate;
+use crate::treestate::TreestateEntry;
 
 /// What one sync run did to the garden.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

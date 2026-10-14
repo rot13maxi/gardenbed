@@ -28,8 +28,8 @@
 //! A crash therefore leaves the object either absent or byte-complete.
 
 use crate::StoreError;
-use gardenbed_model::blob_id;
 use gardenbed_model::Id;
+use gardenbed_model::blob_id;
 use sha2::Digest;
 use sha2::Sha256;
 use std::fs;
@@ -80,10 +80,10 @@ impl FsObjectStore {
     ///
     /// Idempotent: an existing store is reopened as-is.
     pub fn open(root: &Path) -> Result<Self, StoreError> {
-        let durable = match std::env::var("GARDENBED_FSYNC").as_deref() {
-            Ok("off") | Ok("0") | Ok("false") => false,
-            _ => true,
-        };
+        let durable = !matches!(
+            std::env::var("GARDENBED_FSYNC").as_deref(),
+            Ok("off") | Ok("0") | Ok("false")
+        );
         let objects_dir = root.join("objects");
         fs::create_dir_all(&objects_dir).map_err(io_err)?;
         // Make the directory structure itself durable before any object is
@@ -135,7 +135,10 @@ impl FsObjectStore {
         }
 
         let write = || -> Result<(), StoreError> {
-            let mut f = fs::OpenOptions::new().write(true).open(&tmp).map_err(io_err)?;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .open(&tmp)
+                .map_err(io_err)?;
             f.write_all(bytes).map_err(io_err)?;
             if !self.durable {
                 drop(f);
@@ -308,9 +311,8 @@ fn parse_envelope(raw: &[u8]) -> Result<Vec<u8>, StoreError> {
 /// Decompresses one zstd frame, refusing to produce more than `declared`
 /// bytes (zip-bomb / torn-data guard).
 fn zstd_decode_bounded(frame: &[u8], declared: usize) -> Result<Vec<u8>, StoreError> {
-    let decoder = zstd::stream::Decoder::new(frame).map_err(|e| {
-        StoreError::Corrupt(format!("not a valid zstd frame: {}", squash_io(e)))
-    })?;
+    let decoder = zstd::stream::Decoder::new(frame)
+        .map_err(|e| StoreError::Corrupt(format!("not a valid zstd frame: {}", squash_io(e))))?;
     // Allow exactly one byte beyond the declaration: anything longer is
     // already a length mismatch and must be rejected before it can grow.
     let limit = declared as u64 + 1;
@@ -347,9 +349,7 @@ fn read_file_bounded(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
 
 /// fsyncs a directory so entries created/renamed inside it are durable.
 fn fsync_dir(dir: &Path) -> Result<(), StoreError> {
-    File::open(dir)
-        .and_then(|d| d.sync_all())
-        .map_err(io_err)
+    File::open(dir).and_then(|d| d.sync_all()).map_err(io_err)
 }
 
 fn io_err(e: std::io::Error) -> StoreError {
@@ -379,10 +379,9 @@ mod tests {
     #[test]
     fn envelope_rejects_wrong_id_and_truncation() {
         let env = encode_envelope(b"payload").unwrap();
-        let other = Id::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
+        let other =
+            Id::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+                .unwrap();
         assert!(matches!(
             decode_envelope(&env, other),
             Err(StoreError::Corrupt(_))

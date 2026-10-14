@@ -3,7 +3,7 @@
 
 use std::collections::BTreeSet;
 
-use gardenbed_harness::{generate, git_fsck, git_log, materialize, GenOptions};
+use gardenbed_harness::{GenOptions, generate, git_fsck, git_log, materialize};
 use gardenbed_model::Id;
 
 fn is_sha(s: &str) -> bool {
@@ -81,13 +81,21 @@ fn materialize_preserves_graph_structure() {
     let mat = materialize(&history, dir.path()).expect("materialize");
 
     let log = git_log(&mat.repo_path, "refs/heads/main", 10_000).expect("git log");
-    assert_eq!(log.len(), history.changesets.len(), "one git commit per changeset");
+    assert_eq!(
+        log.len(),
+        history.changesets.len(),
+        "one git commit per changeset"
+    );
 
     for (k, entry) in log.iter().enumerate() {
         let cs_index = history.changesets.len() - 1 - k;
         assert_eq!(entry.sha, mat.mapping[cs_index].1, "log position {k}");
         let cs = &history.changesets[cs_index];
-        assert_eq!(entry.parents.len(), cs.parents.len(), "changeset {cs_index}");
+        assert_eq!(
+            entry.parents.len(),
+            cs.parents.len(),
+            "changeset {cs_index}"
+        );
         assert_eq!(entry.author_name, cs.author.name);
         assert_eq!(entry.author_email, cs.author.email);
         // First-parent lineage: parent[0] of cs[i] is cs[i-1].

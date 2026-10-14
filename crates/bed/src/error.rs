@@ -11,9 +11,7 @@ use gardenbed_store::StoreError;
 #[derive(Debug, thiserror::Error)]
 pub enum BedError {
     /// The directory does not look like a bed: no `config.toml`.
-    #[error(
-        "not a bed: {0} has no config.toml — plant one with `bed clone <server>`"
-    )]
+    #[error("not a bed: {0} has no config.toml — plant one with `bed clone <server>`")]
     NotABed(PathBuf),
 
     /// The config file exists but could not be read.
@@ -164,8 +162,10 @@ pub enum BedError {
 
     /// `bed file` was pointed at a submodule pointer, which has no content
     /// of its own.
-    #[error("{path:?} is a submodule pointer in {cs} — `bed file` prints only \
-             file and symlink content")]
+    #[error(
+        "{path:?} is a submodule pointer in {cs} — `bed file` prints only \
+             file and symlink content"
+    )]
     FileIsGitlink {
         /// The path as requested.
         path: String,
@@ -199,9 +199,7 @@ pub enum BedError {
     },
 
     /// The scan found nothing to sow: the plot is clean.
-    #[error(
-        "the plot is clean — nothing modified, deleted, or untracked to sow"
-    )]
+    #[error("the plot is clean — nothing modified, deleted, or untracked to sow")]
     NothingToSow,
 
     /// A working file changed between the scan and the read that sows it.

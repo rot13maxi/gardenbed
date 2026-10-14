@@ -5,7 +5,9 @@
 
 mod common;
 
-use common::{change_add, from_hex, make_cs, make_tree, sample_changeset, sample_tree, small_id, to_hex};
+use common::{
+    change_add, from_hex, make_cs, make_tree, sample_changeset, sample_tree, small_id, to_hex,
+};
 use gardenbed_model::{Changeset, Mode, Tree};
 use std::path::PathBuf;
 
@@ -75,7 +77,7 @@ fn committed_rejection_vectors_are_refused() {
         if !name.ends_with(".hex") || !name.starts_with("invalid-") {
             continue;
         }
-        let bytes = from_hex(&std::fs::read_to_string(&path).unwrap().trim());
+        let bytes = from_hex(std::fs::read_to_string(&path).unwrap().trim());
         let refused = if name.contains("tree") {
             Tree::decode(&bytes).is_err()
         } else {
@@ -84,7 +86,10 @@ fn committed_rejection_vectors_are_refused() {
         assert!(refused, "{name}: decoder accepted bytes it must reject");
         found += 1;
     }
-    assert!(found >= 8, "expected the committed rejection vectors, found {found}");
+    assert!(
+        found >= 8,
+        "expected the committed rejection vectors, found {found}"
+    );
 }
 
 #[test]
@@ -94,30 +99,46 @@ fn valid_and_invalid_known_cases() {
     assert!(Tree::decode(&t.canonical_bytes().unwrap()).is_ok());
 
     // invalid: absolute path, `..` component, empty path
-    assert!(make_cs(vec![], vec![change_add("/etc/passwd", small_id(1), Mode::Regular)], "")
+    assert!(
+        make_cs(
+            vec![],
+            vec![change_add("/etc/passwd", small_id(1), Mode::Regular)],
+            ""
+        )
         .canonical_bytes()
-        .is_err());
-    assert!(make_cs(vec![], vec![change_add("a/../b", small_id(1), Mode::Regular)], "")
+        .is_err()
+    );
+    assert!(
+        make_cs(
+            vec![],
+            vec![change_add("a/../b", small_id(1), Mode::Regular)],
+            ""
+        )
         .canonical_bytes()
-        .is_err());
-    assert!(make_cs(vec![], vec![change_add("", small_id(1), Mode::Regular)], "")
-        .canonical_bytes()
-        .is_err());
+        .is_err()
+    );
+    assert!(
+        make_cs(vec![], vec![change_add("", small_id(1), Mode::Regular)], "")
+            .canonical_bytes()
+            .is_err()
+    );
 
     // invalid: rename with src_path == path
-    assert!(make_cs(
-        vec![],
-        vec![gardenbed_model::Change {
-            path: "x".into(),
-            op: gardenbed_model::Op::Rename,
-            blob: Some(small_id(1)),
-            src_path: Some("x".into()),
-            mode: Mode::Regular,
-        }],
-        ""
-    )
-    .canonical_bytes()
-    .is_err());
+    assert!(
+        make_cs(
+            vec![],
+            vec![gardenbed_model::Change {
+                path: "x".into(),
+                op: gardenbed_model::Op::Rename,
+                blob: Some(small_id(1)),
+                src_path: Some("x".into()),
+                mode: Mode::Regular,
+            }],
+            ""
+        )
+        .canonical_bytes()
+        .is_err()
+    );
 
     // hex helpers agree with Id display
     assert_eq!(to_hex(&small_id(1).as_bytes()[..1]), "01");

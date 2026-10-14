@@ -28,9 +28,9 @@ pub mod generator;
 pub mod materialize;
 pub mod oracle;
 
-pub use generator::{files_at, format_tz, generate, GenOptions, GeneratedHistory};
-pub use materialize::{materialize, Materialized};
+pub use generator::{GenOptions, GeneratedHistory, files_at, format_tz, generate};
+pub use materialize::{Materialized, materialize};
 pub use oracle::{
-    git_blame_first_parent, git_diff_tree, git_fsck, git_hash_object, git_log, git_ls_tree_r,
-    git_show, BlameRange, DiffEntry, LogEntry,
+    BlameRange, DiffEntry, LogEntry, git_blame_first_parent, git_diff_tree, git_fsck,
+    git_hash_object, git_log, git_ls_tree_r, git_show,
 };

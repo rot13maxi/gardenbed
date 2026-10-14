@@ -8,7 +8,7 @@
 //! writes no new object either way — but the lazy walk keeps commit work
 //! O(change) as D3 requires.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use gardenbed_model::{Id, Mode, Op, Tree, TreeEntry, TreeKind};
 use gardenbed_store::{ObjectStore, StoreError};
@@ -39,6 +39,11 @@ struct WorkingSet<'a> {
     objects: &'a dyn ObjectStore,
     /// Open directories by full path ("" is the root).
     open: HashMap<String, BTreeMap<String, Slot>>,
+    /// File paths written during this apply (Add/Modify/rename
+    /// destinations). A delete beneath one of these is a no-op: the write
+    /// swallowed the whole subtree (canonical path order sorts the write
+    /// of `g` before the delete of `g/h`).
+    written_files: HashSet<String>,
 }
 
 impl<'a> WorkingSet<'a> {
@@ -54,7 +59,11 @@ impl<'a> WorkingSet<'a> {
                 open.insert(String::new(), slots_from_tree(&tree)?);
             }
         }
-        Ok(WorkingSet { objects, open })
+        Ok(WorkingSet {
+            objects,
+            open,
+            written_files: HashSet::new(),
+        })
     }
 
     /// Returns the open entry map of directory `dir`, loading it (and every
@@ -94,7 +103,7 @@ impl<'a> WorkingSet<'a> {
             Some(Slot::Dir { id: None, .. }) => {
                 return Err(StoreError::Corrupt(format!(
                     "directory {dir:?} is marked open but was never loaded"
-                )))
+                )));
             }
             Some(Slot::File { .. }) => Found::Collision,
             None => Found::Create,
@@ -102,21 +111,21 @@ impl<'a> WorkingSet<'a> {
         match found {
             Found::Create => {
                 self.open.insert(dir.to_owned(), BTreeMap::new());
-                self.open
-                    .get_mut(parent)
-                    .expect("parent is open")
-                    .insert(name.to_owned(), Slot::Dir { open: true, id: None });
-                return Ok(());
+                self.open.get_mut(parent).expect("parent is open").insert(
+                    name.to_owned(),
+                    Slot::Dir {
+                        open: true,
+                        id: None,
+                    },
+                );
+                Ok(())
             }
-            Found::Collision => {
-                return Err(StoreError::Invalid(format!(
-                    "path {dir:?} collides with a file entry"
-                )))
-            }
+            Found::Collision => Err(StoreError::Invalid(format!(
+                "path {dir:?} collides with a file entry"
+            ))),
             Found::Load(id) => {
                 let tree = Engine::load_tree(self.objects, id)?;
-                self.open
-                    .insert(dir.to_owned(), slots_from_tree(&tree)?);
+                self.open.insert(dir.to_owned(), slots_from_tree(&tree)?);
                 let parent_entries = self.open.get_mut(parent).expect("parent is open");
                 parent_entries.insert(
                     name.to_owned(),
@@ -131,17 +140,53 @@ impl<'a> WorkingSet<'a> {
     }
 
     /// Upserts a file entry at `path` (used for Add/Modify and rename
-    /// destinations).
+    /// destinations). The upsert replaces whatever occupies the path —
+    /// including a whole directory subtree, git snapshot semantics.
     fn set_file(&mut self, path: &str, blob: Id, mode: Mode) -> Result<(), StoreError> {
         let (dir, name) = split_path(path)?;
         let entries = self.dir(dir)?;
         entries.insert(name.to_owned(), Slot::File { blob, mode });
+        self.written_files.insert(path.to_owned());
         Ok(())
+    }
+
+    /// True when a proper ancestor directory of `path` currently holds a
+    /// file that **this apply** wrote: the write replaced the directory and
+    /// everything beneath it, so a delete inside that subtree refers to a
+    /// path that no longer exists — a no-op, not a collision. (The base
+    /// tree having a file there is *not* enough: deleting under a pre
+    /// existing file is an inconsistent changeset and stays an error.)
+    fn swallowed_by_write(&self, path: &str) -> bool {
+        let mut dir = match split_path(path) {
+            Ok((dir, _)) => dir,
+            Err(_) => return false,
+        };
+        loop {
+            if dir.is_empty() {
+                return false;
+            }
+            if self.written_files.contains(dir) {
+                let (parent, name) = split_dir(dir);
+                if let Some(entries) = self.open.get(parent)
+                    && matches!(entries.get(name), Some(Slot::File { .. }))
+                {
+                    return true;
+                }
+            }
+            let (parent, _) = split_dir(dir);
+            if parent.is_empty() {
+                return false;
+            }
+            dir = parent;
+        }
     }
 
     /// Removes the entry at `path`. `require` controls whether a missing
     /// path is an error (Delete/rename-source: an inconsistency) or a no-op.
     fn remove(&mut self, path: &str, require: bool) -> Result<(), StoreError> {
+        if self.swallowed_by_write(path) {
+            return Ok(());
+        }
         let (dir, name) = split_path(path)?;
         let entries = self.dir(dir)?;
         match entries.remove(name) {
@@ -187,7 +232,7 @@ impl<'a> WorkingSet<'a> {
                                 None => {
                                     return Err(StoreError::Corrupt(format!(
                                         "open directory {dir}/{name} was not serialized first"
-                                    )))
+                                    )));
                                 }
                             }
                         } else {
@@ -197,7 +242,7 @@ impl<'a> WorkingSet<'a> {
                                 None => {
                                     return Err(StoreError::Corrupt(format!(
                                         "closed directory slot {dir}/{name} has no tree id"
-                                    )))
+                                    )));
                                 }
                             }
                         };
@@ -225,7 +270,10 @@ impl<'a> WorkingSet<'a> {
             };
             done.insert(dir, result);
         }
-        Ok(done.get("").copied().expect("the root directory is always open"))
+        Ok(done
+            .get("")
+            .copied()
+            .expect("the root directory is always open"))
     }
 }
 
@@ -237,7 +285,11 @@ impl<'a> WorkingSet<'a> {
 /// are created implicitly (git snapshot semantics); Delete must find the
 /// path (otherwise the changeset is inconsistent with its first parent's
 /// tree); Rename removes `src_path` (which must exist) and writes the new
-/// entry. An empty changeset inherits `base` unchanged, so it writes no
+/// entry. A delete beneath a path an earlier change in the same changeset
+/// wrote as a *file* is a no-op: the write replaced that directory and
+/// swallowed everything beneath it (this is the shape `diff` itself emits
+/// for a dir→file swap — [`Op::Add`] of `g` sorts before [`Op::Delete`] of
+/// `g/h`). An empty changeset inherits `base` unchanged, so it writes no
 /// new tree objects.
 pub(crate) fn apply_changeset(
     objects: &dyn ObjectStore,
@@ -267,9 +319,9 @@ pub(crate) fn apply_changeset(
                     )));
                 }
                 ws.remove(src, true)?;
-                let blob = c
-                    .blob
-                    .ok_or_else(|| StoreError::Invalid(format!("rename {} without a blob", c.path)))?;
+                let blob = c.blob.ok_or_else(|| {
+                    StoreError::Invalid(format!("rename {} without a blob", c.path))
+                })?;
                 ws.set_file(&c.path, blob, c.mode)?;
             }
         }
@@ -324,7 +376,13 @@ fn slots_from_tree(tree: &Tree) -> Result<BTreeMap<String, Slot>, StoreError> {
                 let id = e.tree.ok_or_else(|| {
                     StoreError::Corrupt(format!("dir entry {:?} without a tree id", e.name))
                 })?;
-                out.insert(e.name.clone(), Slot::Dir { open: false, id: Some(id) });
+                out.insert(
+                    e.name.clone(),
+                    Slot::Dir {
+                        open: false,
+                        id: Some(id),
+                    },
+                );
             }
         }
     }

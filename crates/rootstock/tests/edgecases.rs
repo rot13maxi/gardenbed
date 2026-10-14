@@ -9,9 +9,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use common::{open_stores, CatFile};
-use gardenbed_model::{blob_id, Changeset, Id, Mode, Op};
-use gardenbed_rootstock::{import_from_path, ImportOptions};
+use common::{CatFile, open_stores};
+use gardenbed_model::{Changeset, Id, Mode, Op, blob_id};
+use gardenbed_rootstock::{ImportOptions, import_from_path};
 use gardenbed_store::{MetadataStore, ObjectStore};
 use tempfile::TempDir;
 
@@ -26,7 +26,10 @@ impl Builder {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = dir.path().join("repo");
         let mut cmd = Command::new("git");
-        cmd.arg("init").arg("-q").arg("--initial-branch=main").arg(&repo);
+        cmd.arg("init")
+            .arg("-q")
+            .arg("--initial-branch=main")
+            .arg(&repo);
         let out = cmd.output().expect("git init runs");
         assert!(out.status.success(), "git init failed");
         Builder { _dir: dir, repo }
@@ -43,7 +46,10 @@ impl Builder {
             args,
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
     }
 
     fn git_stdin(&self, args: &[&str], input: &[u8]) -> String {
@@ -68,7 +74,10 @@ impl Builder {
             args,
             String::from_utf8_lossy(&out.stderr)
         );
-        String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+        String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_owned()
     }
 
     /// Writes a blob and returns its git sha.
@@ -131,7 +140,11 @@ fn imported_cs(garden: &Path, sha: &str) -> Changeset {
         .cs_for_git(sha)
         .expect("cs_for_git")
         .unwrap_or_else(|| panic!("commit {sha} not mapped"));
-    metadata.get_changeset(cs_id).expect("get").expect("exists").0
+    metadata
+        .get_changeset(cs_id)
+        .expect("get")
+        .expect("exists")
+        .0
 }
 
 /// Decodes 40 hex chars into 20 bytes.
@@ -194,17 +207,18 @@ fn git_tree(repo: &Path, sha: &str) -> Vec<(String, String, Vec<u8>)> {
 }
 
 /// Compares a derived tree against git's, byte-exactly for content.
-fn assert_tree_matches_git(
-    garden: &Path,
-    repo: &Path,
-    sha: &str,
-    cat: &mut CatFile,
-) {
+fn assert_tree_matches_git(garden: &Path, repo: &Path, sha: &str, cat: &mut CatFile) {
     let derived = derived_tree(garden, sha);
     let git_entries = git_tree(repo, sha);
     assert_eq!(
-        derived.iter().map(|(p, _, _)| p.as_str()).collect::<Vec<_>>(),
-        git_entries.iter().map(|(p, _, _)| p.as_str()).collect::<Vec<_>>(),
+        derived
+            .iter()
+            .map(|(p, _, _)| p.as_str())
+            .collect::<Vec<_>>(),
+        git_entries
+            .iter()
+            .map(|(p, _, _)| p.as_str())
+            .collect::<Vec<_>>(),
         "commit {sha}: derived paths differ from git"
     );
     for ((p, mode, blob), (gp, gmode, gsha)) in derived.iter().zip(git_entries.iter()) {
@@ -221,7 +235,10 @@ fn assert_tree_matches_git(
         }
         let ours = {
             let (objects, _, _) = open_stores(garden);
-            objects.get_blob(*blob).expect("get_blob").unwrap_or_else(|| panic!("blob {blob} missing"))
+            objects
+                .get_blob(*blob)
+                .expect("get_blob")
+                .unwrap_or_else(|| panic!("blob {blob} missing"))
         };
         assert_eq!(ours, cat.read(&format!("{sha}:{gp}")), "content of {p:?}");
     }
@@ -289,8 +306,14 @@ fn file_replaced_by_dir_needs_no_repair() {
 
     let garden = b._dir.path().join("garden");
     let (objects, metadata, engine) = open_stores(&garden);
-    import_from_path(&b.repo, objects, metadata.clone(), engine, &ImportOptions::default())
-        .expect("import succeeds");
+    import_from_path(
+        &b.repo,
+        objects,
+        metadata.clone(),
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
 
     let cs2 = imported_cs(&garden, &c2);
     let want = vec![
@@ -334,10 +357,16 @@ fn empty_tree_commits() {
         let mut cmd = Command::new("git");
         cmd.current_dir(&b.repo);
         hermetic(&mut cmd);
-        cmd.arg("mktree").stdin(Stdio::null()).output().expect("mktree runs")
+        cmd.arg("mktree")
+            .stdin(Stdio::null())
+            .output()
+            .expect("mktree runs")
     };
     assert!(empty.status.success());
-    let empty = String::from_utf8(empty.stdout).expect("utf8").trim().to_owned();
+    let empty = String::from_utf8(empty.stdout)
+        .expect("utf8")
+        .trim()
+        .to_owned();
     let c1 = b.git_stdin(&["commit-tree", &empty], b"empty root\n");
 
     b.add("100644", &b.blob(b"content\n"), "a.txt");
@@ -348,8 +377,14 @@ fn empty_tree_commits() {
 
     let garden = b._dir.path().join("garden");
     let (objects, metadata, engine) = open_stores(&garden);
-    import_from_path(&b.repo, objects, metadata, engine, &ImportOptions::default())
-        .expect("import succeeds");
+    import_from_path(
+        &b.repo,
+        objects,
+        metadata,
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
 
     let cs1 = imported_cs(&garden, &c1);
     assert!(cs1.changes.is_empty(), "empty root commit has no changes");
@@ -392,8 +427,14 @@ fn gitlinks_are_padded_and_never_dereferenced() {
 
     let garden = b._dir.path().join("garden");
     let (objects, metadata, engine) = open_stores(&garden);
-    import_from_path(&b.repo, objects.clone(), metadata, engine, &ImportOptions::default())
-        .expect("import succeeds");
+    import_from_path(
+        &b.repo,
+        objects.clone(),
+        metadata,
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
 
     let mut padded = [0u8; 32];
     padded[12..].copy_from_slice(&hex_bytes(fake_sub));
@@ -434,8 +475,14 @@ fn typechange_imports_as_modify() {
 
     let garden = b._dir.path().join("garden");
     let (objects, metadata, engine) = open_stores(&garden);
-    import_from_path(&b.repo, objects, metadata, engine, &ImportOptions::default())
-        .expect("import succeeds");
+    import_from_path(
+        &b.repo,
+        objects,
+        metadata,
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
 
     let cs2 = imported_cs(&garden, &c2);
     assert_eq!(cs2.changes.len(), 1, "git reports one typechange");
@@ -464,8 +511,14 @@ fn renames_off_yields_add_delete_pair() {
     let garden_on = b._dir.path().join("garden-on");
     {
         let (objects, metadata, engine) = open_stores(&garden_on);
-        import_from_path(&b.repo, objects, metadata, engine, &ImportOptions::default())
-            .expect("import with renames");
+        import_from_path(
+            &b.repo,
+            objects,
+            metadata,
+            engine,
+            &ImportOptions::default(),
+        )
+        .expect("import with renames");
         let cs = imported_cs(&garden_on, &c2);
         assert_eq!(cs.changes.len(), 1);
         assert_eq!(cs.changes[0].op, Op::Rename);
@@ -574,7 +627,10 @@ impl Builder {
                 "commit-tree failed: {}",
                 String::from_utf8_lossy(&out.stderr)
             );
-            String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .trim()
+                .to_owned()
         };
         self.git(&["update-ref", "refs/heads/main", &sha]);
         sha
@@ -666,22 +722,31 @@ fn pre_canonical_100664_mode_fixups_import_via_raw_fallback() {
     let garden = b._dir.path().join("garden");
     let report = {
         let (objects, metadata, engine) = open_stores(&garden);
-        import_from_path(&b.repo, objects, metadata, engine, &ImportOptions::default())
-            .expect("the mode-only fixup must not hard-error")
+        import_from_path(
+            &b.repo,
+            objects,
+            metadata,
+            engine,
+            &ImportOptions::default(),
+        )
+        .expect("the mode-only fixup must not hard-error")
     };
     assert_eq!(report.commits_new, 4, "every commit ingested");
     assert_eq!(report.commits_skipped, 0);
 
     let (_, metadata, engine) = open_stores(&garden);
     let cs_of = |sha: &str| -> (Id, Changeset) {
-        let id = metadata.cs_for_git(sha).expect("cs_for_git").expect("mapped");
+        let id = metadata
+            .cs_for_git(sha)
+            .expect("cs_for_git")
+            .expect("mapped");
         let cs = metadata.get_changeset(id).expect("get").expect("exists").0;
         (id, cs)
     };
     let (cs1_id, cs1) = cs_of(&c1);
     let (cs2_id, cs2) = cs_of(&c2);
     let (cs3_id, cs3) = cs_of(&c3);
-    let (cs4_id, cs4) = cs_of(&c4);
+    let (_cs4_id, cs4) = cs_of(&c4);
 
     // c1: full-tree adds; 100664 imports as the canonical Regular mode.
     assert_eq!(cs1.parents, Vec::new());
@@ -760,8 +825,14 @@ fn pre_canonical_100664_mode_fixups_import_via_raw_fallback() {
 
     // The zero-change fixup inherits the parent's derived tree exactly,
     // and every derived mode is the canonical Regular.
-    let t1 = engine.derive_tree(cs1_id).expect("derive").expect("non-empty");
-    let t2 = engine.derive_tree(cs2_id).expect("derive").expect("non-empty");
+    let t1 = engine
+        .derive_tree(cs1_id)
+        .expect("derive")
+        .expect("non-empty");
+    let t2 = engine
+        .derive_tree(cs2_id)
+        .expect("derive")
+        .expect("non-empty");
     assert_eq!(t1, t2, "the zero-change fixup inherits the parent tree");
     assert_eq!(
         engine.flatten_tree(Some(t2)).expect("flatten"),
@@ -789,8 +860,14 @@ fn pre_canonical_100664_mode_fixups_import_via_raw_fallback() {
     drop(cat);
     let second = {
         let (objects, metadata, engine) = open_stores(&garden);
-        import_from_path(&b.repo, objects, metadata, engine, &ImportOptions::default())
-            .expect("re-import succeeds")
+        import_from_path(
+            &b.repo,
+            objects,
+            metadata,
+            engine,
+            &ImportOptions::default(),
+        )
+        .expect("re-import succeeds")
     };
     assert_eq!(second.commits_new, 0, "nothing re-ingested");
     assert_eq!(second.commits_skipped, 1, "the walk prunes at the tip");

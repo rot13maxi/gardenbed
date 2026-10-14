@@ -157,12 +157,13 @@ pub fn export_to_path(
     // ---- report: shas from the marks file, refs verified independently.
     let mut commits = Vec::with_capacity(order.len());
     for id in &order {
-        let mark = commit_marks.get(id).copied().ok_or_else(|| {
-            ExportError::Changeset {
+        let mark = commit_marks
+            .get(id)
+            .copied()
+            .ok_or_else(|| ExportError::Changeset {
                 id: id.to_hex(),
                 detail: "was exported but received no mark".into(),
-            }
-        })?;
+            })?;
         let sha = mark_to_sha.get(&mark).ok_or_else(|| {
             ExportError::Git(format!("the marks file has no entry for mark :{mark}"))
         })?;
@@ -234,7 +235,7 @@ fn topo_order(
                             detail: "the changeset graph has a cycle (a changeset is its own \
                                      ancestor)"
                                 .into(),
-                        })
+                        });
                     }
                     None => {
                         state.insert(id, State::Visiting);
@@ -257,7 +258,7 @@ fn topo_order(
                                         detail: "the changeset graph has a cycle (a changeset \
                                                  is its own ancestor)"
                                             .into(),
-                                    })
+                                    });
                                 }
                             }
                         }
@@ -279,14 +280,14 @@ fn load_changeset<'a>(
     id: Id,
     cache: &'a mut HashMap<Id, Changeset>,
 ) -> Result<&'a Changeset, ExportError> {
-    if !cache.contains_key(&id) {
-        let (cs, _) = metadata.get_changeset(id)?.ok_or_else(|| {
-            ExportError::Changeset {
+    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(id) {
+        let (cs, _) = metadata
+            .get_changeset(id)?
+            .ok_or_else(|| ExportError::Changeset {
                 id: id.to_hex(),
                 detail: "missing from the seedbed (dangling ref or parent)".into(),
-            }
-        })?;
-        cache.insert(id, cs);
+            })?;
+        e.insert(cs);
     }
     Ok(&cache[&id])
 }
@@ -297,10 +298,10 @@ fn collect_blob_ids(order: &[Id], cache: &HashMap<Id, Changeset>) -> Vec<Id> {
     let mut set: HashSet<Id> = HashSet::new();
     for id in order {
         for c in &cache[id].changes {
-            if let Some(blob) = c.blob {
-                if c.mode != Mode::Gitlink {
-                    set.insert(blob);
-                }
+            if let Some(blob) = c.blob
+                && c.mode != Mode::Gitlink
+            {
+                set.insert(blob);
             }
         }
     }
@@ -318,13 +319,11 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
             &["rev-parse", "--git-dir"],
             "inspecting the target repository",
         )?;
-        let format = String::from_utf8_lossy(
-            &run_git(
-                git_dir,
-                &["rev-parse", "--show-object-format"],
-                "inspecting the target repository",
-            )?,
-        )
+        let format = String::from_utf8_lossy(&run_git(
+            git_dir,
+            &["rev-parse", "--show-object-format"],
+            "inspecting the target repository",
+        )?)
         .trim()
         .to_owned();
         if format != "sha1" {
@@ -339,16 +338,15 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|e| {
-            ExportError::Git(format!("creating {}: {e}", parent.display()))
-        })?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| ExportError::Git(format!("creating {}: {e}", parent.display())))?;
         let name = git_dir.file_name().ok_or_else(|| {
             ExportError::Git(format!(
                 "cannot derive a repository directory from {}",
                 git_dir.display()
             ))
         })?;
-        let args = vec![
+        let args = [
             "init".to_owned(),
             "-q".to_owned(),
             "--bare".to_owned(),
@@ -356,11 +354,7 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
             name.to_string_lossy().into_owned(),
         ];
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        run_git(
-            parent,
-            &arg_refs,
-            "initializing the target repository",
-        )?;
+        run_git(parent, &arg_refs, "initializing the target repository")?;
     }
     Ok(())
 }
@@ -369,6 +363,10 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
 /// thread, then waits. The stream is built *inside* the thread so the
 /// store reads overlap with git's parsing; git's stderr is drained by its
 /// own thread so a full pipe can never deadlock the writer.
+// The parameters are the export's inputs (destination, stores, the staged
+// order/cache, and ref tips); bundling them into a struct would move the
+// complexity, not remove it.
+#[allow(clippy::too_many_arguments)]
 fn run_fast_import(
     git_dir: &Path,
     marks_path: &Path,
@@ -391,14 +389,8 @@ fn run_fast_import(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| ExportError::Git(format!("cannot spawn git fast-import: {e}")))?;
-    let stdin = child
-        .stdin
-        .take()
-        .expect("fast-import stdin was piped");
-    let stderr = child
-        .stderr
-        .take()
-        .expect("fast-import stderr was piped");
+    let stdin = child.stdin.take().expect("fast-import stdin was piped");
+    let stderr = child.stderr.take().expect("fast-import stderr was piped");
 
     let stderr_reader = std::thread::spawn(move || {
         let mut text = String::new();
@@ -488,22 +480,24 @@ fn write_stream<W: Write>(
         write_identity(out, id, "author", &cs.author)?;
         write_identity(out, id, "committer", &cs.committer)?;
         let message = cs.message.as_bytes();
-        write!(out, "data {}\n", message.len())?;
+        writeln!(out, "data {}", message.len())?;
         out.write_all(message)?;
         out.write_all(b"\n")?;
         for (i, parent) in cs.parents.iter().enumerate() {
-            let parent_mark = commit_marks.get(parent).copied().ok_or_else(|| {
-                ExportError::Changeset {
-                    id: id.to_hex(),
-                    detail: format!(
-                        "parent {} has no mark — it was not exported before this commit",
-                        parent
-                    ),
-                }
-            })?;
-            write!(
+            let parent_mark =
+                commit_marks
+                    .get(parent)
+                    .copied()
+                    .ok_or_else(|| ExportError::Changeset {
+                        id: id.to_hex(),
+                        detail: format!(
+                            "parent {} has no mark — it was not exported before this commit",
+                            parent
+                        ),
+                    })?;
+            writeln!(
                 out,
-                "{} :{parent_mark}\n",
+                "{} :{parent_mark}",
                 if i == 0 { "from" } else { "merge" }
             )?;
         }
@@ -512,31 +506,26 @@ fn write_stream<W: Write>(
             // `deleteall` the commit would inherit whatever tree the
             // previous commit on this ref had accumulated (a second root
             // mid-stream would grow the wrong tree).
-            write!(out, "deleteall\n")?;
+            writeln!(out, "deleteall")?;
         }
         for c in &cs.changes {
             match c.op {
-                Op::Delete => write!(out, "D {}\n", c_quote(&c.path))?,
+                Op::Delete => writeln!(out, "D {}", c_quote(&c.path))?,
                 Op::Add | Op::Modify | Op::Rename => {
                     if let Some(src) = &c.src_path {
-                        write!(out, "D {}\n", c_quote(src))?;
+                        writeln!(out, "D {}", c_quote(src))?;
                     }
                     let blob = c.blob.ok_or_else(|| ExportError::Changeset {
                         id: id.to_hex(),
                         detail: format!("change on {} carries no blob", c.path),
                     })?;
                     if c.mode == Mode::Gitlink {
-                        write!(
-                            out,
-                            "M 160000 {} {}\n",
-                            gitlink_sha(blob)?,
-                            c_quote(&c.path)
-                        )?;
+                        writeln!(out, "M 160000 {} {}", gitlink_sha(blob)?, c_quote(&c.path))?;
                     } else {
                         let blob_mark = blob_marks[&blob];
-                        write!(
+                        writeln!(
                             out,
-                            "M {} :{blob_mark} {}\n",
+                            "M {} :{blob_mark} {}",
                             git_mode(c.mode),
                             c_quote(&c.path)
                         )?;
@@ -550,12 +539,13 @@ fn write_stream<W: Write>(
     // ---- finalize every ref: the commit lines above streamed onto one
     //      ref; the resets are what actually point the branches.
     for (name, tip) in tips {
-        let tip_mark = commit_marks.get(tip).copied().ok_or_else(|| {
-            ExportError::Ref {
+        let tip_mark = commit_marks
+            .get(tip)
+            .copied()
+            .ok_or_else(|| ExportError::Ref {
                 name: name.clone(),
                 detail: "its tip changeset was not exported".into(),
-            }
-        })?;
+            })?;
         write!(out, "reset {name}\nfrom :{tip_mark}\n")?;
     }
     Ok(commit_marks)
@@ -582,9 +572,9 @@ fn write_identity(
             });
         }
     }
-    write!(
+    writeln!(
         out,
-        "{role} {} <{}> {} {}\n",
+        "{role} {} <{}> {} {}",
         identity.name,
         identity.email,
         identity.time_secs,
@@ -691,10 +681,7 @@ fn validate_ref_name(name: &str) -> Result<(), ExportError> {
         if b < 0x20 || b == 0x7f {
             return Err(fail("the name contains a control character".into()));
         }
-        if matches!(
-            b,
-            b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'['
-        ) {
+        if matches!(b, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[') {
             return Err(fail(format!(
                 "the name contains {:?} (not allowed in ref names)",
                 b as char
@@ -726,17 +713,11 @@ fn parse_marks(path: &Path) -> Result<HashMap<u64, String>, ExportError> {
         let mark = mark_raw
             .strip_prefix(':')
             .ok_or_else(|| {
-                ExportError::Git(format!(
-                    "malformed mark {mark_raw:?} in {}",
-                    path.display()
-                ))
+                ExportError::Git(format!("malformed mark {mark_raw:?} in {}", path.display()))
             })?
             .parse::<u64>()
             .map_err(|_| {
-                ExportError::Git(format!(
-                    "malformed mark {mark_raw:?} in {}",
-                    path.display()
-                ))
+                ExportError::Git(format!("malformed mark {mark_raw:?} in {}", path.display()))
             })?;
         if sha_raw.len() != 40 || !sha_raw.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ExportError::Git(format!(
@@ -770,12 +751,13 @@ fn verify_refs(
                 "git printed a non-40-hex object id for {name}: {sha:?}"
             )));
         }
-        let tip_mark = commit_marks.get(tip).copied().ok_or_else(|| {
-            ExportError::Ref {
+        let tip_mark = commit_marks
+            .get(tip)
+            .copied()
+            .ok_or_else(|| ExportError::Ref {
                 name: name.clone(),
                 detail: "its tip changeset was not exported".into(),
-            }
-        })?;
+            })?;
         let expected = mark_to_sha.get(&tip_mark).ok_or_else(|| {
             ExportError::Git(format!("the marks file has no entry for mark :{tip_mark}"))
         })?;
@@ -880,8 +862,10 @@ mod tests {
     #[test]
     fn gitlink_ids_strip_the_zero_padding() {
         let mut bytes = [0u8; 32];
-        let sha = [0x01u8, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
-            0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67];
+        let sha = [
+            0x01u8, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab,
+            0xcd, 0xef, 0x01, 0x23, 0x45, 0x67,
+        ];
         bytes[12..].copy_from_slice(&sha);
         let id = Id::from_bytes(bytes);
         assert_eq!(

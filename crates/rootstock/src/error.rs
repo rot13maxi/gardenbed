@@ -1,7 +1,7 @@
 //! Errors raised by rootstock imports and exports.
 
-use gardenbed_model::codec::CodecError;
 use gardenbed_model::Id;
+use gardenbed_model::codec::CodecError;
 use gardenbed_store::StoreError;
 
 /// I/O failures inside the export pipeline (stream writing, marks file

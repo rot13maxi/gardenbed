@@ -44,7 +44,9 @@ pub fn ingest(
         let id = metadata.put_changeset(cs).expect("put changeset");
         ids.push(id);
         if eager {
-            engine.on_changeset_created(id).expect("on_changeset_created");
+            engine
+                .on_changeset_created(id)
+                .expect("on_changeset_created");
         }
     }
     ids
@@ -108,8 +110,20 @@ pub fn git_merge_base(repo: &Path, a: &str, b: &str) -> Option<String> {
 /// the tree-to-tree diff between two commits with rename detection off.
 /// Returns `(status, path)` per entry, in git's tree order.
 pub fn git_diff_two(repo: &Path, a: &str, b: &str) -> Vec<(char, String)> {
-    let out = git_out(repo, &["diff-tree", "-r", "-z", "--name-status", "--no-renames", "--no-commit-id", a, b])
-        .unwrap_or_default();
+    let out = git_out(
+        repo,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-status",
+            "--no-renames",
+            "--no-commit-id",
+            a,
+            b,
+        ],
+    )
+    .unwrap_or_default();
     let mut entries = Vec::new();
     let mut tokens = out.split(|c| *c == 0).filter(|t| !t.is_empty());
     while let Some(status) = tokens.next() {

@@ -92,9 +92,7 @@ pub fn parse_line(line: &str) -> Result<Incoming, ProtocolError> {
     let jsonrpc_ok = matches!(map.get("jsonrpc"), Some(Value::String(s)) if s == "2.0")
         || !map.contains_key("jsonrpc");
     if !jsonrpc_ok {
-        return Err(ProtocolError::invalid_request(
-            "jsonrpc must be \"2.0\"",
-        ));
+        return Err(ProtocolError::invalid_request("jsonrpc must be \"2.0\""));
     }
     let Some(method) = map.get("method") else {
         return Err(ProtocolError::invalid_request(
@@ -102,9 +100,7 @@ pub fn parse_line(line: &str) -> Result<Incoming, ProtocolError> {
         ));
     };
     let Value::String(method) = method else {
-        return Err(ProtocolError::invalid_request(
-            "method must be a string",
-        ));
+        return Err(ProtocolError::invalid_request("method must be a string"));
     };
     let params = map.get("params").cloned().unwrap_or_else(|| json!({}));
     let is_request = match map.get("id") {
@@ -113,7 +109,7 @@ pub fn parse_line(line: &str) -> Result<Incoming, ProtocolError> {
         Some(_) => {
             return Err(ProtocolError::invalid_request(
                 "id must be a number or a string",
-            ))
+            ));
         }
     };
     if is_request {
@@ -161,15 +157,24 @@ mod tests {
             other => panic!("expected a request, got {other:?}"),
         }
         let line = r#"{"jsonrpc":"2.0","id":"abc","method":"ping"}"#;
-        assert!(matches!(parse_line(line).unwrap(), Incoming::Request { .. }));
+        assert!(matches!(
+            parse_line(line).unwrap(),
+            Incoming::Request { .. }
+        ));
     }
 
     #[test]
     fn notifications_have_no_id_or_a_null_one() {
         let line = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
-        assert!(matches!(parse_line(line).unwrap(), Incoming::Notification { .. }));
+        assert!(matches!(
+            parse_line(line).unwrap(),
+            Incoming::Notification { .. }
+        ));
         let line = r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#;
-        assert!(matches!(parse_line(line).unwrap(), Incoming::Notification { .. }));
+        assert!(matches!(
+            parse_line(line).unwrap(),
+            Incoming::Notification { .. }
+        ));
     }
 
     #[test]

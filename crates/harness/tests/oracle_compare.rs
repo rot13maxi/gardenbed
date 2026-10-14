@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use gardenbed_harness::{
-    files_at, generate, git_hash_object, git_ls_tree_r, git_show, materialize, GenOptions,
+    GenOptions, files_at, generate, git_hash_object, git_ls_tree_r, git_show, materialize,
 };
 use gardenbed_model::Mode;
 
@@ -70,9 +70,15 @@ fn compare_history(seed: u64) {
         let expected = files_at(&history, i);
         let got = git_ls_tree_r(repo, sha).expect("ls-tree");
 
-        let got_map: HashMap<&str, (&str, &[u8])> =
-            got.iter().map(|(p, m, s)| (p.as_str(), (m.as_str(), s.as_slice()))).collect();
-        assert_eq!(got_map.len(), got.len(), "ls-tree paths must be unique at {i}");
+        let got_map: HashMap<&str, (&str, &[u8])> = got
+            .iter()
+            .map(|(p, m, s)| (p.as_str(), (m.as_str(), s.as_slice())))
+            .collect();
+        assert_eq!(
+            got_map.len(),
+            got.len(),
+            "ls-tree paths must be unique at {i}"
+        );
         assert_eq!(
             got_map.len(),
             expected.len(),
@@ -82,7 +88,11 @@ fn compare_history(seed: u64) {
             let Some((gmode, gsha)) = got_map.get(path.as_str()) else {
                 panic!("path {path:?} missing from git tree at changeset {i}");
             };
-            assert_eq!(git_mode_str(*mode), *gmode, "mode mismatch at {path:?} cs {i}");
+            assert_eq!(
+                git_mode_str(*mode),
+                *gmode,
+                "mode mismatch at {path:?} cs {i}"
+            );
             if *mode == Mode::Gitlink {
                 // Submodule pointer: git stores the upstream sha verbatim.
                 let padded = blob.as_bytes();

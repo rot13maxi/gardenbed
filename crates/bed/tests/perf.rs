@@ -35,12 +35,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use gardenbed::bed::Bed;
-use gardenbed::treestate::{TreestateEntry, MODE_REGULAR, HINT_VERIFIED};
-use gardenbed_harness::generator::{files_at, generate, GenOptions};
+use gardenbed::treestate::{HINT_VERIFIED, MODE_REGULAR, TreestateEntry};
+use gardenbed_harness::generator::{GenOptions, files_at, generate};
 use gardenbed_model::blob_id;
 use tempfile::TempDir;
 
-use common::{bed, Arboretum};
+use common::{Arboretum, bed};
 
 /// Fails `what` if the measured `elapsed` exceeds `budget`.
 fn assert_budget(what: &str, elapsed: Duration, budget: Duration) {
@@ -133,7 +133,11 @@ async fn plot_add_of_1k_files_under_5s() {
     assert!(files >= 500, "fixture should be sizeable: {files}");
     let start = Instant::now();
     let (code, out, stderr) = bed(&w.garden, &["plot", "add", "."]);
-    assert_budget(&format!("plot add of {files} files"), start.elapsed(), Duration::from_secs(5));
+    assert_budget(
+        &format!("plot add of {files} files"),
+        start.elapsed(),
+        Duration::from_secs(5),
+    );
     assert_eq!(code, 0, "plot add: {stderr}\n{out}");
 
     let (code, out, _) = bed(&w.garden, &["status"]);
@@ -163,7 +167,7 @@ fn warm_status_10k_under_500ms() {
     let mut content = Vec::with_capacity(64);
     for i in 0..N {
         content.clear();
-        write!(content, "row {i} of the warm status perf fixture\n").unwrap();
+        writeln!(content, "row {i} of the warm status perf fixture").unwrap();
         let path = format!("file-{i:05}.txt");
         fs::write(garden.join(&path), &content).expect("file written");
         let md = fs::metadata(garden.join(&path)).expect("metadata");
@@ -173,7 +177,7 @@ fn warm_status_10k_under_500ms() {
                 blob_id: blob_id(&content),
                 mode: MODE_REGULAR,
                 size: content.len() as i64,
-                mtime_ns: i64::try_from(md.mtime_nsec()).expect("mtime fits"),
+                mtime_ns: md.mtime_nsec(),
                 hint: HINT_VERIFIED,
             })
             .expect("row upserted");
@@ -198,7 +202,11 @@ fn warm_status_10k_under_500ms() {
         println!("warm status run {i}: {s:.1?}");
     }
     let worst = *samples.iter().max().unwrap();
-    assert_budget("warm status over 10k files (worst of 3)", worst, Duration::from_millis(500));
+    assert_budget(
+        "warm status over 10k files (worst of 3)",
+        worst,
+        Duration::from_millis(500),
+    );
 }
 
 /// M4 perf 3: a cold `bed file` — fresh process every time, warm local
@@ -342,10 +350,7 @@ async fn sow_p50_is_size_independent_10k_vs_1m() {
     let t0 = Instant::now();
     build_sized_repo(&small_repo, 10_000, 10_000);
     build_sized_repo(&big_repo, 1_000_000, 10_000);
-    println!(
-        "fixtures ingested in {:.1?} (10k + 1M files)",
-        t0.elapsed()
-    );
+    println!("fixtures ingested in {:.1?} (10k + 1M files)", t0.elapsed());
 
     let mut small_server = Arboretum::spawn(&small_repo).await;
     let mut big_server = Arboretum::spawn(&big_repo).await;

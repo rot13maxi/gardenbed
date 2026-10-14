@@ -19,7 +19,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use gardenbed_model::{blob_id, Change, Changeset, Id, Mode, Op, Identity};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 
@@ -169,7 +169,9 @@ const UNICODE_NAMES: &[&str] = &[
     "kōan 文字.txt",
     "emoji🌱.txt",
 ];
-const DIR_POOL: &[&str] = &["garden", "orchard", "bed", "plot", "compost", "loam", "trellis"];
+const DIR_POOL: &[&str] = &[
+    "garden", "orchard", "bed", "plot", "compost", "loam", "trellis",
+];
 const UNICODE_DIRS: &[&str] = &["日本語", "grün", "форест"];
 
 const AUTHORS: &[(&str, &str)] = &[
@@ -248,14 +250,18 @@ impl Generator {
             candidates.extend(UNICODE_NAMES.iter().map(|s| (*s).to_owned()));
         }
         let dirs: Vec<&str> = if opts.unicode_paths {
-            DIR_POOL.iter().copied().chain(UNICODE_DIRS.iter().copied()).collect()
+            DIR_POOL
+                .iter()
+                .copied()
+                .chain(UNICODE_DIRS.iter().copied())
+                .collect()
         } else {
             DIR_POOL.to_vec()
         };
         let max_dirs = opts.max_dirs.max(1) as usize;
         let breadth = dirs.len().min(max_dirs.max(2));
         let target = opts.max_files.max(1) as usize * 4 + 64;
-        let mut path_rng = StdRng::seed_from_u64(seed ^ 0x6a09e667_0000_0000);
+        let mut path_rng = StdRng::seed_from_u64(seed ^ 0x6a09_e667_0000_0000);
         let mut attempts = 0usize;
         while candidates.len() < target && attempts < 20_000 {
             attempts += 1;
@@ -557,14 +563,8 @@ impl Generator {
                     let (blob, content) = self.fresh_blob_for_mode(mode, crlf, None);
                     self.blobs.insert(blob, content);
                     self.touched.insert(path.clone());
-                    self.work.insert(
-                        path.clone(),
-                        FileState {
-                            blob,
-                            mode,
-                            crlf,
-                        },
-                    );
+                    self.work
+                        .insert(path.clone(), FileState { blob, mode, crlf });
                     changes.push(Change {
                         path,
                         op: Op::Add,
@@ -645,8 +645,7 @@ impl Generator {
         for _ in 0..n {
             let path = if self.work.len() >= max_files {
                 break;
-            }
-            else {
+            } else {
                 match self.fresh_paths().pop() {
                     Some(p) => p,
                     None => self.synthesized_path(),
@@ -660,14 +659,8 @@ impl Generator {
             let (blob, content) = self.fresh_blob_for_mode(mode, crlf, None);
             self.blobs.insert(blob, content);
             self.touched.insert(path.clone());
-            self.work.insert(
-                path.clone(),
-                FileState {
-                    blob,
-                    mode,
-                    crlf,
-                },
-            );
+            self.work
+                .insert(path.clone(), FileState { blob, mode, crlf });
             changes.push(Change {
                 path,
                 op: Op::Add,
@@ -787,9 +780,8 @@ pub fn generate(seed: u64, opts: &GenOptions) -> GeneratedHistory {
 /// harness bug (reproducible via the deterministic seed) rather than bad
 /// user input.
 fn id_of(cs: &Changeset) -> Id {
-    cs.id().unwrap_or_else(|e| {
-        panic!("harness bug: generated changeset failed to encode: {e}")
-    })
+    cs.id()
+        .unwrap_or_else(|e| panic!("harness bug: generated changeset failed to encode: {e}"))
 }
 
 /// Replays changesets `0..=index` to answer "what files exist at
@@ -876,10 +868,7 @@ mod tests {
         for cs in &h.changesets {
             for c in &cs.changes {
                 if let Some(b) = c.blob {
-                    assert!(
-                        h.blob(&b).is_some(),
-                        "blob {b} missing from contents"
-                    );
+                    assert!(h.blob(&b).is_some(), "blob {b} missing from contents");
                 }
             }
         }

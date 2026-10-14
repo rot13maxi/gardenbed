@@ -21,9 +21,9 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
 use gardenbed_derive::Engine;
-use gardenbed_harness::{generate, materialize, GenOptions, GeneratedHistory};
+use gardenbed_harness::{GenOptions, GeneratedHistory, generate, materialize};
 use gardenbed_model::{Id, Mode};
-use gardenbed_rootstock::{import_from_path, ImportOptions, ImportReport};
+use gardenbed_rootstock::{ImportOptions, ImportReport, import_from_path};
 use gardenbed_store::{FsObjectStore, MetadataStore, ObjectStore, SqliteMetadataStore};
 use tempfile::TempDir;
 
@@ -88,7 +88,8 @@ pub type ImportReportResult = Result<ImportReport, gardenbed_rootstock::ImportEr
 /// A scalar (usually a COUNT) from the seedbed sqlite.
 pub fn sql_scalar(garden: &Path, sql: &str) -> u64 {
     let conn = rusqlite::Connection::open(garden.join("seedbed.sqlite3")).expect("sqlite opens");
-    conn.query_row(sql, [], |r| r.get::<_, u64>(0)).expect("query")
+    conn.query_row(sql, [], |r| r.get::<_, u64>(0))
+        .expect("query")
 }
 
 /// All `(git_sha, cs_hex)` mapping rows, sorted by sha.
@@ -126,7 +127,14 @@ pub fn object_set(garden: &Path) -> BTreeSet<String> {
             if entry.file_type().expect("ft").is_dir() {
                 stack.push(entry.path());
             } else {
-                out.insert(entry.path().strip_prefix(&objects_root).expect("relative").to_string_lossy().to_string());
+                out.insert(
+                    entry
+                        .path()
+                        .strip_prefix(&objects_root)
+                        .expect("relative")
+                        .to_string_lossy()
+                        .to_string(),
+                );
             }
         }
     }
@@ -279,7 +287,7 @@ fn check_delta_semantics(
     }
     // 1. Every disappearing path is explained by a delete or a rename
     //    source. (An in-place change is covered by check 2 via upserts.)
-    for (p, _old) in parent {
+    for p in parent.keys() {
         if !child.contains_key(p) {
             assert!(
                 deletes.contains(p.as_str()) || renames.contains_key(p.as_str()),
@@ -300,11 +308,20 @@ fn check_delta_semantics(
     // 3. Each recorded change agrees with both states.
     for p in &deletes {
         assert!(parent.contains_key(*p), "{label}: Delete of absent {p:?}");
-        assert!(!child.contains_key(*p), "{label}: Delete but {p:?} survives");
+        assert!(
+            !child.contains_key(*p),
+            "{label}: Delete but {p:?} survives"
+        );
     }
     for (src, (dst, blob, mode)) in &renames {
-        assert!(parent.contains_key(*src), "{label}: Rename src {src:?} absent");
-        assert!(!child.contains_key(*src), "{label}: Rename src {src:?} survives");
+        assert!(
+            parent.contains_key(*src),
+            "{label}: Rename src {src:?} absent"
+        );
+        assert!(
+            !child.contains_key(*src),
+            "{label}: Rename src {src:?} survives"
+        );
         assert_eq!(
             child.get(*dst),
             Some(&(*blob, *mode)),
@@ -354,7 +371,10 @@ pub fn sweep(fixture: &Fixture, garden: &Path) {
         );
 
         // -- stored changeset round-trips through the codec
-        let (cs, canonical) = metadata.get_changeset(cs_id).expect("get_changeset").expect("exists");
+        let (cs, canonical) = metadata
+            .get_changeset(cs_id)
+            .expect("get_changeset")
+            .expect("exists");
         let decoded = gardenbed_model::Changeset::decode(&canonical).expect("canonical decodes");
         assert_eq!(decoded, cs, "changeset {i}: stored bytes do not round-trip");
 
@@ -367,14 +387,18 @@ pub fn sweep(fixture: &Fixture, garden: &Path) {
         );
         let log = &gardenbed_harness::git_log(&fixture.repo, sha, 1).expect("git log")[0];
         assert_eq!(log.author_name, cs.author.name, "commit {sha}: author name");
-        assert_eq!(log.author_email, cs.author.email, "commit {sha}: author email");
+        assert_eq!(
+            log.author_email, cs.author.email,
+            "commit {sha}: author email"
+        );
         let parent_css: Vec<Id> = log
             .parents
             .iter()
             .map(|p| {
-                metadata.cs_for_git(p).expect("cs_for_git").unwrap_or_else(|| {
-                    panic!("commit {sha}: parent {p} has no mapping")
-                })
+                metadata
+                    .cs_for_git(p)
+                    .expect("cs_for_git")
+                    .unwrap_or_else(|| panic!("commit {sha}: parent {p} has no mapping"))
             })
             .collect();
         assert_eq!(
@@ -414,8 +438,14 @@ pub fn sweep(fixture: &Fixture, garden: &Path) {
         derived.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
 
         assert_eq!(
-            derived.iter().map(|(p, _, _)| p.as_str()).collect::<Vec<_>>(),
-            git_files.iter().map(|(p, _, _)| p.as_str()).collect::<Vec<_>>(),
+            derived
+                .iter()
+                .map(|(p, _, _)| p.as_str())
+                .collect::<Vec<_>>(),
+            git_files
+                .iter()
+                .map(|(p, _, _)| p.as_str())
+                .collect::<Vec<_>>(),
             "commit {sha}: derived tree paths differ from git"
         );
         assert_eq!(
@@ -425,8 +455,9 @@ pub fn sweep(fixture: &Fixture, garden: &Path) {
         );
         for (path, mode, blob) in &derived {
             // generated expectation
-            let (want_blob, want_mode) =
-                expected.get(path).unwrap_or_else(|| panic!("commit {sha}: path {path:?} missing from files_at"));
+            let (want_blob, want_mode) = expected
+                .get(path)
+                .unwrap_or_else(|| panic!("commit {sha}: path {path:?} missing from files_at"));
             assert_eq!(mode, want_mode, "commit {sha}: mode of {path:?}");
             assert_eq!(blob, want_blob, "commit {sha}: blob id of {path:?}");
         }
@@ -440,7 +471,10 @@ pub fn sweep(fixture: &Fixture, garden: &Path) {
                 assert!(dblob.as_bytes()[..12].iter().all(|b| *b == 0));
                 continue;
             }
-            let ours = objects.get_blob(*dblob).expect("get_blob").unwrap_or_else(|| panic!("blob {} missing", dblob));
+            let ours = objects
+                .get_blob(*dblob)
+                .expect("get_blob")
+                .unwrap_or_else(|| panic!("blob {} missing", dblob));
             let theirs = cat.read(&format!("{sha}:{gpath}"));
             assert_eq!(
                 ours, theirs,

@@ -82,7 +82,10 @@ mod tests {
         assert!(glob_match("refs/heads/rel*", "refs/heads/release-1.2"));
         assert!(!glob_match("refs/heads/rel*", "refs/heads/dev"));
         assert!(glob_match("refs/heads/*-stable", "refs/heads/v3-stable"));
-        assert!(!glob_match("refs/heads/*-stable", "refs/heads/v3-stable/next"));
+        assert!(!glob_match(
+            "refs/heads/*-stable",
+            "refs/heads/v3-stable/next"
+        ));
         assert!(glob_match("*", "refs/heads/anything"));
         assert!(glob_match("refs/heads/ma?n", "refs/heads/main"));
         assert!(glob_match("refs/heads/ma?n", "refs/heads/maan"));

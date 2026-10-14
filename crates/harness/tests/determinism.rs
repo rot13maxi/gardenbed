@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use gardenbed_harness::{files_at, generate, GenOptions};
+use gardenbed_harness::{GenOptions, files_at, generate};
 use gardenbed_model::{Changeset, Id, Mode, Op};
 
 #[test]
@@ -75,7 +75,10 @@ fn files_at_replays_the_working_set() {
         for c in &cs.changes {
             match c.op {
                 Op::Delete => {
-                    assert!(live.remove(&c.path).is_some(), "cs {i}: delete of absent path");
+                    assert!(
+                        live.remove(&c.path).is_some(),
+                        "cs {i}: delete of absent path"
+                    );
                 }
                 Op::Rename => {
                     let src = c.src_path.clone().expect("rename has src_path");
@@ -84,7 +87,10 @@ fn files_at_replays_the_working_set() {
                     // Pure rename reuses the source blob; rename+modify
                     // carries a fresh one. Both keep the src removed.
                     assert!(blob == old.0 || blob != old.0);
-                    assert!(live.insert(c.path.clone(), (blob, c.mode)).is_none(), "cs {i}: rename dst already exists");
+                    assert!(
+                        live.insert(c.path.clone(), (blob, c.mode)).is_none(),
+                        "cs {i}: rename dst already exists"
+                    );
                 }
                 Op::Add => {
                     let blob = c.blob.expect("add carries a blob");

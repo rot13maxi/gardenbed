@@ -36,13 +36,8 @@ fn main() {
 async fn run(cli: &Cli) -> Result<i32, BedError> {
     match &cli.command {
         Command::Clone { server, repo, plot } => {
-            let out = gardenbed::ops::clone(
-                &cli.bed_dir,
-                server,
-                repo.as_deref(),
-                plot.clone(),
-            )
-            .await?;
+            let out =
+                gardenbed::ops::clone(&cli.bed_dir, server, repo.as_deref(), plot.clone()).await?;
             print!("{out}");
             Ok(0)
         }
@@ -57,12 +52,8 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
                 return Ok(0);
             }
             let treestate = bed.treestate()?;
-            let report = gardenbed::status::scan_status(
-                &bed.garden_root(),
-                &plot,
-                &treestate,
-                *full_scan,
-            )?;
+            let report =
+                gardenbed::status::scan_status(&bed.garden_root(), &plot, &treestate, *full_scan)?;
             let rendered = report.render();
             if rendered.is_empty() {
                 println!("the plot is clean — nothing modified, deleted, or untracked.");
@@ -176,8 +167,7 @@ async fn run_plot(cli: &Cli, command: &PlotCommand) -> Result<i32, BedError> {
             for raw in paths {
                 plot::normalize_prefix(raw)?;
             }
-            let out =
-                gardenbed::ops::plot_add(&cli.bed_dir, paths, *concurrency).await?;
+            let out = gardenbed::ops::plot_add(&cli.bed_dir, paths, *concurrency).await?;
             print!("{out}");
             Ok(0)
         }

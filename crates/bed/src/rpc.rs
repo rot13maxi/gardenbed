@@ -18,9 +18,9 @@
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
-use std::sync::Arc;
 
 use gardenbed_model::{Id, Mode, Tree, TreeKind};
 use gardenbed_protocol::client::GardenbedClient;
@@ -114,12 +114,12 @@ impl Session {
         endpoint: &str,
         concurrency: usize,
     ) -> Result<Self, BedError> {
-        let client = GardenbedClient::connect(endpoint).await.map_err(|e| {
-            BedError::Connect {
+        let client = GardenbedClient::connect(endpoint)
+            .await
+            .map_err(|e| BedError::Connect {
                 server: endpoint.to_owned(),
                 message: e.to_string(),
-            }
-        })?;
+            })?;
         let fetcher = Arc::new(Fetcher::new(client.clone(), repo, objects, concurrency));
         Ok(Session {
             client,
@@ -188,11 +188,7 @@ impl Session {
     }
 
     /// The changeset's root tree id (`None` = the empty tree).
-    pub async fn root_tree(
-        &self,
-        cs: Id,
-        command: &'static str,
-    ) -> Result<Option<Id>, BedError> {
+    pub async fn root_tree(&self, cs: Id, command: &'static str) -> Result<Option<Id>, BedError> {
         match self.client.root_tree(&self.repo, cs).await {
             Ok(tree) => Ok(tree),
             Err(status) if status.code() == tonic::Code::NotFound => Err(BedError::MissingCs(cs)),
@@ -312,7 +308,7 @@ impl Session {
             }
             match entry.kind {
                 TreeKind::Dir => {
-                    cur = entry.tree.ok_or_else(|| BedError::BlobHashMismatch(cur))?;
+                    cur = entry.tree.ok_or(BedError::BlobHashMismatch(cur))?;
                 }
                 // A file cannot contain anything below it.
                 TreeKind::File => return Ok(None),
@@ -391,7 +387,10 @@ impl Fetcher {
     /// How many objects this run pulled over the wire so far: `(trees,
     /// blobs)`.
     pub fn fetched(&self) -> (u64, u64) {
-        (self.trees_fetched.load(Relaxed), self.blobs_fetched.load(Relaxed))
+        (
+            self.trees_fetched.load(Relaxed),
+            self.blobs_fetched.load(Relaxed),
+        )
     }
 
     /// A tree by id — local cache first, then one `GetTree` RPC, stored
@@ -404,8 +403,7 @@ impl Fetcher {
     /// per run, whatever the walk shape.
     pub async fn tree(&self, id: Id) -> Result<Tree, BedError> {
         if let Some(bytes) = self.objects.get_tree(id)? {
-            return Tree::decode(&bytes)
-                .map_err(|_| BedError::BlobHashMismatch(id));
+            return Tree::decode(&bytes).map_err(|_| BedError::BlobHashMismatch(id));
         }
         let lock = {
             let mut locks = self.tree_locks.lock().await;
@@ -414,10 +412,13 @@ impl Fetcher {
         let _gate = lock.lock().await;
         // Someone may have fetched it while we waited for the lock.
         if let Some(bytes) = self.objects.get_tree(id)? {
-            return Tree::decode(&bytes)
-                .map_err(|_| BedError::BlobHashMismatch(id));
+            return Tree::decode(&bytes).map_err(|_| BedError::BlobHashMismatch(id));
         }
-        let _permit = self.bound.acquire().await.expect("semaphore is never closed");
+        let _permit = self
+            .bound
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
         let tree = self
             .client
             .get_tree(&self.repo, id)
@@ -441,7 +442,11 @@ impl Fetcher {
         if let Some(content) = self.objects.get_blob(id)? {
             return Ok(content);
         }
-        let _permit = self.bound.acquire().await.expect("semaphore is never closed");
+        let _permit = self
+            .bound
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
         let mut stream = self
             .client
             .get_blob(&self.repo, id)
@@ -543,7 +548,7 @@ pub async fn plan_plot(
             let last = i + 1 == comps.len();
             match entry.kind {
                 TreeKind::Dir => {
-                    let id = entry.tree.ok_or_else(|| BedError::BlobHashMismatch(cur))?;
+                    let id = entry.tree.ok_or(BedError::BlobHashMismatch(cur))?;
                     if last {
                         push(id, prefix.clone(), &mut queue, &mut queued);
                     }
@@ -552,7 +557,7 @@ pub async fn plan_plot(
                 TreeKind::File => {
                     if last {
                         // An exact-file prefix: one entry, no subtree.
-                        let blob = entry.blob.ok_or_else(|| BedError::BlobHashMismatch(cur))?;
+                        let blob = entry.blob.ok_or(BedError::BlobHashMismatch(cur))?;
                         if seen_paths.insert(prefix.clone()) {
                             files.push(PlanFile {
                                 path: prefix.clone(),
@@ -592,15 +597,11 @@ pub async fn plan_plot(
                 };
                 match entry.kind {
                     TreeKind::Dir => {
-                        let id = entry
-                            .tree
-                            .ok_or_else(|| BedError::BlobHashMismatch(tree_id))?;
+                        let id = entry.tree.ok_or(BedError::BlobHashMismatch(tree_id))?;
                         push(id, path.clone(), &mut queue, &mut queued);
                     }
                     TreeKind::File => {
-                        let blob = entry
-                            .blob
-                            .ok_or_else(|| BedError::BlobHashMismatch(tree_id))?;
+                        let blob = entry.blob.ok_or(BedError::BlobHashMismatch(tree_id))?;
                         if seen_paths.insert(path.clone()) {
                             files.push(PlanFile {
                                 path,
@@ -634,4 +635,3 @@ pub async fn plan_plot(
         },
     ))
 }
-

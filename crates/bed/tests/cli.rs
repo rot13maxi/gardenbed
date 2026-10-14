@@ -10,8 +10,8 @@ use std::process::Command;
 
 use gardenbed::bed::Bed;
 use gardenbed::status::mtime_ns;
-use gardenbed::treestate::TreestateEntry;
 use gardenbed::treestate::HINT_VERIFIED;
+use gardenbed::treestate::TreestateEntry;
 use tempfile::TempDir;
 
 /// Runs the real binary in `dir`, returning (exit code, stdout, stderr).
@@ -106,7 +106,10 @@ fn plot_add_needs_the_arboretum_and_writes_nothing_on_failure() {
     let (code, stdout, stderr) = bed(&dir, &["plot", "add", "src"]);
     assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
-    assert!(stderr.contains("cannot reach the arboretum"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot reach the arboretum"),
+        "stderr: {stderr}"
+    );
 
     let config_after = fs::read_to_string(dir.path().join(".bed/config.toml")).unwrap();
     assert_eq!(config_before, config_after, "config must be untouched");
@@ -161,7 +164,10 @@ fn status_reports_modified_deleted_and_untracked() {
 
     // --full-scan agrees (and hashes everything).
     let (_, out, _) = bed(&dir, &["status", "--full-scan"]);
-    assert!(out.contains("modified:") && out.contains("src/a.rs"), "out: {out}");
+    assert!(
+        out.contains("modified:") && out.contains("src/a.rs"),
+        "out: {out}"
+    );
 }
 
 #[test]
@@ -191,7 +197,10 @@ fn read_path_commands_fail_cleanly_without_an_arboretum() {
     ];
     for args in cases {
         let (code, stdout, stderr) = bed(&dir, args);
-        assert_eq!(code, 1, "args {args:?}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(
+            code, 1,
+            "args {args:?}: stdout {stdout:?} stderr {stderr:?}"
+        );
         assert!(
             stderr.contains("cannot reach the arboretum"),
             "args {args:?}: stderr {stderr:?}"
@@ -212,7 +221,10 @@ fn clone_fails_cleanly_without_an_arboretum_and_leaves_no_bed() {
     let (code, stdout, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1"]);
     assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
-    assert!(stderr.contains("cannot reach the arboretum"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cannot reach the arboretum"),
+        "stderr: {stderr}"
+    );
     assert!(!dir.path().join(".bed").exists(), "no bed may be planted");
 }
 
@@ -245,7 +257,10 @@ fn write_path_and_blame_fail_cleanly_without_an_arboretum() {
     for args in [&["graft", "main"][..], &["harvest"][..]] {
         let dir = planted_bed();
         let (code, stdout, stderr) = bed(&dir, args);
-        assert_eq!(code, 1, "args {args:?}: stdout {stdout:?} stderr {stderr:?}");
+        assert_eq!(
+            code, 1,
+            "args {args:?}: stdout {stdout:?} stderr {stderr:?}"
+        );
         assert!(
             stderr.contains("cannot reach the arboretum"),
             "args {args:?}: stderr {stderr:?}"
@@ -275,7 +290,10 @@ fn commands_still_validate_arguments_locally() {
     // A bad revspec on goto likewise.
     let (code, _, stderr) = bed(&dir, &["goto", ""]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("invalid changeset id or ref"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("invalid changeset id or ref"),
+        "stderr: {stderr}"
+    );
 
     // A bad path on blame and on file.
     for args in [&["blame", "/absolute"][..], &["file", "/absolute"][..]] {
@@ -315,10 +333,7 @@ fn custom_bed_dir_override_is_honored() {
     Bed::init(&bed_dir, "http://127.0.0.1:1", "garden").unwrap();
 
     // No ./.bed in cwd — the override must carry the day.
-    let (code, out, stderr) = bed(
-        &dir,
-        &["--bed-dir", bed_dir.to_str().unwrap(), "status"],
-    );
+    let (code, out, stderr) = bed(&dir, &["--bed-dir", bed_dir.to_str().unwrap(), "status"]);
     assert_eq!(code, 0, "{stderr}");
     assert!(out.contains("the plot is empty"), "out: {out}");
 }

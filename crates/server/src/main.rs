@@ -17,6 +17,14 @@
 //!   URL; URLs are cloned/refreshed into a mirror under the gardenbed
 //!   root first. Prints the import report on success.
 //!
+//! * `gardenbed-server export --root DIR --into GIT-DIR [--ref <pattern>...]
+//!   [--mapping FILE]` — renders the changeset graph into a real git
+//!   repository via one `git fast-import` stream
+//!   ([`gardenbed_rootstock::export_to_path`]). Prints the export report;
+//!   with `--mapping` also writes a TSV `<changeset id> <tab> <git sha>`
+//!   file (sorted by changeset id) for roundtrip verification. This is
+//!   scaffolding over the library API, not engine code.
+//!
 //! Logging goes to stderr via `env_logger` (control with `RUST_LOG`,
 //! default `info`). The server runs until SIGINT/SIGTERM, then drains.
 
@@ -26,11 +34,14 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use gardenbed_server::{GardenbedService, Repo};
-use tonic::transport::server::TcpIncoming;
 use tonic::transport::Server;
+use tonic::transport::server::TcpIncoming;
 
 #[derive(Debug, Parser)]
-#[command(name = "gardenbed-server", about = "The gardenbed arboretum (authoritative server)")]
+#[command(
+    name = "gardenbed-server",
+    about = "The gardenbed arboretum (authoritative server)"
+)]
 struct Args {
     /// Listen address (`host:port`; `:0` picks an ephemeral port).
     #[arg(long, default_value = "127.0.0.1:9418")]
@@ -78,6 +89,27 @@ enum Command {
         #[arg(long = "ref")]
         refs: Vec<String>,
     },
+    /// Export the changeset graph into a real git repository (one
+    /// `git fast-import` stream). The changeset→git mapping rides in the
+    /// report; `--mapping FILE` writes it as TSV for verification.
+    Export {
+        /// Gardenbed repository directory (holds `loam/` and
+        /// `seedbed.sqlite3`).
+        #[arg(long)]
+        root: PathBuf,
+        /// Destination git repository: created as a bare sha1 repository
+        /// when missing, accepted as-is when present.
+        #[arg(long)]
+        into: PathBuf,
+        /// Only export refs matching this glob (e.g. `refs/heads/*`);
+        /// repeatable, empty means every ref in the seedbed.
+        #[arg(long = "ref")]
+        refs: Vec<String>,
+        /// Write one `<64-hex changeset id>\t<git sha>` line per exported
+        /// commit, sorted by changeset id, to this file.
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -111,8 +143,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
         Some(Command::Serve { addr, root }) => serve(addr, root).await,
+        Some(Command::Export {
+            root,
+            into,
+            refs,
+            mapping,
+        }) => {
+            if let Err(e) = run_export(&root, &into, refs, mapping) {
+                eprintln!("error: export failed: {e}");
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         None => serve(args.addr, args.root).await,
     }
+}
+
+/// One-shot git export from the stores under `root` into the git
+/// repository at `into` (rootstock's `git fast-import` writer). Prints the
+/// report; optionally writes the changeset→git-SHA mapping as TSV.
+fn run_export(
+    root: &Path,
+    into: &Path,
+    refs: Vec<String>,
+    mapping: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
+
+    let objects = Arc::new(FsObjectStore::open(&root.join("loam"))?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3"))?);
+    let opts = gardenbed_rootstock::ExportOptions { refs };
+    let report = gardenbed_rootstock::export_to_path(into, objects, metadata, &opts)?;
+    if let Some(path) = mapping {
+        use std::io::Write as _;
+        // Sorted by changeset id so the file is deterministic and diffable.
+        let mut rows: Vec<(String, &String)> = report
+            .commits
+            .iter()
+            .map(|(id, sha)| (id.to_hex(), sha))
+            .collect();
+        rows.sort();
+        let f = std::fs::File::create(&path)
+            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+        let mut f = std::io::BufWriter::new(f);
+        for (cs, sha) in rows {
+            writeln!(f, "{cs}\t{sha}")?;
+        }
+        f.flush()?;
+    }
+    println!("{report}");
+    Ok(())
 }
 
 /// One-shot git import into the stores under `root`.
@@ -123,8 +203,8 @@ fn run_import(
     limit: Option<usize>,
     refs: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
     use gardenbed_rootstock as rootstock;
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
 
     let objects = Arc::new(FsObjectStore::open(&root.join("loam"))?);
     let metadata = Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3"))?);
@@ -145,7 +225,10 @@ fn run_import(
     Ok(())
 }
 
-async fn serve(addr_arg: String, root_arg: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(
+    addr_arg: String,
+    root_arg: Option<PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let Some(root) = root_arg.filter(|p| !p.as_os_str().is_empty()) else {
         eprintln!("error: --root is required (the repository directory)");
         std::process::exit(2);

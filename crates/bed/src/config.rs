@@ -130,9 +130,10 @@ impl BedConfig {
             self.current_cs = Some(id.to_hex());
         }
         for raw in std::mem::take(&mut self.plot) {
-            self.plot.push(plot::normalize_prefix(&raw).map_err(|e| {
-                BedError::ConfigInvalid(format!("{}: {e}", path.display()))
-            })?);
+            self.plot.push(
+                plot::normalize_prefix(&raw)
+                    .map_err(|e| BedError::ConfigInvalid(format!("{}: {e}", path.display())))?,
+            );
         }
         Ok(())
     }
@@ -172,7 +173,10 @@ mod tests {
     fn roundtrips_minimal_config() {
         let dir = tempfile::tempdir().unwrap();
         let path = tmpfile(&dir, "config.toml");
-        BedConfig::new("unix:///tmp/arboretum.sock", "repo").unwrap().save(&path).unwrap();
+        BedConfig::new("unix:///tmp/arboretum.sock", "repo")
+            .unwrap()
+            .save(&path)
+            .unwrap();
         let loaded = BedConfig::load(&path).unwrap();
         assert_eq!(loaded.server, "unix:///tmp/arboretum.sock");
         assert_eq!(loaded.repo, "repo");
@@ -199,10 +203,7 @@ mod tests {
     fn rejects_missing_file_as_not_a_bed() {
         let dir = tempfile::tempdir().unwrap();
         let path = tmpfile(&dir, "missing.toml");
-        assert!(matches!(
-            BedConfig::load(&path),
-            Err(BedError::NotABed(_))
-        ));
+        assert!(matches!(BedConfig::load(&path), Err(BedError::NotABed(_))));
     }
 
     #[test]
@@ -220,7 +221,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let path = tmpfile(&dir, "bad-cs.toml");
-        fs::write(&path, "server = \"s\"\nrepo = \"r\"\ncurrent_cs = \"nothex\"\n").unwrap();
+        fs::write(
+            &path,
+            "server = \"s\"\nrepo = \"r\"\ncurrent_cs = \"nothex\"\n",
+        )
+        .unwrap();
         assert!(matches!(
             BedConfig::load(&path),
             Err(BedError::ConfigInvalid(_))

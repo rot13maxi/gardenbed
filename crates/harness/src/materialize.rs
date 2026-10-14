@@ -27,8 +27,7 @@ use std::process::{Command, Stdio};
 
 use gardenbed_model::{Id, Mode, Op};
 
-use crate::generator::{format_tz, GeneratedHistory};
-use crate::oracle::git_fsck;
+use crate::generator::{GeneratedHistory, format_tz};
 
 /// The result of materializing a history into a git repo.
 #[derive(Clone, Debug)]
@@ -158,7 +157,10 @@ fn blob_git_sha(
         hex(&id.as_bytes()[12..])
     } else {
         let content = history.blob(id).ok_or_else(|| {
-            std::io::Error::other(format!("blob {} missing from GeneratedHistory contents", id))
+            std::io::Error::other(format!(
+                "blob {} missing from GeneratedHistory contents",
+                id
+            ))
         })?;
         let out = run_git_stdin(repo, &["hash-object", "-w", "--stdin"], content)?;
         let line = String::from_utf8_lossy(&out);
@@ -182,7 +184,12 @@ pub fn materialize(history: &GeneratedHistory, dest: &Path) -> std::io::Result<M
     std::fs::create_dir_all(dest)?;
     run_git(
         dest,
-        &["init", "-q", "--initial-branch=main", "--object-format=sha1"],
+        &[
+            "init",
+            "-q",
+            "--initial-branch=main",
+            "--object-format=sha1",
+        ],
     )?;
     run_git(dest, &["read-tree", "--empty"])?;
 
@@ -197,21 +204,15 @@ pub fn materialize(history: &GeneratedHistory, dest: &Path) -> std::io::Result<M
             match c.op {
                 Op::Delete => {
                     index_info.extend_from_slice(
-                        format!(
-                            "0 0000000000000000000000000000000000000000\t{}\n",
-                            c.path
-                        )
-                        .as_bytes(),
+                        format!("0 0000000000000000000000000000000000000000\t{}\n", c.path)
+                            .as_bytes(),
                     );
                 }
                 Op::Add | Op::Modify | Op::Rename => {
                     if let Some(src) = &c.src_path {
                         index_info.extend_from_slice(
-                            format!(
-                                "0 0000000000000000000000000000000000000000\t{}\n",
-                                src
-                            )
-                            .as_bytes(),
+                            format!("0 0000000000000000000000000000000000000000\t{}\n", src)
+                                .as_bytes(),
                         );
                     }
                     let Some(blob) = c.blob else {
@@ -227,7 +228,11 @@ pub fn materialize(history: &GeneratedHistory, dest: &Path) -> std::io::Result<M
                         format!(
                             "{} {} {}\t{}\n",
                             git_mode(c.mode),
-                            if c.mode == Mode::Gitlink { "commit" } else { "blob" },
+                            if c.mode == Mode::Gitlink {
+                                "commit"
+                            } else {
+                                "blob"
+                            },
                             sha,
                             c.path
                         )
@@ -267,7 +272,11 @@ pub fn materialize(history: &GeneratedHistory, dest: &Path) -> std::io::Result<M
         cmd.env("GIT_COMMITTER_EMAIL", &cs.committer.email);
         cmd.env(
             "GIT_COMMITTER_DATE",
-            format!("{} {}", cs.committer.time_secs, format_tz(cs.committer.tz_min)),
+            format!(
+                "{} {}",
+                cs.committer.time_secs,
+                format_tz(cs.committer.tz_min)
+            ),
         );
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -287,7 +296,9 @@ pub fn materialize(history: &GeneratedHistory, dest: &Path) -> std::io::Result<M
             )));
         }
         let sha = parse_sha40(&String::from_utf8_lossy(&out.stdout))?;
-        let cs_id = cs.id().map_err(|e| std::io::Error::other(format!("changeset does not encode: {e}")))?;
+        let cs_id = cs
+            .id()
+            .map_err(|e| std::io::Error::other(format!("changeset does not encode: {e}")))?;
         sha_by_cs.insert(cs_id, sha.clone());
         mapping.push((cs_id, sha));
     }
@@ -299,6 +310,8 @@ pub fn materialize(history: &GeneratedHistory, dest: &Path) -> std::io::Result<M
 
     #[cfg(debug_assertions)]
     {
+        use crate::oracle::git_fsck;
+
         // Debug builds (cargo test/dev) prove the repo is well-formed;
         // release builds skip the extra subprocess.
         git_fsck(dest).map_err(|e| {

@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use gardenbed_model::{blob_id, Change, Changeset, Identity, Mode, Op};
+use gardenbed_model::{Change, Changeset, Identity, Mode, Op, blob_id};
 use gardenbed_protocol::client::{CasOutcome, GardenbedClient};
 use tonic::Status;
 
@@ -132,13 +132,20 @@ async fn server_smoke_end_to_end() {
     assert_eq!(err.code(), tonic::Code::InvalidArgument);
 
     let id_root = client
-        .create_changeset(repo, &cs_root, [(blob_id(&a), a.clone()), (blob_id(&b), b.clone())])
+        .create_changeset(
+            repo,
+            &cs_root,
+            [(blob_id(&a), a.clone()), (blob_id(&b), b.clone())],
+        )
         .await
         .expect("root changeset created");
 
     // ------------------------------------------------- object access
     // The wire round-trip of a changeset.
-    let got = client.get_changeset(repo, id_root).await.expect("cs readable");
+    let got = client
+        .get_changeset(repo, id_root)
+        .await
+        .expect("cs readable");
     assert_eq!(got, cs_root, "GetChangeset round-trips the canonical model");
 
     // The root tree and one level of its entries (two GetTree calls).
@@ -187,14 +194,24 @@ async fn server_smoke_end_to_end() {
         .expect("child changeset created");
 
     assert_eq!(
-        client.merge_base(repo, id_root, id_child).await.expect("base"),
+        client
+            .merge_base(repo, id_root, id_child)
+            .await
+            .expect("base"),
         Some(id_root)
     );
-    assert!(client.is_ancestor(repo, id_root, id_child).await.expect("ancestor"));
-    assert!(!client
-        .is_ancestor(repo, id_child, id_root)
-        .await
-        .expect("not ancestor"));
+    assert!(
+        client
+            .is_ancestor(repo, id_root, id_child)
+            .await
+            .expect("ancestor")
+    );
+    assert!(
+        !client
+            .is_ancestor(repo, id_child, id_root)
+            .await
+            .expect("not ancestor")
+    );
 
     // Diff root → child: exactly the a.txt modify.
     let diff = drain(client.diff(repo, id_root, id_child).await).await;
@@ -205,13 +222,22 @@ async fn server_smoke_end_to_end() {
     // Log walks all ancestry, newest first.
     let log = drain(client.log(repo, id_child, 0).await).await;
     assert_eq!(log.len(), 2, "head + root");
-    assert_eq!(log[0].cs_id, gardenbed_protocol::convert::id_to_bytes(id_child));
-    assert_eq!(log[1].cs_id, gardenbed_protocol::convert::id_to_bytes(id_root));
+    assert_eq!(
+        log[0].cs_id,
+        gardenbed_protocol::convert::id_to_bytes(id_child)
+    );
+    assert_eq!(
+        log[1].cs_id,
+        gardenbed_protocol::convert::id_to_bytes(id_root)
+    );
     let limited = drain(client.log(repo, id_child, 1).await).await;
     assert_eq!(limited.len(), 1, "limit respected");
 
     // ----------------------------------------------------------- refs
-    let won = client.cas_ref(repo, "feature", None, id_child).await.expect("cas");
+    let won = client
+        .cas_ref(repo, "feature", None, id_child)
+        .await
+        .expect("cas");
     assert_eq!(won, CasOutcome::Won);
     // A stale CAS comes back as a conflict result, never an error.
     let stale = client
@@ -225,12 +251,15 @@ async fn server_smoke_end_to_end() {
     );
     let refs = drain(client.list_refs(repo).await).await;
     assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "feature");
+    assert_eq!(refs[0].name, "refs/heads/feature");
 
     // Harvest fast-forwards "main"; a non-descendant is refused.
     let harvested = client.harvest(repo, id_child).await.expect("harvest");
     assert_eq!(harvested, id_child);
-    assert_eq!(client.get_ref(repo, "main").await.expect("main"), Some(id_child));
+    assert_eq!(
+        client.get_ref(repo, "main").await.expect("main"),
+        Some(id_child)
+    );
 
     // ----------------------------------------------------------- graft
     // An unrelated branch root; grafting the child onto it replays its
@@ -252,19 +281,33 @@ async fn server_smoke_end_to_end() {
         .graft(repo, id_child, id_branch)
         .await
         .expect("graft succeeds (no conflicts)");
-    let got_graft = client.get_changeset(repo, grafted).await.expect("graft readable");
+    let got_graft = client
+        .get_changeset(repo, grafted)
+        .await
+        .expect("graft readable");
     assert_eq!(got_graft.parents, vec![id_branch], "graft has one parent");
-    assert_eq!(got_graft.changes, cs_child.changes, "changes replayed verbatim");
+    assert_eq!(
+        got_graft.changes, cs_child.changes,
+        "changes replayed verbatim"
+    );
     let graft_tree = client.root_tree(repo, grafted).await.expect("graft tree");
     let grafted_files = client
         .get_tree(repo, graft_tree.expect("non-empty"))
         .await
         .expect("tree");
-    let mut graft_names: Vec<&str> = grafted_files.entries.iter().map(|e| e.name.as_str()).collect();
+    let mut graft_names: Vec<&str> = grafted_files
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect();
     graft_names.sort_unstable();
     // The graft replays the delta only: the branch's other.txt plus the
     // replayed a.txt modify.
-    assert_eq!(graft_names, vec!["a.txt", "other.txt"], "replayed tree merges");
+    assert_eq!(
+        graft_names,
+        vec!["a.txt", "other.txt"],
+        "replayed tree merges"
+    );
 
     // A conflicting graft fails with FAILED_PRECONDITION listing the path:
     // this changeset deletes "other.txt", which exists on its own parent
@@ -292,7 +335,10 @@ async fn server_smoke_end_to_end() {
         .await
         .expect_err("graft conflicts on the missing path");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-    assert!(err.message().contains("other.txt"), "conflict names the path: {err}");
+    assert!(
+        err.message().contains("other.txt"),
+        "conflict names the path: {err}"
+    );
 
     // ---------------------------------------------------------- blame
     // First-parent lineage blame streams coalesced ranges: the child
@@ -328,7 +374,11 @@ async fn server_smoke_end_to_end() {
         .put_blob(repo, tokio_stream::once(big.clone()))
         .await
         .expect("PutBlob ok");
-    assert_eq!(big_id, blob_id(&big), "PutBlob replies with the content address");
+    assert_eq!(
+        big_id,
+        blob_id(&big),
+        "PutBlob replies with the content address"
+    );
     let got_big = read_blob(&client, repo, big_id).await;
     assert_eq!(got_big, big, "the big blob round-trips");
 

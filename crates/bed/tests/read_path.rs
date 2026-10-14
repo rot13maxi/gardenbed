@@ -16,15 +16,15 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
-use gardenbed::treestate::{MODE_EXEC, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK};
 use gardenbed::render;
-use gardenbed_harness::generator::{files_at, generate, GenOptions, GeneratedHistory};
+use gardenbed::treestate::{MODE_EXEC, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK};
+use gardenbed_harness::generator::{GenOptions, GeneratedHistory, files_at, generate};
 use gardenbed_harness::materialize::materialize;
 use gardenbed_harness::oracle;
 use gardenbed_model::{Id, Mode};
 use tempfile::TempDir;
 
-use common::{bed, bed_raw, Arboretum};
+use common::{Arboretum, bed, bed_raw};
 
 /// One running arboretum with an ingested synthetic history, a git
 /// materialization of the same history (the oracle), and a garden the
@@ -111,7 +111,10 @@ fn expected_files(history: &GeneratedHistory, index: usize) -> BTreeMap<String, 
     files_at(history, index)
         .into_iter()
         .map(|(path, (id, mode))| {
-            let content = history.blob(&id).expect("history carries its blobs").to_vec();
+            let content = history
+                .blob(&id)
+                .expect("history carries its blobs")
+                .to_vec();
             (path, (content, mode))
         })
         .collect()
@@ -138,10 +141,18 @@ fn files_under(root: &Path) -> Vec<String> {
                 if name == ".bed" {
                     continue;
                 }
-                let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
                 walk(&entry.path(), &path, out);
             } else {
-                let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
                 out.push(path);
             }
         }
@@ -171,14 +182,24 @@ async fn clone_plants_layout_and_materializes_nothing() {
 
     let head = g.cs_hex(g.head_index());
     let config = fs::read_to_string(bed_dir.join("config.toml")).unwrap();
-    assert!(config.contains(&format!("current_cs = \"{head}\"")), "config: {config}");
-    assert!(config.contains(&format!("server = \"{}\"", g.server.http())), "config: {config}");
+    assert!(
+        config.contains(&format!("current_cs = \"{head}\"")),
+        "config: {config}"
+    );
+    assert!(
+        config.contains(&format!("server = \"{}\"", g.server.http())),
+        "config: {config}"
+    );
 
     let heads = fs::read_to_string(bed_dir.join("heads")).unwrap();
     assert_eq!(heads.trim(), head, "heads records the tip");
 
     // Nothing materialized, no plot, and status says so.
-    assert!(files_under(&g.garden).is_empty(), "files: {:?}", files_under(&g.garden));
+    assert!(
+        files_under(&g.garden).is_empty(),
+        "files: {:?}",
+        files_under(&g.garden)
+    );
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
     assert!(out.contains("the plot is empty"), "out: {out}");
@@ -264,7 +285,11 @@ fn assert_fidelity(g: &Garden, index: usize) {
             .lookup(path)
             .expect("treestate lookup works")
             .unwrap_or_else(|| panic!("row for {path}"));
-        assert_eq!(row.blob_id, ids[path.as_str()].0, "treestate blob id for {path}");
+        assert_eq!(
+            row.blob_id,
+            ids[path.as_str()].0,
+            "treestate blob id for {path}"
+        );
         assert_eq!(row.mode, mode_code, "treestate mode for {path}");
     }
 
@@ -398,10 +423,13 @@ async fn file_serves_bytes_symlinks_and_refuses_gitlinks() {
 
     // A directory path is not a file; neither is a missing path.
     let dir_prefix = gitlink_path.rsplit_once('/').map(|(d, _)| d).unwrap_or(".");
-    let (code, _, stderr) = bed(&g.garden, &["file", &dir_prefix]);
+    let (code, _, stderr) = bed(&g.garden, &["file", dir_prefix]);
     if !dir_prefix.contains('/') {
         // The gitlink sits at the root; use a known dir instead.
-        let (code, _, stderr) = bed(&g.garden, &["file", &some_prefix(&g.history, g.head_index())]);
+        let (code, _, stderr) = bed(
+            &g.garden,
+            &["file", &some_prefix(&g.history, g.head_index())],
+        );
         assert_eq!(code, 1);
         assert!(stderr.contains("no file at"), "stderr: {stderr}");
     } else {
@@ -421,7 +449,10 @@ async fn file_serves_bytes_symlinks_and_refuses_gitlinks() {
     // A changeset id that is not on the arboretum is refused cleanly.
     let (code, _, stderr) = bed(&g.garden, &["file", &plain_path, "--cs", &"ab".repeat(32)]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("is not on the arboretum"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is not on the arboretum"),
+        "stderr: {stderr}"
+    );
 
     g.server.shutdown().await;
 }
@@ -547,9 +578,18 @@ fn parse_bed_diff(out: &str) -> Vec<(char, String)> {
 fn git_name_status(git_repo: &Path, a: &str, b: &str) -> Vec<(char, String)> {
     let out = std::process::Command::new("git")
         .args([
-            "-c", "core.quotePath=false",
-            "diff-tree", "--root", "-r", "-z", "--name-status", "--no-commit-id",
-            "--no-renames", "--diff-merges=first-parent", a, b,
+            "-c",
+            "core.quotePath=false",
+            "diff-tree",
+            "--root",
+            "-r",
+            "-z",
+            "--name-status",
+            "--no-commit-id",
+            "--no-renames",
+            "--diff-merges=first-parent",
+            a,
+            b,
         ])
         .current_dir(git_repo)
         .output()
@@ -581,13 +621,16 @@ async fn diff_matches_git_name_status_over_many_pairs() {
     // Two-argument form over adjacent pairs plus long-range pairs
     // (≥ 30 pairs; adjacent pairs cover every commit).
     let mut pairs: Vec<(usize, usize)> = (0..last).map(|i| (i, i + 1)).collect();
-    pairs.extend([(0, last), (0, last / 2), (last / 2, last), (5, 25.min(last)), (2, last - 1)]);
+    pairs.extend([
+        (0, last),
+        (0, last / 2),
+        (last / 2, last),
+        (5, 25.min(last)),
+        (2, last - 1),
+    ]);
     let mut checked = 0usize;
     for (i, j) in &pairs {
-        let (code, out, stderr) = bed(
-            &g.garden,
-            &["diff", &g.cs_hex(*i), &g.cs_hex(*j)],
-        );
+        let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(*i), &g.cs_hex(*j)]);
         assert_eq!(code, 0, "pair ({i},{j}): {stderr}");
         let got = parse_bed_diff(&out);
         let want = git_name_status(&g.git, &g.sha(*i), &g.sha(*j));
@@ -663,9 +706,16 @@ async fn goto_moves_the_bed_and_status_stays_clean() {
         .filter(|(p, (_, mode))| p.starts_with(&format!("{prefix}/")) && *mode != Mode::Gitlink)
         .map(|(p, _)| p)
         .collect();
-    assert_eq!(files_under(&g.garden), want, "the plot matches the older changeset");
+    assert_eq!(
+        files_under(&g.garden),
+        want,
+        "the plot matches the older changeset"
+    );
     let config = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
-    assert!(config.contains(&format!("current_cs = \"{}\"", g.cs_hex(older))), "config: {config}");
+    assert!(
+        config.contains(&format!("current_cs = \"{}\"", g.cs_hex(older))),
+        "config: {config}"
+    );
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
     assert!(out.contains("the plot is clean"), "out: {out}");
@@ -694,7 +744,10 @@ async fn goto_moves_the_bed_and_status_stays_clean() {
     // An id that is not on the arboretum too.
     let (code, _, stderr) = bed(&g.garden, &["goto", &"cd".repeat(32)]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("is not on the arboretum"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("is not on the arboretum"),
+        "stderr: {stderr}"
+    );
 
     g.server.shutdown().await;
 }
@@ -713,7 +766,8 @@ async fn reruns_fetch_nothing_and_leave_the_plot_faithful() {
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(out.contains("fetched"), "out: {out}");
     let (t1, b1) = g.server.counted(&client).await;
-    let (want_trees, want_blobs) = common::want_list(&g.server.root, g.cs_id(g.head_index()), &["."]);
+    let (want_trees, want_blobs) =
+        common::want_list(&g.server.root, g.cs_id(g.head_index()), &["."]);
     assert_eq!(
         (t1 - t0, b1 - b0),
         (want_trees.len() as u64, want_blobs.len() as u64),
@@ -754,7 +808,10 @@ async fn server_down_fails_cleanly_never_half_states() {
     g.server.shutdown().await;
 
     let config_before = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
-    let ts = gardenbed::bed::Bed::open(&g.bed_dir()).unwrap().treestate().unwrap();
+    let ts = gardenbed::bed::Bed::open(&g.bed_dir())
+        .unwrap()
+        .treestate()
+        .unwrap();
     let rows_before = ts.count().unwrap();
     let files_before = files_under(&g.garden);
 
@@ -784,5 +841,9 @@ async fn server_down_fails_cleanly_never_half_states() {
     let config_after = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
     assert_eq!(config_before, config_after, "config untouched");
     assert_eq!(rows_before, ts.count().unwrap(), "treestate untouched");
-    assert_eq!(files_before, files_under(&g.garden), "working copy untouched");
+    assert_eq!(
+        files_before,
+        files_under(&g.garden),
+        "working copy untouched"
+    );
 }

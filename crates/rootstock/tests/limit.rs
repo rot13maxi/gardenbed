@@ -6,8 +6,8 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{git_map_rows, import, open_stores, ref_rows, Fixture};
-use gardenbed_harness::{files_at, git_log, GenOptions};
+use common::{Fixture, git_map_rows, import, open_stores, ref_rows};
+use gardenbed_harness::{GenOptions, files_at, git_log};
 use gardenbed_model::{Id, Mode, Op};
 use gardenbed_rootstock::ImportOptions;
 use gardenbed_store::MetadataStore;
@@ -41,7 +41,11 @@ fn cs_of(garden: &std::path::Path, sha: &str) -> (gardenbed_model::Changeset, Id
         .cs_for_git(sha)
         .expect("cs_for_git")
         .unwrap_or_else(|| panic!("commit {sha} not mapped"));
-    let cs = metadata.get_changeset(cs_id).expect("get").expect("exists").0;
+    let cs = metadata
+        .get_changeset(cs_id)
+        .expect("get")
+        .expect("exists")
+        .0;
     (cs, cs_id)
 }
 
@@ -80,7 +84,10 @@ fn assert_reroot_full_tree(fixture: &Fixture, index: usize) {
     }
     let want = files_at(&fixture.history, index);
     let got = derived(&fixture.garden, cs_id);
-    assert_eq!(got, want, "commit {sha}: re-rooted tree must equal the history state");
+    assert_eq!(
+        got, want,
+        "commit {sha}: re-rooted tree must equal the history state"
+    );
 }
 
 /// A linear history sliced to its newest 10 commits: exact counts, a
@@ -111,8 +118,8 @@ fn limit_slices_newest_commits_and_reroots_boundary() {
     for i in total - 9..total {
         let sha = &fixture.mapping[i].1;
         let (cs, _) = cs_of(&fixture.garden, sha);
-        let parent_id = mapped_cs(&fixture.garden, &fixture.mapping[i - 1].1)
-            .expect("slice parent is mapped");
+        let parent_id =
+            mapped_cs(&fixture.garden, &fixture.mapping[i - 1].1).expect("slice parent is mapped");
         assert_eq!(
             cs.parents,
             vec![parent_id],
@@ -143,7 +150,10 @@ fn limit_slices_newest_commits_and_reroots_boundary() {
     };
     let report20 = import(&fixture.repo, &fixture.garden, &opts20);
     assert_eq!(report20.commits_new, 10, "exactly the extension");
-    assert_eq!(report20.commits_skipped, 10, "mapped commits inside the slice");
+    assert_eq!(
+        report20.commits_skipped, 10,
+        "mapped commits inside the slice"
+    );
     assert_eq!(report20.commits_total, 20);
     assert_eq!(
         report20.commits_total,
@@ -154,7 +164,10 @@ fn limit_slices_newest_commits_and_reroots_boundary() {
     let rows_after = git_map_rows(&fixture.garden);
     assert_eq!(rows_after.len(), 20);
     for row in &rows_before {
-        assert!(rows_after.contains(row), "previous slice rows are untouched");
+        assert!(
+            rows_after.contains(row),
+            "previous slice rows are untouched"
+        );
     }
     assert_reroot_full_tree(&fixture, total - 20);
 }

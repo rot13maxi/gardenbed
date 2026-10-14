@@ -77,8 +77,8 @@
 use gardenbed_model::{Id, Mode, Op, TreeKind};
 use gardenbed_store::StoreError;
 
-use crate::xdiff;
 use crate::Engine;
+use crate::xdiff;
 
 /// Budget for blame walk steps (changeset visits). The first-parent chain
 /// is finite and cycle-free under content addressing; this cap only
@@ -306,6 +306,9 @@ impl Engine {
     /// parent: resolves the base content (rename-aware), diffs, attributes
     /// diff-added lines (via their final-version line), and hands the
     /// still-unattributed origins to the parent side.
+    // The parameters are the walk's state (who, where, what, bookkeeping);
+    // bundling them would obscure the walk itself.
+    #[allow(clippy::too_many_arguments)]
     fn process_toucher(
         &self,
         cur_cs: Id,
@@ -313,7 +316,7 @@ impl Engine {
         cs: &gardenbed_model::Changeset,
         cur_path: &str,
         origin: &mut Origin,
-        attr: &mut Vec<u32>,
+        attr: &mut [u32],
         table: &mut Vec<Id>,
     ) -> Result<Step, StoreError> {
         // The change that produced the current content of cur_path.
@@ -356,7 +359,7 @@ impl Engine {
                         TreeKind::Dir => {
                             return Err(StoreError::Corrupt(format!(
                                 "rename source {cur_path:?} is a directory"
-                            )))
+                            )));
                         }
                     },
                     None => {
@@ -374,13 +377,13 @@ impl Engine {
                                 TreeKind::Dir => {
                                     return Err(StoreError::Corrupt(format!(
                                         "rename source {src:?} is a directory"
-                                    )))
+                                    )));
                                 }
                             },
                             None => {
                                 return Err(StoreError::Corrupt(format!(
                                     "rename source {src:?} missing in the first parent's tree"
-                                )))
+                                )));
                             }
                         }
                     }
@@ -397,7 +400,7 @@ impl Engine {
                     TreeKind::Dir => {
                         return Err(StoreError::Corrupt(format!(
                             "path {cur_path:?} is a directory in the first parent's tree"
-                        )))
+                        )));
                     }
                 },
                 // Added here: all remaining lines attribute to cur_cs.
@@ -439,11 +442,10 @@ impl Engine {
                 // new lines attribute here — through their final-version
                 // origin — and travel no further.
                 let n_old = old_recs.len();
-                let n_new = new_recs.len();
                 let slot = intern(table, cur_cs);
                 let mut oi = 0usize;
-                for ni in 0..n_new {
-                    if d.changed_new[ni] {
+                for (ni, changed) in d.changed_new.iter().enumerate() {
+                    if *changed {
                         if let Some(fl) = origin[ni] {
                             attr[fl as usize] = slot;
                         }
@@ -482,12 +484,7 @@ impl Engine {
 }
 
 /// Attributes every still-travelling line (those with an origin) to `cs`.
-fn attribute_remaining(
-    attr: &mut [u32],
-    origin: &mut Origin,
-    table: &mut Vec<Id>,
-    cs: Id,
-) {
+fn attribute_remaining(attr: &mut [u32], origin: &mut Origin, table: &mut Vec<Id>, cs: Id) {
     let slot = intern(table, cs);
     for fl in origin.iter_mut() {
         if let Some(fl) = fl.take() {

@@ -52,7 +52,11 @@ fn samples() -> Vec<(String, Vec<u8>, String)> {
         cs.id().unwrap().to_hex(),
     );
 
-    let cs = make_cs(vec![small_id(1)], vec![change_delete("docs/old.md")], "drop stale doc");
+    let cs = make_cs(
+        vec![small_id(1)],
+        vec![change_delete("docs/old.md")],
+        "drop stale doc",
+    );
     push(
         "changeset-delete",
         cs.canonical_bytes().unwrap(),
@@ -61,7 +65,12 @@ fn samples() -> Vec<(String, Vec<u8>, String)> {
 
     let cs = make_cs(
         vec![small_id(1)],
-        vec![change_rename("docs/new.md", "docs/old.md", small_id(3), Mode::Regular)],
+        vec![change_rename(
+            "docs/new.md",
+            "docs/old.md",
+            small_id(3),
+            Mode::Regular,
+        )],
         "rename doc",
     );
     push(
@@ -175,7 +184,9 @@ fn invalid_samples() -> Vec<(String, Vec<u8>)> {
     // parents varint that never terminates within bounds
     push(
         "invalid-changeset-overlong-varint",
-        vec![0x01, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01],
+        vec![
+            0x01, 0x01, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01,
+        ],
     );
 
     let root = make_cs(vec![], vec![], "").canonical_bytes().unwrap();

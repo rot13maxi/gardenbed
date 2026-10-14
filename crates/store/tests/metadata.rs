@@ -19,7 +19,11 @@ fn changeset_checks(store: &dyn MetadataStore) {
 
     let (decoded, canonical) = store.get_changeset(id).expect("get").expect("present");
     assert_eq!(decoded, cs, "decoded row equals the stored changeset");
-    assert_eq!(canonical, cs.canonical_bytes().unwrap(), "canonical bytes exact");
+    assert_eq!(
+        canonical,
+        cs.canonical_bytes().unwrap(),
+        "canonical bytes exact"
+    );
     assert_eq!(Id::from_str(&id.to_hex()).unwrap(), id);
 
     // Idempotent re-put.
@@ -72,7 +76,10 @@ fn git_mapping_checks(store: &dyn MetadataStore) {
     // Fresh mapping in both directions, case-normalized.
     store.record_git_mapping(GIT_SHA_A, cs1).expect("record");
     assert_eq!(store.cs_for_git(GIT_SHA_A).unwrap(), Some(cs1));
-    assert_eq!(store.cs_for_git(&GIT_SHA_A.to_uppercase()).unwrap(), Some(cs1));
+    assert_eq!(
+        store.cs_for_git(&GIT_SHA_A.to_uppercase()).unwrap(),
+        Some(cs1)
+    );
     assert_eq!(store.git_for_cs(cs1).unwrap(), Some(GIT_SHA_A.to_owned()));
 
     // Bijection, enforced both directions.
@@ -86,7 +93,9 @@ fn git_mapping_checks(store: &dyn MetadataStore) {
     ));
 
     // Recording the exact same pair again is idempotent.
-    store.record_git_mapping(GIT_SHA_A, cs1).expect("idempotent");
+    store
+        .record_git_mapping(GIT_SHA_A, cs1)
+        .expect("idempotent");
     store
         .record_git_mapping(&GIT_SHA_A.to_uppercase(), cs1)
         .expect("idempotent with different case");
@@ -101,11 +110,16 @@ fn git_mapping_checks(store: &dyn MetadataStore) {
 
     // Absent lookups are None; malformed SHAs are Invalid.
     assert_eq!(
-        store.cs_for_git("0000000000000000000000000000000000000000").unwrap(),
+        store
+            .cs_for_git("0000000000000000000000000000000000000000")
+            .unwrap(),
         None
     );
     assert_eq!(store.git_for_cs(id_of(0xFFFF)).unwrap(), None);
-    assert!(matches!(store.cs_for_git("short"), Err(StoreError::Invalid(_))));
+    assert!(matches!(
+        store.cs_for_git("short"),
+        Err(StoreError::Invalid(_))
+    ));
 }
 
 #[test]
@@ -208,11 +222,16 @@ fn sqlite_opens_in_wal_mode() {
     let mode: String = conn
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .expect("journal_mode");
-    assert_eq!(mode.to_ascii_lowercase(), "wal", "store must run in WAL mode");
+    assert_eq!(
+        mode.to_ascii_lowercase(),
+        "wal",
+        "store must run in WAL mode"
+    );
 }
 
 #[test]
-fn changesets_and_refs_persist_across_reopen_sqlite() {    // Reopen the same DB: everything persists (WAL-committed data).
+fn changesets_and_refs_persist_across_reopen_sqlite() {
+    // Reopen the same DB: everything persists (WAL-committed data).
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("s.sqlite3");
     let cs = sample_changeset(0x777, 2);

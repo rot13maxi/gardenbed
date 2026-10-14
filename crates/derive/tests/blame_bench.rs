@@ -40,7 +40,7 @@ use std::time::Instant;
 use common::ingest;
 use gardenbed_derive::Engine;
 use gardenbed_harness::GeneratedHistory;
-use gardenbed_model::{blob_id, Change, Changeset, Id, Identity, Mode, Op};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_store::{MemoryStore, MetadataStore, ObjectStore};
 
 /// Mainline commits between merges; merges are the segment heads.
@@ -148,7 +148,8 @@ fn build_history(mainline: u64) -> BenchHistory {
             id
         }
         fn finish(mut self, tip: Id) -> GeneratedHistory {
-            self.blobs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            self.blobs
+                .sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
             GeneratedHistory {
                 changesets: self.cs,
                 blob_contents: self.blobs,
@@ -272,7 +273,9 @@ fn latency_curve_blame_vs_history_length() {
     );
 
     // (n, build+ingest, flat skip, flat naive, deep skip, deep naive)
-    let mut rows: Vec<(u64, f64, f64, f64, f64, f64)> = Vec::new();
+    // One measured row: `(n, prep, flat_skip, flat_naive, deep_skip, deep_naive)` seconds.
+    type BenchRow = (u64, f64, f64, f64, f64, f64);
+    let mut rows: Vec<BenchRow> = Vec::new();
     let mut touch_pct = 0.0;
 
     for &n in SIZES {
@@ -280,7 +283,10 @@ fn latency_curve_blame_vs_history_length() {
         let bench = build_history(n);
         let (objects, metadata) = {
             let m = Arc::new(MemoryStore::new());
-            (m.clone() as Arc<dyn ObjectStore>, m as Arc<dyn MetadataStore>)
+            (
+                m.clone() as Arc<dyn ObjectStore>,
+                m as Arc<dyn MetadataStore>,
+            )
         };
         let _ids = ingest(&objects, &metadata, &bench.h, true);
         let engine = Engine::new(objects, metadata);
@@ -324,7 +330,14 @@ fn latency_curve_blame_vs_history_length() {
                 .blame_no_skip(bench.tip, "deep.txt")
                 .expect("naive blame")
         });
-        rows.push((n, prep, t_flat_skip, t_flat_naive, t_deep_skip, t_deep_naive));
+        rows.push((
+            n,
+            prep,
+            t_flat_skip,
+            t_flat_naive,
+            t_deep_skip,
+            t_deep_naive,
+        ));
     }
 
     let pct = |n: u64| match n {
@@ -348,7 +361,7 @@ fn latency_curve_blame_vs_history_length() {
         );
     }
 
-    let slope = |pick: fn(&(u64, f64, f64, f64, f64, f64)) -> f64| {
+    let slope = |pick: fn(&BenchRow) -> f64| {
         loglog_slope(
             &rows
                 .iter()

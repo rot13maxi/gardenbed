@@ -18,11 +18,11 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use gardenbed_model::{blob_id, Id, Mode, TreeKind};
+use gardenbed_model::{Id, Mode, TreeKind, blob_id};
 use gardenbed_protocol::client::GardenbedClient;
 use gardenbed_server::Repo;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::time::{timeout, Duration};
+use tokio::time::{Duration, timeout};
 
 /// The repo name every fixture is ingested under (and the bed's default).
 pub const REPO: &str = "garden";
@@ -75,7 +75,10 @@ pub fn bed_async(dir: &Path, args: &[&str]) -> tokio::process::Child {
 pub fn server_bin() -> PathBuf {
     if let Ok(path) = std::env::var("BED_SERVER_BIN") {
         let path = PathBuf::from(path);
-        assert!(path.is_file(), "BED_SERVER_BIN points at {path:?}, not a file");
+        assert!(
+            path.is_file(),
+            "BED_SERVER_BIN points at {path:?}, not a file"
+        );
         return path;
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // crates/bed
@@ -159,10 +162,7 @@ impl Arboretum {
 
     /// A snapshot of the server's counted RPCs: `(get_tree, get_blob)`.
     pub async fn counted(&self, client: &GardenbedClient) -> (u64, u64) {
-        let stats: BTreeMap<String, u64> = client
-            .get_stats(REPO)
-            .await
-            .expect("GetStats works");
+        let stats: BTreeMap<String, u64> = client.get_stats(REPO).await.expect("GetStats works");
         (
             *stats.get("get_tree").expect("get_tree counter"),
             *stats.get("get_blob").expect("get_blob counter"),
@@ -179,7 +179,10 @@ impl Arboretum {
 /// True if a blob id is a submodule pointer: 12 zero bytes followed by the
 /// 20-byte upstream git SHA-1 (canonical spec §3 — the pointer's "content"
 /// is the padded pointer itself). Such ids are never loam objects.
-pub fn is_gitlink_pointer(id: &Id, history: &gardenbed_harness::generator::GeneratedHistory) -> bool {
+pub fn is_gitlink_pointer(
+    id: &Id,
+    history: &gardenbed_harness::generator::GeneratedHistory,
+) -> bool {
     id.as_bytes()[..12].iter().all(|b| *b == 0)
         && history.blob(id) == Some(id.as_bytes().as_slice())
 }
@@ -227,24 +230,27 @@ pub fn want_list(root: &Path, head: Id, prefixes: &[&str]) -> (HashSet<Id>, Hash
         .expect("the head changeset has files");
 
     let walk_tree = |id: Id, trees: &mut HashSet<Id>, blobs: &mut HashSet<Id>| {
-            let mut stack = vec![id];
-            while let Some(tid) = stack.pop() {
-                if !trees.insert(tid) {
-                    continue;
-                }
-                let tree = repo.get_tree(tid).expect("tree readable").expect("derived tree exists");
-                for entry in &tree.entries {
-                    match entry.kind {
-                        TreeKind::Dir => stack.push(entry.tree.expect("dir carries a tree id")),
-                        TreeKind::File => {
-                            if entry.mode != Mode::Gitlink {
-                                blobs.insert(entry.blob.expect("file carries a blob id"));
-                            }
+        let mut stack = vec![id];
+        while let Some(tid) = stack.pop() {
+            if !trees.insert(tid) {
+                continue;
+            }
+            let tree = repo
+                .get_tree(tid)
+                .expect("tree readable")
+                .expect("derived tree exists");
+            for entry in &tree.entries {
+                match entry.kind {
+                    TreeKind::Dir => stack.push(entry.tree.expect("dir carries a tree id")),
+                    TreeKind::File => {
+                        if entry.mode != Mode::Gitlink {
+                            blobs.insert(entry.blob.expect("file carries a blob id"));
                         }
                     }
                 }
             }
-        };
+        }
+    };
 
     for &prefix in prefixes {
         if prefix == "." {
@@ -284,8 +290,8 @@ pub fn want_list(root: &Path, head: Id, prefixes: &[&str]) -> (HashSet<Id>, Hash
 
 /// How many of `ids` the bed's local object cache already holds.
 pub fn cached_count(bed_dir: &Path, ids: &HashSet<Id>) -> usize {
-    let store = gardenbed_store::FsObjectStore::open(&bed_dir.join("objects"))
-        .expect("bed object cache opens");
+    // The store root is `.bed` (FsObjectStore appends `objects/` itself).
+    let store = gardenbed_store::FsObjectStore::open(bed_dir).expect("bed object cache opens");
     use gardenbed_store::ObjectStore as _;
     ids.iter().filter(|id| store.has(**id).unwrap()).count()
 }

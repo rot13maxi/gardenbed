@@ -6,8 +6,8 @@
 //! created the object increments the counter. For the filesystem backend
 //! this is exactly the delta of `<root>/objects` directory entries.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gardenbed_model::Id;
 use gardenbed_store::{ObjectStore, StoreError};

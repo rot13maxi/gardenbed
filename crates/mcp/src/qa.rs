@@ -34,11 +34,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
-use gardenbed_harness::generator::{files_at, generate, GenOptions, GeneratedHistory};
-use gardenbed_harness::materialize::{materialize, Materialized};
+use gardenbed_harness::generator::{GenOptions, GeneratedHistory, files_at, generate};
+use gardenbed_harness::materialize::{Materialized, materialize};
 use gardenbed_harness::oracle::{git_blame_first_parent, git_diff_tree, git_log, git_show};
-use gardenbed_model::{blob_id, Id, Identity, Mode};
-use serde_json::{json, Value};
+use gardenbed_model::{Id, Identity, Mode, blob_id};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 use crate::tools::render_log_entry;
@@ -319,8 +319,7 @@ impl McpProcess {
         let id = self.next_id;
         self.next_id += 1;
         self.send(
-            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-                .to_string(),
+            &json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string(),
         )?;
         loop {
             let mut line = String::new();
@@ -349,7 +348,10 @@ impl McpProcess {
             if let Some(error) = value.get("error") {
                 return Err(format!("protocol error for {method:?}: {error}"));
             }
-            return Ok(value.get("result").cloned().unwrap_or_else(|| json!(null)));
+            return Ok(value
+                .get("result")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null));
         }
     }
 
@@ -520,10 +522,13 @@ impl Runner {
             self.transcript(question, &format!("ok: {}", summarize(&got)));
             self.report.passed += 1;
         } else {
-            self.report
-                .failures
-                .push(format!("Q: {question}\n   want substring: {needle:?}\n   got: {got:?}"));
-            self.transcript(question, &format!("FAIL: want substring {needle:?}, got {got:?}"));
+            self.report.failures.push(format!(
+                "Q: {question}\n   want substring: {needle:?}\n   got: {got:?}"
+            ));
+            self.transcript(
+                question,
+                &format!("FAIL: want substring {needle:?}, got {got:?}"),
+            );
             self.report.failed += 1;
         }
     }
@@ -559,9 +564,9 @@ impl Runner {
             self.transcript(question, &format!("ok: {}", summarize(got)));
             self.report.passed += 1;
         } else {
-            self.report
-                .failures
-                .push(format!("Q: {question}\n   want: {want:?}\n   got:  {got:?}"));
+            self.report.failures.push(format!(
+                "Q: {question}\n   want: {want:?}\n   got:  {got:?}"
+            ));
             self.transcript(question, &format!("FAIL: want {want:?}, got {got:?}"));
             self.report.failed += 1;
         }
@@ -650,10 +655,10 @@ fn blame_line_via_tools(
         let Some((lo, hi)) = range.split_once('-') else {
             continue;
         };
-        if let (Ok(lo), Ok(hi)) = (lo.parse::<u64>(), hi.parse::<u64>()) {
-            if (lo..=hi).contains(&line) {
-                return Ok(hex.to_owned());
-            }
+        if let (Ok(lo), Ok(hi)) = (lo.parse::<u64>(), hi.parse::<u64>())
+            && (lo..=hi).contains(&line)
+        {
+            return Ok(hex.to_owned());
         }
     }
     // No range covers the line: an answer, but a wrong one — the judge
@@ -689,9 +694,10 @@ fn git_diff_tree_ab(git: &Path, sha_a: &str, sha_b: &str) -> Vec<(char, String)>
         if status.is_empty() && path.is_empty() {
             break; // the trailing NUL's empty tail
         }
-        let letter = status.chars().next().unwrap_or_else(|| {
-            panic!("git diff-tree printed an empty status token: {status:?}")
-        });
+        let letter = status
+            .chars()
+            .next()
+            .unwrap_or_else(|| panic!("git diff-tree printed an empty status token: {status:?}"));
         entries.push((letter, path));
         i += 2;
     }
@@ -768,11 +774,9 @@ fn touching_via_tools(
 
 /// Does a diff-tool answer (letter/path lines) touch `path`?
 fn touches_path(diff_text: &str, path: &str) -> bool {
-    diff_text.lines().any(|l| {
-        match l.split_once(' ') {
-            Some((letter, p)) => matches!(letter, "A" | "M" | "D" | "T") && p == path,
-            None => false,
-        }
+    diff_text.lines().any(|l| match l.split_once(' ') {
+        Some((letter, p)) => matches!(letter, "A" | "M" | "D" | "T") && p == path,
+        None => false,
     })
 }
 
@@ -827,7 +831,11 @@ fn log_entries(mcp: &mut McpProcess, args: Value) -> Result<Vec<LogEntryParsed>,
 /// id comes from the mapping; the author identity from git; the author
 /// *time* from the generated changeset — the same fields the
 /// materializer wrote into git).
-fn expected_log_text(fixture: &Fixture, git_entries: &[gardenbed_harness::oracle::LogEntry], count: usize) -> String {
+fn expected_log_text(
+    fixture: &Fixture,
+    git_entries: &[gardenbed_harness::oracle::LogEntry],
+    count: usize,
+) -> String {
     let mut out = String::new();
     for (i, e) in git_entries.iter().take(count).enumerate() {
         if i > 0 {
@@ -1131,7 +1139,7 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
     r.judge(
         "Who wrote the most recent commit on main?",
         &git_log_all[0].author_name,
-        &one.first().map(|e| e.name.as_str()).unwrap_or(""),
+        one.first().map(|e| e.name.as_str()).unwrap_or(""),
     );
 
     // ------------------------------------------ commits touching a path
@@ -1235,7 +1243,11 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
             .find(|e| e.id == want_cs.to_hex())
             .map(|e| e.name.clone())
             .unwrap_or_default();
-        let want_author = fixture_b.cs(fixture_b.cs_index(want_cs)).author.name.clone();
+        let want_author = fixture_b
+            .cs(fixture_b.cs_index(want_cs))
+            .author
+            .name
+            .clone();
         b.judge(
             &format!("Who last touched line {line} of {path}? (second history)"),
             &want_author,
@@ -1294,7 +1306,10 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
     b.ask(
         "log",
         json!({ "cs": mid_b.0.to_hex(), "limit": 3 }),
-        &format!("Show the last 3 commits up to {}.", short(&mid_b.0.to_hex())),
+        &format!(
+            "Show the last 3 commits up to {}.",
+            short(&mid_b.0.to_hex())
+        ),
         &expected_log_text(&fixture_b, &git_log_mid, 3),
     );
     // The touching composition once more on the second history.
@@ -1331,7 +1346,7 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
             "file",
             json!({ "path": path, "cs": "no-such-ref" }),
             "Show a file at a ref that does not exist.",
-            &format!("ref \"no-such-ref\" does not exist on this arboretum"),
+            "ref \"no-such-ref\" does not exist on this arboretum",
         );
         b.ask_error(
             "blame",
@@ -1438,8 +1453,8 @@ pub fn probe_workspace_bin(name: &str, env_override: &str) -> PathBuf {
 /// directory anywhere beneath it.
 pub fn assert_no_bed_dir(dir: &Path) {
     fn walk(dir: &Path) {
-        let entries = std::fs::read_dir(dir)
-            .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
         for entry in entries {
             let entry = entry.expect("directory entry readable");
             if entry.file_name() == ".bed" {

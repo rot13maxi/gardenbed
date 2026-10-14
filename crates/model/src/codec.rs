@@ -128,14 +128,14 @@ impl<'a> Reader<'a> {
             }
             let group = (b & 0x7f) as u64;
             let shift = 7 * (count - 1);
-            if shift >= 64 {
-                if group > 1 {
-                    return Err(CodecError::Decode("varint overflow".into()));
-                }
-                v |= group << 63;
-            } else {
-                v |= group << shift;
+            // Payload bits beyond 64 cannot be represented: a group that
+            // would lose any of them is non-canonical (the value would
+            // change on re-encode). `shift >= 64` is checked first — the
+            // shift itself would be undefined.
+            if shift >= 64 || (group << shift) >> shift != group {
+                return Err(CodecError::Decode("varint overflow".into()));
             }
+            v |= group << shift;
             if b & 0x80 == 0 {
                 if count > 1 && b == 0 {
                     return Err(CodecError::Decode("non-minimal varint".into()));
@@ -215,14 +215,18 @@ pub fn validate_path(path: &str) -> Result<(), CodecError> {
         return Err(CodecError::Encode("path must be non-empty".into()));
     }
     if path.starts_with('/') {
-        return Err(CodecError::Encode(format!("path {path:?} must be relative")));
+        return Err(CodecError::Encode(format!(
+            "path {path:?} must be relative"
+        )));
     }
     if path.bytes().any(|b| b == 0) {
         return Err(CodecError::Encode("path must not contain NUL".into()));
     }
     for comp in path.split('/') {
         if comp.is_empty() {
-            return Err(CodecError::Encode(format!("path {path:?} has empty component")));
+            return Err(CodecError::Encode(format!(
+                "path {path:?} has empty component"
+            )));
         }
         if comp == "." || comp == ".." {
             return Err(CodecError::Encode(format!(
@@ -274,10 +278,9 @@ pub fn validate_changeset(cs: &Changeset, require_sorted: bool) -> Result<(), Co
                 }
             }
             Op::Rename => {
-                let src = c
-                    .src_path
-                    .as_deref()
-                    .ok_or_else(|| CodecError::Encode(format!("rename {} requires src_path", c.path)))?;
+                let src = c.src_path.as_deref().ok_or_else(|| {
+                    CodecError::Encode(format!("rename {} requires src_path", c.path))
+                })?;
                 validate_path(src)?;
                 if src == c.path {
                     return Err(CodecError::Encode(format!(
@@ -302,17 +305,16 @@ pub fn validate_changeset(cs: &Changeset, require_sorted: bool) -> Result<(), Co
             return Err(CodecError::Encode(format!("duplicate path {}", c.path)));
         }
     }
-    if require_sorted {
-        if let Some(bad) = cs
+    if require_sorted
+        && let Some(bad) = cs
             .changes
             .windows(2)
             .find(|w| w[0].path.as_bytes() >= w[1].path.as_bytes())
-        {
-            return Err(CodecError::Decode(format!(
-                "changes not strictly ascending at {:?}",
-                bad[1].path
-            )));
-        }
+    {
+        return Err(CodecError::Decode(format!(
+            "changes not strictly ascending at {:?}",
+            bad[1].path
+        )));
     }
     Ok(())
 }
@@ -368,17 +370,16 @@ pub fn validate_tree(tree: &Tree, require_sorted: bool) -> Result<(), CodecError
             return Err(CodecError::Encode(format!("duplicate entry {:?}", e.name)));
         }
     }
-    if require_sorted {
-        if let Some(bad) = tree
+    if require_sorted
+        && let Some(bad) = tree
             .entries
             .windows(2)
             .find(|w| w[0].name.as_bytes() >= w[1].name.as_bytes())
-        {
-            return Err(CodecError::Decode(format!(
-                "entries not strictly ascending at {:?}",
-                bad[1].name
-            )));
-        }
+    {
+        return Err(CodecError::Decode(format!(
+            "entries not strictly ascending at {:?}",
+            bad[1].name
+        )));
     }
     Ok(())
 }
@@ -436,13 +437,13 @@ pub fn decode_changeset(bytes: &[u8]) -> Result<Changeset, CodecError> {
     let n_changes = r.count()?;
     let mut changes = Vec::with_capacity(n_changes.min(4096));
     for _ in 0..n_changes {
-        let op = Op::from_u8(r.u8()?)
-            .ok_or_else(|| CodecError::Decode("invalid op byte".into()))?;
+        let op =
+            Op::from_u8(r.u8()?).ok_or_else(|| CodecError::Decode("invalid op byte".into()))?;
         let path = r.string()?;
         let blob = r.opt_id()?;
         let src_path = r.opt_str()?;
-        let mode = Mode::from_u8(r.u8()?)
-            .ok_or_else(|| CodecError::Decode("invalid mode byte".into()))?;
+        let mode =
+            Mode::from_u8(r.u8()?).ok_or_else(|| CodecError::Decode("invalid mode byte".into()))?;
         changes.push(Change {
             path,
             op,
@@ -524,8 +525,8 @@ pub fn decode_tree(bytes: &[u8]) -> Result<Tree, CodecError> {
         let name = r.string()?;
         let kind = TreeKind::from_u8(r.u8()?)
             .ok_or_else(|| CodecError::Decode("invalid tree kind byte".into()))?;
-        let mode = Mode::from_u8(r.u8()?)
-            .ok_or_else(|| CodecError::Decode("invalid mode byte".into()))?;
+        let mode =
+            Mode::from_u8(r.u8()?).ok_or_else(|| CodecError::Decode("invalid mode byte".into()))?;
         let (blob, tree) = match kind {
             TreeKind::File => (Some(r.id()?), None),
             TreeKind::Dir => (None, Some(r.id()?)),

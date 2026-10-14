@@ -17,11 +17,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gardenbed_model::{blob_id, Id, Mode};
+use gardenbed_model::{Id, Mode, blob_id};
 use gardenbed_store::ObjectStore;
 
 use crate::error::ImportError;
-use crate::gtree::{parse_tree, GEntry, GKind};
+use crate::gtree::{GEntry, GKind, parse_tree};
 use crate::oid::GitOid;
 
 /// Maximum cached parsed trees.
@@ -61,23 +61,23 @@ impl<'r> GitObjects<'r> {
         if let Some(cached) = self.trees.get(&tree) {
             return Ok(Arc::clone(cached));
         }
-        let obj = self.repo.find_object(crate::graph::gix_id(tree)).map_err(|e| {
-            ImportError::Object {
+        let obj = self
+            .repo
+            .find_object(crate::graph::gix_id(tree))
+            .map_err(|e| ImportError::Object {
                 oid: sha_hex.to_owned(),
                 detail: format!("cannot read tree: {e}"),
-            }
-        })?;
+            })?;
         if obj.kind != gix::object::Kind::Tree {
             return Err(ImportError::Object {
                 oid: sha_hex.to_owned(),
                 detail: format!("expected a tree object, found {:?}", obj.kind),
             });
         }
-        let entries =
-            parse_tree(&obj.data).map_err(|detail| ImportError::Object {
-                oid: sha_hex.to_owned(),
-                detail,
-            })?;
+        let entries = parse_tree(&obj.data).map_err(|detail| ImportError::Object {
+            oid: sha_hex.to_owned(),
+            detail,
+        })?;
         if self.trees.len() >= TREE_CACHE_CAP {
             self.trees.clear();
         }
@@ -113,17 +113,14 @@ impl<'r> GitObjects<'r> {
                 (GKind::File, false) => {
                     return Err(ImportError::Diff {
                         sha: commit_hex.to_owned(),
-                        detail: format!(
-                            "path {path:?} crosses a file entry ({:?})",
-                            components[i]
-                        ),
-                    })
+                        detail: format!("path {path:?} crosses a file entry ({:?})", components[i]),
+                    });
                 }
                 (GKind::Dir, true) => {
                     return Err(ImportError::Diff {
                         sha: commit_hex.to_owned(),
                         detail: format!("path {path:?} is a directory, not a file"),
-                    })
+                    });
                 }
             }
         }
@@ -146,12 +143,13 @@ impl<'r> GitObjects<'r> {
             return Ok(*id);
         }
         let hex = blob.to_hex();
-        let obj = self.repo.find_object(crate::graph::gix_id(blob)).map_err(|e| {
-            ImportError::Object {
+        let obj = self
+            .repo
+            .find_object(crate::graph::gix_id(blob))
+            .map_err(|e| ImportError::Object {
                 oid: hex.clone(),
                 detail: format!("cannot read blob (referenced by {context_oid}): {e}"),
-            }
-        })?;
+            })?;
         if obj.kind != gix::object::Kind::Blob {
             return Err(ImportError::Object {
                 oid: hex.clone(),

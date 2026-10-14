@@ -164,8 +164,12 @@ pub(crate) fn parse_ls_tree_z(out: &[u8]) -> std::io::Result<Vec<(String, String
         }
         let mut sha = Vec::with_capacity(20);
         for i in 0..20 {
-            let hi = (sha_hex.as_bytes()[2 * i] as char).to_digit(16).unwrap_or(0) as u8;
-            let lo = (sha_hex.as_bytes()[2 * i + 1] as char).to_digit(16).unwrap_or(0) as u8;
+            let hi = (sha_hex.as_bytes()[2 * i] as char)
+                .to_digit(16)
+                .unwrap_or(0) as u8;
+            let lo = (sha_hex.as_bytes()[2 * i + 1] as char)
+                .to_digit(16)
+                .unwrap_or(0) as u8;
             sha.push((hi << 4) | lo);
         }
         let path = std::str::from_utf8(&after_type[tab + 1..])
@@ -313,13 +317,13 @@ pub(crate) fn parse_blame_porcelain(out: &[u8]) -> Vec<BlameRange> {
         if raw.is_empty() || raw[0] == b'\t' {
             continue;
         }
-        if let Ok(s) = std::str::from_utf8(raw) {
-            if let Some((sha, final_line, count)) = parse_porcelain_record(s) {
-                let last = final_line.saturating_add(count - 1);
-                lines.push((final_line, sha.clone()));
-                for l in final_line + 1..=last {
-                    lines.push((l, sha.clone()));
-                }
+        if let Ok(s) = std::str::from_utf8(raw)
+            && let Some((sha, final_line, count)) = parse_porcelain_record(s)
+        {
+            let last = final_line.saturating_add(count - 1);
+            lines.push((final_line, sha.clone()));
+            for l in final_line + 1..=last {
+                lines.push((l, sha.clone()));
             }
         }
     }

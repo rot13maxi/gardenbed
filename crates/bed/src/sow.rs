@@ -35,13 +35,13 @@ use std::path::Path;
 use std::str::FromStr;
 
 use gardenbed_model::codec::validate_changeset;
-use gardenbed_model::{blob_id, Change, Changeset, Id, Identity, Mode, Op};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 
 use crate::bed::Bed;
 use crate::error::BedError;
 use crate::rpc::Session;
-use crate::status::{mtime_ns, scan_paths, ScanDelta};
-use crate::treestate::{TreestateEntry, HINT_VERIFIED};
+use crate::status::{ScanDelta, mtime_ns, scan_paths};
+use crate::treestate::{HINT_VERIFIED, TreestateEntry};
 use gardenbed_store::ObjectStore as _;
 
 /// Blobs at or under this many bytes ride on `CreateChangeset` inline;
@@ -104,7 +104,11 @@ struct WriteEntry {
 /// `GARDENBED_AUTHOR` environment variable, else the bed's default
 /// identity. Author and committer are the same person at the same instant
 /// (v0.1 has no separate-committer workflow).
-pub async fn sow(bed_dir: &Path, message: &str, author: Option<&str>) -> Result<SowOutcome, BedError> {
+pub async fn sow(
+    bed_dir: &Path,
+    message: &str,
+    author: Option<&str>,
+) -> Result<SowOutcome, BedError> {
     if message.trim().is_empty() {
         return Err(BedError::ConfigInvalid(
             "the message is empty — sow with -m <message>".into(),
@@ -227,7 +231,11 @@ pub async fn sow(bed_dir: &Path, message: &str, author: Option<&str>) -> Result<
         }
     }
 
-    let cs_id = match session.client.create_changeset(&repo, &cs, inline.clone()).await {
+    let cs_id = match session
+        .client
+        .create_changeset(&repo, &cs, inline.clone())
+        .await
+    {
         Ok(id) => id,
         Err(status)
             if status.code() == tonic::Code::InvalidArgument
@@ -241,14 +249,18 @@ pub async fn sow(bed_dir: &Path, message: &str, author: Option<&str>) -> Result<
                 put_blob_heavy(&session, &repo, *id, content).await?;
                 uploaded += 1;
             }
-            match session.client.create_changeset(&repo, &cs, inline.clone()).await {
+            match session
+                .client
+                .create_changeset(&repo, &cs, inline.clone())
+                .await
+            {
                 Ok(id) => id,
                 Err(status) => {
                     return Err(BedError::Rpc {
                         command: "sow",
                         code: status.code(),
                         message: status.message().to_owned(),
-                    })
+                    });
                 }
             }
         }
@@ -257,7 +269,7 @@ pub async fn sow(bed_dir: &Path, message: &str, author: Option<&str>) -> Result<
                 command: "sow",
                 code: status.code(),
                 message: status.message().to_owned(),
-            })
+            });
         }
     };
     // The inline blobs are now known-good on the arboretum; keep them in
@@ -427,9 +439,9 @@ fn read_working(root: &Path, rel: &str) -> Result<Option<WorkingFile>, BedError>
     }
     let is_symlink = meta.is_symlink();
     let content: Vec<u8> = if is_symlink {
-        std::os::unix::ffi::OsStrExt::as_bytes(std::ffi::OsStr::new(
-            &std::fs::read_link(root.join(rel))?,
-        ))
+        std::os::unix::ffi::OsStrExt::as_bytes(std::ffi::OsStr::new(&std::fs::read_link(
+            root.join(rel),
+        )?))
         .to_vec()
     } else {
         std::fs::read(root.join(rel))?
@@ -472,11 +484,12 @@ async fn put_blob_heavy(
     id: Id,
     content: &[u8],
 ) -> Result<(), BedError> {
-    let chunks: Vec<Vec<u8>> = content
-        .chunks(PUT_BLOB_CHUNK)
-        .map(<[u8]>::to_vec)
-        .collect();
-    match session.client.put_blob(repo, tokio_stream::iter(chunks)).await {
+    let chunks: Vec<Vec<u8>> = content.chunks(PUT_BLOB_CHUNK).map(<[u8]>::to_vec).collect();
+    match session
+        .client
+        .put_blob(repo, tokio_stream::iter(chunks))
+        .await
+    {
         Ok(received) if received == id => Ok(()),
         Ok(received) => Err(BedError::BlobHashMismatch(received)),
         Err(status) => Err(BedError::Rpc {
@@ -503,7 +516,7 @@ async fn put_blob_heavy(
 /// is nothing to move from.
 fn build_changes(
     mut delete_blobs: Vec<(String, Option<Id>)>,
-    writes: &mut Vec<WriteEntry>,
+    writes: &mut [WriteEntry],
 ) -> Result<(Vec<Change>, usize), BedError> {
     delete_blobs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     writes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
@@ -514,13 +527,13 @@ fn build_changes(
     for (wi, w) in writes.iter().enumerate() {
         let mut hit = None;
         for (di, (dp, db)) in delete_blobs.iter().enumerate() {
-            if !consumed[di] && *dp != w.path {
-                if let Some(db) = db {
-                    if *db == w.blob {
-                        hit = Some(di);
-                        break;
-                    }
-                }
+            if !consumed[di]
+                && *dp != w.path
+                && let Some(db) = db
+                && *db == w.blob
+            {
+                hit = Some(di);
+                break;
             }
         }
         match hit {
@@ -622,10 +635,7 @@ mod tests {
 
     #[test]
     fn changes_are_canonical_and_disjoint() {
-        let mut writes = vec![
-            write("z.md", b"z", true),
-            write("m.rs", b"m", false),
-        ];
+        let mut writes = vec![write("z.md", b"z", true), write("m.rs", b"m", false)];
         let deletes = vec![
             ("k.txt".to_owned(), Some(blob_id(b"k"))),
             ("a.rs".to_owned(), Some(blob_id(b"m.rs-content"))),

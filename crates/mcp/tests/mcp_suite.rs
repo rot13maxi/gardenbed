@@ -25,13 +25,11 @@ use std::path::{Path, PathBuf};
 
 use gardenbed::render::{self as bed_render, LogEntry as BedLogEntry};
 use gardenbed_harness::oracle::{git_blame_first_parent, git_show};
-use gardenbed_model::Mode;
-use gardenbed_mcp::qa::{
-    assert_no_bed_dir, run_canned_qa, run_demo, McpProcess,
-};
+use gardenbed_mcp::qa::{McpProcess, assert_no_bed_dir, run_canned_qa, run_demo};
 use gardenbed_mcp::{handle_line, protocol};
+use gardenbed_model::Mode;
 use gardenbed_server::Repo;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// The built `gardenbed-mcp` binary (this package's own bin target).
 fn mcp_bin() -> PathBuf {
@@ -118,7 +116,10 @@ fn m7_4_protocol_conformance_in_process() {
     assert!(init.get("error").is_none());
 
     // initialize without a version: the spec revision gardenbed-mcp serves.
-    let init = resp(handle_line(&repo, r#"{"jsonrpc":"2.0","id":"a","method":"initialize"}"#));
+    let init = resp(handle_line(
+        &repo,
+        r#"{"jsonrpc":"2.0","id":"a","method":"initialize"}"#,
+    ));
     assert_eq!(init["id"], json!("a"));
     assert_eq!(
         init["result"]["protocolVersion"],
@@ -127,24 +128,39 @@ fn m7_4_protocol_conformance_in_process() {
 
     // Notifications are never answered.
     assert_eq!(
-        handle_line(&repo, r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+        handle_line(
+            &repo,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        ),
         None
     );
     assert_eq!(
-        handle_line(&repo, r#"{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}"#),
+        handle_line(
+            &repo,
+            r#"{"jsonrpc":"2.0","id":null,"method":"notifications/initialized"}"#
+        ),
         None
     );
 
     // ping answers an empty result.
-    let ping = resp(handle_line(&repo, r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#));
+    let ping = resp(handle_line(
+        &repo,
+        r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#,
+    ));
     assert_eq!(ping["id"], json!(2));
     assert_eq!(ping["result"], json!({}));
 
     // tools/list: exactly the four tools, each with an object inputSchema;
     // diff requires both sides (a headless tool has no working copy).
-    let list = resp(handle_line(&repo, r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#));
+    let list = resp(handle_line(
+        &repo,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#,
+    ));
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().expect("name")).collect();
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("name"))
+        .collect();
     assert_eq!(names, vec!["log", "diff", "blame", "file"]);
     for t in tools {
         assert_eq!(t["inputSchema"]["type"], json!("object"), "for {t}");
@@ -180,10 +196,12 @@ fn m7_4_protocol_conformance_in_process() {
     let answer = resp(handle_line(&repo, &call.to_string()));
     assert!(answer.get("error").is_none(), "tool errors are results");
     assert_eq!(answer["result"]["isError"], json!(true));
-    assert!(answer["result"]["content"][0]["text"]
-        .as_str()
-        .unwrap()
-        .contains("diff needs two changesets"));
+    assert!(
+        answer["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("diff needs two changesets")
+    );
 
     // Unknown tool names are isError results too.
     let call = json!({
@@ -211,7 +229,10 @@ fn m7_4_protocol_conformance_in_process() {
     assert_eq!(code(&answer), protocol::INVALID_PARAMS);
 
     // Unknown methods: -32601, id echoed.
-    let answer = resp(handle_line(&repo, r#"{"jsonrpc":"2.0","id":9,"method":"resources/list"}"#));
+    let answer = resp(handle_line(
+        &repo,
+        r#"{"jsonrpc":"2.0","id":9,"method":"resources/list"}"#,
+    ));
     assert_eq!(answer["id"], json!(9));
     assert_eq!(code(&answer), protocol::METHOD_NOT_FOUND);
 
@@ -220,11 +241,17 @@ fn m7_4_protocol_conformance_in_process() {
     let answer = resp(handle_line(&repo, "{oops"));
     assert_eq!(answer["id"], json!(null));
     assert_eq!(code(&answer), protocol::PARSE_ERROR);
-    let ping = resp(handle_line(&repo, r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#));
+    let ping = resp(handle_line(
+        &repo,
+        r#"{"jsonrpc":"2.0","id":10,"method":"ping"}"#,
+    ));
     assert_eq!(ping["result"], json!({}));
 
     // A JSON-RPC batch is not part of the served contract: -32600.
-    let answer = resp(handle_line(&repo, r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#));
+    let answer = resp(handle_line(
+        &repo,
+        r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+    ));
     assert_eq!(code(&answer), protocol::INVALID_REQUEST);
 }
 
@@ -245,7 +272,8 @@ fn m7_4_protocol_conformance_over_stdio() {
     let init = mcp.handshake().expect("handshake");
     assert_eq!(init["protocolVersion"], json!("2025-06-18"));
     assert_eq!(init["serverInfo"]["name"], json!("gardenbed-mcp"));
-    let ping = mcp.raw(r#"{"jsonrpc":"2.0","id":"string-ids-too","method":"ping"}"#)
+    let ping = mcp
+        .raw(r#"{"jsonrpc":"2.0","id":"string-ids-too","method":"ping"}"#)
         .expect("ping answered");
     assert_eq!(ping["id"], json!("string-ids-too"));
     assert_eq!(ping["result"], json!({}));
@@ -277,7 +305,10 @@ fn m7_4_protocol_conformance_over_stdio() {
 
     // EOF is a clean end: exit success.
     let status = mcp.shutdown().expect("wait for the server");
-    assert!(status.success(), "EOF must end the server cleanly: {status}");
+    assert!(
+        status.success(),
+        "EOF must end the server cleanly: {status}"
+    );
 
     // The sandbox is still empty — the server never wrote a checkout.
     assert_no_bed_dir(sandbox.path());
@@ -308,10 +339,16 @@ fn m7_1_parity_with_repo_engine_and_bed() {
     // bed's renderer byte for byte — after widening bed's 16-hex id
     // column to the documented full 64-hex MCP form.
     let repo_log = repo.log(head, 0).expect("repo log");
-    let answer = mcp.call_tool("log", json!({ "limit": 0 })).expect("log call");
+    let answer = mcp
+        .call_tool("log", json!({ "limit": 0 }))
+        .expect("log call");
     assert!(!answer.is_error);
     let want_ids: Vec<String> = repo_log.iter().map(|(id, _)| id.to_hex()).collect();
-    assert_eq!(log_ids(&answer.text), want_ids, "MCP log order == Repo::log order");
+    assert_eq!(
+        log_ids(&answer.text),
+        want_ids,
+        "MCP log order == Repo::log order"
+    );
     let mut want = String::new();
     for (i, (id, cs)) in repo_log.iter().enumerate() {
         if i > 0 {
@@ -330,7 +367,10 @@ fn m7_1_parity_with_repo_engine_and_bed() {
         entry.replace_range(0..16, &id.to_hex()); // the documented divergence
         want.push_str(&entry);
     }
-    assert_eq!(answer.text, want, "MCP log text == bed's rendering (64-hex ids)");
+    assert_eq!(
+        answer.text, want,
+        "MCP log text == bed's rendering (64-hex ids)"
+    );
 
     // ---- diff: letters == git diff-tree --name-status; paths == Repo::diff.
     let n = fixture.history.changesets.len();
@@ -343,13 +383,19 @@ fn m7_1_parity_with_repo_engine_and_bed() {
         let want = if letters.is_empty() {
             format!("no changes between {} and {}", a.to_hex(), b.to_hex())
         } else {
-            letters.iter().map(|(l, p)| format!("{l} {p}\n")).collect::<String>()
+            letters
+                .iter()
+                .map(|(l, p)| format!("{l} {p}\n"))
+                .collect::<String>()
         };
         assert_eq!(answer.text, want, "MCP diff {ai}→{bi} == git's tree diff");
         let changes = repo.diff(a, b).expect("repo diff");
         let got_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
         let want_paths: Vec<String> = letters.iter().map(|(_, p)| p.clone()).collect();
-        assert_eq!(got_paths, want_paths, "Repo::diff paths track git's for {ai}→{bi}");
+        assert_eq!(
+            got_paths, want_paths,
+            "Repo::diff paths track git's for {ai}→{bi}"
+        );
     }
 
     // ---- blame: the wire text == Repo::blame's ranges, and every range
@@ -359,22 +405,40 @@ fn m7_1_parity_with_repo_engine_and_bed() {
         .filter(|(_, (_, mode))| *mode != Mode::Gitlink)
         .map(|(p, (id, _))| (p.clone(), *id))
         .collect();
-    assert!(!blameable.is_empty(), "the fixture has a blameable file at head");
+    assert!(
+        !blameable.is_empty(),
+        "the fixture has a blameable file at head"
+    );
     for (path, _) in blameable.iter().take(2) {
-        let answer = mcp.call_tool("blame", json!({ "path": path })).expect("blame call");
+        let answer = mcp
+            .call_tool("blame", json!({ "path": path }))
+            .expect("blame call");
         let ranges = repo.blame(head, path).expect("repo blame");
         let want: String = ranges
             .iter()
             .map(|(lo, hi, cs)| format!("{lo}-{hi} {}\n", cs.to_hex()))
             .collect();
-        assert_eq!(answer.text, want, "MCP blame text == Repo::blame for {path}");
-        let oracle = git_blame_first_parent(&fixture.git, &head_sha, path)
-            .expect("git blame oracle");
+        assert_eq!(
+            answer.text, want,
+            "MCP blame text == Repo::blame for {path}"
+        );
+        let oracle =
+            git_blame_first_parent(&fixture.git, &head_sha, path).expect("git blame oracle");
         let want_git: String = oracle
             .iter()
-            .map(|r| format!("{}-{} {}\n", r.lo, r.hi, fixture.cs_of(&r.commit_sha).to_hex()))
+            .map(|r| {
+                format!(
+                    "{}-{} {}\n",
+                    r.lo,
+                    r.hi,
+                    fixture.cs_of(&r.commit_sha).to_hex()
+                )
+            })
             .collect();
-        assert_eq!(answer.text, want_git, "MCP blame == git blame --first-parent for {path}");
+        assert_eq!(
+            answer.text, want_git,
+            "MCP blame == git blame --first-parent for {path}"
+        );
     }
 
     // ---- file: text == the repo's blob bytes == `git show` bytes, for a
@@ -386,15 +450,26 @@ fn m7_1_parity_with_repo_engine_and_bed() {
         })
         .map(|(p, (id, _))| (p.clone(), *id))
         .expect("the fixture has a content file at head");
-    let answer = mcp.call_tool("file", json!({ "path": content.0 })).expect("file call");
-    let blob = repo.get_blob(content.1).expect("blob readable").expect("blob exists");
-    assert_eq!(answer.text, String::from_utf8_lossy(&blob), "MCP file == Repo bytes");
+    let answer = mcp
+        .call_tool("file", json!({ "path": content.0 }))
+        .expect("file call");
+    let blob = repo
+        .get_blob(content.1)
+        .expect("blob readable")
+        .expect("blob exists");
+    assert_eq!(
+        answer.text,
+        String::from_utf8_lossy(&blob),
+        "MCP file == Repo bytes"
+    );
     let shown = git_show(&fixture.git, &head_sha, &content.0).expect("git show");
     let want = String::from_utf8_lossy(&shown);
     assert_eq!(answer.text, want, "MCP file == git show for {}", content.0);
 
     if let Some((path, _)) = files.iter().find(|(_, (_, mode))| *mode == Mode::Symlink) {
-        let answer = mcp.call_tool("file", json!({ "path": path })).expect("file call");
+        let answer = mcp
+            .call_tool("file", json!({ "path": path }))
+            .expect("file call");
         let shown = git_show(&fixture.git, &head_sha, path).expect("git show");
         let want = String::from_utf8_lossy(&shown);
         assert_eq!(answer.text, want, "MCP file == git show for symlink {path}");
@@ -404,7 +479,9 @@ fn m7_1_parity_with_repo_engine_and_bed() {
         .find(|(_, (id, mode))| *mode != Mode::Gitlink && fixture.blob(*id).is_empty())
         .map(|(p, _)| p.clone());
     if let Some(path) = empty {
-        let answer = mcp.call_tool("file", json!({ "path": path })).expect("file call");
+        let answer = mcp
+            .call_tool("file", json!({ "path": path }))
+            .expect("file call");
         assert_eq!(answer.text, "", "an empty file answers empty text");
     }
 
@@ -432,7 +509,9 @@ fn m7_2_zero_checkout_all_tools_from_root_alone() {
     mcp.handshake().expect("handshake");
 
     // All four tools answer — with the cwd holding nothing at all.
-    let log = mcp.call_tool("log", json!({ "limit": 2 })).expect("log call");
+    let log = mcp
+        .call_tool("log", json!({ "limit": 2 }))
+        .expect("log call");
     assert!(!log.is_error);
     let (a, b) = (fixture.mapping[0].0, head);
     let diff = mcp

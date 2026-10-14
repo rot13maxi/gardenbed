@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{compressible_bytes, random_bytes, shard_path, sample_tree};
+use common::{compressible_bytes, random_bytes, sample_tree, shard_path};
 use gardenbed_model::{Id, Tree};
 use gardenbed_store::{FsObjectStore, MemoryStore, ObjectStore};
 use std::fs;
@@ -12,7 +12,11 @@ use std::str::FromStr;
 
 fn assert_roundtrip(store: &dyn ObjectStore, content: &[u8]) {
     let id = store.put_blob(content).expect("put_blob");
-    assert_eq!(id, gardenbed_model::blob_id(content), "id is SHA-256(content)");
+    assert_eq!(
+        id,
+        gardenbed_model::blob_id(content),
+        "id is SHA-256(content)"
+    );
     let got = store.get_blob(id).expect("get_blob");
     assert_eq!(got.as_deref(), Some(content), "byte-exact roundtrip");
     assert!(store.has(id).expect("has"), "has() true after put");
@@ -55,8 +59,14 @@ fn fs_on_disk_envelope_matches_spec_section_6() {
     assert!(path.exists(), "object at objects/<2hex>/<62hex> path");
     // Exactly the two-level shard directories exist.
     let parent = path.parent().unwrap();
-    assert_eq!(parent.file_name().unwrap().to_str().unwrap(), &id.to_hex()[..2]);
-    assert_eq!(path.file_name().unwrap().to_str().unwrap(), &id.to_hex()[2..]);
+    assert_eq!(
+        parent.file_name().unwrap().to_str().unwrap(),
+        &id.to_hex()[..2]
+    );
+    assert_eq!(
+        path.file_name().unwrap().to_str().unwrap(),
+        &id.to_hex()[2..]
+    );
 
     let raw = fs::read(&path).expect("read object file");
     assert_eq!(&raw[..5], b"GBLO1", "magic");
@@ -85,7 +95,10 @@ fn tree_roundtrip_fs_and_memory() {
 
     let mem = MemoryStore::new();
     mem.put_tree(tree_id, &canonical).expect("put_tree");
-    assert_eq!(mem.get_tree(tree_id).unwrap().as_deref(), Some(canonical.as_slice()));
+    assert_eq!(
+        mem.get_tree(tree_id).unwrap().as_deref(),
+        Some(canonical.as_slice())
+    );
     assert!(mem.has(tree_id).unwrap());
 }
 
@@ -140,12 +153,24 @@ fn damaged_envelopes_are_corrupt_never_wrong_bytes() {
     let original = fs::read(&path).expect("read envelope");
 
     let variants: Vec<Vec<u8>> = vec![
-        original[..original.len() - 1].to_vec(),        // truncated tail
-        original[..13].to_vec(),                        // header only, no frame
-        original[..5].to_vec(),                         // magic only
-        { let mut v = original.clone(); v[0] = b'X'; v }, // bad magic
-        { let mut v = original.clone(); v[5] ^= 0x01; v }, // corrupt raw_len
-        { let mut v = original.clone(); v[20] ^= 0xFF; v }, // corrupt frame body
+        original[..original.len() - 1].to_vec(), // truncated tail
+        original[..13].to_vec(),                 // header only, no frame
+        original[..5].to_vec(),                  // magic only
+        {
+            let mut v = original.clone();
+            v[0] = b'X';
+            v
+        }, // bad magic
+        {
+            let mut v = original.clone();
+            v[5] ^= 0x01;
+            v
+        }, // corrupt raw_len
+        {
+            let mut v = original.clone();
+            v[20] ^= 0xFF;
+            v
+        }, // corrupt frame body
     ];
     for v in variants {
         fs::write(&path, &v).expect("write tampered envelope");
@@ -163,10 +188,8 @@ fn damaged_envelopes_are_corrupt_never_wrong_bytes() {
 fn absent_ids_read_as_none() {
     let root = tempfile::tempdir().expect("tempdir");
     let store = FsObjectStore::open(root.path()).expect("open");
-    let ghost = Id::from_str(
-        "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-    )
-    .unwrap();
+    let ghost =
+        Id::from_str("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef").unwrap();
     assert_eq!(store.get_blob(ghost).unwrap(), None);
     assert_eq!(store.get_tree(ghost).unwrap(), None);
     assert!(!store.has(ghost).unwrap());
@@ -211,7 +234,13 @@ fn sharding_layout_is_two_levels() {
         .join("objects")
         .join(&id.to_hex()[..2])
         .join(&id.to_hex()[2..]);
-    assert_eq!(store.objects_dir().join(&id.to_hex()[..2]).join(&id.to_hex()[2..]), expected);
+    assert_eq!(
+        store
+            .objects_dir()
+            .join(&id.to_hex()[..2])
+            .join(&id.to_hex()[2..]),
+        expected
+    );
     assert!(expected.is_file());
     assert_eq!(store.get_blob(id).unwrap().unwrap(), content.to_vec());
 }

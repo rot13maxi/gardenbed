@@ -185,7 +185,15 @@ mod tests {
             other => panic!("expected Clone, got {other:?}"),
         }
 
-        let cli = parsed(&["clone", "unix:///tmp/a.sock", "--repo", "x", "--plot", "src", "docs"]);
+        let cli = parsed(&[
+            "clone",
+            "unix:///tmp/a.sock",
+            "--repo",
+            "x",
+            "--plot",
+            "src",
+            "docs",
+        ]);
         match cli.command {
             Command::Clone { server, repo, plot } => {
                 assert_eq!(server, "unix:///tmp/a.sock");
@@ -206,26 +214,34 @@ mod tests {
     #[test]
     fn plot_subcommands_parse() {
         match parsed(&["plot", "add", "src", "docs"]).command {
-            Command::Plot { command: PlotCommand::Add { paths, .. } } => {
+            Command::Plot {
+                command: PlotCommand::Add { paths, .. },
+            } => {
                 assert_eq!(paths, vec!["src", "docs"])
             }
             other => panic!("expected plot add, got {other:?}"),
         }
         match parsed(&["plot", "add", "--concurrency", "3", "src"]).command {
-            Command::Plot { command: PlotCommand::Add { paths, concurrency } } => {
+            Command::Plot {
+                command: PlotCommand::Add { paths, concurrency },
+            } => {
                 assert_eq!(paths, vec!["src"]);
                 assert_eq!(concurrency, 3);
             }
             other => panic!("expected plot add, got {other:?}"),
         }
         match parsed(&["plot", "remove", "src"]).command {
-            Command::Plot { command: PlotCommand::Remove { paths } } => {
+            Command::Plot {
+                command: PlotCommand::Remove { paths },
+            } => {
                 assert_eq!(paths, vec!["src"])
             }
             other => panic!("expected plot remove, got {other:?}"),
         }
         match parsed(&["plot", "list"]).command {
-            Command::Plot { command: PlotCommand::List } => {}
+            Command::Plot {
+                command: PlotCommand::List,
+            } => {}
             other => panic!("expected plot list, got {other:?}"),
         }
         // `plot add` with no paths is a usage error.
@@ -277,8 +293,14 @@ mod tests {
             }
             other => panic!("expected Diff, got {other:?}"),
         }
-        match parsed(&["sow", "-m", "tend the rows", "--author", "G. Gardener <g@bed.dev>"])
-            .command
+        match parsed(&[
+            "sow",
+            "-m",
+            "tend the rows",
+            "--author",
+            "G. Gardener <g@bed.dev>",
+        ])
+        .command
         {
             Command::Sow { message, author } => {
                 assert_eq!(message, "tend the rows");

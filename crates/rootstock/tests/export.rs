@@ -30,13 +30,13 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use gardenbed_harness::oracle::{git_fsck, git_hash_object, git_ls_tree_r};
-use gardenbed_harness::{files_at, generate, GenOptions};
-use gardenbed_model::{blob_id, Change, Changeset, Id, Identity, Mode, Op};
-use gardenbed_rootstock::{export_to_path, import_from_path, ExportOptions, ImportOptions};
+use gardenbed_harness::{GenOptions, files_at, generate};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
+use gardenbed_rootstock::{ExportOptions, ImportOptions, export_to_path, import_from_path};
 use gardenbed_store::{MetadataStore, ObjectStore, RefCas};
 use tempfile::tempdir;
 
-use common::{open_stores, CatFile, Fixture};
+use common::{CatFile, Fixture, open_stores};
 
 // ---------------------------------------------------------------- helpers
 
@@ -100,11 +100,15 @@ fn rev_ref(repo: &Path, name: &str) -> Option<String> {
 /// Every ref name in the target repo (`git for-each-ref`, sorted by
 /// refname — symbolic refs like HEAD are not listed).
 fn ref_names(repo: &Path) -> Vec<String> {
-    String::from_utf8_lossy(&git_out(repo, &["for-each-ref", "--format=%(refname)"], b""))
-        .lines()
-        .filter(|l| !l.is_empty())
-        .map(|l| l.to_owned())
-        .collect()
+    String::from_utf8_lossy(&git_out(
+        repo,
+        &["for-each-ref", "--format=%(refname)"],
+        b"",
+    ))
+    .lines()
+    .filter(|l| !l.is_empty())
+    .map(|l| l.to_owned())
+    .collect()
 }
 
 /// The message bytes of a commit, parsed from its raw object (no `%B`
@@ -260,22 +264,21 @@ fn check_native_export(
             cs.committer.time_secs,
             format_tz(cs.committer.tz_min)
         );
-        assert!(text.contains(&want_author), "author line of changeset {i}:\n{text}");
+        assert!(
+            text.contains(&want_author),
+            "author line of changeset {i}:\n{text}"
+        );
         assert!(
             text.contains(&want_committer),
             "committer line of changeset {i}:\n{text}"
         );
 
         // -- parent structure
-        let got_parents = String::from_utf8_lossy(&git_out(
-            target,
-            &["show", "-s", "--format=%P", sha],
-            b"",
-        ))
-        .trim()
-        .to_owned();
-        let want_parents: Vec<&str> =
-            cs.parents.iter().map(|p| cs_sha[p].as_str()).collect();
+        let got_parents =
+            String::from_utf8_lossy(&git_out(target, &["show", "-s", "--format=%P", sha], b""))
+                .trim()
+                .to_owned();
+        let want_parents: Vec<&str> = cs.parents.iter().map(|p| cs_sha[p].as_str()).collect();
         let got: Vec<&str> = got_parents.split_whitespace().collect();
         assert_eq!(got, want_parents, "parents of changeset {i}");
 
@@ -295,9 +298,7 @@ fn check_native_export(
                         .unwrap_or_else(|| panic!("blob {blob} has no content"));
                     let sha = git_shas
                         .entry(blob)
-                        .or_insert_with(|| {
-                            git_hash_object(target, content).expect("hash-object")
-                        })
+                        .or_insert_with(|| git_hash_object(target, content).expect("hash-object"))
                         .clone();
                     expected.insert(path, (git_mode_str(mode).to_owned(), hex_bytes(&sha)));
                 }
@@ -325,8 +326,13 @@ fn export_roundtrips_unsigned_history_sha_exact() {
 
     let (objects, metadata, _engine) = open_stores(&fx.garden);
     let target = fx.dir.path().join("export.git");
-    let report = export_to_path(&target, objects, metadata.clone(), &ExportOptions::default())
-        .expect("export succeeds");
+    let report = export_to_path(
+        &target,
+        objects,
+        metadata.clone(),
+        &ExportOptions::default(),
+    )
+    .expect("export succeeds");
 
     assert_eq!(
         report.commits_exported,
@@ -334,7 +340,10 @@ fn export_roundtrips_unsigned_history_sha_exact() {
         "one commit per imported changeset"
     );
     assert_eq!(report.commits.len() as u64, report.commits_exported);
-    assert_eq!(report.signed_dropped, 0, "the generated history is unsigned");
+    assert_eq!(
+        report.signed_dropped, 0,
+        "the generated history is unsigned"
+    );
     assert_eq!(
         report.blobs_exported,
         distinct_blobs(&fx.history.changesets).len() as u64,
@@ -352,7 +361,10 @@ fn export_roundtrips_unsigned_history_sha_exact() {
     let mut fixture_shas: Vec<&str> = fx.mapping.iter().map(|(_, s)| s.as_str()).collect();
     exported_shas.sort_unstable();
     fixture_shas.sort_unstable();
-    assert_eq!(exported_shas, fixture_shas, "every git sha reproduced exactly");
+    assert_eq!(
+        exported_shas, fixture_shas,
+        "every git sha reproduced exactly"
+    );
 
     let mut imported: Vec<(Id, String)> = fx
         .mapping
@@ -393,7 +405,11 @@ fn export_roundtrips_unsigned_history_sha_exact() {
         );
     }
     let got: Vec<String> = report.refs.iter().map(|(n, _)| n.clone()).collect();
-    assert_eq!(ref_names(&target), got, "git holds exactly the exported refs");
+    assert_eq!(
+        ref_names(&target),
+        got,
+        "git holds exactly the exported refs"
+    );
 
     git_fsck(&target).expect("fsck --strict clean");
 
@@ -421,14 +437,25 @@ fn export_roundtrips_unsigned_history_sha_exact() {
 /// same shas) and leaves the repository fsck-clean.
 #[test]
 fn export_into_an_existing_repo_is_idempotent() {
-    let fx = Fixture::generate(777, &GenOptions { commits: 15, ..Default::default() });
+    let fx = Fixture::generate(
+        777,
+        &GenOptions {
+            commits: 15,
+            ..Default::default()
+        },
+    );
     import_fixture(&fx);
 
     let (objects, metadata, _engine) = open_stores(&fx.garden);
     let target = fx.dir.path().join("export.git");
 
-    let first = export_to_path(&target, objects.clone(), metadata.clone(), &ExportOptions::default())
-        .expect("first export");
+    let first = export_to_path(
+        &target,
+        objects.clone(),
+        metadata.clone(),
+        &ExportOptions::default(),
+    )
+    .expect("first export");
     let second = export_to_path(&target, objects, metadata, &ExportOptions::default())
         .expect("second export into the same repository");
 
@@ -447,7 +474,11 @@ fn export_into_an_existing_repo_is_idempotent() {
 fn export_honors_the_ref_glob() {
     let fx = Fixture::generate(
         99,
-        &GenOptions { commits: 16, merge_ratio: 0.0, ..Default::default() },
+        &GenOptions {
+            commits: 16,
+            merge_ratio: 0.0,
+            ..Default::default()
+        },
     );
     import_fixture(&fx);
 
@@ -460,21 +491,30 @@ fn export_honors_the_ref_glob() {
         .expect("cs_for_git")
         .unwrap_or_else(|| panic!("commit {} not mapped", fx.mapping[mid].1));
     assert!(matches!(
-        metadata.cas_ref("refs/heads/wip", None, mid_cs).expect("cas_ref"),
+        metadata
+            .cas_ref("refs/heads/wip", None, mid_cs)
+            .expect("cas_ref"),
         RefCas::Won { .. }
     ));
 
     // -- everything: both refs, sorted by name, each at its changeset's sha.
     let all_target = fx.dir.path().join("all.git");
-    let all =
-        export_to_path(&all_target, objects.clone(), metadata.clone(), &ExportOptions::default())
-            .expect("export of all refs");
+    let all = export_to_path(
+        &all_target,
+        objects.clone(),
+        metadata.clone(),
+        &ExportOptions::default(),
+    )
+    .expect("export of all refs");
     let names: Vec<String> = all.refs.iter().map(|(n, _)| n.clone()).collect();
     assert_eq!(names, vec!["refs/heads/main", "refs/heads/wip"]);
-    assert_eq!(ref_names(&all_target), names, "git holds exactly the exported refs");
     assert_eq!(
-        all.refs[1].1,
-        fx.mapping[mid].1,
+        ref_names(&all_target),
+        names,
+        "git holds exactly the exported refs"
+    );
+    assert_eq!(
+        all.refs[1].1, fx.mapping[mid].1,
         "wip points at its changeset's original (materialized) sha"
     );
     assert_eq!(all.commits_exported, fx.mapping.len() as u64);
@@ -486,7 +526,9 @@ fn export_honors_the_ref_glob() {
         &main_target,
         objects,
         metadata,
-        &ExportOptions { refs: vec!["refs/heads/main".into()] },
+        &ExportOptions {
+            refs: vec!["refs/heads/main".into()],
+        },
     )
     .expect("export of main only");
     assert_eq!(
@@ -518,7 +560,11 @@ fn signed_commits_drop_their_signature() {
 
     // Hand-build the signed commit with plumbing (no GPG available/needed):
     // one blob, one file, a structurally valid fake signature.
-    let blob = git_out(&src, &["hash-object", "-w", "--stdin"], b"hello signed world\n");
+    let blob = git_out(
+        &src,
+        &["hash-object", "-w", "--stdin"],
+        b"hello signed world\n",
+    );
     let blob_sha = String::from_utf8_lossy(&blob).trim().to_owned();
     let tree = git_out(
         &src,
@@ -539,22 +585,38 @@ fn signed_commits_drop_their_signature() {
     ]
     .join("\n");
     let raw = format!("{raw}\n");
-    let commit = git_out(&src, &["hash-object", "-t", "commit", "-w", "--stdin"], raw.as_bytes());
+    let commit = git_out(
+        &src,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        raw.as_bytes(),
+    );
     let orig_sha = String::from_utf8_lossy(&commit).trim().to_owned();
     git_out(&src, &["update-ref", "refs/heads/main", &orig_sha], b"");
     git_fsck(&src).expect("the hand-built signed commit is valid git");
 
     // -- import: the signature is captured.
     let (objects, metadata, engine) = open_stores(&dir.path().join("garden"));
-    let import = import_from_path(&src, objects.clone(), metadata.clone(), engine, &ImportOptions::default())
-        .expect("import succeeds");
+    let import = import_from_path(
+        &src,
+        objects.clone(),
+        metadata.clone(),
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
     assert_eq!(import.commits_new, 1);
     let cs_id = metadata
         .cs_for_git(&orig_sha)
         .expect("cs_for_git")
         .unwrap_or_else(|| panic!("commit {orig_sha} not mapped"));
-    let (cs, _) = metadata.get_changeset(cs_id).expect("get_changeset").expect("exists");
-    let sig = cs.signature.as_ref().expect("the signature is captured at import");
+    let (cs, _) = metadata
+        .get_changeset(cs_id)
+        .expect("get_changeset")
+        .expect("exists");
+    let sig = cs
+        .signature
+        .as_ref()
+        .expect("the signature is captured at import");
     assert!(
         String::from_utf8_lossy(sig).contains("BEGIN PGP SIGNATURE"),
         "the captured signature is the gpgsig payload"
@@ -563,12 +625,15 @@ fn signed_commits_drop_their_signature() {
 
     // -- export: unsigned, counted, tree-preserving.
     let target = dir.path().join("export.git");
-    let report =
-        export_to_path(&target, objects, metadata, &ExportOptions::default()).expect("export succeeds");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
     assert_eq!(report.commits_exported, 1);
     assert_eq!(report.signed_dropped, 1, "the dropped signature is counted");
     let exported_sha = &report.commits[0].1;
-    assert_ne!(exported_sha, &orig_sha, "dropping the signature changes the sha");
+    assert_ne!(
+        exported_sha, &orig_sha,
+        "dropping the signature changes the sha"
+    );
 
     // The tree survives byte-exactly; only the header is gone.
     assert_eq!(
@@ -578,7 +643,10 @@ fn signed_commits_drop_their_signature() {
     );
     let mut cat = CatFile::spawn(&target);
     let raw_text = String::from_utf8_lossy(&cat.commit_raw(exported_sha)).to_string();
-    assert!(!raw_text.contains("gpgsig"), "no signature header in:\n{raw_text}");
+    assert!(
+        !raw_text.contains("gpgsig"),
+        "no signature header in:\n{raw_text}"
+    );
     assert!(raw_text.contains("author Gopher <g@arden> 1700000000 +0000"));
     assert!(raw_text.contains("committer Gopher <g@arden> 1700000000 +0000"));
     assert_eq!(commit_message(&mut cat, exported_sha), b"signed!\n");
@@ -617,13 +685,13 @@ fn export_of_native_history_reproduces_trees_and_messages() {
     let blobs: HashMap<Id, Vec<u8>> = history.blob_contents.iter().cloned().collect();
     for cs in &history.changesets {
         for c in &cs.changes {
-            if let Some(b) = c.blob {
-                if c.mode != Mode::Gitlink {
-                    let content = blobs
-                        .get(&b)
-                        .unwrap_or_else(|| panic!("blob {b} has no content"));
-                    objects.put_blob(content).expect("put_blob");
-                }
+            if let Some(b) = c.blob
+                && c.mode != Mode::Gitlink
+            {
+                let content = blobs
+                    .get(&b)
+                    .unwrap_or_else(|| panic!("blob {b} has no content"));
+                objects.put_blob(content).expect("put_blob");
             }
         }
     }
@@ -635,8 +703,8 @@ fn export_of_native_history_reproduces_trees_and_messages() {
         .expect("cas_ref");
 
     let target = dir.path().join("export.git");
-    let report =
-        export_to_path(&target, objects, metadata, &ExportOptions::default()).expect("export succeeds");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
 
     assert_eq!(report.commits_exported, history.changesets.len() as u64);
     assert_eq!(report.signed_dropped, 0);
@@ -775,14 +843,19 @@ fn export_of_a_hand_built_history_reproduces_every_special_shape() {
         metadata.put_changeset(cs).expect("put_changeset");
     }
     let head = changesets.last().unwrap().id().expect("head encodes");
-    metadata.cas_ref("refs/heads/main", None, head).expect("cas_ref");
+    metadata
+        .cas_ref("refs/heads/main", None, head)
+        .expect("cas_ref");
 
     let target = dir.path().join("export.git");
-    let report =
-        export_to_path(&target, objects, metadata, &ExportOptions::default()).expect("export succeeds");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
 
     assert_eq!(report.commits_exported, 3);
-    assert_eq!(report.blobs_exported, 6, "readme1, readme2, script, spaced, link, empty");
+    assert_eq!(
+        report.blobs_exported, 6,
+        "readme1, readme2, script, spaced, link, empty"
+    );
     assert_eq!(report.signed_dropped, 0);
 
     check_native_export(&target, &report, &changesets, &blobs, &|i| {
@@ -799,8 +872,8 @@ fn export_of_an_empty_store_is_a_clean_noop() {
     let (objects, metadata, _engine) = open_stores(&dir.path().join("garden"));
 
     let target = dir.path().join("export.git");
-    let report =
-        export_to_path(&target, objects, metadata, &ExportOptions::default()).expect("export succeeds");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
 
     assert_eq!(report.commits_exported, 0);
     assert_eq!(report.blobs_exported, 0);
@@ -811,7 +884,9 @@ fn export_of_an_empty_store_is_a_clean_noop() {
     // The marks file is created even for an empty stream and stays on disk.
     assert!(report.marks_path.exists(), "marks file left in place");
     assert!(
-        std::fs::read(&report.marks_path).expect("read marks").is_empty(),
+        std::fs::read(&report.marks_path)
+            .expect("read marks")
+            .is_empty(),
         "no marks for an empty stream"
     );
 

@@ -249,21 +249,37 @@ fn render_diff_entry(
     // Content hunks. Gitlinks have no local content; symlinks diff as
     // their target bytes; adds and deletes diff against nothing.
     let old_content = match entry.old {
-        Some(DiffSide { mode: Mode::Gitlink, .. }) | None => None,
+        Some(DiffSide {
+            mode: Mode::Gitlink,
+            ..
+        })
+        | None => None,
         Some(side) => Some(content_of(side.blob)?),
     };
     let new_content = match entry.new {
-        Some(DiffSide { mode: Mode::Gitlink, .. }) | None => None,
+        Some(DiffSide {
+            mode: Mode::Gitlink,
+            ..
+        })
+        | None => None,
         Some(side) => Some(content_of(side.blob)?),
     };
     match (&old_content, &new_content) {
         (None, None) => {} // pure pointer change: mode lines carry it
         (old, new) => {
             out.push_str("--- ");
-            out.push_str(&old.as_ref().map(|_| format!("a/{}", entry.path)).unwrap_or_else(|| "/dev/null".to_owned()));
+            out.push_str(
+                &old.as_ref()
+                    .map(|_| format!("a/{}", entry.path))
+                    .unwrap_or_else(|| "/dev/null".to_owned()),
+            );
             out.push('\n');
             out.push_str("+++ ");
-            out.push_str(&new.as_ref().map(|_| format!("b/{}", entry.path)).unwrap_or_else(|| "/dev/null".to_owned()));
+            out.push_str(
+                &new.as_ref()
+                    .map(|_| format!("b/{}", entry.path))
+                    .unwrap_or_else(|| "/dev/null".to_owned()),
+            );
             out.push('\n');
             let old_bytes = old.as_deref().unwrap_or(b"");
             let new_bytes = new.as_deref().unwrap_or(b"");
@@ -535,9 +551,9 @@ pub fn render_blame(groups: &[BlameGroup], content: &[u8]) -> String {
         while gi + 1 < groups.len() && groups[gi].hi < lineno {
             gi += 1;
         }
-        let g = groups.get(gi).unwrap_or_else(|| {
-            panic!("blame range {gi} must cover line {lineno} (walk contract)")
-        });
+        let g = groups
+            .get(gi)
+            .unwrap_or_else(|| panic!("blame range {gi} must cover line {lineno} (walk contract)"));
         assert!(
             g.lo <= lineno && lineno <= g.hi,
             "blame ranges must cover every line; line {lineno} not covered"
@@ -599,27 +615,63 @@ mod tests {
     #[test]
     fn diff_classifies_like_git_name_status() {
         let blob = gardenbed_model::blob_id(b"x");
-        assert_eq!(classify(None, Some(DiffSide { blob, mode: Mode::Regular })), DiffOp::Add);
-        assert_eq!(classify(Some(DiffSide { blob, mode: Mode::Exec }), None), DiffOp::Delete);
+        assert_eq!(
+            classify(
+                None,
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Regular
+                })
+            ),
+            DiffOp::Add
+        );
+        assert_eq!(
+            classify(
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Exec
+                }),
+                None
+            ),
+            DiffOp::Delete
+        );
         // Regular ↔ exec is M (same type); regular ↔ symlink is T.
         assert_eq!(
             classify(
-                Some(DiffSide { blob, mode: Mode::Regular }),
-                Some(DiffSide { blob, mode: Mode::Exec })
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Regular
+                }),
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Exec
+                })
             ),
             DiffOp::Modify
         );
         assert_eq!(
             classify(
-                Some(DiffSide { blob, mode: Mode::Regular }),
-                Some(DiffSide { blob, mode: Mode::Symlink })
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Regular
+                }),
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Symlink
+                })
             ),
             DiffOp::TypeChange
         );
         assert_eq!(
             classify(
-                Some(DiffSide { blob, mode: Mode::Gitlink }),
-                Some(DiffSide { blob, mode: Mode::Symlink })
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Gitlink
+                }),
+                Some(DiffSide {
+                    blob,
+                    mode: Mode::Symlink
+                })
             ),
             DiffOp::TypeChange
         );

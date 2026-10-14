@@ -2,10 +2,10 @@
 //! order-independence, plus a random-bytes acceptance property that acts as
 //! an always-on miniature fuzzer in CI.
 
-use proptest::prelude::*;
-use proptest::strategy::Strategy;
 use gardenbed_model::codec::CodecError;
 use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, Tree, TreeEntry, TreeKind};
+use proptest::prelude::*;
+use proptest::strategy::Strategy;
 
 fn fail(e: CodecError) -> TestCaseError {
     TestCaseError::fail(e.to_string())
@@ -88,32 +88,28 @@ fn arb_changeset() -> impl Strategy<Value = Changeset> {
         arb_identity(),
         proptest::option::of(proptest::collection::vec(any::<u8>(), 0..64)),
     )
-        .prop_map(|(changes, parents, message, author, committer, signature)| {
-            // Canonical form requires unique paths; dedupe by path.
-            let mut seen = std::collections::BTreeMap::new();
-            for c in changes {
-                seen.entry(c.path.clone()).or_insert(c);
-            }
-            Changeset {
-                parents,
-                changes: seen.into_values().collect(),
-                message,
-                author,
-                committer,
-                signature,
-            }
-        })
+        .prop_map(
+            |(changes, parents, message, author, committer, signature)| {
+                // Canonical form requires unique paths; dedupe by path.
+                let mut seen = std::collections::BTreeMap::new();
+                for c in changes {
+                    seen.entry(c.path.clone()).or_insert(c);
+                }
+                Changeset {
+                    parents,
+                    changes: seen.into_values().collect(),
+                    message,
+                    author,
+                    committer,
+                    signature,
+                }
+            },
+        )
 }
 
 fn arb_tree() -> impl Strategy<Value = Tree> {
     proptest::collection::vec(
-        (
-            0usize..64,
-            any::<bool>(),
-            arb_mode(),
-            arb_id(),
-            arb_id(),
-        ),
+        (0usize..64, any::<bool>(), arb_mode(), arb_id(), arb_id()),
         0..12,
     )
     .prop_map(|items| {

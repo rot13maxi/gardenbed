@@ -103,9 +103,9 @@ fn run_history(seed: u64, commits: u32) {
         check_pair(&engine, git_dir.path(), &mat.mapping, &ids, i, j);
     }
     // Identical changesets diff to nothing.
-    for i in 0..ids.len() {
+    for (i, id) in ids.iter().enumerate() {
         assert!(
-            engine.diff(ids[i], ids[i]).expect("self diff").is_empty(),
+            engine.diff(*id, *id).expect("self diff").is_empty(),
             "self-diff at cs {i} must be empty"
         );
     }

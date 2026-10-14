@@ -70,10 +70,8 @@ pub(crate) fn repair_dir_to_file(
             if !has_under_paths(changes, i, &x.path) {
                 continue;
             }
-            let self_consuming = x.op == Op::Rename
-                && x.src_path
-                    .as_deref()
-                    .is_some_and(|s| is_under(&x.path, s));
+            let self_consuming =
+                x.op == Op::Rename && x.src_path.as_deref().is_some_and(|s| is_under(&x.path, s));
             if self_consuming {
                 continue;
             }
@@ -89,9 +87,7 @@ pub(crate) fn repair_dir_to_file(
 
 /// `child` lies strictly under directory `dir` (`dir/…`).
 fn is_under(dir: &str, child: &str) -> bool {
-    child.len() > dir.len()
-        && child.starts_with(dir)
-        && child.as_bytes()[dir.len()] == b'/'
+    child.len() > dir.len() && child.starts_with(dir) && child.as_bytes()[dir.len()] == b'/'
 }
 
 /// Whether any *other* change targets a path strictly under `dir` — either
@@ -114,19 +110,22 @@ fn consume_one(changes: &mut Vec<Change>, xi: usize, commit_hex: &str) -> Result
         if j == xi {
             continue;
         }
-        if c.op == Op::Delete && is_under(&dir, &c.path) {
-            if best_delete.as_ref().is_none_or(|(p, _)| c.path.as_bytes() < p.as_bytes()) {
-                best_delete = Some((c.path.clone(), j));
-            }
+        if c.op == Op::Delete
+            && is_under(&dir, &c.path)
+            && best_delete
+                .as_ref()
+                .is_none_or(|(p, _)| c.path.as_bytes() < p.as_bytes())
+        {
+            best_delete = Some((c.path.clone(), j));
         }
-        if c.op == Op::Rename {
-            if let Some(src) = &c.src_path {
-                if is_under(&dir, src)
-                    && best_src.as_ref().is_none_or(|(p, _)| src.as_bytes() < p.as_bytes())
-                {
-                    best_src = Some((src.clone(), j));
-                }
-            }
+        if c.op == Op::Rename
+            && let Some(src) = &c.src_path
+            && is_under(&dir, src)
+            && best_src
+                .as_ref()
+                .is_none_or(|(p, _)| src.as_bytes() < p.as_bytes())
+        {
+            best_src = Some((src.clone(), j));
         }
     }
     // Old-side path accounting: the old source of a consuming rename must
@@ -188,16 +187,16 @@ fn consume_one(changes: &mut Vec<Change>, xi: usize, commit_hex: &str) -> Result
         src_path: Some(q),
         mode,
     };
-    if let Some(s) = old_src {
-        if s != dir {
-            changes.push(Change {
-                op: Op::Delete,
-                path: s,
-                blob: None,
-                src_path: None,
-                mode: Mode::Regular,
-            });
-        }
+    if let Some(s) = old_src
+        && s != dir
+    {
+        changes.push(Change {
+            op: Op::Delete,
+            path: s,
+            blob: None,
+            src_path: None,
+            mode: Mode::Regular,
+        });
     }
     Ok(())
 }
@@ -209,7 +208,7 @@ mod tests {
     //! that the resulting tree matches the git snapshot the changes were
     //! derived from.
     use gardenbed_derive::Engine;
-    use gardenbed_model::{blob_id, Change, Changeset, Identity, Mode, Op};
+    use gardenbed_model::{Change, Changeset, Identity, Mode, Op, blob_id};
     use gardenbed_store::{MemoryStore, MetadataStore};
 
     use super::repair_dir_to_file;
@@ -257,9 +256,7 @@ mod tests {
             committer: id("a"),
             signature: None,
         };
-        let base_id = metadata
-            .put_changeset(&base)
-            .map_err(|e| e.to_string())?;
+        let base_id = metadata.put_changeset(&base).map_err(|e| e.to_string())?;
         engine
             .on_changeset_created(base_id)
             .map_err(|e| e.to_string())?;
@@ -331,7 +328,10 @@ mod tests {
             change("P/f2", Op::Add, "two", Mode::Regular),
         ];
         let tree = apply(base, changes).expect("applies");
-        assert_eq!(tree, vec![("P".into(), Mode::Regular, Some(blob_id(b"one")))]);
+        assert_eq!(
+            tree,
+            vec![("P".into(), Mode::Regular, Some(blob_id(b"one")))]
+        );
     }
 
     #[test]
@@ -378,9 +378,7 @@ mod tests {
         let p = changes.iter().find(|c| c.path == "P").expect("P present");
         assert_eq!(p.op, Op::Rename);
         assert_eq!(p.src_path.as_deref(), Some("P/f1"));
-        assert!(changes
-            .iter()
-            .any(|c| c.op == Op::Delete && c.path == "Z"));
+        assert!(changes.iter().any(|c| c.op == Op::Delete && c.path == "Z"));
 
         let base = vec![
             change("P/f1", Op::Add, "one", Mode::Regular),
@@ -430,7 +428,10 @@ mod tests {
 
         let base = vec![change("P/sub/c", Op::Add, "c", Mode::Regular)];
         let tree = apply(base, changes).expect("applies");
-        assert_eq!(tree, vec![("P/sub".into(), Mode::Regular, Some(blob_id(b"file")))]);
+        assert_eq!(
+            tree,
+            vec![("P/sub".into(), Mode::Regular, Some(blob_id(b"file")))]
+        );
     }
 
     #[test]

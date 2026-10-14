@@ -15,12 +15,15 @@ use std::sync::Arc;
 
 use common::ingest;
 use gardenbed_derive::Engine;
-use gardenbed_harness::{files_at, generate, git_blame_first_parent, materialize, GenOptions};
+use gardenbed_harness::{GenOptions, files_at, generate, git_blame_first_parent, materialize};
 use gardenbed_model::{Id, Mode};
 use gardenbed_store::{MemoryStore, ObjectStore, StoreError};
 
 /// Fresh in-memory stores (loam + seedbed) for one history.
-fn fresh_stores() -> (Arc<dyn ObjectStore>, Arc<dyn gardenbed_store::MetadataStore>) {
+fn fresh_stores() -> (
+    Arc<dyn ObjectStore>,
+    Arc<dyn gardenbed_store::MetadataStore>,
+) {
     let m = Arc::new(MemoryStore::new());
     (m.clone(), m)
 }
@@ -100,18 +103,19 @@ fn compare_history(name: &str, seed: u64, opts: &GenOptions, full_sweep: bool) -
                 stats.cases += 1;
                 continue;
             }
-            let got = engine
-                .blame(*cs_id, path)
-                .unwrap_or_else(|e| panic!("{name} seed {seed} cs{idx} {path:?}: engine blame failed: {e}"));
-            let naive = engine
-                .blame_no_skip(*cs_id, path)
-                .unwrap_or_else(|e| panic!("{name} seed {seed} cs{idx} {path:?}: naive blame failed: {e}"));
+            let got = engine.blame(*cs_id, path).unwrap_or_else(|e| {
+                panic!("{name} seed {seed} cs{idx} {path:?}: engine blame failed: {e}")
+            });
+            let naive = engine.blame_no_skip(*cs_id, path).unwrap_or_else(|e| {
+                panic!("{name} seed {seed} cs{idx} {path:?}: naive blame failed: {e}")
+            });
             assert_eq!(
                 got, naive,
                 "{name} seed {seed} cs{idx} {path:?}: skip-enabled and naive blame disagree"
             );
-            let want = git_blame_first_parent(&mat.repo_path, &sha, path)
-                .unwrap_or_else(|e| panic!("{name} seed {seed} cs{idx} {path:?}: git oracle failed: {e}"));
+            let want = git_blame_first_parent(&mat.repo_path, sha, path).unwrap_or_else(|e| {
+                panic!("{name} seed {seed} cs{idx} {path:?}: git oracle failed: {e}")
+            });
             assert_eq!(
                 got.len(),
                 want.len(),
@@ -124,7 +128,7 @@ fn compare_history(name: &str, seed: u64, opts: &GenOptions, full_sweep: bool) -
                     (w.lo as u64, w.hi as u64, w.commit_sha.as_str()),
                     "{name} seed {seed} cs{idx} {path:?}: range differs\n ours: {got:?}\n  git: {want:?}"
                 );
-                stats.lines += u64::from(g.1 - g.0 + 1);
+                stats.lines += g.1 - g.0 + 1;
             }
             // The ranges must tile the file exactly (both sides; this
             // guards against our walk dropping or duplicating lines).
@@ -307,8 +311,14 @@ fn differential_full_sweeps() {
     let a = compare_history("full-balanced", 101, &opts_balanced(), true);
     println!("full sweep balanced: {} cases, {} lines", a.cases, a.lines);
     let b = compare_history("full-rename", 111, &opts_rename_heavy(), true);
-    println!("full sweep rename-heavy: {} cases, {} lines", b.cases, b.lines);
-    assert!(a.cases > 300 && b.cases > 300, "sweeps must be exhaustive-scale");
+    println!(
+        "full sweep rename-heavy: {} cases, {} lines",
+        b.cases, b.lines
+    );
+    assert!(
+        a.cases > 300 && b.cases > 300,
+        "sweeps must be exhaustive-scale"
+    );
 }
 
 // ------------------------------------------------------- random triples
@@ -379,8 +389,10 @@ fn random_triples_agree_with_git() {
             assert_eq!(got, naive, "seed {seed} cs{idx} {path:?}: skip != naive");
             let want = git_blame_first_parent(&mat.repo_path, sha, &path)
                 .unwrap_or_else(|e| panic!("git oracle seed {seed} cs{idx} {path:?}: {e}"));
-            let got_norm: Vec<(u64, u64, &str)> =
-                got.iter().map(|(lo, hi, id)| (*lo, *hi, sha_of[id].as_str())).collect();
+            let got_norm: Vec<(u64, u64, &str)> = got
+                .iter()
+                .map(|(lo, hi, id)| (*lo, *hi, sha_of[id].as_str()))
+                .collect();
             let want_norm: Vec<(u64, u64, &str)> = want
                 .iter()
                 .map(|r| (r.lo as u64, r.hi as u64, r.commit_sha.as_str()))

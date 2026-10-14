@@ -23,7 +23,10 @@
 
 fn main() {
     let bin = gardenbed_mcp::qa::probe_workspace_bin("gardenbed-mcp", "MCP_BIN");
-    println!("gardenbed-qa-agent: spawning {} (MCP over stdio)\n", bin.display());
+    println!(
+        "gardenbed-qa-agent: spawning {} (MCP over stdio)\n",
+        bin.display()
+    );
 
     let report = gardenbed_mcp::qa::run_demo(&bin);
 

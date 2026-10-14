@@ -24,11 +24,11 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
-use gardenbed_model::{blob_id, Change, Changeset, Id, Identity, Mode, Op};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_server::Repo;
 use tempfile::TempDir;
 
-use common::{bed, bed_async, Arboretum, REPO};
+use common::{Arboretum, REPO, bed, bed_async};
 
 /// A small, fully hand-built history whose files and ids the tests know
 /// exactly: three changesets ending at `head`, ref `main` pointing there.
@@ -101,9 +101,7 @@ async fn setup() -> World {
     for (blob, content) in [(&c1, &b1), (&c2, &b2), (&c3, &b3), (&c4, &b4)] {
         inline1.insert(blob.blob.unwrap().to_hex(), content.clone());
     }
-    let id1 = repo
-        .create_changeset(&cs1, &inline1)
-        .expect("cs1 ingests");
+    let id1 = repo.create_changeset(&cs1, &inline1).expect("cs1 ingests");
 
     let (d1, e1) = add("src/extra.rs", b"pub mod extra;\n", Mode::Regular);
     let modify = Change {
@@ -121,18 +119,34 @@ async fn setup() -> World {
     );
     let mut inline2 = std::collections::BTreeMap::new();
     inline2.insert(d1.blob.unwrap().to_hex(), e1);
-    inline2.insert(modify.blob.unwrap().to_hex(), b"# hello\n\n tended\n".to_vec());
-    let id2 = repo
-        .create_changeset(&cs2, &inline2)
-        .expect("cs2 ingests");
+    inline2.insert(
+        modify.blob.unwrap().to_hex(),
+        b"# hello\n\n tended\n".to_vec(),
+    );
+    let id2 = repo.create_changeset(&cs2, &inline2).expect("cs2 ingests");
     repo.cas_ref("main", None, id2).expect("main created");
 
     let mut files = std::collections::BTreeMap::new();
-    files.insert("docs/readme.md".into(), (modify.blob.unwrap(), Mode::Regular));
-    files.insert("src/main.rs".into(), (blob_id(b"fn main() {}\n"), Mode::Regular));
-    files.insert("src/lib.rs".into(), (blob_id(b"pub fn bed() {}\n"), Mode::Regular));
-    files.insert("notes/todo.txt".into(), (blob_id(b"buy seeds\n"), Mode::Regular));
-    files.insert("src/extra.rs".into(), (blob_id(b"pub mod extra;\n"), Mode::Regular));
+    files.insert(
+        "docs/readme.md".into(),
+        (modify.blob.unwrap(), Mode::Regular),
+    );
+    files.insert(
+        "src/main.rs".into(),
+        (blob_id(b"fn main() {}\n"), Mode::Regular),
+    );
+    files.insert(
+        "src/lib.rs".into(),
+        (blob_id(b"pub fn bed() {}\n"), Mode::Regular),
+    );
+    files.insert(
+        "notes/todo.txt".into(),
+        (blob_id(b"buy seeds\n"), Mode::Regular),
+    );
+    files.insert(
+        "src/extra.rs".into(),
+        (blob_id(b"pub mod extra;\n"), Mode::Regular),
+    );
 
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
@@ -167,7 +181,11 @@ fn current_cs(garden: &Path) -> Id {
         if line.trim().starts_with("current_cs") {
             let (_, value) = line.split_once('=').expect("current_cs = <hex>");
             let hex = value.trim().trim_matches('"');
-            assert_eq!(hex.len(), 64, "current_cs in config.toml is not 64 hex: {line:?}\n{text}");
+            assert_eq!(
+                hex.len(),
+                64,
+                "current_cs in config.toml is not 64 hex: {line:?}\n{text}"
+            );
             return Id::from_str(hex).expect("current_cs is 64 hex chars");
         }
     }
@@ -201,21 +219,24 @@ fn flat_files(repo: &Repo, cs: Id) -> std::collections::BTreeMap<String, (Mode, 
 
 /// Applies `changes` to a flat file map the way the delta applier does —
 /// the independent tree oracle for graft checks.
-fn apply(
-    files: &mut std::collections::BTreeMap<String, (Mode, Id)>,
-    changes: &[Change],
-) {
+fn apply(files: &mut std::collections::BTreeMap<String, (Mode, Id)>, changes: &[Change]) {
     for c in changes {
         match c.op {
             Op::Delete => {
                 files.remove(&c.path);
             }
             Op::Add | Op::Modify => {
-                files.insert(c.path.clone(), (c.mode, c.blob.expect("write carries a blob")));
+                files.insert(
+                    c.path.clone(),
+                    (c.mode, c.blob.expect("write carries a blob")),
+                );
             }
             Op::Rename => {
                 files.remove(c.src_path.as_deref().expect("rename carries a src"));
-                files.insert(c.path.clone(), (c.mode, c.blob.expect("rename carries a blob")));
+                files.insert(
+                    c.path.clone(),
+                    (c.mode, c.blob.expect("rename carries a blob")),
+                );
             }
         }
     }
@@ -244,7 +265,9 @@ async fn sow_covers_every_change_shape_and_leaves_status_clean() {
     fs::rename(w.garden.join("src/lib.rs"), w.garden.join("src/moved.rs")).expect("mv");
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(w.garden.join("src/moved.rs")).unwrap().permissions();
+        let mut perms = fs::metadata(w.garden.join("src/moved.rs"))
+            .unwrap()
+            .permissions();
         perms.set_mode(perms.mode() | 0o111);
         fs::set_permissions(w.garden.join("src/moved.rs"), perms).unwrap();
     }
@@ -270,13 +293,20 @@ async fn sow_covers_every_change_shape_and_leaves_status_clean() {
     );
     assert_eq!(code, 0, "sow: {stderr}\n{out}");
     assert!(out.contains("planted seed "), "out: {out}");
-    assert!(out.contains("3 added, 1 modified, 1 deleted, 1 renamed"), "out: {out}");
+    assert!(
+        out.contains("3 added, 1 modified, 1 deleted, 1 renamed"),
+        "out: {out}"
+    );
     assert!(out.contains("the bed now grows from "), "out: {out}");
 
     // The changeset, read back through the library (uncounted):
     let cs_id = current_cs(&w.garden);
     let sown = w.repo.get_changeset(cs_id).expect("changeset readable");
-    assert_eq!(sown.parents, vec![w.head], "parent is the bed's previous tip");
+    assert_eq!(
+        sown.parents,
+        vec![w.head],
+        "parent is the bed's previous tip"
+    );
     assert_eq!(sown.message, "tend the rows");
     assert_eq!(sown.author.name, "A. Gardener");
     assert_eq!(sown.author.email, "a@bed.example");
@@ -327,7 +357,10 @@ async fn sow_covers_every_change_shape_and_leaves_status_clean() {
             mode: Mode::Regular,
         },
     ];
-    assert_eq!(sown.changes, expect, "the sown delta must match, byte for byte");
+    assert_eq!(
+        sown.changes, expect,
+        "the sown delta must match, byte for byte"
+    );
 
     // Every sown blob is a real loam object with the right content.
     for c in &sown.changes {
@@ -335,7 +368,11 @@ async fn sow_covers_every_change_shape_and_leaves_status_clean() {
             continue;
         }
         let Some(blob) = c.blob else { continue };
-        let stored = w.repo.get_blob(blob).expect("get_blob").expect("blob exists");
+        let stored = w
+            .repo
+            .get_blob(blob)
+            .expect("get_blob")
+            .expect("blob exists");
         let want = match c.op {
             Op::Delete => unreachable!(),
             Op::Add | Op::Modify => match c.path.as_str() {
@@ -371,7 +408,10 @@ async fn sow_cli_contract_authors_and_refusals() {
     // Nothing to sow on a clean plot.
     let (code, _, stderr) = bed(&w.garden, &["sow", "-m", "nothing here"]);
     assert_eq!(code, 1, "clean sow must fail");
-    assert!(stderr.contains("nothing modified, deleted, or untracked"), "{stderr}");
+    assert!(
+        stderr.contains("nothing modified, deleted, or untracked"),
+        "{stderr}"
+    );
 
     // Empty message.
     let (code, _, stderr) = bed(&w.garden, &["sow", "-m", "   "]);
@@ -404,7 +444,12 @@ async fn sow_cli_contract_authors_and_refusals() {
         .env("NO_COLOR", "1")
         .output()
         .expect("bed spawns");
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let sown = w.repo.get_changeset(current_cs(&w.garden)).unwrap();
     assert_eq!(sown.author.name, "Env Keeper");
 
@@ -412,7 +457,13 @@ async fn sow_cli_contract_authors_and_refusals() {
     fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n flag\n").unwrap();
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_bed"))
         .current_dir(&w.garden)
-        .args(["sow", "-m", "flag wins", "--author", "Flag Keeper <flag@bed.example>"])
+        .args([
+            "sow",
+            "-m",
+            "flag wins",
+            "--author",
+            "Flag Keeper <flag@bed.example>",
+        ])
         .env("GARDENBED_AUTHOR", "Env Keeper <env@bed.example>")
         .env("NO_COLOR", "1")
         .output()
@@ -464,10 +515,13 @@ async fn graft_replays_onto_moved_main_and_conflicts_name_paths() {
     );
     let upstream_id = w
         .repo
-        .create_changeset(&upstream_cs, &std::collections::BTreeMap::from([(
-            upstream.blob.unwrap().to_hex(),
-            b"fn main() { println!(\"upstream\"); }\n".to_vec(),
-        )]))
+        .create_changeset(
+            &upstream_cs,
+            &std::collections::BTreeMap::from([(
+                upstream.blob.unwrap().to_hex(),
+                b"fn main() { println!(\"upstream\"); }\n".to_vec(),
+            )]),
+        )
         .expect("upstream ingests");
     w.repo
         .cas_ref("main", Some(w.head), upstream_id)
@@ -496,7 +550,10 @@ async fn graft_replays_onto_moved_main_and_conflicts_name_paths() {
     apply(&mut expected, &upstream_cs.changes);
     apply(&mut expected, &bs.changes);
     let actual = flat_files(&w.repo, grafted);
-    assert_eq!(actual, expected, "grafted tree must equal the hand-computed union");
+    assert_eq!(
+        actual, expected,
+        "grafted tree must equal the hand-computed union"
+    );
 
     // The working copy came along: both sides' content on disk, plot clean.
     let (code, out, stderr) = bed(&w.garden, &["status"]);
@@ -534,10 +591,13 @@ async fn graft_replays_onto_moved_main_and_conflicts_name_paths() {
     );
     let clash_id = w
         .repo
-        .create_changeset(&clash_cs, &std::collections::BTreeMap::from([(
-            upstream2.blob.unwrap().to_hex(),
-            b"# hello\n\n upstream clash\n".to_vec(),
-        )]))
+        .create_changeset(
+            &clash_cs,
+            &std::collections::BTreeMap::from([(
+                upstream2.blob.unwrap().to_hex(),
+                b"# hello\n\n upstream clash\n".to_vec(),
+            )]),
+        )
         .expect("clash cs ingests");
     w.repo
         .cas_ref("main", Some(upstream_id), clash_id)
@@ -546,7 +606,10 @@ async fn graft_replays_onto_moved_main_and_conflicts_name_paths() {
     let (code, _, stderr) = bed(&w.garden, &["graft", "main"]);
     assert_eq!(code, 1, "a conflicting graft must fail");
     assert!(stderr.contains("graft conflicts on"), "{stderr}");
-    assert!(stderr.contains("docs/readme.md"), "the conflicting path is named: {stderr}");
+    assert!(
+        stderr.contains("docs/readme.md"),
+        "the conflicting path is named: {stderr}"
+    );
     // The bed is untouched by the refusal: still at the clashing changeset.
     assert_eq!(current_cs(&w.garden), clashing);
 
@@ -579,7 +642,11 @@ async fn harvest_fast_forwards_and_losers_get_the_recipe() {
     assert_eq!(code, 0, "harvest: {stderr}\n{out}");
     assert!(out.contains("harvested"), "out: {out}");
     assert_eq!(w.repo.get_ref("main").expect("get_ref"), Some(sown));
-    assert_eq!(current_cs(&w.garden), sown, "harvesting does not move the bed");
+    assert_eq!(
+        current_cs(&w.garden),
+        sown,
+        "harvesting does not move the bed"
+    );
 
     // The second bed (still at the old tip) sows a sibling changeset; its
     // harvest is no longer a fast-forward of `main` and is refused with
@@ -640,10 +707,7 @@ async fn sixteen_concurrent_harvests_exactly_one_wins() {
         if code == 0 {
             winners += 1;
         } else {
-            loser_messages.push((
-                i,
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            ));
+            loser_messages.push((i, String::from_utf8_lossy(&out.stderr).into_owned()));
         }
     }
     assert_eq!(winners, 1, "exactly one harvester wins the CAS");
@@ -654,7 +718,11 @@ async fn sixteen_concurrent_harvests_exactly_one_wins() {
     }
 
     // The ref points at the winner's changeset — one of the sixteen.
-    let main = w.repo.get_ref("main").expect("get_ref").expect("main exists");
+    let main = w
+        .repo
+        .get_ref("main")
+        .expect("get_ref")
+        .expect("main exists");
     assert!(sown.contains(&main), "main is one of the sown changesets");
     assert_ne!(main, base);
 
@@ -722,18 +790,20 @@ async fn chaos_killed_harvests_leave_a_consistent_ref() {
             results.push(Some(out.status.code().unwrap_or(-1)));
         }
     }
-    let survivor_wins = results
-        .iter()
-        .filter(|r| matches!(r, Some(0)))
-        .count();
+    let survivor_wins = results.iter().filter(|r| matches!(r, Some(0))).count();
     assert!(survivor_wins <= 1, "at most one survivor can have won");
 
     // Whatever happened, main is the base or exactly one candidate — and a
     // real changeset (a torn CAS would point at nothing valid).
     let main = w.repo.get_ref("main").expect("get_ref");
     if let Some(m) = main {
-        assert!(m == base || sown.contains(&m), "main is a candidate or the base");
-        w.repo.get_changeset(m).expect("main names a real changeset");
+        assert!(
+            m == base || sown.contains(&m),
+            "main is a candidate or the base"
+        );
+        w.repo
+            .get_changeset(m)
+            .expect("main names a real changeset");
     }
 
     // Round 2, sequential: exactly one bed wins the (possibly fresh) ref
@@ -745,8 +815,15 @@ async fn chaos_killed_harvests_leave_a_consistent_ref() {
             round2_winners += 1;
         }
     }
-    assert_eq!(round2_winners, 1, "exactly one winner in the follow-up round");
-    let main = w.repo.get_ref("main").expect("get_ref").expect("main exists");
+    assert_eq!(
+        round2_winners, 1,
+        "exactly one winner in the follow-up round"
+    );
+    let main = w
+        .repo
+        .get_ref("main")
+        .expect("get_ref")
+        .expect("main exists");
     assert!(sown.contains(&main));
 
     w.server.shutdown().await;
@@ -789,7 +866,11 @@ async fn sow_killed_between_upload_and_commit_retries_uploading_once() {
     let _ = child.wait().await;
 
     // The local bed state never moved (it only moves after success).
-    assert_eq!(current_cs(&w.garden), w.head, "config untouched by the crash");
+    assert_eq!(
+        current_cs(&w.garden),
+        w.head,
+        "config untouched by the crash"
+    );
 
     // Re-sow: succeeds, and the heavy blob went over the wire exactly once
     // in total — the retry must trust the cache, never re-upload.
@@ -808,7 +889,11 @@ async fn sow_killed_between_upload_and_commit_retries_uploading_once() {
 
     // The blob is really there, and the plot is clean.
     let blob = blob_id(&heavy);
-    let stored = w.repo.get_blob(blob).expect("get_blob").expect("blob exists");
+    let stored = w
+        .repo
+        .get_blob(blob)
+        .expect("get_blob")
+        .expect("blob exists");
     assert_eq!(stored, heavy);
     let (code, out, stderr) = bed(&w.garden, &["status"]);
     assert_eq!(code, 0, "status: {stderr}");
@@ -833,7 +918,10 @@ async fn heavy_blobs_upload_first_and_never_twice() {
     let (code, out, stderr) = bed(&w.garden, &["sow", "-m", "bring the bulk"]);
     assert_eq!(code, 0, "{stderr}\n{out}");
     // The outcome spells out the two-phase split.
-    assert!(out.contains("1 heavy blob(s) went over the wire first"), "out: {out}");
+    assert!(
+        out.contains("1 heavy blob(s) went over the wire first"),
+        "out: {out}"
+    );
     assert!(out.contains(" rode inline"), "out: {out}");
     let after = client.get_stats(REPO).await.expect("get_stats");
     assert_eq!(
@@ -846,7 +934,11 @@ async fn heavy_blobs_upload_first_and_never_twice() {
     // a second sow of it (e.g. after a goto away and back) uploads nothing.
     // Here: sow a different file, then verify the counter stayed put.
     let before = after;
-    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n bulky again\n").unwrap();
+    fs::write(
+        w.garden.join("docs/readme.md"),
+        b"# hello\n\n bulky again\n",
+    )
+    .unwrap();
     let (code, _, stderr) = bed(&w.garden, &["sow", "-m", "no bulk this time"]);
     assert_eq!(code, 0, "{stderr}");
     let after = client.get_stats(REPO).await.expect("get_stats");

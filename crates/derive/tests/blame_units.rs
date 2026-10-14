@@ -13,9 +13,11 @@ mod common;
 use std::sync::Arc;
 
 use common::ingest;
-use gardenbed_derive::{Engine, DERIVED_PATHSUMMARY, BLOOM_BITS, MAX_SUMMARY_PATHS};
-use gardenbed_harness::{generate, git_blame_first_parent, materialize, GenOptions, GeneratedHistory};
-use gardenbed_model::{blob_id, Change, Changeset, Id, Identity, Mode, Op};
+use gardenbed_derive::{BLOOM_BITS, DERIVED_PATHSUMMARY, Engine, MAX_SUMMARY_PATHS};
+use gardenbed_harness::{
+    GenOptions, GeneratedHistory, generate, git_blame_first_parent, materialize,
+};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_store::{MemoryStore, MetadataStore, ObjectStore, StoreError};
 
 // ------------------------------------------------------------- builder
@@ -123,7 +125,14 @@ impl Hist {
     }
 
     fn add(&mut self, path: &str, content: &[u8]) -> Change {
-        chg(&mut self.blobs, path, Op::Add, Some(content), None, Mode::Regular)
+        chg(
+            &mut self.blobs,
+            path,
+            Op::Add,
+            Some(content),
+            None,
+            Mode::Regular,
+        )
     }
 
     fn add_mode(&mut self, path: &str, content: &[u8], mode: Mode) -> Change {
@@ -131,7 +140,14 @@ impl Hist {
     }
 
     fn modify(&mut self, path: &str, content: &[u8]) -> Change {
-        chg(&mut self.blobs, path, Op::Modify, Some(content), None, Mode::Regular)
+        chg(
+            &mut self.blobs,
+            path,
+            Op::Modify,
+            Some(content),
+            None,
+            Mode::Regular,
+        )
     }
 
     fn delete(&mut self, path: &str) -> Change {
@@ -140,7 +156,14 @@ impl Hist {
 
     /// Pure rename (the blob must equal the source's blob).
     fn rename(&mut self, src: &str, dst: &str, content: &[u8]) -> Change {
-        chg(&mut self.blobs, dst, Op::Rename, Some(content), Some(src), Mode::Regular)
+        chg(
+            &mut self.blobs,
+            dst,
+            Op::Rename,
+            Some(content),
+            Some(src),
+            Mode::Regular,
+        )
     }
 
     fn finish(self) -> GeneratedHistory {
@@ -180,10 +203,7 @@ fn blame_ok(engine: &Engine, cs: Id, path: &str) -> Vec<(u64, u64, Id)> {
 }
 
 /// Maps engine ranges onto git ranges via the changeset→sha mapping.
-fn to_git_norm(
-    ranges: &[(u64, u64, Id)],
-    mapping: &[(Id, String)],
-) -> Vec<(u64, u64, String)> {
+fn to_git_norm(ranges: &[(u64, u64, Id)], mapping: &[(Id, String)]) -> Vec<(u64, u64, String)> {
     ranges
         .iter()
         .map(|(lo, hi, id)| {
@@ -213,7 +233,9 @@ fn git_norm(ranges: &[gardenbed_harness::BlameRange]) -> Vec<(u64, u64, String)>
 fn rename_chain_across_merge() {
     let mut h = Hist::new();
     let c0 = h.commit_with(vec![], "root", |h| vec![h.add("a.txt", b"l1\nl2\nl3\n")]);
-    let c1 = h.commit_with(vec![c0], "append l4", |h| vec![h.modify("a.txt", b"l1\nl2\nl3\nl4\n")]);
+    let c1 = h.commit_with(vec![c0], "append l4", |h| {
+        vec![h.modify("a.txt", b"l1\nl2\nl3\nl4\n")]
+    });
     let c2 = h.commit_with(vec![c1], "rename to b.txt", |h| {
         vec![h.rename("a.txt", "b.txt", b"l1\nl2\nl3\nl4\n")]
     });
@@ -233,14 +255,21 @@ fn rename_chain_across_merge() {
     // At the end of the chain: every line traced to its introducer.
     let want = vec![(1, 3, c0), (4, 4, c1), (5, 5, c4), (6, 6, c5)];
     assert_eq!(blame_ok(&engine, c5, "d/c.txt"), want, "full chain blame");
-    assert_eq!(engine.blame_no_skip(c5, "d/c.txt").unwrap(), want, "naive equal");
+    assert_eq!(
+        engine.blame_no_skip(c5, "d/c.txt").unwrap(),
+        want,
+        "naive equal"
+    );
     // Mid-chain: the merge is a head; its own append attributes to it.
     assert_eq!(
         blame_ok(&engine, c4, "d/c.txt"),
         vec![(1, 3, c0), (4, 4, c1), (5, 5, c4)]
     );
     // Pure renames carry attribution through untouched.
-    assert_eq!(blame_ok(&engine, c3, "d/c.txt"), vec![(1, 3, c0), (4, 4, c1)]);
+    assert_eq!(
+        blame_ok(&engine, c3, "d/c.txt"),
+        vec![(1, 3, c0), (4, 4, c1)]
+    );
     assert_eq!(blame_ok(&engine, c2, "b.txt"), vec![(1, 3, c0), (4, 4, c1)]);
     assert_eq!(blame_ok(&engine, c1, "a.txt"), vec![(1, 3, c0), (4, 4, c1)]);
     assert_eq!(blame_ok(&engine, c0, "a.txt"), vec![(1, 3, c0)]);
@@ -252,8 +281,14 @@ fn rename_chain_across_merge() {
     assert_eq!(e2.head_dist, 2);
     assert_eq!(e2.first_parent, Some(c1));
     // Rename sources and destinations both count as touched.
-    assert!(e2.bloom_maybe_contains("a.txt"), "rename src must be in the bloom");
-    assert!(e2.bloom_maybe_contains("b.txt"), "rename dst must be in the bloom");
+    assert!(
+        e2.bloom_maybe_contains("a.txt"),
+        "rename src must be in the bloom"
+    );
+    assert!(
+        e2.bloom_maybe_contains("b.txt"),
+        "rename dst must be in the bloom"
+    );
     assert!(!e2.bloom_maybe_contains("zzz/none.txt"));
     let e4 = engine.pathsummary_entry(c4).unwrap();
     assert!(e4.is_head);
@@ -279,7 +314,9 @@ fn rename_onto_occupied_path_matches_git() {
     let c1 = h.commit_with(vec![c0], "rename onto y.txt", |h| {
         vec![h.rename("x.txt", "y.txt", b"old1\nold2\n")]
     });
-    let c2 = h.commit_with(vec![c1], "append", |h| vec![h.modify("y.txt", b"old1\nold2\nold3\n")]);
+    let c2 = h.commit_with(vec![c1], "append", |h| {
+        vec![h.modify("y.txt", b"old1\nold2\nold3\n")]
+    });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
     let mat = materialize(&hh, dir.path()).expect("materialize");
@@ -289,20 +326,27 @@ fn rename_onto_occupied_path_matches_git() {
     let want = vec![(1, 2, c1)];
     assert_eq!(blame_ok(&engine, c1, "y.txt"), want);
     assert_eq!(engine.blame_no_skip(c1, "y.txt").unwrap(), want);
-    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "y.txt")
-        .expect("git blames");
-    assert_eq!(to_git_norm(&want, &mat.mapping), git_norm(&git), "git agrees");
+    let git =
+        git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "y.txt").expect("git blames");
+    assert_eq!(
+        to_git_norm(&want, &mat.mapping),
+        git_norm(&git),
+        "git agrees"
+    );
 
     // After the append: old lines → c1, the append → c2.
     let want2 = vec![(1, 2, c1), (3, 3, c2)];
     assert_eq!(blame_ok(&engine, c2, "y.txt"), want2);
     assert_eq!(engine.blame_no_skip(c2, "y.txt").unwrap(), want2);
-    let git2 = git_blame_first_parent(&mat.repo_path, &mat.mapping[2].1, "y.txt")
-        .expect("git blames");
+    let git2 =
+        git_blame_first_parent(&mat.repo_path, &mat.mapping[2].1, "y.txt").expect("git blames");
     assert_eq!(to_git_norm(&want2, &mat.mapping), git_norm(&git2));
 
     // The renamed-away source no longer exists: both sides fail.
-    assert!(matches!(engine.blame(c1, "x.txt"), Err(StoreError::NotFound)));
+    assert!(matches!(
+        engine.blame(c1, "x.txt"),
+        Err(StoreError::NotFound)
+    ));
     assert!(git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "x.txt").is_err());
 }
 
@@ -313,7 +357,9 @@ fn deleted_then_readded_blames_current_lineage() {
     let mut h = Hist::new();
     let c0 = h.commit_with(vec![], "root", |h| vec![h.add("f.txt", b"a\nb\n")]);
     let c1 = h.commit_with(vec![c0], "delete", |h| vec![h.delete("f.txt")]);
-    let c2 = h.commit_with(vec![c1], "re-add same content", |h| vec![h.add("f.txt", b"a\nb\n")]);
+    let c2 = h.commit_with(vec![c1], "re-add same content", |h| {
+        vec![h.add("f.txt", b"a\nb\n")]
+    });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
     let mat = materialize(&hh, dir.path()).expect("materialize");
@@ -322,12 +368,15 @@ fn deleted_then_readded_blames_current_lineage() {
     let want = vec![(1, 2, c2)];
     assert_eq!(blame_ok(&engine, c2, "f.txt"), want);
     assert_eq!(engine.blame_no_skip(c2, "f.txt").unwrap(), want);
-    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[2].1, "f.txt")
-        .expect("git blames");
+    let git =
+        git_blame_first_parent(&mat.repo_path, &mat.mapping[2].1, "f.txt").expect("git blames");
     assert_eq!(to_git_norm(&want, &mat.mapping), git_norm(&git));
 
     // At the delete changeset the path is gone: NotFound here, git error.
-    assert!(matches!(engine.blame(c1, "f.txt"), Err(StoreError::NotFound)));
+    assert!(matches!(
+        engine.blame(c1, "f.txt"),
+        Err(StoreError::NotFound)
+    ));
     assert!(git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "f.txt").is_err());
 }
 
@@ -336,15 +385,16 @@ fn deleted_then_readded_blames_current_lineage() {
 #[test]
 fn empty_file_yields_no_ranges_and_git_agrees() {
     let mut h = Hist::new();
-    let c0 = h.commit_with(vec![], "root", |h| vec![h.add("e.txt", b""), h.add("f.txt", b"x\n")]);
+    let c0 = h.commit_with(vec![], "root", |h| {
+        vec![h.add("e.txt", b""), h.add("f.txt", b"x\n")]
+    });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
     let mat = materialize(&hh, dir.path()).expect("materialize");
     let (_ids, engine, _) = setup(&hh, true);
     assert_eq!(blame_ok(&engine, c0, "e.txt"), Vec::new());
     assert_eq!(engine.blame_no_skip(c0, "e.txt").unwrap(), Vec::new());
-    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[0].1, "e.txt")
-        .expect("git runs");
+    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[0].1, "e.txt").expect("git runs");
     assert!(git.is_empty(), "git prints nothing for an empty file");
     // Sanity: a non-empty sibling still blames.
     assert_eq!(blame_ok(&engine, c0, "f.txt"), vec![(1, 1, c0)]);
@@ -353,9 +403,18 @@ fn empty_file_yields_no_ranges_and_git_agrees() {
 #[test]
 fn symlink_blames_its_target_line_like_git() {
     let mut h = Hist::new();
-    let c0 = h.commit_with(vec![], "root", |h| vec![h.add_mode("lnk", b"target-v1", Mode::Symlink)]);
+    let c0 = h.commit_with(vec![], "root", |h| {
+        vec![h.add_mode("lnk", b"target-v1", Mode::Symlink)]
+    });
     let c1 = h.commit_with(vec![c0], "retarget", |h| {
-        vec![chg(&mut h.blobs, "lnk", Op::Modify, Some(b"target-v2"), None, Mode::Symlink)]
+        vec![chg(
+            &mut h.blobs,
+            "lnk",
+            Op::Modify,
+            Some(b"target-v2"),
+            None,
+            Mode::Symlink,
+        )]
     });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -408,8 +467,11 @@ fn directory_and_missing_paths_are_not_found() {
     let hh = h.finish();
     let (_ids, engine, _) = setup(&hh, true);
     assert!(matches!(engine.blame(c0, "d"), Err(StoreError::NotFound)));
-    assert!(matches!(engine.blame(c0, "d/x.txt"), Ok(_)));
-    assert!(matches!(engine.blame(c0, "nope.txt"), Err(StoreError::NotFound)));
+    assert!(engine.blame(c0, "d/x.txt").is_ok());
+    assert!(matches!(
+        engine.blame(c0, "nope.txt"),
+        Err(StoreError::NotFound)
+    ));
     assert!(matches!(engine.blame(c0, ""), Err(StoreError::Invalid(_))));
 }
 
@@ -419,7 +481,9 @@ fn directory_and_missing_paths_are_not_found() {
 fn crlf_lines_pair_like_git() {
     let mut h = Hist::new();
     let c0 = h.commit_with(vec![], "root", |h| vec![h.add("c.txt", b"a\r\nb\r\n")]);
-    let c1 = h.commit_with(vec![c0], "insert B", |h| vec![h.modify("c.txt", b"a\r\nB\r\nb\r\n")]);
+    let c1 = h.commit_with(vec![c0], "insert B", |h| {
+        vec![h.modify("c.txt", b"a\r\nB\r\nb\r\n")]
+    });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
     let mat = materialize(&hh, dir.path()).expect("materialize");
@@ -428,8 +492,8 @@ fn crlf_lines_pair_like_git() {
     let want = vec![(1, 1, c0), (2, 2, c1), (3, 3, c0)];
     assert_eq!(blame_ok(&engine, c1, "c.txt"), want);
     assert_eq!(engine.blame_no_skip(c1, "c.txt").unwrap(), want);
-    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "c.txt")
-        .expect("git blames");
+    let git =
+        git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "c.txt").expect("git blames");
     assert_eq!(to_git_norm(&want, &mat.mapping), git_norm(&git));
 }
 
@@ -440,7 +504,9 @@ fn missing_trailing_newline_blames_like_git() {
     // unterminated last record is a DIFFERENT record from the terminated
     // one (git semantics), so line 2 re-attributes.
     let c0 = h.commit_with(vec![], "root", |h| vec![h.add("f.txt", b"a\nb")]);
-    let c1 = h.commit_with(vec![c0], "append c", |h| vec![h.modify("f.txt", b"a\nb\nc")]);
+    let c1 = h.commit_with(vec![c0], "append c", |h| {
+        vec![h.modify("f.txt", b"a\nb\nc")]
+    });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
     let mat = materialize(&hh, dir.path()).expect("materialize");
@@ -448,8 +514,8 @@ fn missing_trailing_newline_blames_like_git() {
 
     let got = blame_ok(&engine, c1, "f.txt");
     assert_eq!(engine.blame_no_skip(c1, "f.txt").unwrap(), got);
-    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "f.txt")
-        .expect("git blames");
+    let git =
+        git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "f.txt").expect("git blames");
     assert_eq!(to_git_norm(&got, &mat.mapping), git_norm(&git));
 }
 
@@ -460,7 +526,14 @@ fn mode_only_change_inherits_all_lines_like_git() {
     let c0 = h.commit_with(vec![], "root", |h| vec![h.add("s.sh", content)]);
     // Mode-only modify: same blob id, mode flips Regular → Exec.
     let c1 = h.commit_with(vec![c0], "chmod +x", |h| {
-        vec![chg(&mut h.blobs, "s.sh", Op::Modify, Some(content), None, Mode::Exec)]
+        vec![chg(
+            &mut h.blobs,
+            "s.sh",
+            Op::Modify,
+            Some(content),
+            None,
+            Mode::Exec,
+        )]
     });
     let hh = h.finish();
     let dir = tempfile::tempdir().expect("tempdir");
@@ -468,10 +541,14 @@ fn mode_only_change_inherits_all_lines_like_git() {
     let (_ids, engine, _) = setup(&hh, true);
 
     let want = vec![(1, 3, c0)];
-    assert_eq!(blame_ok(&engine, c1, "s.sh"), want, "mode-only change inherits 1:1");
+    assert_eq!(
+        blame_ok(&engine, c1, "s.sh"),
+        want,
+        "mode-only change inherits 1:1"
+    );
     assert_eq!(engine.blame_no_skip(c1, "s.sh").unwrap(), want);
-    let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "s.sh")
-        .expect("git blames");
+    let git =
+        git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "s.sh").expect("git blames");
     assert_eq!(to_git_norm(&want, &mat.mapping), git_norm(&git));
 }
 
@@ -481,21 +558,41 @@ fn mode_only_change_inherits_all_lines_like_git() {
 /// (git 2.43). The root adds `old`, the change commit rewrites to `new`;
 /// the expectation lists which lines attribute to the root (0) vs the
 /// change (1).
+/// One captured ambiguity shape: (name, old bytes, new bytes, expected
+/// attribution — `(line, line, owner)` triples, owner 0 = root, 1 = the
+/// change commit).
+type AmbiguityCase<'a> = (&'a str, &'a [u8], &'a [u8], &'a [(u64, u64, u8)]);
+
 #[test]
 fn diff_ambiguity_cases_match_git_and_captured_shapes() {
-    let cases: &[(&str, &[u8], &[u8], &[(u64, u64, u8)])] = &[
+    let cases: &[AmbiguityCase] = &[
         // swap: old2↔new1 pair; the new "a" is the added line.
         ("swap", b"a\nb\n", b"b\na\n", &[(1, 1, 0), (2, 2, 1)]),
         // move-around: x slides up (old2↔new1, old3↔new3); "a" re-adds.
-        ("move", b"a\nx\nb\n", b"x\na\nb\n", &[(1, 1, 0), (2, 2, 1), (3, 3, 0)]),
+        (
+            "move",
+            b"a\nx\nb\n",
+            b"x\na\nb\n",
+            &[(1, 1, 0), (2, 2, 1), (3, 3, 0)],
+        ),
         // shift: keeping a,b (edit script of 1 add + 1 del) is strictly
         // smaller than keeping c, so git adds the leading c and a,b stay
         // with the root. (git 2.43 live capture.)
         ("shift", b"a\nb\nc\n", b"c\na\nb\n", &[(1, 1, 1), (2, 3, 0)]),
         // dup: old1↔new1 (a), old3↔new2 (b); the second a is added.
         ("dup", b"a\na\nb\n", b"a\nb\na\n", &[(1, 2, 0), (3, 3, 1)]),
-        ("insmid", b"a\nb\nc\nd\n", b"a\nX\nb\nc\nd\n", &[(1, 1, 0), (2, 2, 1), (3, 5, 0)]),
-        ("dupins", b"a\nb\n", b"a\na\nb\n", &[(1, 1, 0), (2, 2, 1), (3, 3, 0)]),
+        (
+            "insmid",
+            b"a\nb\nc\nd\n",
+            b"a\nX\nb\nc\nd\n",
+            &[(1, 1, 0), (2, 2, 1), (3, 5, 0)],
+        ),
+        (
+            "dupins",
+            b"a\nb\n",
+            b"a\na\nb\n",
+            &[(1, 1, 0), (2, 2, 1), (3, 3, 0)],
+        ),
     ];
     for (name, old, new, expect) in cases {
         let mut h = Hist::new();
@@ -510,11 +607,23 @@ fn diff_ambiguity_cases_match_git_and_captured_shapes() {
             .iter()
             .map(|&(lo, hi, side)| (lo, hi, if side == 0 { c0 } else { c1 }))
             .collect();
-        assert_eq!(blame_ok(&engine, c1, "f.txt"), want, "{name}: captured shape");
-        assert_eq!(engine.blame_no_skip(c1, "f.txt").unwrap(), want, "{name}: naive equal");
+        assert_eq!(
+            blame_ok(&engine, c1, "f.txt"),
+            want,
+            "{name}: captured shape"
+        );
+        assert_eq!(
+            engine.blame_no_skip(c1, "f.txt").unwrap(),
+            want,
+            "{name}: naive equal"
+        );
         let git = git_blame_first_parent(&mat.repo_path, &mat.mapping[1].1, "f.txt")
             .unwrap_or_else(|e| panic!("{name}: git oracle: {e}"));
-        assert_eq!(to_git_norm(&want, &mat.mapping), git_norm(&git), "{name}: git agrees");
+        assert_eq!(
+            to_git_norm(&want, &mat.mapping),
+            git_norm(&git),
+            "{name}: git agrees"
+        );
     }
 }
 
@@ -545,18 +654,33 @@ fn long_sparse_chain_skip_equals_naive() {
     assert_eq!(ids, ids2, "ingest order matches construction");
 
     let want = vec![(1, 1, c0), (2, 2, last)];
-    assert_eq!(blame_ok(&engine, last, "log.txt"), want, "skip walk attributes correctly");
-    assert_eq!(engine.blame_no_skip(last, "log.txt").unwrap(), want, "naive agrees");
+    assert_eq!(
+        blame_ok(&engine, last, "log.txt"),
+        want,
+        "skip walk attributes correctly"
+    );
+    assert_eq!(
+        engine.blame_no_skip(last, "log.txt").unwrap(),
+        want,
+        "naive agrees"
+    );
 
     // The whole chain is one segment below the root head; the tip's bloom
     // names its own touch (log.txt), but the member just below the tip
     // covers (root, member] — no log.txt touch — and proves the skip.
     let tip = engine.pathsummary_entry(last).unwrap();
-    assert!(tip.bloom_maybe_contains("log.txt"), "tip touched log.txt itself");
+    assert!(
+        tip.bloom_maybe_contains("log.txt"),
+        "tip touched log.txt itself"
+    );
     let below = engine.pathsummary_entry(ids[ids.len() - 2]).unwrap();
     assert!(!below.is_head);
     assert_eq!(below.head, Some(c0));
-    assert!(below.head_dist > 100, "chain must be deep, got {}", below.head_dist);
+    assert!(
+        below.head_dist > 100,
+        "chain must be deep, got {}",
+        below.head_dist
+    );
     assert!(
         !below.bloom_maybe_contains("log.txt"),
         "log.txt must be provably absent from the mid-chain segment bloom"
@@ -579,7 +703,9 @@ fn pathsummary_overflow_keeps_bloom_sound() {
     }
     let c0 = h.commit(vec![], adds, "root with 300 files");
     // Second changeset modifies one file; its segment bloom covers just it.
-    let c1 = h.commit_with(vec![c0], "touch one", |h| vec![h.modify("p123.txt", b"changed\n")]);
+    let c1 = h.commit_with(vec![c0], "touch one", |h| {
+        vec![h.modify("p123.txt", b"changed\n")]
+    });
     let hh = h.finish();
     let (_ids, engine, _) = setup(&hh, true);
 
@@ -591,7 +717,10 @@ fn pathsummary_overflow_keeps_bloom_sound() {
     all.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
     assert_eq!(&e0.paths[..], &all[..MAX_SUMMARY_PATHS]);
     assert!(e0.is_head, "root is a head");
-    assert!(e0.bloom.iter().all(|&b| b == 0), "heads carry an all-zero bloom");
+    assert!(
+        e0.bloom.iter().all(|&b| b == 0),
+        "heads carry an all-zero bloom"
+    );
     // A truncated head's list cannot prove absence, so blame must (and
     // does) read the changeset instead — exercised by blaming a path
     // beyond the cap:
@@ -637,12 +766,17 @@ fn pathsummary_rebuild_bytes_identical_and_poison_resistant() {
             .derived_get(DERIVED_PATHSUMMARY, *cs)
             .expect("read A")
             .expect("eagerly written");
-        let summary = engine_b.pathsummary_entry(*cs).expect("B computes on demand");
+        let summary = engine_b
+            .pathsummary_entry(*cs)
+            .expect("B computes on demand");
         let bytes_b = metadata_b
             .derived_get(DERIVED_PATHSUMMARY, *cs)
             .expect("read B")
             .expect("persisted after compute");
-        assert_eq!(bytes_a, bytes_b, "recomputed entry must be byte-identical at cs {i}");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "recomputed entry must be byte-identical at cs {i}"
+        );
         // Structural invariants of the decoded summary.
         assert_eq!(summary.bloom.len(), BLOOM_BITS / 8);
         if summary.is_head {
@@ -652,7 +786,10 @@ fn pathsummary_rebuild_bytes_identical_and_poison_resistant() {
         } else {
             assert!(summary.head.is_some());
             assert!(summary.head_dist >= 1);
-            assert_eq!(summary.first_parent, h.changesets[i].parents.first().copied());
+            assert_eq!(
+                summary.first_parent,
+                h.changesets[i].parents.first().copied()
+            );
         }
         // Paths deduped and ascending.
         let mut sorted = summary.paths.clone();
@@ -666,9 +803,15 @@ fn pathsummary_rebuild_bytes_identical_and_poison_resistant() {
     // entry recomputes to the correct value.
     let victim = ids[3];
     metadata_b
-        .derived_put(DERIVED_PATHSUMMARY, victim, b"\xff\xfe garbage not a payload")
+        .derived_put(
+            DERIVED_PATHSUMMARY,
+            victim,
+            b"\xff\xfe garbage not a payload",
+        )
         .expect("poison");
-    let rep = engine_b.pathsummary_entry(victim).expect("recompute after poisoning");
+    let rep = engine_b
+        .pathsummary_entry(victim)
+        .expect("recompute after poisoning");
     let bytes_a = metadata_a
         .derived_get(DERIVED_PATHSUMMARY, victim)
         .expect("read A")
@@ -677,6 +820,9 @@ fn pathsummary_rebuild_bytes_identical_and_poison_resistant() {
         .derived_get(DERIVED_PATHSUMMARY, victim)
         .expect("read B")
         .expect("rewritten");
-    assert_eq!(bytes_a, bytes_c, "poisoned entry must be replaced by the true bytes");
+    assert_eq!(
+        bytes_a, bytes_c,
+        "poisoned entry must be replaced by the true bytes"
+    );
     assert_eq!(rep, engine_a.pathsummary_entry(victim).expect("A entry"));
 }

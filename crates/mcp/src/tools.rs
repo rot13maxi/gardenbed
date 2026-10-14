@@ -148,7 +148,10 @@ pub fn extract_call(params: &serde_json::Value) -> Result<(String, serde_json::V
     let Some(name) = name.as_str() else {
         return Err("tools/call's \"name\" must be a string".into());
     };
-    let args = params.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
     if !args.is_object() {
         return Err("tools/call's \"arguments\" must be an object".into());
     }
@@ -187,9 +190,8 @@ fn resolve_cs(repo: &Repo, cs: Option<&str>) -> Result<Id, String> {
                 return Err("cs is empty — give a 64-hex changeset id or a ref name".into());
             }
             if spec.len() == 64 {
-                return Id::from_str(spec).map_err(|_| {
-                    format!("cs is 64 characters but not valid hex: {spec:?}")
-                });
+                return Id::from_str(spec)
+                    .map_err(|_| format!("cs is 64 characters but not valid hex: {spec:?}"));
             }
             repo.get_ref(spec)
                 .map_err(err_text)?
@@ -308,7 +310,12 @@ pub fn tool_log(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
 /// message indentation byte-match `gardenbed_bed::render::render_log_entry`
 /// for the same author/message; that format is pinned by the M7 parity
 /// tests — replicated here so the MCP server does not link the CLI crate).
-pub fn render_log_entry(id: Id, author: &gardenbed_model::Identity, message: &str, out: &mut String) {
+pub fn render_log_entry(
+    id: Id,
+    author: &gardenbed_model::Identity,
+    message: &str,
+    out: &mut String,
+) {
     out.push_str(&id.to_hex());
     out.push_str("  ");
     out.push_str(&author.name);
@@ -435,11 +442,11 @@ pub fn tool_diff(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
         out.push(letter);
         out.push(' ');
         out.push_str(&c.path);
-        if c.op == Op::Rename {
-            if let Some(src) = &c.src_path {
-                out.push_str(" from ");
-                out.push_str(src);
-            }
+        if c.op == Op::Rename
+            && let Some(src) = &c.src_path
+        {
+            out.push_str(" from ");
+            out.push_str(src);
         }
         out.push('\n');
     }
@@ -530,8 +537,7 @@ pub fn tool_file(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
         // 20-byte git SHA-1 (canonical spec §3). The upstream commit is
         // what an agent wants to know.
         let blob = entry.blob.expect("gitlink entries carry their pointer");
-        let sha = blob
-            .as_bytes()[12..]
+        let sha = blob.as_bytes()[12..]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>();
@@ -551,7 +557,7 @@ pub fn tool_file(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
             return ToolOutcome::error(format!(
                 "blob {} is referenced but missing from loam",
                 blob.to_hex()
-            ))
+            ));
         }
         Err(e) => return ToolOutcome::error(err_text(e)),
     };

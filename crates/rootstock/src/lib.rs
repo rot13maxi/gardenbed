@@ -89,20 +89,23 @@
 
 mod commit;
 mod counting;
-mod difftree;
+// `difftree` and `oid` are public for the fuzz target
+// (`fuzz/fuzz_targets/fuzz_difftree_parse.rs`), which feeds random bytes to
+// the batch parser; they are not part of the stabilized surface.
+pub mod difftree;
 mod error;
 mod export;
 mod graph;
 mod gtree;
 mod import;
-mod oid;
+pub mod oid;
 mod options;
 mod report;
 mod resolve;
 mod transform;
 
 pub use error::{ExportError, ImportError};
-pub use export::{export_to_path, ExportOptions, ExportReport};
+pub use export::{ExportOptions, ExportReport, export_to_path};
 pub use import::import_from_path;
 pub use options::ImportOptions;
 pub use report::ImportReport;

@@ -1,7 +1,7 @@
 //! Log oracle: structure of `git_log` matches the changeset history —
 //! order, parent counts, spine lineage, identities, messages, limits.
 
-use gardenbed_harness::{generate, git_log, materialize, GenOptions};
+use gardenbed_harness::{GenOptions, generate, git_log, materialize};
 
 fn opts() -> GenOptions {
     GenOptions {
@@ -34,7 +34,11 @@ fn log_matches_changeset_order_and_structure() {
         let idx = history.changesets.len() - 1 - k;
         let cs = &history.changesets[idx];
         assert_eq!(entry.sha, mat.mapping[idx].1, "position {k}");
-        assert_eq!(entry.parents.len(), cs.parents.len(), "cs {idx} parent count");
+        assert_eq!(
+            entry.parents.len(),
+            cs.parents.len(),
+            "cs {idx} parent count"
+        );
         // Spine: parent[0] is the previous changeset's commit.
         if idx > 0 {
             assert_eq!(entry.parents[0], mat.mapping[idx - 1].1);

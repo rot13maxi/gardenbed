@@ -43,5 +43,10 @@ tonic = { version = "0.14.6", default-features = false, features = [
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
+# The chaos suite verifies object checksums and seedbed integrity offline
+# (same codec versions as the stores they inspect).
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 tempfile = "3"
 tokio-stream = "0.1"
+zstd = "0.13"

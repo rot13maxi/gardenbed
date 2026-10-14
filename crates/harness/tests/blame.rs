@@ -3,7 +3,7 @@
 //! ranges; empty files yield empty output.
 
 use gardenbed_harness::{
-    files_at, generate, git_blame_first_parent, materialize, BlameRange, GenOptions,
+    BlameRange, GenOptions, files_at, generate, git_blame_first_parent, materialize,
 };
 use gardenbed_model::Mode;
 
@@ -58,7 +58,10 @@ fn blame_ranges_tile_and_reference_mapped_commits() {
         mat.mapping.iter().map(|(_, s)| s).collect();
 
     let tip = files_at(&history, history.changesets.len() - 1);
-    assert!(tip.len() >= 5, "rename-heavy history should end non-trivial");
+    assert!(
+        tip.len() >= 5,
+        "rename-heavy history should end non-trivial"
+    );
 
     let mut blamed = 0;
     let mut empty_seen = false;
@@ -133,8 +136,8 @@ fn blame_attribution_follows_first_parent_through_renames() {
             continue;
         }
         let content = history.blob(&blob).expect("blob present");
-        let ranges = git_blame_first_parent(&mat.repo_path, head_sha, &path)
-            .expect("blame runs cleanly");
+        let ranges =
+            git_blame_first_parent(&mat.repo_path, head_sha, &path).expect("blame runs cleanly");
         let total = line_count(content) as u32;
         if total == 0 {
             assert!(ranges.is_empty());

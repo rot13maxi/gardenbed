@@ -70,25 +70,25 @@ pub async fn clone(
     }
 
     // ---- connection and resolution: still no local state ----
-    let client = GardenbedClient::connect(server).await.map_err(|e| {
-        BedError::Connect {
+    let client = GardenbedClient::connect(server)
+        .await
+        .map_err(|e| BedError::Connect {
             server: server.to_owned(),
             message: e.to_string(),
-        }
-    })?;
+        })?;
     let main = match client.get_ref(&repo, DEFAULT_REF).await {
         Ok(Some(id)) => id,
         Ok(None) => {
             return Err(BedError::MissingRef {
                 name: DEFAULT_REF.to_owned(),
-            })
+            });
         }
         Err(status) => {
             return Err(BedError::Rpc {
                 command: "clone",
                 code: status.code(),
                 message: status.message().to_owned(),
-            })
+            });
         }
     };
     // The ref must name a real changeset (a ref to nowhere is refused here,
@@ -103,7 +103,7 @@ pub async fn clone(
                 command: "clone",
                 code: status.code(),
                 message: status.message().to_owned(),
-            })
+            });
         }
     }
 
@@ -258,7 +258,7 @@ pub async fn file(
             return Err(BedError::FileNotAFile {
                 path: path.to_owned(),
                 cs: cs_id.short(),
-            })
+            });
         }
         TreeKind::File => {}
     }
@@ -270,9 +270,7 @@ pub async fn file(
     }
     // "Present exactly when kind == File" is the tree invariant; a missing
     // blob id would mean the arboretum handed us a malformed tree.
-    let blob = entry
-        .blob
-        .ok_or_else(|| BedError::BlobHashMismatch(cs_id))?;
+    let blob = entry.blob.ok_or(BedError::BlobHashMismatch(cs_id))?;
     let content = session.fetcher().blob(blob).await?;
     // Raw bytes, exactly — no trailing newline added. A closed pipe (e.g.
     // `bed file x | head -1`) is a graceful end, not an error.
@@ -313,14 +311,18 @@ pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError>
 
     // The replay is the arboretum's decision; conflicts come back as a
     // FAILED_PRECONDITION whose message lists every conflicting path.
-    let grafted = match session.client.graft(&bed.config().repo, current, parent).await {
+    let grafted = match session
+        .client
+        .graft(&bed.config().repo, current, parent)
+        .await
+    {
         Ok(id) => id,
         Err(status) => {
             return Err(BedError::Rpc {
                 command: "graft",
                 code: status.code(),
                 message: status.message().to_owned(),
-            })
+            });
         }
     };
 
@@ -443,7 +445,7 @@ pub async fn log(bed_dir: &Path, limit: Option<u32>, cs: Option<&str>) -> Result
     let session = Session::open(&bed).await?;
     let cs_id = resolve_target(&session, &bed, cs, "log").await?;
     let summaries = session.log(cs_id, limit.unwrap_or(0), "log").await?;
-    let entries: Vec<LogEntry> = summaries.iter().map(|s| log_entry_of(s)).collect();
+    let entries: Vec<LogEntry> = summaries.iter().map(log_entry_of).collect();
     Ok(render::render_log(&entries))
 }
 
@@ -451,9 +453,7 @@ pub async fn log(bed_dir: &Path, limit: Option<u32>, cs: Option<&str>) -> Result
 fn log_entry_of(summary: &ChangesetSummary) -> LogEntry {
     let author = summary.author.clone().unwrap_or_default();
     LogEntry {
-        id: Id::from_bytes(
-            summary.cs_id.as_slice().try_into().unwrap_or([0u8; 32]),
-        ),
+        id: Id::from_bytes(summary.cs_id.as_slice().try_into().unwrap_or([0u8; 32])),
         author_name: author.name,
         author_email: author.email,
         time_secs: author.time_secs,
@@ -498,8 +498,7 @@ pub async fn diff(bed_dir: &Path, a: Option<&str>, b: Option<&str>) -> Result<St
         }
         (None, Some(_)) => {
             return Err(BedError::ConfigInvalid(
-                "bed diff takes two changesets, or none for the current one vs its parent"
-                    .into(),
+                "bed diff takes two changesets, or none for the current one vs its parent".into(),
             ));
         }
         (None, None) => {
@@ -522,9 +521,7 @@ pub async fn diff(bed_dir: &Path, a: Option<&str>, b: Option<&str>) -> Result<St
     // local store, no async needed.
     let objects = bed.objects()?;
     let content_of = |id: Id| -> Result<Vec<u8>, BedError> {
-        objects
-            .get_blob(id)?
-            .ok_or_else(|| BedError::BlobHashMismatch(id))
+        objects.get_blob(id)?.ok_or(BedError::BlobHashMismatch(id))
     };
     render::render_diff(&entries, &content_of)
 }
@@ -552,9 +549,9 @@ async fn build_entries(
                     .blob_id
                     .as_deref()
                     .and_then(|b| <[u8; 32]>::try_from(b).ok().map(Id::from_bytes))
-                    .ok_or_else(|| BedError::BlobHashMismatch(newer))?;
-                let mode = mode_from_wire(change.mode)
-                    .map_err(|_| BedError::BlobHashMismatch(newer))?;
+                    .ok_or(BedError::BlobHashMismatch(newer))?;
+                let mode =
+                    mode_from_wire(change.mode).map_err(|_| BedError::BlobHashMismatch(newer))?;
                 if mode != Mode::Gitlink {
                     wanted.insert(blob);
                 }
@@ -568,14 +565,11 @@ async fn build_entries(
             gardenbed_model::Op::Add => None,
             _ => match session.locate_entry(older, &path, "diff").await? {
                 Some(e) if e.kind == TreeKind::File => {
-                    let blob = e.blob.ok_or_else(|| BedError::BlobHashMismatch(older))?;
+                    let blob = e.blob.ok_or(BedError::BlobHashMismatch(older))?;
                     if e.mode != Mode::Gitlink {
                         wanted.insert(blob);
                     }
-                    Some(render::DiffSide {
-                        blob,
-                        mode: e.mode,
-                    })
+                    Some(render::DiffSide { blob, mode: e.mode })
                 }
                 _ => None,
             },
@@ -635,7 +629,7 @@ pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<Strin
             return Err(BedError::FileNotAFile {
                 path: path.to_owned(),
                 cs: cs_id.short(),
-            })
+            });
         }
         TreeKind::File => {}
     }
@@ -647,9 +641,7 @@ pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<Strin
     }
 
     let ranges = session.blame(cs_id, path, "blame").await?;
-    let blob = entry
-        .blob
-        .ok_or_else(|| BedError::BlobHashMismatch(cs_id))?;
+    let blob = entry.blob.ok_or(BedError::BlobHashMismatch(cs_id))?;
     let content = session.fetcher().blob(blob).await?;
 
     // Identity lookups per attributed changeset, cached for this run.
@@ -661,7 +653,11 @@ pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<Strin
             Some(hit) => hit.clone(),
             None => {
                 let cs = session.get_changeset(id, "blame").await?;
-                let hit = (cs.author.name.clone(), cs.author.time_secs, cs.author.tz_min);
+                let hit = (
+                    cs.author.name.clone(),
+                    cs.author.time_secs,
+                    cs.author.tz_min,
+                );
                 authors.insert(id, hit.clone());
                 hit
             }

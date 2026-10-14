@@ -31,7 +31,7 @@ pub(crate) fn diff_trees(
 ) -> Result<Vec<gardenbed_model::Change>, StoreError> {
     let mut out = Vec::new();
     diff_dir(objects, a, b, "", &mut out, 0)?;
-    out.sort_by(|x, y| x.path.as_bytes().cmp(&y.path.as_bytes()));
+    out.sort_by(|x, y| x.path.as_bytes().cmp(y.path.as_bytes()));
     Ok(out)
 }
 
@@ -73,7 +73,7 @@ fn diff_dir(
             std::cmp::Ordering::Less => {
                 // Only in a: deleted (recursively, if a directory).
                 let e = ea.expect("Less implies Some");
-                push_deleted(objects, e, dir, out, depth)?;
+                push_deleted(objects, e, dir, out)?;
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
@@ -83,7 +83,10 @@ fn diff_dir(
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                let (x, y) = (ea.expect("Equal implies Some"), eb.expect("Equal implies Some"));
+                let (x, y) = (
+                    ea.expect("Equal implies Some"),
+                    eb.expect("Equal implies Some"),
+                );
                 match (x.kind, y.kind) {
                     (TreeKind::File, TreeKind::File) => {
                         if x.blob != y.blob || x.mode != y.mode {
@@ -98,23 +101,16 @@ fn diff_dir(
                     }
                     (TreeKind::Dir, TreeKind::Dir) => {
                         if x.tree != y.tree {
-                            diff_dir(
-                                objects,
-                                x.tree,
-                                y.tree,
-                                &join(dir, &x.name),
-                                out,
-                                depth + 1,
-                            )?;
+                            diff_dir(objects, x.tree, y.tree, &join(dir, &x.name), out, depth + 1)?;
                         }
                     }
                     // A file↔directory swap deletes one side and adds the other.
                     (TreeKind::File, TreeKind::Dir) => {
-                        push_deleted(objects, x, dir, out, depth)?;
+                        push_deleted(objects, x, dir, out)?;
                         push_added(objects, y, dir, out, depth)?;
                     }
                     (TreeKind::Dir, TreeKind::File) => {
-                        push_deleted(objects, x, dir, out, depth)?;
+                        push_deleted(objects, x, dir, out)?;
                         push_added(objects, y, dir, out, depth)?;
                     }
                 }
@@ -132,7 +128,6 @@ fn push_deleted(
     e: &gardenbed_model::TreeEntry,
     dir: &str,
     out: &mut Vec<gardenbed_model::Change>,
-    depth: usize,
 ) -> Result<(), StoreError> {
     let path = join(dir, &e.name);
     match e.kind {
@@ -148,7 +143,7 @@ fn push_deleted(
                 StoreError::Corrupt(format!("dir entry {:?} without a tree id", e.name))
             })?;
             for sub in Engine::load_tree(objects, id)?.entries {
-                push_deleted(objects, &sub, &path, out, depth + 1)?;
+                push_deleted(objects, &sub, &path, out)?;
             }
         }
     }

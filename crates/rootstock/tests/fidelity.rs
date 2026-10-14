@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{import, sweep, Fixture};
+use common::{Fixture, import, sweep};
 use gardenbed_harness::GenOptions;
 
 fn base_opts() -> GenOptions {
@@ -24,7 +24,10 @@ fn content_fidelity_three_seeded_histories() {
     for seed in [7u64, 4242, 918_273] {
         let fixture = Fixture::generate(seed, &base_opts());
         let report = import(&fixture.repo, &fixture.garden, &Default::default());
-        assert_eq!(report.commits_new as usize, fixture.history.changesets.len());
+        assert_eq!(
+            report.commits_new as usize,
+            fixture.history.changesets.len()
+        );
         assert_eq!(report.commits_skipped, 0);
         sweep(&fixture, &fixture.garden);
     }
@@ -48,7 +51,10 @@ fn content_fidelity_edge_case_content() {
     };
     let fixture = Fixture::generate(31337, &opts);
     let report = import(&fixture.repo, &fixture.garden, &Default::default());
-    assert_eq!(report.commits_new as usize, fixture.history.changesets.len());
+    assert_eq!(
+        report.commits_new as usize,
+        fixture.history.changesets.len()
+    );
     sweep(&fixture, &fixture.garden);
 }
 
@@ -65,6 +71,9 @@ fn content_fidelity_long_linear_history() {
     };
     let fixture = Fixture::generate(8675309, &opts);
     let report = import(&fixture.repo, &fixture.garden, &Default::default());
-    assert_eq!(report.commits_new as usize, fixture.history.changesets.len());
+    assert_eq!(
+        report.commits_new as usize,
+        fixture.history.changesets.len()
+    );
     sweep(&fixture, &fixture.garden);
 }

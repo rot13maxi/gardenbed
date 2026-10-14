@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use gardenbed_derive::Engine;
-use gardenbed_model::{blob_id, Change, Changeset, Id, Identity, Mode, Op};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_store::{FsObjectStore, MemoryStore, MetadataStore, ObjectStore};
 
 fn identity(name: &str, secs: u64) -> Identity {
@@ -58,7 +58,12 @@ fn root_changeset(n_dirs: usize, files_per_dir: usize, tag: &str) -> (Changeset,
 
 /// A changeset modifying `n_changes` files, one per each of `n_changes`
 /// distinct directories (`dNNNN/f00`), on top of `parent`.
-fn modify_changeset(parent: Id, n_changes: usize, dirs: usize, tag: &str) -> (Changeset, Vec<Vec<u8>>) {
+fn modify_changeset(
+    parent: Id,
+    n_changes: usize,
+    dirs: usize,
+    tag: &str,
+) -> (Changeset, Vec<Vec<u8>>) {
     let mut changes = Vec::with_capacity(n_changes);
     let mut contents = Vec::with_capacity(n_changes);
     for i in 0..n_changes {
@@ -135,7 +140,10 @@ fn run_locality(total_files: usize, total_dirs: usize, changed_dirs: usize) {
     }
     let before = count_object_files(dir.path());
     let id2 = metadata.put_changeset(&cs2).expect("store cs2");
-    engine.derive_tree(id2).expect("derive child tree").expect("non-empty");
+    engine
+        .derive_tree(id2)
+        .expect("derive child tree")
+        .expect("non-empty");
     let after = count_object_files(dir.path());
 
     let new_objects = after - before;
@@ -200,7 +208,10 @@ fn locality_5k_files_one_dir() {
     }
     let before = count_object_files(dir.path());
     let id2 = metadata.put_changeset(&cs2).expect("store cs2");
-    engine.derive_tree(id2).expect("derive child tree").expect("non-empty");
+    engine
+        .derive_tree(id2)
+        .expect("derive child tree")
+        .expect("non-empty");
     let after = count_object_files(dir.path());
 
     let new_objects = after - before;

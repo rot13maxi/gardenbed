@@ -25,11 +25,11 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use gardenbed_harness::generator::{files_at, generate, GenOptions, GeneratedHistory};
+use gardenbed_harness::generator::{GenOptions, GeneratedHistory, files_at, generate};
 use gardenbed_model::Id;
 use tempfile::TempDir;
 
-use common::{bed, bed_async, Arboretum};
+use common::{Arboretum, bed, bed_async};
 
 /// One arboretum carrying a large generated history, plus two gardens:
 /// one for each resumability cycle.
@@ -112,10 +112,18 @@ fn files_under(root: &std::path::Path) -> Vec<String> {
                 if name == ".bed" {
                     continue;
                 }
-                let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
                 walk(&entry.path(), &path, out);
             } else {
-                let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+                let path = if rel.is_empty() {
+                    name
+                } else {
+                    format!("{rel}/{name}")
+                };
                 out.push(path);
             }
         }
@@ -210,7 +218,10 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
         blobs
     });
     let cached_total = (cached_trees + cached_blobs) as u64;
-    assert!(cached_total < want_total, "the kill must leave work to resume");
+    assert!(
+        cached_total < want_total,
+        "the kill must leave work to resume"
+    );
 
     let (t1, b1) = world.server.counted(&client).await;
     // Singleflight/dedup: even mid-flight, no distinct id was asked twice.
@@ -292,7 +303,10 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
         let (_, blobs) = common::want_list(&world.server.root, world.head, &["."]);
         blobs
     })) as u64;
-    assert_eq!(cached_total, want_total, "everything fetched is in the cache");
+    assert_eq!(
+        cached_total, want_total,
+        "everything fetched is in the cache"
+    );
 
     // The rerun therefore fetches nothing and repairs the half-planted
     // garden to a clean, faithful state.

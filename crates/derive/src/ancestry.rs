@@ -139,7 +139,10 @@ impl SegmentEntry {
 
     /// The jump target at an exact power-of-two distance, if recorded.
     fn sample(&self, dist: u64) -> Option<Id> {
-        self.samples.iter().find(|(d, _)| *d == dist).map(|(_, t)| *t)
+        self.samples
+            .iter()
+            .find(|(d, _)| *d == dist)
+            .map(|(_, t)| *t)
     }
 }
 
@@ -157,17 +160,30 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
 
 fn get_varint(bytes: &[u8], i: &mut usize) -> Option<u64> {
     let mut v = 0u64;
-    let mut shift = 0u32;
-    while shift < 64 {
+    let mut count = 0usize;
+    loop {
         let b = *bytes.get(*i)?;
         *i += 1;
-        v |= u64::from(b & 0x7f) << shift;
+        count += 1;
+        if count > 10 {
+            return None;
+        }
+        let group = u64::from(b & 0x7f);
+        let shift = 7 * (count - 1);
+        // Bits beyond 64 cannot be represented (they would change the
+        // value on re-encode); a zero final group is non-minimal. Either
+        // way the entry is not well-formed.
+        if shift >= 64 || (group << shift) >> shift != group {
+            return None;
+        }
+        v |= group << shift;
         if b & 0x80 == 0 {
+            if count > 1 && b == 0 {
+                return None;
+            }
             return Some(v);
         }
-        shift += 7;
     }
-    None
 }
 
 /// The cached segment entry for `cs`, or `None` when absent/unreadable
@@ -365,7 +381,11 @@ fn ancestors_naive(metadata: &dyn MetadataStore, start: Id) -> Result<HashSet<Id
 /// so this deterministic rule is gardenbed's documented answer. On v0.1
 /// histories (redundant merges over a linear mainline) the maximal common
 /// ancestor is unique and both agree exactly.
-fn merge_base_naive_impl(metadata: &dyn MetadataStore, a: Id, b: Id) -> Result<Option<Id>, StoreError> {
+fn merge_base_naive_impl(
+    metadata: &dyn MetadataStore,
+    a: Id,
+    b: Id,
+) -> Result<Option<Id>, StoreError> {
     if a == b {
         return Ok(Some(a));
     }
@@ -380,7 +400,10 @@ fn merge_base_naive_impl(metadata: &dyn MetadataStore, a: Id, b: Id) -> Result<O
         let (cs, _) = metadata.get_changeset(c)?.ok_or(StoreError::NotFound)?;
         candidates.push((cs.committer.time_secs, c));
     }
-    candidates.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| y.1.as_bytes().cmp(x.1.as_bytes())));
+    candidates.sort_by(|x, y| {
+        y.0.cmp(&x.0)
+            .then_with(|| y.1.as_bytes().cmp(x.1.as_bytes()))
+    });
     let mut kept: Vec<Id> = Vec::new();
     for (_, c) in candidates {
         // c is non-maximal iff it is a proper ancestor of an already-kept
@@ -407,7 +430,13 @@ fn merge_base_naive_impl(metadata: &dyn MetadataStore, a: Id, b: Id) -> Result<O
 /// first-parent step inside a segment decrements the height by exactly one,
 /// so the target distance is known and binary-lifting samples cover it
 /// without ever stepping past `a`.
-fn on_same_run(engine: &Engine, x: Id, xe: &SegmentEntry, a: Id, a_height: u64) -> Result<bool, StoreError> {
+fn on_same_run(
+    engine: &Engine,
+    x: Id,
+    xe: &SegmentEntry,
+    a: Id,
+    a_height: u64,
+) -> Result<bool, StoreError> {
     if xe.height <= a_height {
         return Ok(false); // caller prunes equal-to-self earlier
     }

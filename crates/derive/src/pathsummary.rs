@@ -215,17 +215,30 @@ fn put_varint(out: &mut Vec<u8>, mut v: u64) {
 
 fn get_varint(bytes: &[u8], i: &mut usize) -> Option<u64> {
     let mut v = 0u64;
-    let mut shift = 0u32;
-    while shift < 64 {
+    let mut count = 0usize;
+    loop {
         let b = *bytes.get(*i)?;
         *i += 1;
-        v |= u64::from(b & 0x7f) << shift;
+        count += 1;
+        if count > 10 {
+            return None;
+        }
+        let group = u64::from(b & 0x7f);
+        let shift = 7 * (count - 1);
+        // Bits beyond 64 cannot be represented (they would change the
+        // value on re-encode); a zero final group is non-minimal. Either
+        // way the entry is not well-formed.
+        if shift >= 64 || (group << shift) >> shift != group {
+            return None;
+        }
+        v |= group << shift;
         if b & 0x80 == 0 {
+            if count > 1 && b == 0 {
+                return None;
+            }
             return Some(v);
         }
-        shift += 7;
     }
-    None
 }
 
 fn get_str(bytes: &[u8], i: &mut usize) -> Option<String> {
@@ -281,10 +294,10 @@ fn touched_paths(cs: &gardenbed_model::Changeset) -> Vec<String> {
         if !set.iter().any(|p| p == &c.path) {
             set.push(c.path.clone());
         }
-        if let Some(src) = &c.src_path {
-            if !set.iter().any(|p| p == src) {
-                set.push(src.clone());
-            }
+        if let Some(src) = &c.src_path
+            && !set.iter().any(|p| p == src)
+        {
+            set.push(src.clone());
         }
     }
     set.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));

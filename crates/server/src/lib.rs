@@ -16,12 +16,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gardenbed_derive::{BlameRange, Engine};
 use gardenbed_model::codec::validate_changeset;
-use gardenbed_model::{blob_id, Change, Changeset, Id, Mode};
+use gardenbed_model::{Change, Changeset, Id, Mode, blob_id};
 use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
@@ -171,9 +171,8 @@ impl Repo {
             if c.mode == Mode::Gitlink {
                 continue; // opaque pointer, never a loam object
             }
-            match resolved.get(&blob) {
-                Some(_) => continue, // already resolved (or rejected) once
-                None => {}
+            if resolved.contains_key(&blob) {
+                continue; // already resolved (or rejected) once
             }
             if self.objects.has(blob)? {
                 resolved.insert(blob, false);
@@ -298,7 +297,11 @@ impl Repo {
         heap.push((head.committer.time_secs, Reverse(seq), *cs_id.as_bytes()));
         seq += 1;
 
-        let cap = if limit == 0 { usize::MAX } else { limit as usize };
+        let cap = if limit == 0 {
+            usize::MAX
+        } else {
+            limit as usize
+        };
         let mut out: Vec<(Id, Changeset)> = Vec::with_capacity(cap.min(64));
         while let Some((_, _, id_bytes)) = heap.pop() {
             let id = Id::from_bytes(id_bytes);
@@ -347,20 +350,48 @@ impl Repo {
     }
 
     /// A ref's current value; `None` when it does not exist.
+    ///
+    /// Histories imported from git carry their full ref names
+    /// (`refs/heads/main`), while v0.1 clients (bed, MCP, harvest) speak
+    /// bare branch names (`main`). A bare name resolves against its
+    /// `refs/heads/` spelling first, falling back to the name as given —
+    /// so an imported arboretum and a natively grown one answer the same
+    /// question identically.
     pub fn get_ref(&self, name: &str) -> Result<Option<Id>, ServerError> {
+        let canonical = branch_ref_name(name);
+        if let found @ Some(_) = self.metadata.resolve_ref(&canonical)? {
+            return Ok(found);
+        }
+        if canonical == name {
+            return Ok(None);
+        }
         Ok(self.metadata.resolve_ref(name)?)
     }
 
     /// Compare-and-swap a ref. Conflicts are results ([`RefCas::Conflict`]),
     /// not errors; expecting `Some` on an absent ref is
     /// [`StoreError::NotFound`].
+    ///
+    /// Like [`Repo::get_ref`], bare branch names are canonicalized: the CAS
+    /// targets the existing `refs/heads/<name>` row when one is there (an
+    /// imported ref moves; a second ref is not forked), falls back to a row
+    /// stored under the name as given, and otherwise creates the ref under
+    /// its canonical `refs/heads/` spelling so exports stay valid git.
     pub fn cas_ref(
         &self,
         name: &str,
         expected: Option<Id>,
         new: Id,
     ) -> Result<RefCas, ServerError> {
-        Ok(self.metadata.cas_ref(name, expected, new)?)
+        let canonical = branch_ref_name(name);
+        let target = if self.metadata.resolve_ref(&canonical)?.is_some() {
+            canonical
+        } else if canonical != name && self.metadata.resolve_ref(name)?.is_some() {
+            name.to_owned()
+        } else {
+            canonical
+        };
+        Ok(self.metadata.cas_ref(&target, expected, new)?)
     }
 
     // ------------------------------------------------- graft and harvest
@@ -455,7 +486,7 @@ impl Repo {
         // The harvested changeset must exist (a clear 404 beats a CAS that
         // would silently create a ref to nowhere).
         self.get_changeset(cs_id)?;
-        let current = self.metadata.resolve_ref("main")?;
+        let current = self.get_ref("main")?;
         if let Some(cur) = current {
             let ok = self
                 .engine
@@ -465,7 +496,7 @@ impl Repo {
                 return Err(ServerError::NotFastForward);
             }
         }
-        match self.metadata.cas_ref("main", current, cs_id)? {
+        match self.cas_ref("main", current, cs_id)? {
             RefCas::Won { .. } => Ok(cs_id),
             RefCas::Conflict { .. } => Err(ServerError::NotFastForward),
         }
@@ -485,6 +516,18 @@ impl Repo {
             "create_changeset" => Some(&self.stats.create_changeset),
             _ => None,
         }
+    }
+}
+
+/// The canonical seedbed name for a client-facing ref: bare branch names
+/// (`main`, `feature`) live under `refs/heads/` — the spelling git itself
+/// requires and the one an import already stores. Full names pass through
+/// untouched.
+fn branch_ref_name(name: &str) -> String {
+    if name.starts_with("refs/") {
+        name.to_owned()
+    } else {
+        format!("refs/heads/{name}")
     }
 }
 
@@ -509,9 +552,9 @@ fn check_write(
         None => {
             // A path under an existing file cannot be created.
             let under_file = files.keys().any(|q| {
-                path.as_bytes().len() > q.as_bytes().len()
+                path.len() > q.len()
                     && path.starts_with(q.as_str())
-                    && path.as_bytes().get(q.as_bytes().len()) == Some(&b'/')
+                    && path.as_bytes().get(q.len()) == Some(&b'/')
             });
             if under_file {
                 conflicts.push(format!("{path:?} sits under an existing file"));
@@ -521,7 +564,7 @@ fn check_write(
             // matching the delta-apply's replacement semantics).
             let swallowed: Vec<String> = files
                 .keys()
-                .filter(|q| q.starts_with(path) && q.as_bytes().get(path.as_bytes().len()) == Some(&b'/'))
+                .filter(|q| q.starts_with(path) && q.as_bytes().get(path.len()) == Some(&b'/'))
                 .cloned()
                 .collect();
             for q in swallowed {
@@ -703,12 +746,12 @@ impl Gardenbed for GardenbedService {
             Some(pb::put_blob_chunk::Frame::Data(_)) => {
                 return Err(Status::invalid_argument(
                     "the first PutBlob frame must be the header, not a body chunk",
-                ))
+                ));
             }
             None => {
                 return Err(Status::invalid_argument(
                     "the first PutBlob frame carries no header",
-                ))
+                ));
             }
         };
         self.repo_field(&repo_name, "PutBlob")?;
@@ -720,12 +763,12 @@ impl Gardenbed for GardenbedService {
                 Some(pb::put_blob_chunk::Frame::Header(_)) => {
                     return Err(Status::invalid_argument(
                         "duplicate header frame in a PutBlob stream",
-                    ))
+                    ));
                 }
                 None => {
                     return Err(Status::invalid_argument(
                         "PutBlob frame carries neither header nor data",
-                    ))
+                    ));
                 }
             }
         }
@@ -810,10 +853,7 @@ impl Gardenbed for GardenbedService {
         Ok(Response::new(Box::pin(iter(items))))
     }
 
-    async fn log(
-        &self,
-        request: Request<pb::LogReq>,
-    ) -> Result<Response<Self::LogStream>, Status> {
+    async fn log(&self, request: Request<pb::LogReq>) -> Result<Response<Self::LogStream>, Status> {
         let req = request.into_inner();
         self.repo_field(&req.repo, "Log")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
@@ -855,9 +895,12 @@ impl Gardenbed for GardenbedService {
         let req = request.into_inner();
         self.repo_field(&req.repo, "ListRefs")?;
         let refs = self.repo.list_refs()?;
-        let items = refs
-            .into_iter()
-            .map(|(name, cs_id)| Ok(pb::RefEntry { name, cs_id: id_to_bytes(cs_id) }));
+        let items = refs.into_iter().map(|(name, cs_id)| {
+            Ok(pb::RefEntry {
+                name,
+                cs_id: id_to_bytes(cs_id),
+            })
+        });
         Ok(Response::new(Box::pin(iter(items))))
     }
 
@@ -911,7 +954,9 @@ impl Gardenbed for GardenbedService {
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let new_parent = Self::id(&req.new_parent, "new_parent")?;
         let id = self.repo.graft(cs_id, new_parent)?;
-        Ok(Response::new(pb::GraftResp { id: id_to_bytes(id) }))
+        Ok(Response::new(pb::GraftResp {
+            id: id_to_bytes(id),
+        }))
     }
 
     async fn harvest(
@@ -922,7 +967,9 @@ impl Gardenbed for GardenbedService {
         self.repo_field(&req.repo, "Harvest")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let id = self.repo.harvest(cs_id)?;
-        Ok(Response::new(pb::HarvestResp { id: id_to_bytes(id) }))
+        Ok(Response::new(pb::HarvestResp {
+            id: id_to_bytes(id),
+        }))
     }
 
     async fn get_stats(
@@ -934,5 +981,82 @@ impl Gardenbed for GardenbedService {
         Ok(Response::new(pb::StatsResp {
             counters: self.repo.stats().into_iter().collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod ref_normalization_tests {
+    use super::*;
+
+    fn id(tag: u8) -> Id {
+        Id::from_bytes([tag; 32])
+    }
+
+    fn repo() -> (tempfile::TempDir, Repo) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::open(dir.path()).expect("repo opens");
+        (dir, repo)
+    }
+
+    /// A bare-name write lands under `refs/heads/` (git-valid on export)
+    /// and reads back through both spellings.
+    #[test]
+    fn bare_ref_writes_land_under_refs_heads() {
+        let (_dir, repo) = repo();
+        assert!(matches!(
+            repo.cas_ref("main", None, id(1)).expect("cas"),
+            RefCas::Won { .. }
+        ));
+        assert_eq!(
+            repo.list_refs().expect("refs"),
+            vec![("refs/heads/main".to_owned(), id(1))]
+        );
+        assert_eq!(repo.get_ref("main").expect("get"), Some(id(1)));
+        assert_eq!(repo.get_ref("refs/heads/main").expect("get"), Some(id(1)));
+    }
+
+    /// An imported history's full-name ref answers bare-name lookups, and a
+    /// bare-name CAS moves *that* row instead of forking a second ref.
+    #[test]
+    fn bare_names_resolve_and_move_imported_refs() {
+        let (_dir, repo) = repo();
+        // The import path stores full names (rootstock does exactly this).
+        repo.cas_ref("refs/heads/main", None, id(1))
+            .expect("imported ref");
+        assert_eq!(repo.get_ref("main").expect("fallback"), Some(id(1)));
+
+        assert!(matches!(
+            repo.cas_ref("main", Some(id(1)), id(2)).expect("cas"),
+            RefCas::Won { .. }
+        ));
+        assert_eq!(
+            repo.list_refs().expect("refs"),
+            vec![("refs/heads/main".to_owned(), id(2))]
+        );
+
+        // CAS semantics are unchanged: a stale expectation still conflicts.
+        assert!(matches!(
+            repo.cas_ref("main", Some(id(1)), id(3)).expect("cas"),
+            RefCas::Conflict { current } if current == id(2)
+        ));
+    }
+
+    /// A row stored under the bare spelling (an older writer) still
+    /// resolves and still receives bare-name CASes.
+    #[test]
+    fn legacy_bare_rows_still_resolve() {
+        let (_dir, repo) = repo();
+        repo.metadata
+            .cas_ref("main", None, id(1))
+            .expect("legacy bare row");
+        assert_eq!(repo.get_ref("main").expect("fallback"), Some(id(1)));
+        assert!(matches!(
+            repo.cas_ref("main", Some(id(1)), id(2)).expect("cas"),
+            RefCas::Won { .. }
+        ));
+        assert_eq!(
+            repo.list_refs().expect("refs"),
+            vec![("main".to_owned(), id(2))]
+        );
     }
 }

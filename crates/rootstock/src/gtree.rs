@@ -53,7 +53,8 @@ pub(crate) fn parse_tree(data: &[u8]) -> Result<Vec<GEntry>, String> {
         let sp = data[pos..]
             .iter()
             .position(|b| *b == b' ')
-            .ok_or("tree entry missing mode separator")? + pos;
+            .ok_or("tree entry missing mode separator")?
+            + pos;
         let mode = std::str::from_utf8(&data[pos..sp])
             .map_err(|_| "tree mode is not UTF-8")?
             .to_owned();
@@ -70,8 +71,8 @@ pub(crate) fn parse_tree(data: &[u8]) -> Result<Vec<GEntry>, String> {
         let mut raw = [0u8; 20];
         raw.copy_from_slice(&data[nul + 1..nul + 1 + 20]);
         let oid = GitOid::from_bytes(raw);
-        let (kind, file_mode) = map_mode(&mode)
-            .ok_or_else(|| format!("unsupported tree entry mode {mode:?}"))?;
+        let (kind, file_mode) =
+            map_mode(&mode).ok_or_else(|| format!("unsupported tree entry mode {mode:?}"))?;
         match kind {
             GKind::Dir => out.push(GEntry {
                 name,
@@ -120,7 +121,7 @@ pub(crate) fn map_mode(mode: &str) -> Option<(GKind, Option<Mode>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{map_mode, parse_tree, GKind};
+    use super::{GKind, map_mode, parse_tree};
     use gardenbed_model::Mode;
 
     fn oid(byte: u8) -> [u8; 20] {

@@ -48,12 +48,13 @@ class Reader:
                 raise CodecError("varint too long")
             group = b & 0x7F
             shift = 7 * (count - 1)
-            if shift >= 64:
-                if group > 1:
-                    raise CodecError("varint overflow")
-                v |= group << 63
-            else:
-                v |= group << shift
+            # Payload bits beyond 64 cannot be represented: a group that
+            # would lose any of them is non-canonical (the value would
+            # change on re-encode). Matches the Rust codec exactly — at
+            # shift 63 only groups 0 and 1 survive.
+            if shift >= 64 or (64 - shift < 7 and group >> (64 - shift) != 0):
+                raise CodecError("varint overflow")
+            v |= group << shift
             if not (b & 0x80):
                 if count > 1 and b == 0:
                     raise CodecError("non-minimal varint")

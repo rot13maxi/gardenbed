@@ -139,14 +139,12 @@ impl MetadataStore for MemoryStore {
             StoreError::Invalid(format!("changeset is not canonically encodable: {e}"))
         })?;
         let id = Id::from_bytes(Sha256::digest(&canonical).into());
-        self.write(|s| {
-            match s.changesets.get(&id) {
-                Some((_, bytes)) if bytes == &canonical => Ok(()),
-                Some(_) => Err(StoreError::ImmutabilityViolation(id)),
-                None => {
-                    s.changesets.insert(id, (cs.clone(), canonical));
-                    Ok(())
-                }
+        self.write(|s| match s.changesets.get(&id) {
+            Some((_, bytes)) if bytes == &canonical => Ok(()),
+            Some(_) => Err(StoreError::ImmutabilityViolation(id)),
+            None => {
+                s.changesets.insert(id, (cs.clone(), canonical));
+                Ok(())
             }
         })?;
         Ok(id)
@@ -193,26 +191,28 @@ impl MetadataStore for MemoryStore {
 
     fn record_git_mapping(&self, git_sha_hex: &str, cs: Id) -> Result<(), StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
-        self.write(|s| match (s.git_by_sha.get(&sha).copied(), s.git_by_cs.get(&cs)) {
-            (Some(existing_cs), Some(existing_sha))
-                if existing_cs == cs && existing_sha.as_str() == sha =>
-            {
-                Ok(()) // idempotent
-            }
-            (Some(existing_cs), _) => Err(StoreError::Invalid(format!(
-                "git sha {sha} already maps to changeset {}",
-                existing_cs.to_hex()
-            ))),
-            (_, Some(existing_sha)) => Err(StoreError::Invalid(format!(
-                "changeset {} already mapped from git sha {existing_sha}",
-                cs.to_hex()
-            ))),
-            (None, None) => {
-                s.git_by_sha.insert(sha.clone(), cs);
-                s.git_by_cs.insert(cs, sha);
-                Ok(())
-            }
-        })
+        self.write(
+            |s| match (s.git_by_sha.get(&sha).copied(), s.git_by_cs.get(&cs)) {
+                (Some(existing_cs), Some(existing_sha))
+                    if existing_cs == cs && existing_sha.as_str() == sha =>
+                {
+                    Ok(()) // idempotent
+                }
+                (Some(existing_cs), _) => Err(StoreError::Invalid(format!(
+                    "git sha {sha} already maps to changeset {}",
+                    existing_cs.to_hex()
+                ))),
+                (_, Some(existing_sha)) => Err(StoreError::Invalid(format!(
+                    "changeset {} already mapped from git sha {existing_sha}",
+                    cs.to_hex()
+                ))),
+                (None, None) => {
+                    s.git_by_sha.insert(sha.clone(), cs);
+                    s.git_by_cs.insert(cs, sha);
+                    Ok(())
+                }
+            },
+        )
     }
 
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {

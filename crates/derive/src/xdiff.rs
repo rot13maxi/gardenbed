@@ -133,7 +133,15 @@ pub fn diff_lines(a: &[&[u8]], b: &[&[u8]]) -> Option<LineDiff> {
     // != 0`; blame leaves that flag unset, so the snake heuristic and the
     // cost cap are active exactly as in git.
     env.recs_cmp(
-        &rindex1, &ha1, &rindex2, &ha2, 0, ha1.len() as i64, 0, ha2.len() as i64, false,
+        &rindex1,
+        &ha1,
+        &rindex2,
+        &ha2,
+        0,
+        ha1.len() as i64,
+        0,
+        ha2.len() as i64,
+        false,
     )?;
 
     // Change compaction, both directions, in git's order. The indent
@@ -283,8 +291,7 @@ fn cleanup_records(cx: &mut Ctx, other: &Ctx) -> (Vec<usize>, Vec<u32>) {
     let mut ha = Vec::new();
     for i in cx.dstart..=cx.dend {
         let iu = i as usize;
-        let keep = dis[iu] == 1
-            || (dis[iu] == 2 && !clean_mmatch(&dis, iu, cx.dstart, cx.dend));
+        let keep = dis[iu] == 1 || (dis[iu] == 2 && !clean_mmatch(&dis, iu, cx.dstart, cx.dend));
         if keep {
             rindex.push(iu);
             ha.push(cx.cls[iu]);
@@ -600,7 +607,7 @@ impl Env<'_, '_> {
         need_min: bool,
     ) -> Option<()> {
         let nreff2 = ha2.len() as i64;
-        let ndiags = (ha1.len() + ha2.len() + 3) as usize;
+        let ndiags = ha1.len() + ha2.len() + 3;
         let mut kvdf = KV {
             v: vec![0; ndiags + 2],
             base: nreff2 + 1,
@@ -690,7 +697,8 @@ fn group_previous(cx: &Ctx, g: &mut Group) -> bool {
 }
 
 fn group_slide_down(cx: &mut Ctx, g: &mut Group) -> bool {
-    if (g.end as usize) < cx.nrec() && recs_match(cx.recs[g.start as usize], cx.recs[g.end as usize])
+    if (g.end as usize) < cx.nrec()
+        && recs_match(cx.recs[g.start as usize], cx.recs[g.end as usize])
     {
         cx.rchg[g.start as usize] = false;
         g.start += 1;
@@ -831,33 +839,35 @@ fn score_add_split(m: &SplitMeasurement, s: &mut SplitScore) {
     let total_blank = m.pre_blank + post_blank;
     s.penalty += TOTAL_BLANK_WEIGHT * total_blank;
     s.penalty += POST_BLANK_WEIGHT * post_blank;
-    let indent = if m.indent != -1 { m.indent } else { m.post_indent };
+    let indent = if m.indent != -1 {
+        m.indent
+    } else {
+        m.post_indent
+    };
     let any_blanks = total_blank != 0;
     s.effective_indent += indent;
-    if indent == -1 {
-        // no adjustment
-    } else if m.pre_indent == -1 {
-        // no adjustment
-    } else if indent > m.pre_indent {
-        s.penalty += if any_blanks {
-            RELATIVE_INDENT_WITH_BLANK_PENALTY
+    if indent != -1 && m.pre_indent != -1 {
+        if indent > m.pre_indent {
+            s.penalty += if any_blanks {
+                RELATIVE_INDENT_WITH_BLANK_PENALTY
+            } else {
+                RELATIVE_INDENT_PENALTY
+            };
+        } else if indent == m.pre_indent {
+            // no adjustment
+        } else if m.post_indent != -1 && m.post_indent > indent {
+            s.penalty += if any_blanks {
+                RELATIVE_OUTDENT_WITH_BLANK_PENALTY
+            } else {
+                RELATIVE_OUTDENT_PENALTY
+            };
         } else {
-            RELATIVE_INDENT_PENALTY
-        };
-    } else if indent == m.pre_indent {
-        // no adjustment
-    } else if m.post_indent != -1 && m.post_indent > indent {
-        s.penalty += if any_blanks {
-            RELATIVE_OUTDENT_WITH_BLANK_PENALTY
-        } else {
-            RELATIVE_OUTDENT_PENALTY
-        };
-    } else {
-        s.penalty += if any_blanks {
-            RELATIVE_DEDENT_WITH_BLANK_PENALTY
-        } else {
-            RELATIVE_DEDENT_PENALTY
-        };
+            s.penalty += if any_blanks {
+                RELATIVE_DEDENT_WITH_BLANK_PENALTY
+            } else {
+                RELATIVE_DEDENT_PENALTY
+            };
+        }
     }
 }
 
@@ -870,17 +880,11 @@ fn score_cmp(s1: &SplitScore, s2: &SplitScore) -> i64 {
 /// git's `xdl_change_compact`, including the indent heuristic when
 /// `indent_heuristic` is set (git's default).
 fn change_compact(cx: &mut Ctx, cxo: &Ctx, indent_heuristic: bool) {
-    let mut g = Group {
-        start: 0,
-        end: 0,
-    };
+    let mut g = Group { start: 0, end: 0 };
     while cx.rchg(g.end) {
         g.end += 1;
     }
-    let mut go = Group {
-        start: 0,
-        end: 0,
-    };
+    let mut go = Group { start: 0, end: 0 };
     while cxo.rchg(go.end) {
         go.end += 1;
     }

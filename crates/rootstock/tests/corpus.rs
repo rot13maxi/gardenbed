@@ -16,9 +16,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use common::{open_stores, sweep, CatFile, Fixture, import};
+use common::{CatFile, Fixture, import, open_stores, sweep};
 use gardenbed_model::{Id, Mode};
-use gardenbed_rootstock::{import_from_path, ImportOptions};
+use gardenbed_rootstock::{ImportOptions, import_from_path};
 use gardenbed_store::{MetadataStore, ObjectStore};
 
 const MIRROR: &str = "/tmp/opencode/ripgrep.git";
@@ -81,7 +81,10 @@ fn ls_tree(repo: &Path, sha: &str) -> Vec<(String, String, Vec<u8>)> {
         }
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
-        let o = cmd.args(["ls-tree", "-r", "-z", sha]).output().expect("ls-tree");
+        let o = cmd
+            .args(["ls-tree", "-r", "-z", sha])
+            .output()
+            .expect("ls-tree");
         assert!(o.status.success(), "ls-tree failed for {sha}");
         o.stdout
     };
@@ -127,7 +130,10 @@ fn run_corpus(detect_renames: bool, tag: &str) {
         .trim()
         .parse::<usize>()
         .expect("count");
-    assert_eq!(report.commits_total as usize, rev_count, "walk covers rev-list --branches");
+    assert_eq!(
+        report.commits_total as usize, rev_count,
+        "walk covers rev-list --branches"
+    );
     assert_eq!(report.commits_new as usize, rev_count);
     assert_eq!(report.commits_skipped, 0);
     assert!(rev_count > 1_000, "unexpectedly few commits");
@@ -160,7 +166,10 @@ fn run_corpus(detect_renames: bool, tag: &str) {
             .cs_for_git(sha)
             .expect("cs_for_git")
             .unwrap_or_else(|| panic!("commit {sha} unmapped"));
-        let root = engine.derive_tree(cs_id).expect("derive").expect("non-empty tree");
+        let root = engine
+            .derive_tree(cs_id)
+            .expect("derive")
+            .expect("non-empty tree");
         let flat: BTreeMap<String, (Mode, Id)> = engine
             .flatten_tree(Some(root))
             .expect("flatten")
@@ -175,8 +184,14 @@ fn run_corpus(detect_renames: bool, tag: &str) {
             "commit {sha}: file count differs from git"
         );
         for (path, mode, gsha) in &entries {
-            let (m, b) = flat.get(path).unwrap_or_else(|| panic!("commit {sha}: path {path:?} missing"));
-            assert_eq!(m, &common::mode_from_git(mode), "commit {sha}: mode of {path:?}");
+            let (m, b) = flat
+                .get(path)
+                .unwrap_or_else(|| panic!("commit {sha}: path {path:?} missing"));
+            assert_eq!(
+                m,
+                &common::mode_from_git(mode),
+                "commit {sha}: mode of {path:?}"
+            );
             if *m == Mode::Gitlink {
                 assert_eq!(&b.as_bytes()[12..], gsha.as_slice());
             }

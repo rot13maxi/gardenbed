@@ -39,8 +39,11 @@ use crate::oid::GitOid;
 pub(crate) const DIFF_BATCH: usize = 256;
 
 /// One entry of a commit's first-parent diff (`--name-status`).
+///
+/// Public for the fuzz target that feeds random bytes to [`parse_batch`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DiffRecord {
+pub struct DiffRecord {
+    /// The status letter's meaning.
     pub status: DiffStatus,
     /// Destination path (the path in the new tree).
     pub path: String,
@@ -49,8 +52,10 @@ pub(crate) struct DiffRecord {
 }
 
 /// The status letters rootstock understands.
+///
+/// Public for the fuzz target that feeds random bytes to [`parse_batch`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DiffStatus {
+pub enum DiffStatus {
     Add,
     Modify,
     /// Type change (`T`): the path changed kind between blob-like entries
@@ -101,9 +106,9 @@ pub(crate) fn run_batch(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let mut child = cmd.spawn().map_err(|e| {
-        ImportError::Git(format!("cannot spawn git diff-tree: {e}"))
-    })?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| ImportError::Git(format!("cannot spawn git diff-tree: {e}")))?;
     let mut stdin = child.stdin.take().expect("stdin piped");
     let mut input = Vec::with_capacity(shas.len() * 41);
     for sha in shas {
@@ -111,13 +116,13 @@ pub(crate) fn run_batch(
         input.push(b'\n');
     }
     // ~10 KiB per batch fits the pipe buffer: no writer/reader deadlock.
-    stdin.write_all(&input).map_err(|e| {
-        ImportError::Git(format!("writing to git diff-tree stdin: {e}"))
-    })?;
+    stdin
+        .write_all(&input)
+        .map_err(|e| ImportError::Git(format!("writing to git diff-tree stdin: {e}")))?;
     drop(stdin);
-    let out = child.wait_with_output().map_err(|e| {
-        ImportError::Git(format!("waiting for git diff-tree: {e}"))
-    })?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| ImportError::Git(format!("waiting for git diff-tree: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         return Err(batch_failure(cwd, shas, detect_renames, stderr.trim_end()));
@@ -139,9 +144,9 @@ pub(crate) fn run_batch(
                 ]);
                 cmd.arg(if detect_renames { "-M" } else { "--no-renames" });
                 cmd.arg(sha.to_hex());
-                let out = cmd.output().map_err(|e| {
-                    ImportError::Git(format!("cannot spawn git diff-tree: {e}"))
-                })?;
+                let out = cmd
+                    .output()
+                    .map_err(|e| ImportError::Git(format!("cannot spawn git diff-tree: {e}")))?;
                 if !out.status.success() {
                     let stderr = String::from_utf8_lossy(&out.stderr);
                     return Err(ImportError::Diff {
@@ -154,8 +159,7 @@ pub(crate) fn run_batch(
             }
             Err(ImportError::Diff {
                 sha: String::new(),
-                detail: "diff-tree output could not be parsed (re-runs all succeeded)"
-                    .to_owned(),
+                detail: "diff-tree output could not be parsed (re-runs all succeeded)".to_owned(),
             })
         }
     }
@@ -227,7 +231,10 @@ fn git_cmd(cwd: &Path) -> Command {
 /// status" — because a status token is never 40-hex and a path token never
 /// directly follows an id, so the stream is unambiguous despite commits
 /// being interleaved freely.
-pub(crate) fn parse_batch(
+///
+/// Public for the fuzz target (`fuzz_difftree_parse`): random bytes must
+/// always parse to `Ok` or a descriptive `Err`, never panic.
+pub fn parse_batch(
     out: &[u8],
     expected: &[GitOid],
 ) -> Result<HashMap<GitOid, Vec<DiffRecord>>, ImportError> {
@@ -237,8 +244,7 @@ pub(crate) fn parse_batch(
     // `None` until the first id token: an entry before any id is malformed.
     let mut current: Option<GitOid> = None;
     while let Some(tok) = tokens.next() {
-        let text = std::str::from_utf8(tok)
-            .map_err(|_| diff_parse("token is not UTF-8"))?;
+        let text = std::str::from_utf8(tok).map_err(|_| diff_parse("token is not UTF-8"))?;
         if let Some(oid) = GitOid::from_hex(text) {
             // A commit id begins a record. Empty-diff commits contribute
             // exactly this (an empty record list).
@@ -246,7 +252,9 @@ pub(crate) fn parse_batch(
                 return Err(diff_parse(format!("duplicate commit id {text} in output")));
             }
             if !wanted.contains(&oid) {
-                return Err(diff_parse(format!("commit {text} in output was not requested")));
+                return Err(diff_parse(format!(
+                    "commit {text} in output was not requested"
+                )));
             }
             current = Some(oid);
             continue;
@@ -259,12 +267,12 @@ pub(crate) fn parse_batch(
             .ok_or_else(|| diff_parse(format!("unsupported diff status {text:?}")))?;
         let record = match status {
             DiffStatus::Rename | DiffStatus::Copy => {
-                let src = tokens.next().ok_or_else(|| {
-                    diff_parse("rename entry is missing its source path")
-                })?;
-                let dst = tokens.next().ok_or_else(|| {
-                    diff_parse("rename entry is missing its destination path")
-                })?;
+                let src = tokens
+                    .next()
+                    .ok_or_else(|| diff_parse("rename entry is missing its source path"))?;
+                let dst = tokens
+                    .next()
+                    .ok_or_else(|| diff_parse("rename entry is missing its destination path"))?;
                 DiffRecord {
                     status,
                     path: utf8(dst, "rename destination")?,
@@ -316,7 +324,7 @@ impl ImportError {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_batch, DiffRecord, DiffStatus};
+    use super::{DiffRecord, DiffStatus, parse_batch};
     use crate::oid::GitOid;
 
     fn oid(n: u8) -> GitOid {
@@ -342,14 +350,24 @@ mod tests {
         // observed git behavior for a *non-empty* record followed by an
         // empty one would be just the id, but even that id may be absent;
         // both shapes parse identically).
-        let out = stream(&[hex(1).as_bytes(), b"A", b"a.txt", b"M", b"b.txt", hex(2).as_bytes()]);
+        let out = stream(&[
+            hex(1).as_bytes(),
+            b"A",
+            b"a.txt",
+            b"M",
+            b"b.txt",
+            hex(2).as_bytes(),
+        ]);
         let map = parse_batch(&out, &[oid(1), oid(2)]).expect("parses");
         assert_eq!(map[&oid(1)].len(), 2);
-        assert_eq!(map[&oid(1)][0], DiffRecord {
-            status: DiffStatus::Add,
-            path: "a.txt".into(),
-            src: None,
-        });
+        assert_eq!(
+            map[&oid(1)][0],
+            DiffRecord {
+                status: DiffStatus::Add,
+                path: "a.txt".into(),
+                src: None,
+            }
+        );
         assert_eq!(map[&oid(1)][1].status, DiffStatus::Modify);
         assert!(map[&oid(2)].is_empty());
     }
@@ -364,22 +382,39 @@ mod tests {
 
     #[test]
     fn rename_consumes_two_path_tokens() {
-        let out = stream(&[hex(1).as_bytes(), b"R100", b"old.txt", b"new.txt", b"D", b"gone.txt"]);
+        let out = stream(&[
+            hex(1).as_bytes(),
+            b"R100",
+            b"old.txt",
+            b"new.txt",
+            b"D",
+            b"gone.txt",
+        ]);
         let map = parse_batch(&out, &[oid(1)]).expect("parses");
         let recs = &map[&oid(1)];
         assert_eq!(recs.len(), 2);
-        assert_eq!(recs[0], DiffRecord {
-            status: DiffStatus::Rename,
-            path: "new.txt".into(),
-            src: Some("old.txt".into()),
-        });
+        assert_eq!(
+            recs[0],
+            DiffRecord {
+                status: DiffStatus::Rename,
+                path: "new.txt".into(),
+                src: Some("old.txt".into()),
+            }
+        );
         assert_eq!(recs[1].status, DiffStatus::Delete);
     }
 
     #[test]
     fn a_40hex_path_does_not_confuse_the_parser() {
         let path40 = hex(9); // a path that happens to look like a git id
-        let out = stream(&[hex(1).as_bytes(), b"M", path40.as_bytes(), hex(2).as_bytes(), b"A", b"x"]);
+        let out = stream(&[
+            hex(1).as_bytes(),
+            b"M",
+            path40.as_bytes(),
+            hex(2).as_bytes(),
+            b"A",
+            b"x",
+        ]);
         let map = parse_batch(&out, &[oid(1), oid(2), oid(9)]).expect("parses");
         assert_eq!(map[&oid(1)].len(), 1);
         assert_eq!(map[&oid(1)][0].path, path40);

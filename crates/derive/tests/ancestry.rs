@@ -9,7 +9,7 @@ mod common;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gardenbed_derive::{Engine, SegmentEntry, DERIVED_SKIPLIST};
+use gardenbed_derive::{DERIVED_SKIPLIST, Engine, SegmentEntry};
 use gardenbed_harness::{GenOptions, GeneratedHistory, generate, materialize};
 use gardenbed_model::{Changeset, Id};
 use gardenbed_store::{MemoryStore, MetadataStore, StoreError};
@@ -155,7 +155,10 @@ fn check_pair(
         "merge base({a},{b}) disagrees with git (ours {naive_base:?}, git {git_base_sha:?})"
     );
     let git_anc = git_base == Some(a);
-    assert_eq!(naive_anc, git_anc, "is_ancestor({a},{b}) disagrees with git");
+    assert_eq!(
+        naive_anc, git_anc,
+        "is_ancestor({a},{b}) disagrees with git"
+    );
 }
 
 /// Runs the full differential battery on one generated history.
@@ -221,8 +224,16 @@ fn run_history(seed: u64, commits: u32, eager: bool) {
     for (i, &id) in ids.iter().enumerate() {
         assert_eq!(engine.merge_base(id, id).expect("self base"), Some(id));
         assert!(engine.is_ancestor(id, id).expect("self ancestor"));
-        assert!(engine.is_ancestor_skip(id, id).expect("self ancestor (skip)"));
-        assert!(engine.is_ancestor_naive(id, id).expect("self ancestor (naive)"));
+        assert!(
+            engine
+                .is_ancestor_skip(id, id)
+                .expect("self ancestor (skip)")
+        );
+        assert!(
+            engine
+                .is_ancestor_naive(id, id)
+                .expect("self ancestor (naive)")
+        );
         let sha = &sha_by_cs[&id];
         assert_eq!(
             git_merge_base(git_dir.path(), sha, sha).as_deref(),

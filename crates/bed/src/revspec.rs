@@ -36,7 +36,10 @@ impl CsOrRef {
         }
         if trimmed.len() == 64 {
             let id = Id::from_str(trimmed).map_err(|e| {
-                revspec_err(raw, &format!("64 characters suggests a changeset id, but it is not valid hex: {e}"))
+                revspec_err(
+                    raw,
+                    &format!("64 characters suggests a changeset id, but it is not valid hex: {e}"),
+                )
             })?;
             return Ok(CsOrRef::Id(id));
         }
@@ -98,10 +101,7 @@ mod tests {
 
     #[test]
     fn names_parse_as_refs() {
-        assert_eq!(
-            CsOrRef::parse("main").unwrap(),
-            CsOrRef::Ref("main".into())
-        );
+        assert_eq!(CsOrRef::parse("main").unwrap(), CsOrRef::Ref("main".into()));
         assert_eq!(
             CsOrRef::parse("heirloom/2026-10").unwrap(),
             CsOrRef::Ref("heirloom/2026-10".into())

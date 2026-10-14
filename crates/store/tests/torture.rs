@@ -184,14 +184,16 @@ fn verify_everything(
             // observable. Absent can only mean the rename had not been made
             // durable yet — it is never wrong bytes.
             Some(bytes) => assert_eq!(
-                bytes,
-                expected,
+                bytes, expected,
                 "blob iter={iter} idx={idx} id={id} must read back byte-exact"
             ),
             None => absent += 1,
         }
         match store.has(*id) {
-            Ok(present) => assert_eq!(present, present_expected, "has() must agree with get_blob()"),
+            Ok(present) => assert_eq!(
+                present, present_expected,
+                "has() must agree with get_blob()"
+            ),
             Err(e) => panic!("has() after reopen failed: {e:?}"),
         }
     }
@@ -199,7 +201,9 @@ fn verify_everything(
     let seedbed = SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("reopen seedbed");
     for (iter, idx, id) in all_css {
         let expected = torture_changeset(*iter, *idx);
-        let got = seedbed.get_changeset(*id).expect("get_changeset after kill");
+        let got = seedbed
+            .get_changeset(*id)
+            .expect("get_changeset after kill");
         let (decoded, canonical) = got.expect("committed changeset must survive");
         assert_eq!(decoded, expected, "changeset iter={iter} idx={idx} decoded");
         assert_eq!(
@@ -289,7 +293,8 @@ fn torture_child_entry() {
     let root = std::env::var("GARDENBED_TORTURE_ROOT").expect("child root");
     let root = Path::new(&root);
     let store = FsObjectStore::open(&root.join("loam")).expect("child opens loam");
-    let seedbed = SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("child opens seedbed");
+    let seedbed =
+        SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("child opens seedbed");
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

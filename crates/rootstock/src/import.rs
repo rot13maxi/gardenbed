@@ -32,17 +32,18 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gardenbed_derive::Engine;
-use gardenbed_model::{Change, Changeset, Id, Mode, Op};use gardenbed_store::{MetadataStore, ObjectStore};
+use gardenbed_model::{Change, Changeset, Id, Mode, Op};
+use gardenbed_store::{MetadataStore, ObjectStore};
 
 use crate::counting::CountingObjects;
-use crate::difftree::{run_batch, DiffRecord, DiffStatus, DIFF_BATCH};
+use crate::difftree::{DIFF_BATCH, DiffRecord, DiffStatus, run_batch};
 use crate::error::ImportError;
-use crate::graph::{read_commit, Arena, Node};
+use crate::graph::{Arena, Node, read_commit};
 use crate::gtree::{GEntry, GKind};
 use crate::oid::GitOid;
 use crate::options::ImportOptions;
 use crate::report::ImportReport;
-use crate::resolve::{gitlink_blob_id, GitObjects, MAX_TREE_DEPTH};
+use crate::resolve::{GitObjects, MAX_TREE_DEPTH, gitlink_blob_id};
 use crate::transform::repair_dir_to_file;
 
 /// Imports every selected branch of the git repository at `git_dir` into
@@ -215,16 +216,12 @@ pub fn import_from_path(
             continue; // already there: unchanged re-import
         }
         match metadata.cas_ref(name, current, target)? {
-            gardenbed_store::RefCas::Won { .. } => {
-                report.refs_updated.push((name.clone(), target))
-            }
+            gardenbed_store::RefCas::Won { .. } => report.refs_updated.push((name.clone(), target)),
             gardenbed_store::RefCas::Conflict { current } => {
                 return Err(ImportError::Ref {
                     name: name.clone(),
-                    detail: format!(
-                        "lost a concurrent update: the ref now points at {current}"
-                    ),
-                })
+                    detail: format!("lost a concurrent update: the ref now points at {current}"),
+                });
             }
         }
     }
@@ -347,15 +344,15 @@ fn build_changes(
                 }
             }
         }
-    } else if let Some(first) = node.parents.first() {
-        if node.tree == nodes[*first as usize].tree {
-            return Err(ImportError::Diff {
-                sha: sha_hex.to_owned(),
-                detail: "diff-tree reported changes although the tree equals the first \
+    } else if let Some(first) = node.parents.first()
+        && node.tree == nodes[*first as usize].tree
+    {
+        return Err(ImportError::Diff {
+            sha: sha_hex.to_owned(),
+            detail: "diff-tree reported changes although the tree equals the first \
                          parent's tree"
-                    .into(),
-            });
-        }
+                .into(),
+        });
     }
 
     for record in &records {
@@ -515,10 +512,10 @@ fn raw_diff_dir(
             detail: "tree nesting exceeds the maximum supported depth".into(),
         });
     }
-    if let (Some(p), Some(c)) = (parent, child) {
-        if p == c {
-            return Ok(()); // identical subtree: pruned without reading it
-        }
+    if let (Some(p), Some(c)) = (parent, child)
+        && p == c
+    {
+        return Ok(()); // identical subtree: pruned without reading it
     }
     let old = match parent {
         Some(t) => sorted_tree_entries(git_objects, t, sha_hex)?,
@@ -539,7 +536,15 @@ fn raw_diff_dir(
         };
         match ord {
             Ordering::Less => {
-                raw_emit_side(git_objects, prefix, &old[i], false, sha_hex, changes, leaves)?;
+                raw_emit_side(
+                    git_objects,
+                    prefix,
+                    &old[i],
+                    false,
+                    sha_hex,
+                    changes,
+                    leaves,
+                )?;
                 i += 1;
             }
             Ordering::Greater => {
@@ -704,6 +709,22 @@ fn raw_join(prefix: &str, name: &str) -> String {
     }
 }
 
+/// The gardenbed blob id for a tree entry: gitlinks carry the padded
+/// upstream SHA and are never read or written; everything else is read
+/// from git and mirrored into loam (once per distinct content).
+fn blob_id_for(
+    git_objects: &mut GitObjects<'_>,
+    mode: Mode,
+    blob: GitOid,
+    context_oid: &str,
+) -> Result<gardenbed_model::Id, ImportError> {
+    if mode == Mode::Gitlink {
+        Ok(gitlink_blob_id(blob))
+    } else {
+        git_objects.ensure_blob(blob, context_oid)
+    }
+}
+
 #[cfg(test)]
 mod raw_fallback_tests {
     //! Focused tests for the raw mode-aware tree-diff fallback ([`super`]):
@@ -716,9 +737,9 @@ mod raw_fallback_tests {
     use std::process::{Command, Stdio};
 
     use gardenbed_model::{Change, Mode, Op};
-    use gardenbed_store::{MemoryStore, ObjectStore};
+    use gardenbed_store::MemoryStore;
 
-    use super::{raw_diff_dir, RAW_DIFF_LEAF_CAP};
+    use super::{RAW_DIFF_LEAF_CAP, raw_diff_dir};
     use crate::oid::GitOid;
     use crate::resolve::GitObjects;
 
@@ -772,7 +793,10 @@ mod raw_fallback_tests {
                 args,
                 String::from_utf8_lossy(&out.stderr)
             );
-            String::from_utf8(out.stdout).expect("utf8").trim().to_owned()
+            String::from_utf8(out.stdout)
+                .expect("utf8")
+                .trim()
+                .to_owned()
         }
 
         fn blob(&self, content: &[u8]) -> String {
@@ -903,8 +927,7 @@ mod raw_fallback_tests {
             ("100644", &c, "g"),
         ]);
         let changes = diff_trees(&r, &parent, &child, RAW_DIFF_LEAF_CAP).expect("diffs");
-        let shown: Vec<(Op, String)> =
-            changes.iter().map(|c| (c.op, c.path.clone())).collect();
+        let shown: Vec<(Op, String)> = changes.iter().map(|c| (c.op, c.path.clone())).collect();
         assert_eq!(
             shown,
             vec![
@@ -920,7 +943,10 @@ mod raw_fallback_tests {
                 (Op::Add, "g".into()),
             ],
         );
-        assert!(changes.iter().all(|c| c.src_path.is_none()), "no invented renames");
+        assert!(
+            changes.iter().all(|c| c.src_path.is_none()),
+            "no invented renames"
+        );
         assert_eq!(
             changes
                 .iter()
@@ -957,22 +983,5 @@ mod raw_fallback_tests {
         let changes = diff_trees(&r, &parent, &child, RAW_DIFF_LEAF_CAP).expect("diffs");
         assert_eq!(changes.len(), 3);
         assert!(changes.iter().all(|c| c.op == Op::Modify));
-    }
-}
-
-
-/// The gardenbed blob id for a tree entry: gitlinks carry the padded
-/// upstream SHA and are never read or written; everything else is read
-/// from git and mirrored into loam (once per distinct content).
-fn blob_id_for(
-    git_objects: &mut GitObjects<'_>,
-    mode: Mode,
-    blob: GitOid,
-    context_oid: &str,
-) -> Result<gardenbed_model::Id, ImportError> {
-    if mode == Mode::Gitlink {
-        Ok(gitlink_blob_id(blob))
-    } else {
-        git_objects.ensure_blob(blob, context_oid)
     }
 }
