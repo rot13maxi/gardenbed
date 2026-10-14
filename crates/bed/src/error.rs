@@ -4,6 +4,7 @@
 
 use std::path::PathBuf;
 
+use gardenbed_model::Id;
 use gardenbed_store::StoreError;
 
 /// Everything `bed` can fail with in its local (offline) half.
@@ -98,4 +99,82 @@ pub enum BedError {
     /// An error surfaced by the local loam cache (`FsObjectStore`).
     #[error(transparent)]
     Store(#[from] StoreError),
+
+    // ------------------------------------------------- arboretum (M4 read path)
+    /// The arboretum could not be reached. Validation and connection both
+    /// happen before any local state is written, so nothing is half-planted.
+    #[error(
+        "cannot reach the arboretum at {server}: {message}\n  \
+         is it running? plant the arboretum with `gardenbed-server --addr <ip:port> --root <dir>`"
+    )]
+    Connect {
+        /// The endpoint bed tried.
+        server: String,
+        /// Why the connection failed.
+        message: String,
+    },
+
+    /// An RPC reached the arboretum and was refused. The command is named so
+    /// the human knows which step of the tending failed.
+    #[error("bed {command}: the arboretum refused ({code}): {message}")]
+    Rpc {
+        /// The command that issued the RPC (`file`, `goto`, …).
+        command: &'static str,
+        /// gRPC status code, e.g. `not found`.
+        code: tonic::Code,
+        /// The server's explanation.
+        message: String,
+    },
+
+    /// The command needs a current changeset and the bed has none.
+    #[error(
+        "this bed has no current changeset — plant one with `bed clone` or \
+         move with `bed goto`"
+    )]
+    NoCurrentCs,
+
+    /// The bed is already planted at this directory.
+    #[error(
+        "there is already a bed at {0} — tend it where it grows, or choose \
+         another --bed-dir"
+    )]
+    AlreadyABed(PathBuf),
+
+    /// The named ref does not exist on the arboretum.
+    #[error("the arboretum has no ref {name:?}")]
+    MissingRef {
+        /// The ref name as requested.
+        name: String,
+    },
+
+    /// The changeset id is not on the arboretum (never sown there, or the
+    /// arboretum is a different garden).
+    #[error("changeset {0} is not on the arboretum")]
+    MissingCs(Id),
+
+    /// The file the command wanted does not exist (or is a directory) at
+    /// that changeset.
+    #[error("there is no file at {path:?} in {cs}")]
+    FileNotAFile {
+        /// The path as requested.
+        path: String,
+        /// The changeset it was asked for (short form).
+        cs: String,
+    },
+
+    /// `bed file` was pointed at a submodule pointer, which has no content
+    /// of its own.
+    #[error("{path:?} is a submodule pointer in {cs} — `bed file` prints only \
+             file and symlink content")]
+    FileIsGitlink {
+        /// The path as requested.
+        path: String,
+        /// The changeset it was asked for (short form).
+        cs: String,
+    },
+
+    /// The arboretum streamed blob bytes that do not hash to the address
+    /// they were asked for. A cache or tier is lying; refuse the bytes.
+    #[error("the arboretum sent blob {0} with content that does not match its address")]
+    BlobHashMismatch(Id),
 }

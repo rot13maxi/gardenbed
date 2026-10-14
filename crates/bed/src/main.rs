@@ -1,9 +1,11 @@
-//! `bed` — the binary. Parses the CLI and dispatches; all local state
-//! lives in the `gardenbed` library so later waves (RPC read path, MCP)
-//! can reuse it unchanged.
+//! `bed` — the binary. Parses the CLI and dispatches; all behavior lives
+//! in the `gardenbed` library so later waves (write path, MCP) reuse it
+//! unchanged.
 //!
-//! Commands that need the arboretum parse and validate fully, then stop at
-//! [`todo_rpc`] until the server-facing half of M4 lands.
+//! The read-path commands (`clone`, `plot add`, `goto`, `file`, `log`,
+//! `diff`) run against the arboretum. `sow`, `graft`, `harvest` and
+//! `blame` (M5/M6) still stop at [`todo_rpc`] — exit 2, after full local
+//! validation.
 
 use clap::Parser as _;
 
@@ -14,57 +16,58 @@ use gardenbed::cli::PlotCommand;
 use gardenbed::error::BedError;
 use gardenbed::plot;
 use gardenbed::revspec::CsOrRef;
-use gardenbed::status;
 
 fn main() {
     let cli = Cli::parse();
-    std::process::exit(match run(&cli) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let code = match runtime.block_on(run(&cli)) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("bed: {e}");
             1
         }
-    });
+    };
+    std::process::exit(code);
 }
 
-/// Exit code for "everything is parsed, but the server half is not wired
-/// yet" — distinct from errors (1).
+/// Exit code for "everything is parsed, but this command is a later
+/// milestone" — distinct from errors (1).
 const NOT_WIRED: i32 = 2;
 
-/// The single stub for every command that needs the arboretum. Argument
-/// parsing and local validation are complete; the RPC call itself is a
-/// later wave.
-///
-/// Extension points for the read-path agent: each match arm below that
-/// ends in `todo_rpc("<command>")` is where the client wiring goes
-/// (`gardenbed_protocol::client::GardenbedClient`).
+/// The stub for the write-path commands (`sow`, `graft`, `harvest`) and
+/// `blame` (M6). Argument parsing and local validation are complete; the
+/// RPC call itself is a later wave.
 fn todo_rpc(command: &str) -> ! {
     eprintln!(
         "bed {command}: requires a running arboretum — not wired yet."
     );
     eprintln!(
-        "The server-facing half of this command lands in a later wave. \
-         The local bed state (.bed/config.toml, .bed/treestate, .bed/objects, \
-         .bed/heads) is in place, and `bed status` and `bed plot` work offline today."
+        "This command lands in a later wave. The local bed state \
+         (.bed/config.toml, .bed/treestate, .bed/objects, .bed/heads) is in \
+         place, and `bed status`, `bed plot`, `bed clone`, `bed goto`, \
+         `bed file`, `bed log` and `bed diff` work today."
     );
     std::process::exit(NOT_WIRED);
 }
 
-fn run(cli: &Cli) -> Result<i32, BedError> {
+async fn run(cli: &Cli) -> Result<i32, BedError> {
     match &cli.command {
-        Command::Clone { server: _, repo, plot } => {
-            // Validate everything we can before the (future) network hop:
-            // repo name, and every requested plot prefix.
-            if repo.as_ref().is_some_and(|r| r.trim().is_empty()) {
-                return Err(BedError::ConfigInvalid("repo name is empty".into()));
-            }
-            for raw in plot {
-                plot::normalize_prefix(raw)?;
-            }
-            todo_rpc("clone")
+        Command::Clone { server, repo, plot } => {
+            let out = gardenbed::ops::clone(
+                &cli.bed_dir,
+                server,
+                repo.as_deref(),
+                plot.clone(),
+            )
+            .await?;
+            print!("{out}");
+            Ok(0)
         }
 
-        Command::Plot { command } => run_plot(cli, command),
+        Command::Plot { command } => run_plot(cli, command).await,
 
         Command::Status { full_scan } => {
             let bed = Bed::open(&cli.bed_dir)?;
@@ -74,7 +77,7 @@ fn run(cli: &Cli) -> Result<i32, BedError> {
                 return Ok(0);
             }
             let treestate = bed.treestate()?;
-            let report = status::scan_status(
+            let report = gardenbed::status::scan_status(
                 &bed.garden_root(),
                 &plot,
                 &treestate,
@@ -90,34 +93,43 @@ fn run(cli: &Cli) -> Result<i32, BedError> {
         }
 
         Command::Goto { cs_or_ref } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
             CsOrRef::parse(cs_or_ref)?;
-            todo_rpc("goto")
+            let out = gardenbed::ops::goto(&cli.bed_dir, cs_or_ref).await?;
+            print!("{out}");
+            Ok(0)
         }
 
         Command::File { path, cs } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
             validate_path_arg(path)?;
             if let Some(cs) = cs {
                 CsOrRef::parse(cs)?;
             }
-            todo_rpc("file")
+            let mut out = std::io::stdout().lock();
+            gardenbed::ops::file(&cli.bed_dir, path, cs.as_deref(), &mut out).await?;
+            Ok(0)
         }
 
-        Command::Log { limit: _, cs } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
+        Command::Log { limit, cs } => {
             if let Some(cs) = cs {
                 CsOrRef::parse(cs)?;
             }
-            todo_rpc("log")
+            let out = gardenbed::ops::log(&cli.bed_dir, *limit, cs.as_deref()).await?;
+            // render_log already terminates every entry with a newline.
+            if !out.is_empty() {
+                print!("{out}");
+            }
+            Ok(0)
         }
 
         Command::Diff { a, b } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
             for arg in [a, b].into_iter().flatten() {
                 CsOrRef::parse(arg)?;
             }
-            todo_rpc("diff")
+            let out = gardenbed::ops::diff(&cli.bed_dir, a.as_deref(), b.as_deref()).await?;
+            if !out.is_empty() {
+                print!("{out}");
+            }
+            Ok(0)
         }
 
         Command::Sow { message, author } => {
@@ -158,8 +170,9 @@ fn run(cli: &Cli) -> Result<i32, BedError> {
     }
 }
 
-/// `bed plot` — fully local: reads and writes `.bed/config.toml`.
-fn run_plot(cli: &Cli, command: &PlotCommand) -> Result<i32, BedError> {
+/// `bed plot` — `list` and `remove` are fully local; `add` records the
+/// prefixes and then fetches + materializes them from the arboretum.
+async fn run_plot(cli: &Cli, command: &PlotCommand) -> Result<i32, BedError> {
     match command {
         PlotCommand::List => {
             let bed = Bed::open(&cli.bed_dir)?;
@@ -174,28 +187,15 @@ fn run_plot(cli: &Cli, command: &PlotCommand) -> Result<i32, BedError> {
             Ok(0)
         }
 
-        PlotCommand::Add { paths } => {
-            let mut bed = Bed::open(&cli.bed_dir)?;
-            let mut added: Vec<String> = Vec::new();
+        PlotCommand::Add { paths, concurrency } => {
+            // Normalize everything first: a bad prefix is rejected before
+            // any connection is attempted.
             for raw in paths {
-                let prefix = plot::normalize_prefix(raw)?;
-                if !bed.config().plot.contains(&prefix) {
-                    bed.config_mut().plot.push(prefix.clone());
-                    added.push(prefix);
-                }
+                plot::normalize_prefix(raw)?;
             }
-            if added.is_empty() {
-                println!("nothing to add — those prefixes are already in the plot");
-                return Ok(0);
-            }
-            bed.save_config()?;
-            for prefix in &added {
-                println!("plotted {prefix}");
-            }
-            println!(
-                "materializing these prefixes needs a running arboretum — not wired yet; \
-                 until then `bed status` will show their files as untracked"
-            );
+            let out =
+                gardenbed::ops::plot_add(&cli.bed_dir, paths, *concurrency).await?;
+            print!("{out}");
             Ok(0)
         }
 

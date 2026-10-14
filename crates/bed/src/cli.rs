@@ -1,15 +1,17 @@
 //! The clap-derived CLI surface for `bed` — every v0.1 subcommand from
 //! docs/v0.1.md §1, with complete argument parsing.
 //!
-//! The commands that need the arboretum (`clone`, `goto`, `file`, `log`,
-//! `diff`, `sow`, `graft`, `harvest`, `blame`) parse and validate fully,
-//! then stop at the "requires a running arboretum" stub in `main.rs` until
-//! the RPC read path is wired.
+//! The read-path commands (`clone`, `plot add`, `goto`, `file`, `log`,
+//! `diff`) run against the arboretum; `sow`, `graft`, `harvest` and
+//! `blame` are later milestones and stop at the "not wired yet" stub in
+//! `main.rs` (exit 2).
 
 use std::path::PathBuf;
 
 use clap::Parser;
 use clap::Subcommand;
+
+use crate::rpc::DEFAULT_CONCURRENCY;
 
 /// bed — tend your gardenbed: a sparse, server-backed working copy.
 #[derive(Parser, Debug)]
@@ -86,10 +88,11 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// Diff two changesets (default: the plot's working state vs. the
-    /// current changeset).
+    /// Diff two changesets (default: the current changeset vs its first
+    /// parent).
     Diff {
-        /// The older side: changeset id or ref.
+        /// The older side: changeset id or ref. With `b` omitted: diffs
+        /// against this changeset's first parent.
         a: Option<String>,
         /// The newer side: changeset id or ref.
         b: Option<String>,
@@ -124,11 +127,15 @@ pub enum Command {
 /// Subcommands of `bed plot`.
 #[derive(Subcommand, Debug)]
 pub enum PlotCommand {
-    /// Add path prefixes to the plot (directory or exact file).
+    /// Add path prefixes to the plot (directory or exact file) and
+    /// materialize them at the current changeset.
     Add {
         /// Repo-relative prefixes; `.` plants the whole garden.
         #[arg(required = true, num_args = 1.., value_name = "PATH")]
         paths: Vec<String>,
+        /// Bound on concurrent object fetches from the arboretum.
+        #[arg(long, value_name = "N", default_value_t = DEFAULT_CONCURRENCY)]
+        concurrency: usize,
     },
     /// Remove path prefixes from the plot.
     Remove {
@@ -196,8 +203,15 @@ mod tests {
     #[test]
     fn plot_subcommands_parse() {
         match parsed(&["plot", "add", "src", "docs"]).command {
-            Command::Plot { command: PlotCommand::Add { paths } } => {
+            Command::Plot { command: PlotCommand::Add { paths, .. } } => {
                 assert_eq!(paths, vec!["src", "docs"])
+            }
+            other => panic!("expected plot add, got {other:?}"),
+        }
+        match parsed(&["plot", "add", "--concurrency", "3", "src"]).command {
+            Command::Plot { command: PlotCommand::Add { paths, concurrency } } => {
+                assert_eq!(paths, vec!["src"]);
+                assert_eq!(concurrency, 3);
             }
             other => panic!("expected plot add, got {other:?}"),
         }

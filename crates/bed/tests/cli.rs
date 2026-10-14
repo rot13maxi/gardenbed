@@ -1,6 +1,9 @@
 //! End-to-end tests of the `bed` binary: the CLI voice, exit codes, and
-//! the offline behaviors M4 promises (status works with no server; RPC
-//! commands fail cleanly, never half-states).
+//! the offline behaviors M4 promises (`status`/`plot` work with no server;
+//! server-backed commands fail cleanly, never half-states).
+//!
+//! Full server-backed round-trips live in `read_path.rs` (they spawn a
+//! real arboretum); here the arboretum is unreachable on purpose.
 
 use std::fs;
 use std::process::Command;
@@ -26,11 +29,22 @@ fn bed(dir: &TempDir, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// A tempdir with a freshly planted bed.
+/// A tempdir with a freshly planted bed (as `bed clone` would leave it,
+/// minus the server round-trip).
 fn planted_bed() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     Bed::init(&dir.path().join(".bed"), "http://127.0.0.1:1", "garden").unwrap();
     dir
+}
+
+/// Records `prefixes` in the bed's config, as `bed plot add` would once
+/// its fetch phase succeeded (the tests here run offline, so the plot
+/// list is set through the library).
+fn plot(dir: &TempDir, prefixes: &[&str]) {
+    let mut bed = Bed::open(&dir.path().join(".bed")).unwrap();
+    bed.config_mut().current_cs = Some("0".repeat(64));
+    bed.config_mut().plot = prefixes.iter().map(|s| s.to_string()).collect();
+    bed.save_config().unwrap();
 }
 
 /// Seeds the treestate as if `src/<name>` had been materialized from the
@@ -64,23 +78,13 @@ fn status_without_a_bed_fails_clearly() {
 }
 
 #[test]
-fn plot_add_list_remove_roundtrip() {
+fn plot_list_and_remove_roundtrip_offline() {
     let dir = planted_bed();
-
-    let (code, out, _) = bed(&dir, &["plot", "add", "src/", "docs"]);
-    assert_eq!(code, 0, "{out}");
-    assert!(out.contains("plotted src"), "out: {out}");
-    assert!(out.contains("plotted docs"), "out: {out}");
-    assert!(out.contains("not wired yet"), "out: {out}");
+    plot(&dir, &["src", "docs"]);
 
     let (code, out, _) = bed(&dir, &["plot", "list"]);
     assert_eq!(code, 0);
     assert_eq!(out, "src\ndocs\n", "out: {out}");
-
-    // Idempotent re-add.
-    let (code, out, _) = bed(&dir, &["plot", "add", "src"]);
-    assert_eq!(code, 0);
-    assert!(out.contains("already in the plot"), "out: {out}");
 
     let (code, out, _) = bed(&dir, &["plot", "remove", "src", "tests"]);
     assert_eq!(code, 0);
@@ -93,9 +97,34 @@ fn plot_add_list_remove_roundtrip() {
 }
 
 #[test]
+fn plot_add_needs_the_arboretum_and_writes_nothing_on_failure() {
+    let dir = planted_bed();
+    let config_before = fs::read_to_string(dir.path().join(".bed/config.toml")).unwrap();
+
+    // The arboretum is unreachable: `plot add` fails cleanly and the plot
+    // list stays as it was (validate + connect before any local write).
+    let (code, stdout, stderr) = bed(&dir, &["plot", "add", "src"]);
+    assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("cannot reach the arboretum"), "stderr: {stderr}");
+
+    let config_after = fs::read_to_string(dir.path().join(".bed/config.toml")).unwrap();
+    assert_eq!(config_before, config_after, "config must be untouched");
+
+    let (code, out, _) = bed(&dir, &["plot", "list"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("the plot is empty"), "out: {out}");
+
+    // A prefix that fails normalization is rejected even earlier.
+    let (code, _, stderr) = bed(&dir, &["plot", "add", "../escape"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("invalid plot prefix"), "stderr: {stderr}");
+}
+
+#[test]
 fn status_is_clean_right_after_planting() {
     let dir = planted_bed();
-    bed(&dir, &["plot", "add", "src"]);
+    plot(&dir, &["src"]);
     materialize(&dir, "a.rs", b"hello");
 
     let (code, out, _) = bed(&dir, &["status"]);
@@ -110,7 +139,7 @@ fn status_is_clean_right_after_planting() {
 #[test]
 fn status_reports_modified_deleted_and_untracked() {
     let dir = planted_bed();
-    bed(&dir, &["plot", "add", "src"]);
+    plot(&dir, &["src"]);
     materialize(&dir, "a.rs", b"hello");
     materialize(&dir, "b.rs", b"byebye");
 
@@ -138,7 +167,7 @@ fn status_reports_modified_deleted_and_untracked() {
 #[test]
 fn status_touch_without_content_change_is_not_modified() {
     let dir = planted_bed();
-    bed(&dir, &["plot", "add", "src"]);
+    plot(&dir, &["src"]);
     materialize(&dir, "a.rs", b"hello");
 
     // Rewrite identical bytes: mtime moves, size and content don't.
@@ -148,18 +177,52 @@ fn status_touch_without_content_change_is_not_modified() {
 }
 
 #[test]
-fn rpc_commands_ask_for_the_arboretum() {
+fn read_path_commands_fail_cleanly_without_an_arboretum() {
     let dir = planted_bed();
+    plot(&dir, &["src"]);
+    // The bed "has" a current changeset id that no arboretum knows; the
+    // connection itself is the first thing to fail.
     let cases: &[&[&str]] = &[
         &["goto", "main"],
         &["file", "src/a.rs", "--cs", "main"],
         &["log", "--limit", "3"],
         &["diff"],
+    ];
+    for args in cases {
+        let (code, stdout, stderr) = bed(&dir, args);
+        assert_eq!(code, 1, "args {args:?}: stdout {stdout:?} stderr {stderr:?}");
+        assert!(
+            stderr.contains("cannot reach the arboretum"),
+            "args {args:?}: stderr {stderr:?}"
+        );
+        assert!(stdout.is_empty(), "args {args:?}: stdout {stdout:?}");
+    }
+
+    // A bed with no current changeset names the missing state instead.
+    let dir = planted_bed();
+    let (code, _, stderr) = bed(&dir, &["log"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("no current changeset"), "stderr: {stderr}");
+}
+
+#[test]
+fn clone_fails_cleanly_without_an_arboretum_and_leaves_no_bed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (code, stdout, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1"]);
+    assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(stderr.contains("cannot reach the arboretum"), "stderr: {stderr}");
+    assert!(!dir.path().join(".bed").exists(), "no bed may be planted");
+}
+
+#[test]
+fn write_path_commands_ask_for_a_later_wave() {
+    let dir = planted_bed();
+    let cases: &[&[&str]] = &[
         &["sow", "-m", "tend the rows"],
         &["graft", "main"],
         &["harvest"],
         &["blame", "src/a.rs"],
-        &["clone", "http://127.0.0.1:1"],
     ];
     for args in cases {
         let (code, stdout, stderr) = bed(&dir, args);
@@ -173,10 +236,10 @@ fn rpc_commands_ask_for_the_arboretum() {
 }
 
 #[test]
-fn rpc_commands_still_validate_arguments_locally() {
+fn commands_still_validate_arguments_locally() {
     let dir = planted_bed();
 
-    // A bad plot prefix on clone is rejected before the stub (exit 1, not 2).
+    // A bad plot prefix on clone is rejected before any connection.
     let (code, _, stderr) = bed(&dir, &["clone", "http://s", "--plot", "../escape"]);
     assert_eq!(code, 1, "stderr: {stderr}");
     assert!(stderr.contains("invalid plot prefix"), "stderr: {stderr}");
@@ -186,15 +249,25 @@ fn rpc_commands_still_validate_arguments_locally() {
     assert_eq!(code, 1);
     assert!(stderr.contains("invalid changeset id or ref"), "stderr: {stderr}");
 
-    // A bad path on blame.
-    let (code, _, stderr) = bed(&dir, &["blame", "/absolute"]);
-    assert_eq!(code, 1);
-    assert!(stderr.contains("invalid path"), "stderr: {stderr}");
+    // A bad path on blame and on file.
+    for args in [&["blame", "/absolute"][..], &["file", "/absolute"][..]] {
+        let (code, _, stderr) = bed(&dir, args);
+        assert_eq!(code, 1, "args {args:?}");
+        assert!(stderr.contains("invalid path"), "args {args:?}: {stderr}");
+    }
 
     // An empty message on sow.
     let (code, _, stderr) = bed(&dir, &["sow", "-m", "   "]);
     assert_eq!(code, 1);
     assert!(stderr.contains("message is empty"), "stderr: {stderr}");
+}
+
+#[test]
+fn clone_refuses_to_overwrite_an_existing_bed_before_connecting() {
+    let dir = planted_bed();
+    let (code, _, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1"]);
+    assert_eq!(code, 1);
+    assert!(stderr.contains("already a bed"), "stderr: {stderr}");
 }
 
 #[test]

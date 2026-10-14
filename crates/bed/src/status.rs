@@ -28,6 +28,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::fs::Metadata;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -37,6 +38,8 @@ use crate::error::BedError;
 use crate::plot::dir_may_hold_plotted;
 use crate::plot::in_plot;
 use crate::treestate::Treestate;
+use crate::treestate::MODE_GITLINK;
+use crate::treestate::MODE_SYMLINK;
 
 /// What `bed status` found under the plot.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -96,14 +99,22 @@ pub fn scan_status(
     let tracked: HashSet<String> = tracked_paths.iter().cloned().collect();
 
     // Pass 1 — deleted: tracked, inside the plot, and gone from disk (or
-    // replaced by something that is not a file, e.g. a directory landed on
-    // the path).
+    // replaced by something that is not a file or symlink, e.g. a directory
+    // landed on the path). Gitlink rows are skipped: submodule pointers are
+    // never materialized as files, so their absence is their normal state.
     for path in &tracked_paths {
         if !in_plot(path, plot) {
             continue;
         }
-        match fs::metadata(root.join(path)) {
-            Ok(m) if m.is_file() => {}
+        let entry = match treestate.lookup(path)? {
+            Some(entry) => entry,
+            None => continue,
+        };
+        if entry.mode == MODE_GITLINK {
+            continue;
+        }
+        match fs::symlink_metadata(root.join(path)) {
+            Ok(m) if m.is_file() || m.is_symlink() => {}
             Ok(_) => report.deleted.push(path.clone()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 report.deleted.push(path.clone())
@@ -164,6 +175,10 @@ pub fn scan_status(
 
 /// Classifies one tracked, on-disk file: hint-pass clean, or hash and
 /// compare against the recorded blob id.
+///
+/// Symlinks are checked as the link itself (`symlink_metadata`, never
+/// following): the "content" is the link-target bytes, the mode is
+/// [`MODE_SYMLINK`], and a broken target is still a faithful symlink.
 fn check_tracked(
     root: &Path,
     rel: &str,
@@ -177,20 +192,25 @@ fn check_tracked(
         // is not a state bed reports on — treat it as untouched.
         None => return Ok(()),
     };
+    // A gitlink row never has a file on disk; nothing to check here.
+    if entry.mode == MODE_GITLINK {
+        return Ok(());
+    }
 
-    let meta = match fs::metadata(root.join(rel)) {
+    let meta = match fs::symlink_metadata(root.join(rel)) {
         Ok(m) => m,
         // Vanished between pass 1 and here: pass 1 already called it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e.into()),
     };
-    if !meta.is_file() {
+    if meta.is_dir() {
         return Ok(()); // replaced by a directory — already reported deleted
     }
 
+    let is_symlink = meta.is_symlink();
     let size = meta.len() as i64;
     let mtime_ns = mtime_ns(&meta);
-    let mode = mode_of(&meta);
+    let mode = if is_symlink { MODE_SYMLINK } else { mode_of(&meta) };
 
     // Hint pass: size+mtime+mode unchanged on a verified row → untouched,
     // without reading the file. `--full-scan` skips this entirely.
@@ -203,12 +223,18 @@ fn check_tracked(
         return Ok(());
     }
 
-    // Suspect: hash it and let content decide.
-    let content = fs::read(root.join(rel))?;
+    // Suspect: hash it and let content decide. A symlink's content is its
+    // target; everything else is the file's bytes.
+    let content: Vec<u8> = if is_symlink {
+        fs::read_link(root.join(rel))?.as_os_str().as_bytes().to_vec()
+    } else {
+        fs::read(root.join(rel))?
+    };
     if blob_id(&content) == entry.blob_id {
         if mode != entry.mode {
-            // Content is unchanged but the mode moved (e.g. the exec bit):
-            // a real modification until the treestate catches up.
+            // Content is unchanged but the mode moved (e.g. the exec bit or
+            // a file↔symlink swap): a real modification until the
+            // treestate catches up.
             report.modified.push(rel.to_owned());
         } else {
             // Touch-without-change (mtime or hint metadata moved): refresh
@@ -235,8 +261,8 @@ pub fn mtime_ns(meta: &Metadata) -> i64 {
 }
 
 /// The working file's mode as a §4 code: 1 (exec) when any execute bit is
-/// set, else 0 (regular). Symlink/gitlink modes are materialization's
-/// business (later waves); a scan never writes them.
+/// set, else 0 (regular). Symlink (2) and gitlink (3) rows are classified
+/// by their metadata shape in [`check_tracked`]; a scan never writes them.
 fn mode_of(meta: &Metadata) -> i64 {
     #[cfg(unix)]
     {

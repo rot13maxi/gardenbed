@@ -39,6 +39,15 @@ pub const HINT_VERIFIED: i64 = 1;
 /// by anything other than a hash-checked materialization should use this.
 pub const HINT_UNVERIFIED: i64 = 0;
 
+/// §4 mode code for a regular file (materialized with default permissions).
+pub const MODE_REGULAR: i64 = 0;
+/// §4 mode code for an executable file.
+pub const MODE_EXEC: i64 = 1;
+/// §4 mode code for a symlink (the "content" is the link target).
+pub const MODE_SYMLINK: i64 = 2;
+/// §4 mode code for a submodule pointer (never materialized as a file).
+pub const MODE_GITLINK: i64 = 3;
+
 /// One row of the treestate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreestateEntry {
