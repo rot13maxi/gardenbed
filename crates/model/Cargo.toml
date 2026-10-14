@@ -3,3 +3,10 @@ name = "gardenbed-model"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[dependencies]
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

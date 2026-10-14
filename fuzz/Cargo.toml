@@ -1,0 +1,23 @@
+[package]
+name = "gardenbed-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gardenbed-model = { path = "../crates/model" }
+
+[[bin]]
+name = "decode_changeset"
+path = "fuzz_targets/decode_changeset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_tree"
+path = "fuzz_targets/decode_tree.rs"
+test = false
+doc = false
+bench = false
