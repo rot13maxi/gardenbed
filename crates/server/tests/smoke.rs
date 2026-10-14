@@ -1,7 +1,7 @@
 //! Verification M2.5 (server smoke test): spawns the built
 //! `gardenbed-server` binary on an ephemeral port with a temp repo root and
 //! drives it through the typed client — object access, the change graph,
-//! refs, graft/harvest, blame's unimplemented status, the empty-`repo`
+//! refs, graft/harvest, blame ranges, the empty-`repo`
 //! rejection, and the request counters.
 
 use std::collections::BTreeMap;
@@ -295,8 +295,22 @@ async fn server_smoke_end_to_end() {
     assert!(err.message().contains("other.txt"), "conflict names the path: {err}");
 
     // ---------------------------------------------------------- blame
-    let err = client.blame(repo, id_child, "a.txt").await.expect_err("blame");
-    assert_eq!(err.code(), tonic::Code::Unimplemented);
+    // First-parent lineage blame streams coalesced ranges: the child
+    // rewrote a.txt's only line, so it attributes to the child changeset.
+    let ranges = drain(client.blame(repo, id_child, "a.txt").await).await;
+    assert_eq!(ranges.len(), 1, "one coalesced range: {ranges:?}");
+    assert_eq!(ranges[0].lo, 1);
+    assert_eq!(ranges[0].hi, 1);
+    assert_eq!(
+        ranges[0].cs_id,
+        gardenbed_protocol::convert::id_to_bytes(id_child)
+    );
+    // A path that does not exist at that changeset is a clean `not_found`.
+    let err = client
+        .blame(repo, id_child, "no-such-path.txt")
+        .await
+        .expect_err("blame of a missing path");
+    assert_eq!(err.code(), tonic::Code::NotFound);
 
     // --------------------------------------------------------- counters
     // Exactly the four counted RPCs were exercised, in these amounts:

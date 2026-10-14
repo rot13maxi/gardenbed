@@ -11,16 +11,15 @@
 //! Error philosophy: a conforming client never sees an error for a *result*
 //! (ref CAS conflicts come back in `CasResp`, empty answers as absent
 //! optional fields); errors are reserved for genuinely absent objects
-//! (`not_found`), bad input (`invalid_argument`), semantic precondition
-//! violations (`failed_precondition`), and unimplemented surface
-//! (`unimplemented`, blame only — M6).
+//! (`not_found`), bad input (`invalid_argument`), and semantic precondition
+//! violations (`failed_precondition`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use gardenbed_derive::Engine;
+use gardenbed_derive::{BlameRange, Engine};
 use gardenbed_model::codec::validate_changeset;
 use gardenbed_model::{blob_id, Change, Changeset, Id, Mode};
 use gardenbed_store::{
@@ -56,9 +55,6 @@ pub enum ServerError {
     /// Graft hit semantic conflicts; the paths are listed in the message.
     #[error("graft conflicts on: {}", .0.join(", "))]
     GraftConflict(Vec<String>),
-    /// Blame is not yet implemented (M6 deliverable).
-    #[error("blame is not yet implemented (planned for M6)")]
-    BlameUnimplemented,
     /// Harvest refused: ref "main" is not an ancestor of the target (or the
     /// CAS was lost to a concurrent harvest after the check passed).
     #[error("harvest refused: \"main\" is not an ancestor of the given changeset")]
@@ -324,11 +320,23 @@ impl Repo {
         Ok(out)
     }
 
-    /// Blame is an M6 deliverable; v0.1 reports it as unimplemented.
-    pub fn blame(&self, cs_id: Id, _path: &str) -> Result<Vec<(u64, u64, Id)>, ServerError> {
-        // Validate the changeset exists so the error is honest, then refuse.
-        self.get_changeset(cs_id)?;
-        Err(ServerError::BlameUnimplemented)
+    /// First-parent lineage blame of `path` at changeset `cs_id` (v0.1.md
+    /// D7): coalesced `(lo, hi, changeset)` ranges, 1-based inclusive,
+    /// ascending, with rename following. Delegates to the compost
+    /// [`Engine`] — the very implementation the M6 differential suite
+    /// anchors to `git blame --first-parent`, so the gRPC surface and
+    /// `bed blame` are semantically identical by construction.
+    ///
+    /// Errors with [`ServerError::ChangesetNotFound`] when the changeset
+    /// (or the path at it) does not exist — the engine reports both as
+    /// `NotFound`, and v0.1 carries a single `not_found` shape on the wire
+    /// (clients that care about the distinction pre-check the path via
+    /// `RootTree`/`GetTree`, as `bed blame` does). Gitlink paths and empty
+    /// files answer with zero ranges (documented divergences, engine docs).
+    pub fn blame(&self, cs_id: Id, path: &str) -> Result<Vec<BlameRange>, ServerError> {
+        self.engine
+            .blame(cs_id, path)
+            .map_err(|e| ServerError::for_changeset(e, cs_id))
     }
 
     // -------------------------------------------------------------- refs
@@ -558,7 +566,6 @@ impl From<ServerError> for Status {
             ServerError::GraftConflict(_) | ServerError::NotFastForward => {
                 Status::failed_precondition(e.to_string())
             }
-            ServerError::BlameUnimplemented => Status::unimplemented(e.to_string()),
         }
     }
 }
@@ -614,8 +621,8 @@ impl Gardenbed for GardenbedService {
     type DiffStream = BoxStream<pb::ChangeMsg>;
     /// Server-streaming response type for `Log`.
     type LogStream = BoxStream<pb::ChangesetSummary>;
-    /// Server-streaming response type for `Blame` (the RPC is unimplemented
-    /// in v0.1 and always errors, but the associated type is required).
+    /// Server-streaming response type for `Blame` (first-parent lineage
+    /// blame ranges, v0.1.md D7).
     type BlameStream = BoxStream<pb::BlameRange>;
     /// Server-streaming response type for `ListRefs`.
     type ListRefsStream = BoxStream<pb::RefEntry>;
@@ -830,12 +837,15 @@ impl Gardenbed for GardenbedService {
         let req = request.into_inner();
         self.repo_field(&req.repo, "Blame")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        // Repo validates the changeset exists, then refuses: blame is an M6
-        // deliverable, so v0.1 answers `unimplemented`.
-        Err(match self.repo.blame(cs_id, &req.path) {
-            Err(e) => e.into(),
-            Ok(_) => Status::internal("blame unexpectedly succeeded"),
-        })
+        let ranges = self.repo.blame(cs_id, &req.path)?;
+        let items = ranges.into_iter().map(|(lo, hi, cs)| {
+            Ok(pb::BlameRange {
+                lo,
+                hi,
+                cs_id: id_to_bytes(cs),
+            })
+        });
+        Ok(Response::new(Box::pin(iter(items))))
     }
 
     async fn list_refs(

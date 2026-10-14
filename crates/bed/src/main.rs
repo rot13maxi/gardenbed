@@ -1,10 +1,11 @@
 //! `bed` — the binary. Parses the CLI and dispatches; all behavior lives
-//! in the `gardenbed` library so later waves (MCP) reuse it unchanged.
+//! in the `gardenbed` library so other surfaces (the MCP server) reuse it
+//! unchanged.
 //!
-//! The read-path commands (`clone`, `plot add`, `goto`, `file`, `log`,
-//! `diff`) and the write path (`sow`, `graft`, `harvest`) run against the
-//! arboretum. Only `blame` (M6) still stops at [`todo_rpc`] — exit 2,
-//! after full local validation.
+//! Every v0.1 command is wired: the read path (`clone`, `plot add`,
+//! `goto`, `file`, `log`, `diff`, `blame`) and the write path (`sow`,
+//! `graft`, `harvest`) run against the arboretum; `status` and `plot
+//! list/remove` are fully offline.
 
 use clap::Parser as _;
 
@@ -30,25 +31,6 @@ fn main() {
         }
     };
     std::process::exit(code);
-}
-
-/// Exit code for "everything is parsed, but this command is a later
-/// milestone" — distinct from errors (1). After M5 only `blame` (M6)
-/// still lands here.
-const NOT_WIRED: i32 = 2;
-
-/// The stub for `blame` (M6). Argument parsing and local validation are
-/// complete; the lineage walk is a later wave.
-fn todo_rpc(command: &str) -> ! {
-    eprintln!(
-        "bed {command}: not wired yet — it lands with the blame milestone."
-    );
-    eprintln!(
-        "Everything else works today: `bed status`, `bed plot`, `bed clone`, \
-         `bed goto`, `bed file`, `bed log`, `bed diff`, `bed sow`, \
-         `bed graft` and `bed harvest`."
-    );
-    std::process::exit(NOT_WIRED);
 }
 
 async fn run(cli: &Cli) -> Result<i32, BedError> {
@@ -156,10 +138,17 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
             Ok(0)
         }
 
-        Command::Blame { path } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
+        Command::Blame { path, cs } => {
             validate_path_arg(path)?;
-            todo_rpc("blame")
+            if let Some(cs) = cs {
+                CsOrRef::parse(cs)?;
+            }
+            let out = gardenbed::ops::blame(&cli.bed_dir, path, cs.as_deref()).await?;
+            // render_blame already terminates every line with a newline.
+            if !out.is_empty() {
+                print!("{out}");
+            }
+            Ok(0)
         }
     }
 }

@@ -178,6 +178,11 @@ pub enum BedError {
     #[error("the arboretum sent blob {0} with content that does not match its address")]
     BlobHashMismatch(Id),
 
+    /// The arboretum streamed a malformed item (e.g. a blame range whose
+    /// changeset address is not 32 bytes). Refuse the answer, not the bed.
+    #[error("the arboretum sent a malformed response: {0}")]
+    MalformedRpc(String),
+
     // ------------------------------------------------- write path (M5)
     /// An `--author` (or `GARDENBED_AUTHOR`) value is not a usable
     /// `Name <email>` identity, or carries characters git's ident format

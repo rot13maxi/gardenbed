@@ -1,5 +1,5 @@
 //! The server-backed commands (M4 read path): `clone`, `plot add`, `goto`,
-//! `file`, `log`, `diff`.
+//! `file`, `log`, `diff`; M6/M7 add `blame`.
 //!
 //! Two invariants shape every function here:
 //!
@@ -11,7 +11,7 @@
 //!   `.bed/objects`, with bounded parallelism, so every command is
 //!   resumable and idempotent by construction.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -592,4 +592,102 @@ async fn build_entries(
     // output is produced.
     session.fetcher().blobs(&wanted).await?;
     Ok(entries)
+}
+
+/// `bed blame <path> [--cs id-or-ref]` — first-parent lineage blame of one
+/// path (v0.1.md D7), rendered git-blame-like (see [`crate::render`]):
+///
+/// ```text
+/// <16-hex-short> (<author name> <YYYY-MM-DD> <lineno>) <line content>
+/// ```
+///
+/// Pure read like `file`/`log`: the path is validated and the changeset
+/// resolved first, the file content is fetched cache-first, and identity
+/// lookups per attributed changeset are cached for the run, so a file
+/// blamed to k changesets costs at most k `GetChangeset` RPCs however many
+/// ranges they cover. A path that is missing or a directory at the target
+/// changeset, and submodule pointers, are refused before the blame RPC —
+/// the same rules `bed file` applies.
+pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<String, BedError> {
+    validate_path(path).map_err(|e| BedError::Path {
+        raw: path.to_owned(),
+        reason: e.to_string(),
+    })?;
+    let bed = Bed::open(bed_dir)?;
+    if cs.is_none() {
+        require_current_cs(&bed)?;
+    }
+    let session = Session::open(&bed).await?;
+    let cs_id = resolve_target(&session, &bed, cs, "blame").await?;
+
+    // The path must exist as a file at that changeset: blame answers a
+    // content lineage, and a precise "no file here" beats the server's
+    // generic not_found (which cannot distinguish path from changeset).
+    let entry = session
+        .locate_entry(cs_id, path, "blame")
+        .await?
+        .ok_or_else(|| BedError::FileNotAFile {
+            path: path.to_owned(),
+            cs: cs_id.short(),
+        })?;
+    match entry.kind {
+        TreeKind::Dir => {
+            return Err(BedError::FileNotAFile {
+                path: path.to_owned(),
+                cs: cs_id.short(),
+            })
+        }
+        TreeKind::File => {}
+    }
+    if entry.mode == Mode::Gitlink {
+        return Err(BedError::FileIsGitlink {
+            path: path.to_owned(),
+            cs: cs_id.short(),
+        });
+    }
+
+    let ranges = session.blame(cs_id, path, "blame").await?;
+    let blob = entry
+        .blob
+        .ok_or_else(|| BedError::BlobHashMismatch(cs_id))?;
+    let content = session.fetcher().blob(blob).await?;
+
+    // Identity lookups per attributed changeset, cached for this run.
+    let mut authors: HashMap<Id, (String, u64, i32)> = HashMap::new();
+    let mut groups = Vec::with_capacity(ranges.len());
+    for r in &ranges {
+        let id = blame_cs_id(r)?;
+        let (name, time_secs, tz_min) = match authors.get(&id) {
+            Some(hit) => hit.clone(),
+            None => {
+                let cs = session.get_changeset(id, "blame").await?;
+                let hit = (cs.author.name.clone(), cs.author.time_secs, cs.author.tz_min);
+                authors.insert(id, hit.clone());
+                hit
+            }
+        };
+        groups.push(render::BlameGroup {
+            lo: r.lo,
+            hi: r.hi,
+            id,
+            author_name: name,
+            time_secs,
+            tz_min,
+        });
+    }
+    Ok(render::render_blame(&groups, &content))
+}
+
+/// The changeset id off a wire blame range (a 32-byte content address).
+fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, BedError> {
+    <[u8; 32]>::try_from(r.cs_id.as_slice())
+        .map(Id::from_bytes)
+        .map_err(|_| {
+            BedError::MalformedRpc(format!(
+                "blame range {}-{} carries a {}-byte changeset address",
+                r.lo,
+                r.hi,
+                r.cs_id.len()
+            ))
+        })
 }

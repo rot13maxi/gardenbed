@@ -1,10 +1,9 @@
 //! The clap-derived CLI surface for `bed` — every v0.1 subcommand from
 //! docs/v0.1.md §1, with complete argument parsing.
 //!
-//! The read-path commands (`clone`, `plot add`, `goto`, `file`, `log`,
-//! `diff`) run against the arboretum; `sow`, `graft`, `harvest` and
-//! `blame` are later milestones and stop at the "not wired yet" stub in
-//! `main.rs` (exit 2).
+//! All commands are wired: the read path (`clone`, `plot add`, `goto`,
+//! `file`, `log`, `diff`, `blame`), the write path (`sow`, `graft`,
+//! `harvest`), and the fully offline ones (`status`, `plot list/remove`).
 
 use std::path::PathBuf;
 
@@ -122,6 +121,9 @@ pub enum Command {
     Blame {
         /// The file's repo-relative path.
         path: String,
+        /// Changeset id or ref to blame at (default: the current one).
+        #[arg(long = "cs", value_name = "ID-OR-REF")]
+        cs: Option<String>,
     },
 }
 
@@ -298,7 +300,17 @@ mod tests {
             other => panic!("expected Harvest, got {other:?}"),
         }
         match parsed(&["blame", "src/lib.rs"]).command {
-            Command::Blame { path } => assert_eq!(path, "src/lib.rs"),
+            Command::Blame { path, cs } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(cs, None);
+            }
+            other => panic!("expected Blame, got {other:?}"),
+        }
+        match parsed(&["blame", "src/lib.rs", "--cs", "main"]).command {
+            Command::Blame { path, cs } => {
+                assert_eq!(path, "src/lib.rs");
+                assert_eq!(cs.as_deref(), Some("main"));
+            }
             other => panic!("expected Blame, got {other:?}"),
         }
         // `-m` is required.

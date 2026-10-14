@@ -487,6 +487,73 @@ fn emit(out: &mut String, sign: u8, line: &[u8]) {
     out.push('\n');
 }
 
+// ----------------------------------------------------------------- blame
+
+/// One blame attribution group: lines `lo..=hi` (1-based, inclusive) of
+/// the file were introduced by changeset `id`, authored by `author_name`
+/// at author time (`time_secs`, `tz_min`) — git blame shows the *author*
+/// identity, not the committer's.
+pub struct BlameGroup {
+    /// First line of the range (1-based, inclusive).
+    pub lo: u64,
+    /// Last line of the range (1-based, inclusive).
+    pub hi: u64,
+    /// The changeset that introduced these lines.
+    pub id: gardenbed_model::Id,
+    /// The author's name.
+    pub author_name: String,
+    /// Author time, git-native epoch seconds.
+    pub time_secs: u64,
+    /// Author tz offset in minutes.
+    pub tz_min: i32,
+}
+
+/// The author date as `YYYY-MM-DD` (its own timezone offset applied) —
+/// the day-precision date `bed blame` prints.
+pub fn render_date_short(time_secs: u64, tz_min: i32) -> String {
+    render_date(time_secs, tz_min)[..10].to_owned()
+}
+
+/// Renders blame output: one line per file line, in git blame's default
+/// format shape:
+///
+/// ```text
+/// <16-hex-short> (<author name> <YYYY-MM-DD> <lineno>) <line content>
+/// ```
+///
+/// `groups` are the blame ranges (ascending, coalesced, covering every
+/// line — the blame walk's contract); `content` is the file's raw bytes at
+/// the blamed changeset. An empty file renders empty output (git prints
+/// nothing for one). The date is day-precision (v0.1: git's default also
+/// shows the clock time — a documented cosmetic divergence).
+pub fn render_blame(groups: &[BlameGroup], content: &[u8]) -> String {
+    let (lines, _ends_with_newline) = split_lines(content);
+    let mut out = String::new();
+    let mut gi = 0usize;
+    for (i, line) in lines.iter().enumerate() {
+        let lineno = i as u64 + 1;
+        while gi + 1 < groups.len() && groups[gi].hi < lineno {
+            gi += 1;
+        }
+        let g = groups.get(gi).unwrap_or_else(|| {
+            panic!("blame range {gi} must cover line {lineno} (walk contract)")
+        });
+        assert!(
+            g.lo <= lineno && lineno <= g.hi,
+            "blame ranges must cover every line; line {lineno} not covered"
+        );
+        out.push_str(&g.id.short());
+        out.push_str(" (");
+        out.push_str(&g.author_name);
+        out.push(' ');
+        out.push_str(&render_date_short(g.time_secs, g.tz_min));
+        out.push_str(&format!(" {lineno}) "));
+        out.push_str(&String::from_utf8_lossy(line));
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -625,5 +692,55 @@ mod tests {
         assert!(h.contains("-b\r\n"), "{h}");
         // Mode-only change (identical bytes) renders no hunks at all.
         assert_eq!(hunk_of("x\n", "x\n"), "");
+    }
+
+    // ---------------------------------------------------------- blame
+
+    fn group(lo: u64, hi: u64, byte: u8, name: &str, secs: u64, tz: i32) -> BlameGroup {
+        BlameGroup {
+            lo,
+            hi,
+            id: gardenbed_model::Id::from_bytes([byte; 32]),
+            author_name: name.into(),
+            time_secs: secs,
+            tz_min: tz,
+        }
+    }
+
+    #[test]
+    fn blame_renders_git_like_lines() {
+        let groups = [
+            group(1, 2, 0xAA, "Ada", 1_700_000_000, 0),
+            group(3, 4, 0xBB, "Bob", 1_700_086_400 + 3600, 60),
+        ];
+        let out = render_blame(&groups, b"one\ntwo\nthree\nfour\n");
+        assert_eq!(
+            out,
+            "aaaaaaaaaaaaaaaa (Ada 2023-11-14 1) one\n\
+             aaaaaaaaaaaaaaaa (Ada 2023-11-14 2) two\n\
+             bbbbbbbbbbbbbbbb (Bob 2023-11-16 3) three\n\
+             bbbbbbbbbbbbbbbb (Bob 2023-11-16 4) four\n"
+        );
+    }
+
+    #[test]
+    fn blame_day_dates_render_in_their_own_tz() {
+        // +0545 pushes 22:13 UTC into the next civil day.
+        assert_eq!(render_date_short(1_700_000_000, 345), "2023-11-15");
+        assert_eq!(render_date_short(1_700_000_000, 0), "2023-11-14");
+        assert_eq!(render_date_short(1_700_000_000, -840), "2023-11-14");
+    }
+
+    #[test]
+    fn blame_of_an_empty_file_is_empty_output() {
+        let groups = [group(1, 1, 0xAA, "Ada", 1, 0)];
+        assert_eq!(render_blame(&groups, b""), "");
+    }
+
+    #[test]
+    fn blame_keeps_a_missing_trailing_newline_line() {
+        let groups = [group(1, 2, 0xAA, "Ada", 1, 0)];
+        let out = render_blame(&groups, b"x\ny");
+        assert!(out.ends_with(" 2) y\n"), "{out}");
     }
 }

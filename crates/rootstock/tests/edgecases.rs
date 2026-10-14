@@ -511,8 +511,8 @@ impl Builder {
     /// ("refusing to create malformed object", `badFilemode`), so the
     /// bytes are written with `--literally`, which bypasses the check.
     /// The resulting object is accepted by plain `git fsck` (rc 0 —
-    /// `badFilemode` is only a warning, escalated by neither `--strict`
-    /// variant observed on git 2.43), exactly like the pre-canonical
+    /// `badFilemode` is only a warning; git 2.43 keeps it one even under
+    /// `--strict`), exactly like the pre-canonical
     /// objects preserved in old histories (the linux corpus's "new git
     /// world order" commits normalize exactly such entries). `entries`
     /// are `(mode, hex sha, name)` and are written in git's tree order

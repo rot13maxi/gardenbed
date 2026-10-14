@@ -187,6 +187,7 @@ fn read_path_commands_fail_cleanly_without_an_arboretum() {
         &["file", "src/a.rs", "--cs", "main"],
         &["log", "--limit", "3"],
         &["diff"],
+        &["blame", "src/a.rs", "--cs", "main"],
     ];
     for args in cases {
         let (code, stdout, stderr) = bed(&dir, args);
@@ -216,7 +217,7 @@ fn clone_fails_cleanly_without_an_arboretum_and_leaves_no_bed() {
 }
 
 #[test]
-fn write_path_is_wired_but_blame_still_asks_for_a_later_wave() {
+fn write_path_and_blame_fail_cleanly_without_an_arboretum() {
     // -- sow never contacts the arboretum for a clean plot: the local
     //    NothingToSow error comes first (exit 1, no stub code involved).
     let dir = planted_bed();
@@ -252,12 +253,13 @@ fn write_path_is_wired_but_blame_still_asks_for_a_later_wave() {
         assert!(stdout.is_empty(), "args {args:?}: stdout {stdout:?}");
     }
 
-    // -- blame (M6) is still the stub: distinct milestone code, distinct
-    //    message.
+    // -- blame is wired as well (M7): this bed has no current changeset,
+    //    which is diagnosed locally, before any connection attempt — the
+    //    same validate-then-connect ordering every read command follows.
     let dir = planted_bed();
     let (code, stdout, stderr) = bed(&dir, &["blame", "src/a.rs"]);
-    assert_eq!(code, 2, "stdout {stdout:?} stderr {stderr:?}");
-    assert!(stderr.contains("not wired yet"), "stderr: {stderr}");
+    assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(stderr.contains("no current changeset"), "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
 }
 

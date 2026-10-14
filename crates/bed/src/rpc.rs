@@ -261,6 +261,33 @@ impl Session {
         drain(stream, command).await
     }
 
+    /// First-parent lineage blame ranges of `path` at `cs` (v0.1.md D7),
+    /// collected from the streamed RPC. Callers pre-validate the path
+    /// (`locate_entry`), so a `not_found` here means the changeset is not
+    /// on the arboretum — mapped to [`BedError::MissingCs`]; stream
+    /// failures map to [`BedError::Rpc`].
+    pub async fn blame(
+        &self,
+        cs: Id,
+        path: &str,
+        command: &'static str,
+    ) -> Result<Vec<gardenbed_protocol::pb::BlameRange>, BedError> {
+        let stream = match self.client.blame(&self.repo, cs, path).await {
+            Ok(stream) => stream,
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                return Err(BedError::MissingCs(cs));
+            }
+            Err(status) => {
+                return Err(BedError::Rpc {
+                    command,
+                    code: status.code(),
+                    message: status.message().to_owned(),
+                });
+            }
+        };
+        drain(stream, command).await
+    }
+
     /// The tree entry at `path` under `cs`'s root tree, resolving
     /// `RootTree` and walking down (caching trees along the way). `None`
     /// when the path names nothing (or sits under a file).
