@@ -60,10 +60,19 @@ const ZSTD_LEVEL: i32 = 3;
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The filesystem (loam) object store.
+///
+/// Durability: writes are fully fsynced by default. `GARDENBED_FSYNC=off`
+/// (read once at [`FsObjectStore::open`]) relaxes durability to
+/// atomicity-only (tmp+rename is kept, fsync calls are skipped). This is
+/// meant for rebuildable bulk loads — corpus imports and demo seeds, where
+/// a crash costs a re-import, not data. Real repositories must run with
+/// durability on; the torn-write torture tests always do.
 #[derive(Debug)]
 pub struct FsObjectStore {
     /// `<root>/objects` — holds the two shard levels.
     objects_dir: PathBuf,
+    /// fsync enabled? See the type-level docs.
+    durable: bool,
 }
 
 impl FsObjectStore {
@@ -71,13 +80,20 @@ impl FsObjectStore {
     ///
     /// Idempotent: an existing store is reopened as-is.
     pub fn open(root: &Path) -> Result<Self, StoreError> {
+        let durable = match std::env::var("GARDENBED_FSYNC").as_deref() {
+            Ok("off") | Ok("0") | Ok("false") => false,
+            _ => true,
+        };
         let objects_dir = root.join("objects");
         fs::create_dir_all(&objects_dir).map_err(io_err)?;
         // Make the directory structure itself durable before any object is
         // written into it.
         fsync_dir(root)?;
         fsync_dir(&objects_dir)?;
-        Ok(FsObjectStore { objects_dir })
+        Ok(FsObjectStore {
+            objects_dir,
+            durable,
+        })
     }
 
     /// The `objects/` directory holding all shards.
@@ -121,6 +137,10 @@ impl FsObjectStore {
         let write = || -> Result<(), StoreError> {
             let mut f = fs::OpenOptions::new().write(true).open(&tmp).map_err(io_err)?;
             f.write_all(bytes).map_err(io_err)?;
+            if !self.durable {
+                drop(f);
+                return Ok(());
+            }
             // 1. fsync the file: payload fully on disk.
             f.sync_all().map_err(io_err)?;
             // 2. fsync the parent dir before rename (durable tmp entry).
@@ -138,7 +158,9 @@ impl FsObjectStore {
             return Err(io_err(e));
         }
         // 4. fsync the dir again so the rename survives a crash.
-        fsync_dir(dir)?;
+        if self.durable {
+            fsync_dir(dir)?;
+        }
         Ok(())
     }
 }
