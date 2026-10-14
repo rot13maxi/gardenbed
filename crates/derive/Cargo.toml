@@ -6,3 +6,9 @@ license.workspace = true
 
 [dependencies]
 gardenbed-model.workspace = true
+gardenbed-store = { path = "../store" }
+thiserror = "2"
+
+[dev-dependencies]
+gardenbed-harness = { path = "../harness" }
+tempfile = "3"
