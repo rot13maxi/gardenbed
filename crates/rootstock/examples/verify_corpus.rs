@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use gardenbed_derive::Engine;
 use gardenbed_model::Mode;
-use gardenbed_store::{FsObjectStore, MetadataStore as _, ObjectStore, SqliteMetadataStore};
+use gardenbed_store::{FsObjectStore, ObjectStore, SqliteMetadataStore};
 
 struct Rng(u64);
 
@@ -62,15 +62,6 @@ fn git(mirror: &PathBuf, args: &[&str]) -> Result<Vec<u8>, String> {
 
 fn git_show(mirror: &PathBuf, sha: &str, path: &str) -> Result<Vec<u8>, String> {
     git(mirror, &["show", &format!("{sha}:{path}")])
-}
-
-fn git_ls_tree_mode(mirror: &PathBuf, sha: &str, path: &str) -> Result<String, String> {
-    let out = git(mirror, &["ls-tree", sha, "--", path])?;
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.split_whitespace()
-        .next()
-        .map(str::to_owned)
-        .ok_or_else(|| format!("ls-tree empty for {path}"))
 }
 
 /// git modes normalize to the model's mode table (pre-canonical `100664`
@@ -114,8 +105,7 @@ fn main() {
     assert!(!root.as_os_str().is_empty(), "--root required");
     assert!(!mirror.as_os_str().is_empty(), "--git required");
 
-    let objects: Arc<dyn ObjectStore> =
-        Arc::new(FsObjectStore::open(&root).expect("loam opens"));
+    let objects: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::open(&root).expect("loam opens"));
     let metadata: Arc<dyn gardenbed_store::MetadataStore> =
         Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("seedbed opens"));
     let engine = Engine::new(objects, metadata.clone());
@@ -167,7 +157,7 @@ fn main() {
             skipped += 1;
             continue;
         }
-        let Some(Ok(Some(content))) = engine.objects().get_blob(blob).map(Some) else {
+        let Ok(Some(content)) = engine.objects().get_blob(blob) else {
             skipped += 1;
             continue;
         };
@@ -189,12 +179,13 @@ fn main() {
             Err(e) => {
                 // git refuses to `show` some pre-canonical-mode entries; if
                 // the tree entry itself agrees, count the pair as checked.
-                match git(mirror, &["ls-tree", &git_sha, "--", &path]) {
-                    Ok(ls) if String::from_utf8_lossy(&ls)
-                        .split_whitespace()
-                        .next()
-                        .and_then(canon_mode)
-                        == Some(model_mode_name(mode)) =>
+                match git(&mirror, &["ls-tree", &git_sha, "--", &path]) {
+                    Ok(ls)
+                        if String::from_utf8_lossy(&ls)
+                            .split_whitespace()
+                            .next()
+                            .and_then(canon_mode)
+                            == Some(model_mode_name(mode)) =>
                     {
                         checked += 1;
                     }
@@ -205,7 +196,7 @@ fn main() {
                 }
             }
         }
-        if checked % 100 == 0 {
+        if checked.is_multiple_of(100) {
             println!("... {checked} checked, {mismatches} mismatches, {skipped} skipped");
         }
     }
