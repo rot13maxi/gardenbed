@@ -110,9 +110,7 @@ pub async fn sow(
     author: Option<&str>,
 ) -> Result<SowOutcome, BedError> {
     if message.trim().is_empty() {
-        return Err(BedError::ConfigInvalid(
-            "the message is empty — sow with -m <message>".into(),
-        ));
+        return Err(BedError::EmptyMessage);
     }
     let (name, email) = resolve_author(author)?;
 

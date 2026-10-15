@@ -415,7 +415,10 @@ impl Repo {
     /// The replayed changes must apply cleanly: the stored changeset is
     /// derived by the engine exactly like any other (lenient apply), so the
     /// conflict checker only admits changes whose lenient application gives
-    /// the same tree.
+    /// the same tree. A write onto a path the new parent already has is
+    /// admitted when that copy is the pre-image (untouched between the
+    /// changeset's parent and the new parent) — otherwise it is a conflict,
+    /// because replaying would silently clobber a concurrent change.
     pub fn graft(&self, cs_id: Id, new_parent: Id) -> Result<Id, ServerError> {
         let cs = self.get_changeset(cs_id)?;
         // The new parent must exist and its tree must be derivable (a
@@ -430,11 +433,33 @@ impl Repo {
             .map(|(path, mode, blob)| (path, (mode, blob)))
             .collect();
 
+        // The pre-image: the flat tree of the changeset's own first parent.
+        // A write may overwrite a path the new parent already has when that
+        // copy is exactly the one the changeset was made against — the
+        // text-merge-free three-way rule: untouched between parent and new
+        // parent means the replay is as safe as it was against the parent.
+        let pre: BTreeMap<String, (Mode, Id)> = match cs.parents.first() {
+            Some(first_parent) => self
+                .engine
+                .flatten_tree(self.root_tree(*first_parent)?)?
+                .into_iter()
+                .map(|(path, mode, blob)| (path, (mode, blob)))
+                .collect(),
+            None => BTreeMap::new(),
+        };
+
         let mut conflicts: Vec<String> = Vec::new();
         for c in &cs.changes {
             match c.op {
                 gardenbed_model::Op::Add | gardenbed_model::Op::Modify => {
-                    check_write(&mut files, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(
+                        &mut files,
+                        pre.get(&c.path),
+                        &c.path,
+                        c.blob,
+                        c.mode,
+                        &mut conflicts,
+                    );
                 }
                 gardenbed_model::Op::Delete => {
                     if files.remove(&c.path).is_none() {
@@ -450,7 +475,14 @@ impl Repo {
                         conflicts.push(format!("rename of missing path {src:?}"));
                         continue;
                     }
-                    check_write(&mut files, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(
+                        &mut files,
+                        pre.get(src),
+                        &c.path,
+                        c.blob,
+                        c.mode,
+                        &mut conflicts,
+                    );
                 }
             }
         }
@@ -533,8 +565,15 @@ fn branch_ref_name(name: &str) -> String {
 
 /// One write (Add/Modify/rename destination) in the graft replay: `files` is
 /// the flat working set, mutated only when the write is conflict-free.
+/// `pre` is the path's pre-image — the (mode, blob) the changeset's own
+/// parent had at this path (the rename source for a rename destination).
+/// Overwriting an existing path is a conflict unless the write is a no-op
+/// (same content and mode) or the existing copy *is* the pre-image (the
+/// three-way rule: the file is untouched between the changeset's parent and
+/// the new parent, so replaying the change is as safe as it originally was).
 fn check_write(
     files: &mut BTreeMap<String, (Mode, Id)>,
+    pre: Option<&(Mode, Id)>,
     path: &str,
     blob: Option<Id>,
     mode: Mode,
@@ -547,6 +586,10 @@ fn check_write(
     match files.get(path) {
         // Same content and mode: the write is a no-op.
         Some(existing) if *existing == (mode, blob) => {}
+        // The copy the changeset was made against: replay over it.
+        Some(existing) if pre == Some(existing) => {
+            files.insert(path.to_owned(), (mode, blob));
+        }
         // Different content or mode: a hard conflict.
         Some(_) => conflicts.push(format!("{path:?} already exists with different content")),
         None => {

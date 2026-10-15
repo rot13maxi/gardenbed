@@ -94,7 +94,7 @@ real symlinks). Reads work against the arboretum; status works offline:
 bed status                  # mtime/size hints; only suspects get hashed
 bed status --full-scan      # hash every tracked file
 bed file src/main.rs        # one file's bytes at the current changeset
-bed log --limit 5           # first-parent history, newest first
+bed log --limit 5           # history, newest first (all lineages, like git log)
 bed diff                    # current changeset vs its first parent
 bed diff main 4f5e6d…       # any two changesets or refs
 bed blame src/main.rs       # first-parent lineage blame

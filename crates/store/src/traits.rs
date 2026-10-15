@@ -109,4 +109,53 @@ pub trait MetadataStore: Send + Sync {
 
     /// Bytes previously stored under `(kind, cs)`, if any.
     fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError>;
+
+    /// Atomically ingests one new changeset: the changeset row, its git-SHA
+    /// mapping and any derived-data cache rows land in a single transaction,
+    /// so a crash mid-ingest leaves the commit entirely absent (cleanly
+    /// resumable) rather than partially recorded.
+    ///
+    /// `canonical` must be the changeset's canonical encoding (the id is
+    /// recomputed from it). The same immutability and mapping-bijection
+    /// rules as [`MetadataStore::put_changeset`] and
+    /// [`MetadataStore::record_git_mapping`] apply. Derived rows are cache
+    /// entries keyed by their own changeset id — normally the ingested
+    /// changeset's id; rows for already-committed changesets (cache
+    /// backfill) are equally valid here.
+    ///
+    /// The default implementation composes the individual operations (one
+    /// transaction each); backends with real transactions override it.
+    fn ingest_changeset(
+        &self,
+        canonical: &[u8],
+        git_sha_hex: &str,
+        derived: &[DerivedRow],
+    ) -> Result<Id, StoreError> {
+        use sha2::Digest;
+        let id = Id::from_bytes(sha2::Sha256::digest(canonical).into());
+        let cs = Changeset::decode(canonical)
+            .map_err(|e| StoreError::Corrupt(format!("canonical bytes do not decode: {e}")))?;
+        let stored = self.put_changeset(&cs)?;
+        if stored != id {
+            return Err(StoreError::Corrupt(format!(
+                "changeset canonical bytes hash to {id}, stored as {stored}"
+            )));
+        }
+        self.record_git_mapping(git_sha_hex, id)?;
+        for row in derived {
+            self.derived_put(&row.kind, row.cs, &row.bytes)?;
+        }
+        Ok(id)
+    }
+}
+
+/// One derived-data cache row handed to [`MetadataStore::ingest_changeset`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedRow {
+    /// Derived-data kind tag (e.g. `"tree"`).
+    pub kind: String,
+    /// The changeset the row belongs to.
+    pub cs: Id,
+    /// The encoded payload.
+    pub bytes: Vec<u8>,
 }

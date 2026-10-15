@@ -73,7 +73,7 @@ pub fn descriptors() -> serde_json::Value {
         "tools": [
             {
                 "name": "log",
-                "description": "First-parent history from a changeset, newest first (git-log-like text: id, author, Date, indented message). `limit` 0 means all.",
+                "description": "History from a changeset, newest first — every parent lineage, date-ordered, like `git log`'s default walk (git-log-like text: id, author, Date, indented message). `limit` 0 means all.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -175,9 +175,12 @@ pub fn call_tool(repo: &Repo, name: &str, args: &serde_json::Value) -> ToolOutco
 
 // ------------------------------------------------------------ shared plumbing
 
-/// Resolves the `cs` argument to an existing changeset id: absent → the
-/// `main` ref; 64 hex chars → an id; anything else → a ref name. Every
-/// resolution verifies existence, so callers never see a dangling id.
+/// Resolves the `cs` argument to a changeset id: absent → the `main` ref;
+/// 64 hex chars → an id; anything else → a ref name. Ref names are looked
+/// up (a missing one errors here); a 64-hex id is passed through and
+/// verified by the Repo call that uses it — a dangling id surfaces the
+/// server's "changeset … not found" from there, never a mysterious
+/// missing-object error deeper in the walk.
 fn resolve_cs(repo: &Repo, cs: Option<&str>) -> Result<Id, String> {
     match cs {
         None => repo

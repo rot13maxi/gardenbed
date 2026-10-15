@@ -14,6 +14,14 @@ pub enum BedError {
     #[error("not a bed: {0} has no config.toml — plant one with `bed clone <server>`")]
     NotABed(PathBuf),
 
+    /// The given bed directory looks like a garden root: a `.bed` lives
+    /// inside it. `--bed-dir` names the `.bed` directory itself.
+    #[error(
+        "no bed at {0} — but {0}/.bed exists: --bed-dir names the .bed \
+         directory itself, so pass --bed-dir {0}/.bed"
+    )]
+    BedDirIsGardenRoot(PathBuf),
+
     /// The config file exists but could not be read.
     #[error("cannot read the bed config at {path}: {source}")]
     ConfigRead {
@@ -114,11 +122,11 @@ pub enum BedError {
 
     /// An RPC reached the arboretum and was refused. The command is named so
     /// the human knows which step of the tending failed.
-    #[error("bed {command}: the arboretum refused ({code}): {message}")]
+    #[error("bed {command}: the arboretum refused ({code:?}): {message}")]
     Rpc {
         /// The command that issued the RPC (`file`, `goto`, …).
         command: &'static str,
-        /// gRPC status code, e.g. `not found`.
+        /// gRPC status code, e.g. `NotFound`.
         code: tonic::Code,
         /// The server's explanation.
         message: String,
@@ -197,6 +205,10 @@ pub enum BedError {
         /// Why it was rejected.
         reason: String,
     },
+
+    /// `sow` was called with an empty (or whitespace-only) message.
+    #[error("the message is empty — sow with -m <message>")]
+    EmptyMessage,
 
     /// The scan found nothing to sow: the plot is clean.
     #[error("the plot is clean — nothing modified, deleted, or untracked to sow")]

@@ -75,7 +75,7 @@ pub struct SegmentEntry {
 }
 
 impl SegmentEntry {
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(80 + self.samples.len() * 37);
         out.push(SKIPLIST_VERSION);
         put_varint(&mut out, self.height);
@@ -199,7 +199,17 @@ fn load_entry(metadata: &dyn MetadataStore, cs: Id) -> Result<Option<SegmentEntr
 /// its ancestry, iteratively so deep histories cannot overflow the stack.
 /// Post-order guarantees every ancestor's entry exists before a node's own
 /// entry needs it (jump samples point at ancestors).
-fn compute_entry(engine: &Engine, cs: Id) -> Result<SegmentEntry, StoreError> {
+///
+/// `defer_head` skips the write of the HEAD entry (returned instead): the
+/// batched import stores it in the same transaction as the changeset row,
+/// which must not be fetched from the store either — `head_override`
+/// carries its content.
+fn compute_entry_impl(
+    engine: &Engine,
+    cs: Id,
+    head_override: Option<&gardenbed_model::Changeset>,
+    defer_head: bool,
+) -> Result<SegmentEntry, StoreError> {
     /// Stack cap: legitimate depth is bounded by DAG height; a cycle is
     /// unreachable under content addressing, but hostile data must not hang
     /// the process.
@@ -217,10 +227,19 @@ fn compute_entry(engine: &Engine, cs: Id) -> Result<SegmentEntry, StoreError> {
             stack.pop();
             continue;
         }
-        let (c, _) = engine
-            .metadata()
-            .get_changeset(top)?
-            .ok_or(StoreError::NotFound)?;
+        // The head's row may not exist yet (batched import): its content is
+        // supplied by the caller.
+        let c_owned: gardenbed_model::Changeset = match (top == cs, head_override) {
+            (true, Some(h)) => h.clone(),
+            _ => {
+                engine
+                    .metadata()
+                    .get_changeset(top)?
+                    .ok_or(StoreError::NotFound)?
+                    .0
+            }
+        };
+        let c = &c_owned;
         // Ensure every parent has an entry available (memo or store cache).
         let mut ready = true;
         for p in &c.parents {
@@ -245,16 +264,30 @@ fn compute_entry(engine: &Engine, cs: Id) -> Result<SegmentEntry, StoreError> {
             }
             continue;
         }
-        let entry = build_entry(engine, &memo, &c)?;
-        engine
-            .metadata()
-            .derived_put(crate::DERIVED_SKIPLIST, top, &entry.encode())?;
+        let entry = build_entry(engine, &memo, c)?;
+        if !(defer_head && top == cs) {
+            engine
+                .metadata()
+                .derived_put(crate::DERIVED_SKIPLIST, top, &entry.encode())?;
+        }
         memo.insert(top, entry);
         stack.pop();
     }
     memo.get(&cs)
         .cloned()
         .ok_or_else(|| StoreError::Corrupt(format!("segment entry for {cs} missing after compute")))
+}
+
+/// Computes segment entries for `cs`, persisting every entry except the
+/// head's — the head's entry is returned for the caller to store together
+/// with the changeset (batched import). `head` is the stored content of
+/// `cs`, whose changeset row does not exist yet.
+pub(crate) fn skiplist_entry_for_new(
+    engine: &Engine,
+    cs: Id,
+    head: &gardenbed_model::Changeset,
+) -> Result<SegmentEntry, StoreError> {
+    compute_entry_impl(engine, cs, Some(head), true)
 }
 
 /// Builds the entry for `c` from its parents' (already computed) entries.
@@ -546,7 +579,7 @@ impl Engine {
             return Ok(e);
         }
         self.get_changeset(cs)?; // NotFound for unknown ids, before any walk
-        compute_entry(self, cs)
+        compute_entry_impl(self, cs, None, false)
     }
 
     /// Is `a` an ancestor of `b`? (Every changeset is an ancestor of

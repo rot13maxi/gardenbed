@@ -31,6 +31,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
+use sha2::Digest;
+use sha2::Sha256;
+
 use gardenbed_derive::Engine;
 use gardenbed_model::{Change, Changeset, Id, Mode, Op};
 use gardenbed_store::{MetadataStore, ObjectStore};
@@ -170,9 +173,17 @@ pub fn import_from_path(
                 committer: raw.committer,
                 signature: raw.signature,
             };
-            let cs_id = metadata.put_changeset(&cs)?;
-            metadata.record_git_mapping(&sha_hex, cs_id)?;
-            engine.on_changeset_created(cs_id)?;
+            // Batched ingest: the changeset row, the git mapping and the
+            // derived-data rows (tree cache, skiplist, path summary) land in
+            // ONE seedbed transaction — a crash leaves the commit entirely
+            // absent, which the incremental skip pass treats exactly like a
+            // commit never reached (parents before children still holds).
+            // The derived values are byte-identical to the eager
+            // on_changeset_created path.
+            let canonical = cs.canonical_bytes()?;
+            let cs_id = Id::from_bytes(Sha256::digest(&canonical).into());
+            let rows = engine.derived_rows_for_new(cs_id, &cs)?;
+            metadata.ingest_changeset(&canonical, &sha_hex, &rows)?;
             arena.nodes[*idx as usize].cs = Some(cs_id);
             report.commits_new += 1;
             if report.commits_new % 25_000 == 0 {

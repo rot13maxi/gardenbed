@@ -137,6 +137,31 @@ already contain the mode are accepted by plain `git fsck`, warning only).
 
 ---
 
+## 5. Blame attributes blank context lines per our own diff, not xdiff's
+
+**What:** `bed blame` (and the MCP `blame` tool) attribute line ranges by
+diffing each first-parent step with the store's own minimal diff. git's
+xdiff applies additional hunk-placement heuristics (indent heuristic,
+compaction). When a commit inserts a block next to a blank line, the two
+diffs are both minimal but place the blank on opposite sides of the hunk:
+xdiff appends the inserted blank *after* the block, gardenbed's diff keeps
+the pre-existing blank where it was and inserts the block before it. For
+the file's *content* the two encodings are identical; for *attribution*,
+an identical blank line may be blamed on a different (equally valid)
+commit — usually a merge on either side of the insertion.
+
+**Observed:** across ~11,000 blamed lines of git.git (builtin/checkout.c,
+builtin/remote.c, Makefile, builtin/commit.c, builtin/add.c, and others)
+compared per line against `git blame --first-parent --porcelain`, 4 lines
+diverged — all blank lines adjacent to insertion hunks (e.g.
+builtin/checkout.c lines 328 and 661, builtin/remote.c lines 872 and 875).
+
+**Why not fixed:** the choice is inherent to diff ambiguity, not a
+correctness bug: both diffs are minimal, the trees are identical, and
+every non-blank line in the corpus attributed identically. Matching git
+line-for-line would require reimplementing xdiff's heuristics in the
+derive diff; if exact parity ever matters, that is the fix.
+
 ## Explicitly *not* divergences
 
 These shapes differ from git's most literal rendering but produce

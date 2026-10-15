@@ -244,8 +244,9 @@ message DiffReq {
   bytes b = 3;
 }
 
-// Walks first-parent history from `cs_id`, newest first, up to `limit`
-// changesets (0 = no limit).
+// Walks the changeset history from `cs_id`, newest first, up to `limit`
+// changesets (0 = no limit). The walk is date-ordered over ALL parent
+// lineages — `git log`'s default algorithm, not `--first-parent`.
 message LogReq {
   string repo = 1;
   bytes cs_id = 2;
@@ -362,8 +363,9 @@ service Gardenbed {
   // never blob content.
   rpc Diff(DiffReq) returns (stream ChangeMsg);
 
-  // First-parent log from `cs_id`, newest first, at most `limit` entries
-  // (0 = unlimited).
+  // Log from `cs_id`, newest first, at most `limit` entries (0 =
+  // unlimited). Date-ordered over all parent lineages, like `git log`'s
+  // default walk.
   rpc Log(LogReq) returns (stream ChangesetSummary);
 
   // First-parent lineage blame of one path at `cs_id`, with rename following.

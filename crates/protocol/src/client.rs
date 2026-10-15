@@ -280,8 +280,9 @@ impl GardenbedClient {
         Ok(inner.diff(req).await?.into_inner())
     }
 
-    /// First-parent log from `cs_id`, newest first, at most `limit` entries
-    /// (0 = unlimited).
+    /// Log from `cs_id`, newest first, at most `limit` entries (0 =
+    /// unlimited). Date-ordered over all parent lineages, like `git log`'s
+    /// default walk.
     pub async fn log(
         &self,
         repo: &str,

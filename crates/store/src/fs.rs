@@ -113,7 +113,14 @@ impl FsObjectStore {
             .parent()
             .ok_or_else(|| StoreError::Invalid("object path has no parent directory".into()))?;
         fs::create_dir_all(dir).map_err(io_err)?;
-        fsync_dir(dir)?;
+        if self.durable {
+            // The shard directory must hold the tmp entry durably before the
+            // payload write. With `GARDENBED_FSYNC=off` this (like every
+            // other fsync here) is skipped: bulk loads only promise
+            // atomicity, and one journal-commit wait per object dominated
+            // import wall clock (each fsync parks in the ext4 journal).
+            fsync_dir(dir)?;
+        }
 
         // Unique tmp name; `create_new` makes collisions impossible.
         let mut tmp;

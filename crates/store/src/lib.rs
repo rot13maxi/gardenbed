@@ -22,6 +22,7 @@ pub use error::StoreError;
 pub use fs::FsObjectStore;
 pub use memory::MemoryStore;
 pub use sqlite::SqliteMetadataStore;
+pub use traits::DerivedRow;
 pub use traits::MetadataStore;
 pub use traits::ObjectStore;
 pub use traits::RefCas;

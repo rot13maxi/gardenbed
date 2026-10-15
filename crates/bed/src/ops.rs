@@ -151,7 +151,18 @@ pub async fn plot_add(
     let cs = session.resolve_current_cs(&bed, "plot add").await?;
     let root = session.root_tree(cs, "plot add").await?;
     let prefixes: Vec<String> = bed.config().plot.clone();
-    let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
+    let (plan_files, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
+
+    // Which of the newly added prefixes actually matched something at the
+    // current changeset? Computed before the plan moves into sync_plot.
+    let prefix_matches: Vec<bool> = added
+        .iter()
+        .map(|p| {
+            plan_files
+                .iter()
+                .any(|f| crate::plot::in_plot(&f.path, std::slice::from_ref(p)))
+        })
+        .collect();
 
     if !added.is_empty() {
         bed.save_config()?;
@@ -161,15 +172,23 @@ pub async fn plot_add(
     let outcome = sync::sync_plot(
         &bed.garden_root(),
         &prefixes,
-        plan,
+        plan_files,
         session.fetcher(),
         &treestate,
     )
     .await?;
 
     let mut out = String::new();
-    for prefix in &added {
-        out.push_str(&format!("plotted {prefix}\n"));
+    for (prefix, matched) in added.iter().zip(&prefix_matches) {
+        if *matched {
+            out.push_str(&format!("plotted {prefix}\n"));
+        } else {
+            out.push_str(&format!(
+                "plotted {prefix} — note: nothing exists under it at the \
+                 current changeset; it fills as history lands (check the \
+                 spelling if that surprises you)\n"
+            ));
+        }
     }
     if added.is_empty() {
         out.push_str("those prefixes are already in the plot — re-tending them\n");

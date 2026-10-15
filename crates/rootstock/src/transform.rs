@@ -55,11 +55,30 @@ use crate::error::ImportError;
 /// `commit_hex` only feeds error context. Deterministic: consuming changes
 /// are processed in ascending path order and the smallest candidate is
 /// consumed each round.
+///
+/// The "does anything sit under `P`" test is answered by binary search over
+/// a sorted index of target paths and rename sources instead of a linear
+/// scan of every change (kernel merges touch tens of thousands of paths, so
+/// the naive scan was quadratic in the change count and dominated import
+/// CPU). Rebuilding the two sorted index vectors per outer round keeps the
+/// rounds' total at O(rounds · C log C) — the round count is the number of
+/// repaired directories, a handful in real history.
 pub(crate) fn repair_dir_to_file(
     changes: &mut Vec<Change>,
     commit_hex: &str,
 ) -> Result<(), ImportError> {
     loop {
+        // Sorted views of the current path and rename-source sets. Rebuilt
+        // each round: a consume removes one path, retargets one rename's
+        // source and may append a delete.
+        let mut paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        paths.sort_unstable();
+        let mut srcs: Vec<&str> = changes
+            .iter()
+            .filter_map(|c| c.src_path.as_deref())
+            .collect();
+        srcs.sort_unstable();
+
         // The smallest-path change that places a file into a directory
         // being replaced and is not already self-consuming.
         let mut target: Option<usize> = None;
@@ -67,7 +86,12 @@ pub(crate) fn repair_dir_to_file(
             if !matches!(x.op, Op::Add | Op::Modify | Op::Rename) {
                 continue;
             }
-            if !has_under_paths(changes, i, &x.path) {
+            // Any path index found under `x.path` belongs to another change
+            // (a path is never under itself). A source index found under
+            // `x.path` either belongs to another change or to `x` itself —
+            // in which case `x` is self-consuming and skipped right below,
+            // exactly as the linear scan skipped it.
+            if !has_under(&paths, &x.path) && !has_under(&srcs, &x.path) {
                 continue;
             }
             let self_consuming =
@@ -85,18 +109,19 @@ pub(crate) fn repair_dir_to_file(
     Ok(())
 }
 
+/// Whether the sorted list holds any entry strictly under `dir` (`dir/…`).
+/// The first entry above `dir` is the only candidate: entries are sorted by
+/// raw bytes, so every entry under `dir` sorts right after `dir` itself.
+fn has_under(sorted: &[&str], dir: &str) -> bool {
+    let idx = sorted.partition_point(|p| p.as_bytes() <= dir.as_bytes());
+    sorted.get(idx).is_some_and(|p| {
+        p.len() > dir.len() && p.starts_with(dir) && p.as_bytes()[dir.len()] == b'/'
+    })
+}
+
 /// `child` lies strictly under directory `dir` (`dir/…`).
 fn is_under(dir: &str, child: &str) -> bool {
     child.len() > dir.len() && child.starts_with(dir) && child.as_bytes()[dir.len()] == b'/'
-}
-
-/// Whether any *other* change targets a path strictly under `dir` — either
-/// as its own path (a delete) or as a rename source.
-fn has_under_paths(changes: &[Change], exclude: usize, dir: &str) -> bool {
-    changes.iter().enumerate().any(|(j, c)| {
-        j != exclude
-            && (is_under(dir, &c.path) || c.src_path.as_deref().is_some_and(|s| is_under(dir, s)))
-    })
 }
 
 /// Performs exactly one consuming rewrite for the file-placing change at

@@ -112,22 +112,19 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         // same id gets the idempotent path, not a constraint error.
         self.in_tx(|tx| {
             let existing: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT canonical FROM changesets WHERE id = ?1",
-                    params![id.as_bytes()],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT canonical FROM changesets WHERE id = ?1")
+                .map_err(db_err)?
+                .query_row(params![id.as_bytes()], |r| r.get(0))
                 .optional()
                 .map_err(db_err)?;
             match existing {
                 Some(bytes) if bytes == canonical => Ok(id), // idempotent re-put
                 Some(_) => Err(StoreError::ImmutabilityViolation(id)),
                 None => {
-                    tx.execute(
-                        "INSERT INTO changesets(id, canonical) VALUES(?1, ?2)",
-                        params![id.as_bytes(), canonical],
-                    )
-                    .map_err(db_err)?;
+                    tx.prepare_cached("INSERT INTO changesets(id, canonical) VALUES(?1, ?2)")
+                        .map_err(db_err)?
+                        .execute(params![id.as_bytes(), canonical])
+                        .map_err(db_err)?;
                     Ok(id)
                 }
             }
@@ -137,11 +134,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
     fn get_changeset(&self, id: Id) -> Result<Option<(Changeset, Vec<u8>)>, StoreError> {
         let conn = self.lock()?;
         let canonical: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT canonical FROM changesets WHERE id = ?1",
-                params![id.as_bytes()],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT canonical FROM changesets WHERE id = ?1")
+            .map_err(db_err)?
+            .query_row(params![id.as_bytes()], |r| r.get(0))
             .optional()
             .map_err(db_err)?;
         let canonical = match canonical {
@@ -157,9 +152,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         check_ref_name(name)?;
         let conn = self.lock()?;
         let cs: Option<Vec<u8>> = conn
-            .query_row("SELECT cs FROM refs WHERE name = ?1", params![name], |r| {
-                r.get(0)
-            })
+            .prepare_cached("SELECT cs FROM refs WHERE name = ?1")
+            .map_err(db_err)?
+            .query_row(params![name], |r| r.get(0))
             .optional()
             .map_err(db_err)?;
         cs.map(|b| id_from_blob(&b)).transpose()
@@ -195,9 +190,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         // transaction, which holds the database write lock throughout.
         self.in_tx(|tx| {
             let current: Option<Vec<u8>> = tx
-                .query_row("SELECT cs FROM refs WHERE name = ?1", params![name], |r| {
-                    r.get(0)
-                })
+                .prepare_cached("SELECT cs FROM refs WHERE name = ?1")
+                .map_err(db_err)?
+                .query_row(params![name], |r| r.get(0))
                 .optional()
                 .map_err(db_err)?;
             match (expected, current) {
@@ -205,11 +200,10 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                     current: id_from_blob(&cur)?,
                 }),
                 (None, None) => {
-                    tx.execute(
-                        "INSERT INTO refs(name, cs) VALUES(?1, ?2)",
-                        params![name, new.as_bytes()],
-                    )
-                    .map_err(db_err)?;
+                    tx.prepare_cached("INSERT INTO refs(name, cs) VALUES(?1, ?2)")
+                        .map_err(db_err)?
+                        .execute(params![name, new.as_bytes()])
+                        .map_err(db_err)?;
                     Ok(crate::traits::RefCas::Won { current: new })
                 }
                 (Some(expected), Some(cur)) => {
@@ -218,10 +212,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                         // the immediate transaction it cannot fail, but keep
                         // the CAS a single guarded statement.
                         let changed = tx
-                            .execute(
-                                "UPDATE refs SET cs = ?1 WHERE name = ?2 AND cs = ?3",
-                                params![new.as_bytes(), name, expected.as_bytes()],
-                            )
+                            .prepare_cached("UPDATE refs SET cs = ?1 WHERE name = ?2 AND cs = ?3")
+                            .map_err(db_err)?
+                            .execute(params![new.as_bytes(), name, expected.as_bytes()])
                             .map_err(db_err)?;
                         if changed == 1 {
                             Ok(crate::traits::RefCas::Won { current: new })
@@ -245,19 +238,15 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         let sha = normalize_git_sha(git_sha_hex)?;
         self.in_tx(|tx| {
             let by_sha: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT cs FROM git_map WHERE git_sha = ?1",
-                    params![sha],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
+                .map_err(db_err)?
+                .query_row(params![sha], |r| r.get(0))
                 .optional()
                 .map_err(db_err)?;
             let by_cs: Option<String> = tx
-                .query_row(
-                    "SELECT git_sha FROM git_map WHERE cs = ?1",
-                    params![cs.as_bytes()],
-                    |r| r.get(0),
-                )
+                .prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
+                .map_err(db_err)?
+                .query_row(params![cs.as_bytes()], |r| r.get(0))
                 .optional()
                 .map_err(db_err)?;
             match (by_sha, by_cs) {
@@ -278,11 +267,10 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                     cs.to_hex()
                 ))),
                 (None, None) => {
-                    tx.execute(
-                        "INSERT INTO git_map(git_sha, cs) VALUES(?1, ?2)",
-                        params![sha, cs.as_bytes()],
-                    )
-                    .map_err(db_err)?;
+                    tx.prepare_cached("INSERT INTO git_map(git_sha, cs) VALUES(?1, ?2)")
+                        .map_err(db_err)?
+                        .execute(params![sha, cs.as_bytes()])
+                        .map_err(db_err)?;
                     Ok(())
                 }
             }
@@ -293,11 +281,9 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         let sha = normalize_git_sha(git_sha_hex)?;
         let conn = self.lock()?;
         let cs: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT cs FROM git_map WHERE git_sha = ?1",
-                params![sha],
-                |r| r.get(0),
-            )
+            .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
+            .map_err(db_err)?
+            .query_row(params![sha], |r| r.get(0))
             .optional()
             .map_err(db_err)?;
         cs.map(|b| id_from_blob(&b)).transpose()
@@ -305,36 +291,113 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
 
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
         let conn = self.lock()?;
-        conn.query_row(
-            "SELECT git_sha FROM git_map WHERE cs = ?1",
-            params![cs.as_bytes()],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(db_err)
+        conn.prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
+            .map_err(db_err)?
+            .query_row(params![cs.as_bytes()], |r| r.get(0))
+            .optional()
+            .map_err(db_err)
     }
 
     fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
         check_kind(kind)?;
         let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO derived(kind, cs, bytes) VALUES(?1, ?2, ?3)",
-            params![kind, cs.as_bytes(), bytes],
-        )
-        .map_err(db_err)?;
+        conn.prepare_cached("INSERT OR REPLACE INTO derived(kind, cs, bytes) VALUES(?1, ?2, ?3)")
+            .map_err(db_err)?
+            .execute(params![kind, cs.as_bytes(), bytes])
+            .map_err(db_err)?;
         Ok(())
     }
 
     fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
         check_kind(kind)?;
         let conn = self.lock()?;
-        conn.query_row(
-            "SELECT bytes FROM derived WHERE kind = ?1 AND cs = ?2",
-            params![kind, cs.as_bytes()],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(db_err)
+        let bytes: Option<Vec<u8>> = conn
+            .prepare_cached("SELECT bytes FROM derived WHERE kind = ?1 AND cs = ?2")
+            .map_err(db_err)?
+            .query_row(params![kind, cs.as_bytes()], |r| r.get(0))
+            .optional()
+            .map_err(db_err)?;
+        Ok(bytes)
+    }
+
+    fn ingest_changeset(
+        &self,
+        canonical: &[u8],
+        git_sha_hex: &str,
+        derived: &[crate::traits::DerivedRow],
+    ) -> Result<Id, StoreError> {
+        use sha2::Digest;
+        let sha = normalize_git_sha(git_sha_hex)?;
+        let id = Id::from_bytes(sha2::Sha256::digest(canonical).into());
+        // One immediate transaction for changeset + git mapping + derived
+        // rows: a crash lands either the whole commit or none of it, and
+        // the per-commit WAL traffic (and its shm lock churn) shrinks from
+        // one transaction per row to one per commit.
+        self.in_tx(|tx| {
+            let existing: Option<Vec<u8>> = tx
+                .prepare_cached("SELECT canonical FROM changesets WHERE id = ?1")
+                .map_err(db_err)?
+                .query_row(params![id.as_bytes()], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
+            match existing {
+                Some(bytes) if bytes == canonical => {} // idempotent re-put
+                Some(_) => return Err(StoreError::ImmutabilityViolation(id)),
+                None => {
+                    tx.prepare_cached("INSERT INTO changesets(id, canonical) VALUES(?1, ?2)")
+                        .map_err(db_err)?
+                        .execute(params![id.as_bytes(), canonical])
+                        .map_err(db_err)?;
+                }
+            }
+            // Mapping bijection, mirroring record_git_mapping's checks.
+            let by_sha: Option<Vec<u8>> = tx
+                .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
+                .map_err(db_err)?
+                .query_row(params![sha], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
+            let by_cs: Option<String> = tx
+                .prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
+                .map_err(db_err)?
+                .query_row(params![id.as_bytes()], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
+            match (by_sha, by_cs) {
+                (Some(bytes), Some(existing_sha))
+                    if id_from_blob(&bytes)? == id && existing_sha == sha => {}
+                (Some(bytes), _) => {
+                    let other = id_from_blob(&bytes)?;
+                    return Err(StoreError::Invalid(format!(
+                        "git sha {sha} already maps to changeset {}",
+                        other.to_hex()
+                    )));
+                }
+                (_, Some(existing_sha)) => {
+                    return Err(StoreError::Invalid(format!(
+                        "changeset {} already mapped from git sha {existing_sha}",
+                        id.to_hex()
+                    )));
+                }
+                (None, None) => {
+                    tx.prepare_cached("INSERT INTO git_map(git_sha, cs) VALUES(?1, ?2)")
+                        .map_err(db_err)?
+                        .execute(params![sha, id.as_bytes()])
+                        .map_err(db_err)?;
+                }
+            }
+            for row in derived {
+                check_kind(&row.kind)?;
+                tx.prepare_cached(
+                    "INSERT OR REPLACE INTO derived(kind, cs, bytes) VALUES(?1, ?2, ?3)",
+                )
+                .map_err(db_err)?
+                .execute(params![row.kind, row.cs.as_bytes(), row.bytes])
+                .map_err(db_err)?;
+            }
+            Ok(())
+        })?;
+        Ok(id)
     }
 }
 

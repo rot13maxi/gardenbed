@@ -340,6 +340,79 @@ async fn server_smoke_end_to_end() {
         "conflict names the path: {err}"
     );
 
+    // A modify replays onto a new parent whose copy is the pre-image: the
+    // text-merge-free three-way rule. This branch root carries a.txt exactly
+    // as id_root had it, so the child's a.txt update replays cleanly over it.
+    let cs_branch_pre = Changeset {
+        parents: vec![],
+        changes: vec![add("a.txt", &a), add("other.txt", &c)],
+        message: "branch with the pre-image a.txt".into(),
+        author: identity("cat", 30),
+        committer: identity("cat", 30),
+        signature: None,
+    };
+    let id_branch_pre = client
+        .create_changeset(
+            repo,
+            &cs_branch_pre,
+            [(blob_id(&a), a.clone()), (blob_id(&c), c.clone())],
+        )
+        .await
+        .expect("pre-image branch created");
+    let grafted_pre = client
+        .graft(repo, id_child, id_branch_pre)
+        .await
+        .expect("graft over an untouched pre-image succeeds");
+    let pre_tree = client
+        .root_tree(repo, grafted_pre)
+        .await
+        .expect("graft tree")
+        .expect("non-empty");
+    let mut pre_files: Vec<String> = client
+        .get_tree(repo, pre_tree)
+        .await
+        .expect("tree")
+        .entries
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
+    pre_files.sort_unstable();
+    let pre_names: Vec<&str> = pre_files.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        pre_names,
+        vec!["a.txt", "other.txt"],
+        "replayed modify overwrote the pre-image copy"
+    );
+
+    // But a copy that diverged from the pre-image is a hard conflict: the
+    // replay would clobber a concurrent change.
+    let diverged = b"divergent\n".to_vec();
+    let cs_branch_div = Changeset {
+        parents: vec![],
+        changes: vec![add("a.txt", &diverged), add("other.txt", &c)],
+        message: "branch with a diverged a.txt".into(),
+        author: identity("cat", 30),
+        committer: identity("cat", 30),
+        signature: None,
+    };
+    let id_branch_div = client
+        .create_changeset(
+            repo,
+            &cs_branch_div,
+            [(blob_id(&diverged), diverged), (blob_id(&c), c)],
+        )
+        .await
+        .expect("diverged branch created");
+    let err = client
+        .graft(repo, id_child, id_branch_div)
+        .await
+        .expect_err("graft onto a diverged copy conflicts");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+    assert!(
+        err.message().contains("a.txt"),
+        "conflict names the path: {err}"
+    );
+
     // ---------------------------------------------------------- blame
     // First-parent lineage blame streams coalesced ranges: the child
     // rewrote a.txt's only line, so it attributes to the child changeset.
@@ -360,11 +433,12 @@ async fn server_smoke_end_to_end() {
 
     // --------------------------------------------------------- counters
     // Exactly the four counted RPCs were exercised, in these amounts:
-    // create_changeset ×4 (root, child, branch, bad); GetTree ×3 (root,
-    // child subtree, graft tree); GetBlob ×1; PutBlob ×0 so far.
+    // create_changeset ×6 (root, child, branch, bad, pre-image branch,
+    // diverged branch); GetTree ×4 (root, child subtree, graft tree,
+    // pre-image graft tree); GetBlob ×1; PutBlob ×0 so far.
     let stats: BTreeMap<String, u64> = client.get_stats(repo).await.expect("stats");
-    assert_eq!(stats.get("create_changeset"), Some(&4), "stats: {stats:?}");
-    assert_eq!(stats.get("get_tree"), Some(&3), "stats: {stats:?}");
+    assert_eq!(stats.get("create_changeset"), Some(&6), "stats: {stats:?}");
+    assert_eq!(stats.get("get_tree"), Some(&4), "stats: {stats:?}");
     assert_eq!(stats.get("get_blob"), Some(&1), "stats: {stats:?}");
     assert_eq!(stats.get("put_blob"), Some(&0), "stats: {stats:?}");
 
@@ -385,8 +459,8 @@ async fn server_smoke_end_to_end() {
     let stats = client.get_stats(repo).await.expect("stats");
     assert_eq!(stats.get("put_blob"), Some(&1), "stats: {stats:?}");
     assert_eq!(stats.get("get_blob"), Some(&2), "stats: {stats:?}");
-    assert_eq!(stats.get("create_changeset"), Some(&4));
-    assert_eq!(stats.get("get_tree"), Some(&3));
+    assert_eq!(stats.get("create_changeset"), Some(&6));
+    assert_eq!(stats.get("get_tree"), Some(&4));
 
     server.shutdown().await;
 }

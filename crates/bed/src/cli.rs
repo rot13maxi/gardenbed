@@ -77,9 +77,11 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// First-parent history from a changeset or ref, newest first.
+    /// History from a changeset or ref, newest first — every parent
+    /// lineage, date-ordered, exactly like `git log`'s default walk.
     Log {
-        /// Show at most N changesets (default: all).
+        /// Show at most N changesets (default: all). Like `git log`, 0
+        /// means "no limit", not "show none".
         #[arg(long, value_name = "N")]
         limit: Option<u32>,
         /// Where to start (default: the current changeset).

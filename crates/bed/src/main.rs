@@ -105,9 +105,7 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
 
         Command::Sow { message, author } => {
             if message.trim().is_empty() {
-                return Err(BedError::ConfigInvalid(
-                    "the message is empty — sow with -m <message>".into(),
-                ));
+                return Err(BedError::EmptyMessage);
             }
             let outcome = gardenbed::sow::sow(&cli.bed_dir, message, author.as_deref()).await?;
             print!("{}", gardenbed::sow::render_outcome(&outcome));

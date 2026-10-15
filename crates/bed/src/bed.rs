@@ -62,9 +62,25 @@ impl Bed {
     }
 
     /// Opens an existing bed. Fails with [`BedError::NotABed`] when there
-    /// is no `config.toml` to read.
+    /// is no `config.toml` to read. The error names the *directory* so the
+    /// message does not read "`config.toml` has no `config.toml`"; when the
+    /// given directory is a garden root (a `.bed` inside it), the error
+    /// says so, since that mix-up is easy to make.
     pub fn open(bed_dir: &Path) -> Result<Self, BedError> {
-        let config = BedConfig::load(&bed_dir.join("config.toml"))?;
+        let config_path = bed_dir.join("config.toml");
+        let config = BedConfig::load(&config_path).map_err(|e| match e {
+            // Rewrite the "no config.toml" case to name the directory; the
+            // read/parse failures already name the file precisely.
+            BedError::NotABed(_) => {
+                let inner = bed_dir.join(".bed").join("config.toml");
+                if inner.is_file() {
+                    BedError::BedDirIsGardenRoot(bed_dir.to_path_buf())
+                } else {
+                    BedError::NotABed(bed_dir.to_path_buf())
+                }
+            }
+            other => other,
+        })?;
         Ok(Self {
             bed_dir: bed_dir.to_path_buf(),
             config,
@@ -154,10 +170,24 @@ mod tests {
     #[test]
     fn open_loads_config_and_fails_clearly_when_absent() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(matches!(
-            Bed::open(&dir.path().join(".bed")),
-            Err(BedError::NotABed(_))
-        ));
+        let err = Bed::open(&dir.path().join(".bed")).unwrap_err();
+        assert!(matches!(err, BedError::NotABed(_)));
+        // The message names the directory, not "config.toml has no
+        // config.toml".
+        assert!(
+            err.to_string().contains(".bed has no config.toml"),
+            "message names the directory: {err}"
+        );
+
+        // A garden root passed as the bed dir gets a pointing hint.
+        let garden = dir.path().join("garden");
+        std::fs::create_dir_all(&garden).unwrap();
+        Bed::init(&garden.join(".bed"), "http://s", "r").unwrap();
+        let err = Bed::open(&garden).unwrap_err();
+        assert!(
+            err.to_string().contains("pass --bed-dir"),
+            "garden-root mix-up gets a hint: {err}"
+        );
 
         let bed_dir = dir.path().join(".bed");
         Bed::init(&bed_dir, "http://s", "r").unwrap();

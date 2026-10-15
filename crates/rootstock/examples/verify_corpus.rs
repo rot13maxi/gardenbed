@@ -4,8 +4,11 @@
 //! For `--samples` random (changeset, path) pairs it compares gardenbed's
 //! derived tree entry content against `git show <git-sha>:<path>` in the
 //! source repository — the same oracle the synthetic suites use, at
-//! corpus scale. Sampling walks the imported graph itself (random descent
-//! from the resolved ref), so no full mapping listing is needed.
+//! corpus scale. Revs are sampled uniformly from the imported mapping by
+//! rowid poke; paths by random descent through the derived tree.
+//!
+//! `--root` is the gardenbed **repo root** (the server's convention): it
+//! holds `loam/` (the object store) and `seedbed.sqlite3` (metadata).
 //!
 //! ```sh
 //! cargo run --release -p gardenbed-rootstock --example verify_corpus -- \
@@ -24,7 +27,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use gardenbed_derive::Engine;
-use gardenbed_model::Mode;
+use gardenbed_model::{Id, Mode};
 use gardenbed_store::{FsObjectStore, ObjectStore, SqliteMetadataStore};
 
 struct Rng(u64);
@@ -85,6 +88,40 @@ fn model_mode_name(mode: Mode) -> &'static str {
     }
 }
 
+/// Picks a random file leaf by random descent through the tree (a handful
+/// of tree reads per sample, vs millions for a full flatten at kernel
+/// scale). Returns `None` to resample (gitlink leaf, dangling dir, or a
+/// leafless subtree). Shallow paths are overrepresented — fine for a
+/// sampled sweep.
+fn random_leaf(
+    engine: &Engine,
+    root: Id,
+    rng: &mut Rng,
+) -> Option<(String, Mode, gardenbed_model::Id)> {
+    use gardenbed_model::TreeKind;
+    let mut dir = root;
+    let mut path = String::new();
+    for _ in 0..64 {
+        let tree = engine.tree(dir).ok()??;
+        if tree.entries.is_empty() {
+            return None;
+        }
+        let entry = &tree.entries[rng.below(tree.entries.len() as u64) as usize];
+        match entry.kind {
+            TreeKind::File => {
+                path.push_str(&entry.name);
+                return Some((path, entry.mode, entry.blob?));
+            }
+            TreeKind::Dir => {
+                path.push_str(&entry.name);
+                path.push('/');
+                dir = entry.blob?;
+            }
+        }
+    }
+    None
+}
+
 fn main() {
     let mut root = PathBuf::new();
     let mut mirror = PathBuf::new();
@@ -105,10 +142,17 @@ fn main() {
     assert!(!root.as_os_str().is_empty(), "--root required");
     assert!(!mirror.as_os_str().is_empty(), "--git required");
 
-    let objects: Arc<dyn ObjectStore> = Arc::new(FsObjectStore::open(&root).expect("loam opens"));
+    let objects: Arc<dyn ObjectStore> =
+        Arc::new(FsObjectStore::open(&root.join("loam")).expect("loam opens"));
     let metadata: Arc<dyn gardenbed_store::MetadataStore> =
         Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("seedbed opens"));
     let engine = Engine::new(objects, metadata.clone());
+    // A second, read-only handle for sampling queries (WAL readers coexist).
+    let ro = rusqlite::Connection::open_with_flags(
+        root.join("seedbed.sqlite3"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read-only seedbed opens");
 
     let Some(tip) = metadata.resolve_ref(&ref_name).expect("resolve ref") else {
         panic!("ref {ref_name} not found in the imported corpus");
@@ -121,37 +165,29 @@ fn main() {
     let mut skipped = 0u64;
 
     while checked < samples {
-        // Random descent from the tip: pick a parent at random each step.
-        let mut cs = tip;
-        let depth = rng.below(4096);
-        for _ in 0..depth {
-            let parents = match metadata.get_changeset(cs) {
-                Ok(Some((c, _))) => c.parents,
-                _ => break,
-            };
-            if parents.is_empty() {
-                break;
-            }
-            cs = parents[rng.below(parents.len() as u64) as usize];
-        }
-        let Some(git_sha) = metadata.git_for_cs(cs).ok().flatten() else {
-            skipped += 1;
-            continue;
-        };
+        // Uniform random rev: poke git_map by rowid. (A parent walk costs
+        // thousands of full changeset decodes per sample at kernel scale.)
+        let (git_sha, cs_bytes): (String, Vec<u8>) = ro
+            .query_row(
+                "SELECT git_sha, cs FROM git_map WHERE rowid = \
+                 (abs(random()) % (SELECT max(rowid) FROM git_map) + 1)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("git_map poke");
+        let cs = Id::from_bytes(cs_bytes.try_into().expect("32-byte id"));
 
-        // A random path from this changeset's flattened tree.
+        // A random path from this changeset's tree, by random descent — a
+        // full flatten walks every tree object in a ~90k-file kernel tree,
+        // so we sample the hierarchy instead.
         let Ok(Some(tree)) = engine.root_tree(cs) else {
             skipped += 1;
             continue;
         };
-        let flat = match engine.flatten_tree(Some(tree)) {
-            Ok(f) if !f.is_empty() => f,
-            _ => {
-                skipped += 1;
-                continue;
-            }
+        let Some((path, mode, blob)) = random_leaf(&engine, tree, &mut rng) else {
+            skipped += 1;
+            continue;
         };
-        let (path, mode, blob) = flat[rng.below(flat.len() as u64) as usize].clone();
         if mode == Mode::Gitlink {
             // Submodule pointers have no loam content by design.
             skipped += 1;
@@ -197,7 +233,7 @@ fn main() {
             }
         }
         if checked.is_multiple_of(100) {
-            println!("... {checked} checked, {mismatches} mismatches, {skipped} skipped");
+            eprintln!("... {checked} checked, {mismatches} mismatches, {skipped} skipped");
         }
     }
 
