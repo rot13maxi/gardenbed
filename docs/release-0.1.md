@@ -204,6 +204,37 @@ are robust to host load.
   baselines; fixture repos live on tmpfs and fsync stays **on** — the
   durability story is under test, not the disk.
 
+## Post-M8 hardening (Oct 15, 2026)
+
+Three threads landed after M8's sweep, all committed together:
+
+* **Importer performance (8.5×).** Profiling the live kernel import
+  (`perf` + `strace` + wchan sampling) showed 86% of wall blocked in
+  ext4 journal commits — an unconditional directory fsync per written
+  object survived the `GARDENBED_FSYNC=off` toggle, a quadratic scan in
+  `repair_dir_to_file` ate 11% of CPU, and each commit issued ~95 file
+  locks across 5–6 sqlite transactions. Fixes: dir-fsync honors the
+  toggle, O(C log C) repair, and a single `BEGIN IMMEDIATE` transaction
+  per commit (`ingest_changeset`, values byte-identical to the eager
+  path; kill+resume proven byte-identical). Measured: ripgrep 34→395/s,
+  git.git 52→336/s, kernel segment 30→278/s. Bench budgets below are
+  unaffected (they exercise the bed, not the importer).
+* **End-to-end QA pass.** Every core operation driven through real
+  binaries against git.git (82,443 commits) and compared byte-exact to
+  the git oracle (clone, plot, status, file, log, diff, goto, sow,
+  harvest, export, MCP, offline). One real engine bug: graft replay was
+  over-strict (modify onto a file identical to the changeset's parent's
+  copy was refused — unusable for the common rebase case); fixed to the
+  three-way rule. Six smaller bed/server/mcp fixes; blame compared
+  11,076 lines vs `git blame --first-parent` with 4 blank-line
+  hunk-edge divergences documented (`docs/divergences.md` §5).
+* **Kernel corpus verified (M3.5 at flagship scale).** Bijection
+  1,485,163 ↔ 1,485,163; 1,000-sample sweep vs `git show` 100% match;
+  incremental re-import proof 0 new / 0 objects / 0.03 s. Details in
+  `docs/corpora.md`. `verify_corpus` now takes the repo root (server
+  convention) and samples uniformly — the M3 example had a one-level
+  root-resolution bug that made it verify a store it had built itself.
+
 ## Release procedure
 
 1. Re-run the gates on a clean checkout:
