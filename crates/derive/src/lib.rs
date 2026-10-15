@@ -126,6 +126,52 @@ impl Engine {
         Ok(tree)
     }
 
+    /// Computes the tree of a **not yet stored** changeset `cs_id`/`cs`,
+    /// writing cache rows only for uncached ancestors (rare: a gap in the
+    /// cache under an already-committed changeset). The head's cache payload
+    /// is *returned*, not written — the caller stores it in the same
+    /// transaction as the changeset row itself, so the cache entry can never
+    /// name a missing changeset. Returns `(tree id, cache payload)` where the
+    /// payload mirrors [`Engine::cache_tree`]'s encoding (empty = empty
+    /// tree).
+    fn derive_tree_for_new(
+        &self,
+        cs_id: Id,
+        cs: &Changeset,
+    ) -> Result<(Option<Id>, Vec<u8>), StoreError> {
+        if let Some(cached) = self.cached_tree(cs_id)? {
+            return Ok((cached, cache_payload(cached)));
+        }
+        // The head's content is in hand; only ancestors are read from the
+        // store (they are committed).
+        let mut chain: Vec<(Id, Changeset)> = vec![(cs_id, cs.clone())];
+        // Walk the first-parent chain upward until a cached tree shows up
+        // (or the root, whose base is the empty tree).
+        let mut base: Option<Id> = None;
+        let mut cur = cs.parents.first().copied();
+        while let Some(p) = cur {
+            if let Some(cached) = self.cached_tree(p)? {
+                base = cached;
+                break;
+            }
+            let anc = self.get_changeset(p)?;
+            cur = anc.parents.first().copied();
+            chain.push((p, anc));
+        }
+        // Apply back down the chain, oldest first. Intermediates cache
+        // immediately (their changeset rows are already committed); the
+        // head's payload goes back to the caller.
+        let mut tree = base;
+        for (i, (id, anc)) in chain.iter().enumerate().rev() {
+            tree = apply::apply_changeset(&*self.objects, tree, anc)?;
+            if i == 0 {
+                return Ok((tree, cache_payload(tree)));
+            }
+            self.cache_tree(*id, tree)?;
+        }
+        unreachable!("the head is always chain[0]")
+    }
+
     /// Alias of [`Engine::derive_tree`] (the RPC name).
     pub fn root_tree(&self, cs_id: Id) -> Result<Option<Id>, StoreError> {
         self.derive_tree(cs_id)
@@ -254,8 +300,7 @@ impl Engine {
     /// The cached tree for `cs`: `Some(Some(id))` / `Some(None)` (cached
     /// empty tree) on hit, `None` on miss. A cached id whose object has
     /// vanished is treated as a miss (recompute), never trusted blindly.
-    fn cached_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
-        match self.metadata.derived_get(DERIVED_TREE, cs)? {
+    fn cached_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {        match self.metadata.derived_get(DERIVED_TREE, cs)? {
             None => Ok(None),
             Some(bytes) if bytes.is_empty() => Ok(Some(None)),
             Some(bytes) if bytes.len() == 32 => {
@@ -276,10 +321,55 @@ impl Engine {
     /// Best-effort tree cache write. Called after the tree object itself is
     /// in loam, so the cache entry never names a missing object.
     fn cache_tree(&self, cs: Id, tree: Option<Id>) -> Result<(), StoreError> {
-        let payload = match tree {
-            None => Vec::new(),
-            Some(id) => id.as_bytes().to_vec(),
-        };
-        self.metadata.derived_put(DERIVED_TREE, cs, &payload)
+        self.metadata
+            .derived_put(DERIVED_TREE, cs, &cache_payload(tree))
+    }
+
+    /// Computes the derived-data rows for a **not yet stored** changeset
+    /// without writing them: the derived tree, the segmented-ancestry skip
+    /// list entry and the path summary — exactly what
+    /// [`Engine::on_changeset_created`] would persist, but as plain rows for
+    /// the caller to store atomically together with the changeset (batched
+    /// import). Ancestor backfill rows are written directly (their
+    /// changeset rows are already committed); only rows keyed by `cs_id` are
+    /// deferred.
+    ///
+    /// The row values are byte-identical to what the eager path writes, so
+    /// import-through-`ingest_changeset` and import-through-
+    /// `on_changeset_created` produce the same store contents.
+    pub fn derived_rows_for_new(
+        &self,
+        cs_id: Id,
+        cs: &Changeset,
+    ) -> Result<Vec<gardenbed_store::DerivedRow>, StoreError> {
+        let mut rows = Vec::with_capacity(3);
+        let (_, tree_payload) = self.derive_tree_for_new(cs_id, cs)?;
+        rows.push(gardenbed_store::DerivedRow {
+            kind: DERIVED_TREE.to_owned(),
+            cs: cs_id,
+            bytes: tree_payload,
+        });
+        let seg = ancestry::skiplist_entry_for_new(self, cs_id, cs)?;
+        rows.push(gardenbed_store::DerivedRow {
+            kind: DERIVED_SKIPLIST.to_owned(),
+            cs: cs_id,
+            bytes: seg.encode(),
+        });
+        let summary = pathsummary::pathsummary_entry_for_new(self, cs, &seg)?;
+        rows.push(gardenbed_store::DerivedRow {
+            kind: DERIVED_PATHSUMMARY.to_owned(),
+            cs: cs_id,
+            bytes: summary.encode(),
+        });
+        Ok(rows)
+    }
+}
+
+/// The tree-cache payload for a tree id (`None` = empty tree): the raw id
+/// bytes, or nothing. Mirrors the on-store encoding of `cache_tree`.
+fn cache_payload(tree: Option<Id>) -> Vec<u8> {
+    match tree {
+        None => Vec::new(),
+        Some(id) => id.as_bytes().to_vec(),
     }
 }

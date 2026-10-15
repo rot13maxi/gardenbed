@@ -923,6 +923,7 @@ dependencies = [
  "gix",
  "log",
  "rusqlite",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

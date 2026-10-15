@@ -55,6 +55,7 @@ use gardenbed_model::Id;
 use gardenbed_store::{MetadataStore, StoreError};
 
 use crate::Engine;
+use crate::ancestry::SegmentEntry;
 
 /// Version byte of the path-summary entry payload.
 const PATHSUMMARY_VERSION: u8 = 0x01;
@@ -112,7 +113,7 @@ impl PathSummary {
         bloom_maybe(&self.bloom, path)
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(BLOOM_BYTES + 80 + self.paths.len() * 12);
         out.push(PATHSUMMARY_VERSION);
         out.push(u8::from(self.truncated));
@@ -322,7 +323,19 @@ fn compute_entry(engine: &Engine, cs: Id) -> Result<PathSummary, StoreError> {
         .get_changeset(cs)?
         .ok_or(StoreError::NotFound)?;
     let seg = engine.skiplist_entry(cs)?;
-    let touched = touched_paths(&c);
+    let entry = build_summary(engine, &c, &seg)?;
+    engine
+        .metadata()
+        .derived_put(crate::DERIVED_PATHSUMMARY, cs, &entry.encode())?;
+    Ok(entry)
+}
+
+/// Builds the summary from an in-hand changeset and its (already computed)
+/// segment entry — no store fetches for `cs` itself and no write, so the
+/// batched import can persist the result in the changeset's own
+/// transaction. Parent lookups hit committed changesets only.
+fn build_summary(engine: &Engine, c: &gardenbed_model::Changeset, seg: &SegmentEntry) -> Result<PathSummary, StoreError> {
+    let touched = touched_paths(c);
     let truncated = touched.len() > MAX_SUMMARY_PATHS;
     // The bounded list carries the capped prefix; the bloom covers ALL
     // touched paths (a missing path would make blame's skip unsound).
@@ -350,7 +363,7 @@ fn compute_entry(engine: &Engine, cs: Id) -> Result<PathSummary, StoreError> {
         }
     }
 
-    let entry = PathSummary {
+    Ok(PathSummary {
         paths,
         truncated,
         first_parent: c.parents.first().copied(),
@@ -358,11 +371,19 @@ fn compute_entry(engine: &Engine, cs: Id) -> Result<PathSummary, StoreError> {
         head: seg.head,
         head_dist: seg.head_dist,
         bloom,
-    };
-    engine
-        .metadata()
-        .derived_put(crate::DERIVED_PATHSUMMARY, cs, &entry.encode())?;
-    Ok(entry)
+    })
+}
+
+/// The deferred-head variant for the batched import: `cs`'s row does not
+/// exist yet (its content is `c`), and its segment entry `seg` was computed
+/// without a write. Returns the encoded-ready summary; nothing is persisted
+/// for `cs` itself.
+pub(crate) fn pathsummary_entry_for_new(
+    engine: &Engine,
+    c: &gardenbed_model::Changeset,
+    seg: &SegmentEntry,
+) -> Result<PathSummary, StoreError> {
+    build_summary(engine, c, seg)
 }
 
 fn pathsummary_entry(engine: &Engine, cs: Id) -> Result<PathSummary, StoreError> {
