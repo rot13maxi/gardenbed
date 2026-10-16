@@ -21,6 +21,7 @@ gardenbed-store = { path = "../store" }
 # The wire client (M4 read path): thin, runtime-only — bed never links the
 # server; tests ingest fixtures through `gardenbed-server` as a dev-dep.
 gardenbed-protocol = { path = "../protocol" }
+rustix = { version = "1", features = ["fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"

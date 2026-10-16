@@ -37,3 +37,5 @@ pub mod sow;
 pub mod status;
 pub mod sync;
 pub mod treestate;
+
+mod checkout_fs;

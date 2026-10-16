@@ -254,10 +254,6 @@ pub async fn plot_add(
         })
         .collect();
 
-    if !added.is_empty() {
-        bed.save_config()?;
-    }
-
     let treestate = bed.treestate()?;
     let outcome = sync::sync_plot(
         &bed.garden_root(),
@@ -267,6 +263,9 @@ pub async fn plot_add(
         &treestate,
     )
     .await?;
+    if !added.is_empty() {
+        bed.save_config()?;
+    }
 
     let mut out = String::new();
     for (prefix, matched) in added.iter().zip(&prefix_matches) {
@@ -294,11 +293,12 @@ pub async fn plot_add(
 
 /// `bed goto <cs-or-ref>` — move the bed to a changeset and refresh the
 /// plot's working copy to match it (fetch missing, rewrite changed, remove
-/// gone). After a successful goto, `status` is clean.
+/// gone). Local edits survive when the target leaves their paths unchanged;
+/// destructive collisions are refused before any materialization.
 ///
-/// The config's `current_cs` moves only after the whole fetch phase has
-/// succeeded — a server that is down leaves the bed where it stood — and
-/// an interrupted *refresh* is repaired by simply running goto again.
+/// The config's `current_cs` moves only after successful materialization.
+/// A fetch failure or preflight refusal leaves the bed where it stood;
+/// an interrupted refresh is repaired by simply running goto again.
 pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
     let mut bed = Bed::open(bed_dir)?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;
@@ -311,10 +311,6 @@ pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
     let prefixes = bed.config().plot.clone();
     let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
 
-    // Move the bed, then bring the working copy along.
-    bed.config_mut().current_cs = Some(cs.to_hex());
-    bed.save_config()?;
-
     let treestate = bed.treestate()?;
     let outcome = sync::sync_plot(
         &bed.garden_root(),
@@ -324,6 +320,8 @@ pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
         &treestate,
     )
     .await?;
+    bed.config_mut().current_cs = Some(cs.to_hex());
+    bed.save_config()?;
 
     let where_from = parsed.as_ref_name().unwrap_or("changeset").to_owned();
     Ok(format!(
@@ -440,9 +438,6 @@ pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError>
     let root = session.root_tree(grafted, "graft").await?;
     let prefixes = bed.config().plot.clone();
     let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
-    bed.config_mut().current_cs = Some(grafted.to_hex());
-    bed.save_config()?;
-
     let treestate = bed.treestate()?;
     let outcome = sync::sync_plot(
         &bed.garden_root(),
@@ -452,6 +447,8 @@ pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError>
         &treestate,
     )
     .await?;
+    bed.config_mut().current_cs = Some(grafted.to_hex());
+    bed.save_config()?;
     bed.heads().repoint(current, grafted)?;
 
     Ok(format!(

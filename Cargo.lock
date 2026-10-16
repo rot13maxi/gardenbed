@@ -828,6 +828,7 @@ dependencies = [
  "gardenbed-server",
  "gardenbed-store",
  "rusqlite",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",

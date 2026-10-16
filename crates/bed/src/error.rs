@@ -10,6 +10,15 @@ use gardenbed_store::StoreError;
 /// Everything `bed` can fail with in its local (offline) half.
 #[derive(Debug, thiserror::Error)]
 pub enum BedError {
+    /// A checkout would overwrite local work or cross an unsafe path.
+    #[error("cannot materialize {path:?}: {reason}; preserve or sow local work before retrying")]
+    CheckoutBlocked {
+        /// Repository-relative path.
+        path: String,
+        /// Why materialization is unsafe.
+        reason: String,
+    },
+
     /// The directory does not look like a bed: no `config.toml`.
     #[error("not a bed: {0} has no config.toml — plant one with `bed clone <server>`")]
     NotABed(PathBuf),
