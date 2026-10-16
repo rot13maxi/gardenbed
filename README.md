@@ -1,153 +1,158 @@
-# gardenbed 🌱
+# Gardenbed
 
-An open-source, agent-scale source control system. Native-first: a
-server-side changeset log with a thin, always-online client — designed for
-repos where the merge rate, not the headcount, is the bottleneck.
+Source control for many agents working in the same repository.
 
-**The repo is the garden. Your checkout is the gardenbed. `bed` is the tool
-you tend it with.** Git planted the vocabulary (`branch`, `fork`, `root`,
-`tree`, `cherry-pick`); we grow it with `sow`, `graft`, `harvest`, `prune`.
+Gardenbed keeps history on a central server and gives each worker a sparse
+working copy. Workers fetch the files they need, create changesets, and
+publish them with atomic ref updates. Agents can also query history,
+files, diffs, and blame without creating a checkout.
 
-Inspired by Anthropic's [Scion](https://www.anthropic.com/engineering/redesigning-source-control)
-and a decade of Sapling/Mononoke prior art — but designed from day one to
-interoperate with git rather than replace it wholesale.
+It has its own data model and a bidirectional Git bridge. You can import
+an existing Git repository, work in Gardenbed, and export back to Git.
 
-## The mental model
+## Why Gardenbed?
 
-The **arboretum** is the server-side repository and the only authority: a
-`loam` content-addressed object store plus a `seedbed` sqlite metadata
-store. Your checkout is the **bed** — sparse by construction, it
-materializes nothing until you plant a **plot** (the path prefixes you
-tend). The loop, end to end:
+Large repositories and many concurrent workers put pressure on checkout,
+commit, and integration workflows. Gardenbed is built around three ideas:
 
-> import a git repo into the arboretum → `bed clone` a bed that fetches
-> roots only → `bed plot add` the subtrees you tend → edit and `bed sow`
-> changesets → `bed graft` them onto moved parents, `bed harvest` them
-> into `main` (a compare-and-swap) → `gardenbed-server export` hands the
-> history back to git with identical SHAs — while `gardenbed-mcp` answers
-> log/diff/blame/file questions with **no working copy anywhere**.
+- **Fetch only what you need.** A clone creates local state without
+  materializing files. Select directories or individual files afterward.
+- **Record changes directly.** Changesets describe file changes against
+  their first parent. Trees are derived incrementally, so creating a
+  changeset touches the directories affected by the change.
+- **Make repository operations available as APIs.** The CLI uses gRPC;
+  an MCP server exposes read operations for agents without a working copy.
 
-Git interoperability is bidirectional: rootstock imports git history (the
-seedbed's `git_map` is a bijection — every git SHA ↔ one changeset id) and
-exports it back through one `git fast-import` stream; unsigned histories
-round-trip byte-exactly.
+The server owns the repository. Creating a changeset stores it there
+immediately; publishing it to `main` is a separate operation. There is no
+push step between client and server.
 
-## Quickstart (ten lines)
+## Try it
+
+You need Rust 1.90 or newer and Git. Build from this checkout:
 
 ```sh
 cargo build --release
-BIN="$PWD/target/release"
-$BIN/gardenbed-server import --from /path/to/git-repo --root /tmp/arboretum
-$BIN/gardenbed-server --addr 127.0.0.1:9418 --root /tmp/arboretum &   # default addr
-mkdir -p ~/garden && cd ~/garden
-$BIN/bed clone http://127.0.0.1:9418         # sparse: materializes nothing
-$BIN/bed plot add src                        # plant what you tend
-# edit files under src/, then:
-GARDENBED_AUTHOR="A. Gardener <gardener@example.com>" $BIN/bed sow -m "tend the roses"
-$BIN/bed harvest                             # fast-forward main to the sown changeset
-$BIN/gardenbed-server export --root /tmp/arboretum --into /tmp/export.git
 ```
 
-The ten-minute tour with every flag explained is
-[docs/quickstart.md](docs/quickstart.md); the full command reference is
-[docs/cli.md](docs/cli.md).
+The main binaries are `bed`, `gardenbed-server`, and `gardenbed-mcp`.
+The examples below start from the Gardenbed source directory and assume
+an existing Git repository with a `main` branch.
 
-## Crates
-
-The workspace (`Cargo.toml`, `crates/*`) — every crate is real code, not
-scaffolding:
-
-| crate | binary | what it is |
-|---|---|---|
-| `gardenbed-model` | — | canonical objects: `Id`, `Changeset`, `Change`, `Tree` codecs over the byte spec ([docs/canonical-encoding.md](docs/canonical-encoding.md)) |
-| `gardenbed-store` | — | `loam` (content-addressed fs object store) + `seedbed` (sqlite metadata: changesets, refs, git mapping, derived cache) |
-| `gardenbed-derive` | — | the compost engine: tree derivation (touched dirs only), tree diff, first-parent blame, ancestry skip list |
-| `gardenbed-protocol` | — | `gardenbed.proto` (17 RPCs), tonic/prost codegen, and the thin client wrapper |
-| `gardenbed-server` | `gardenbed-server` | the arboretum: `Repo` service layer, the gRPC server, `import`/`export` git subcommands |
-| `gardenbed` | `bed` | the client: sparse bed, treestate, want-list fetcher, sow/graft/harvest — the `bed` CLI |
-| `gardenbed-mcp` | `gardenbed-mcp` | MCP stdio tools (`log`, `diff`, `blame`, `file`) with no working copy |
-| `gardenbed-rootstock` | — | the git bridge: import (gitoxide pack reads, topological ingest, renames) and export (one `git fast-import` stream) |
-| `gardenbed-bench` | `gen-demo-corpus` | criterion suites behind the M4/M5/M6 perf budgets, plus the deterministic demo corpus |
-| `gardenbed-harness` | — | seeded history generator, git materializer, and differential comparators against git itself |
-
-(`crates/scarecrow` is a stub — the daemon is v0.2 scope,
-[docs/v0.1.md](docs/v0.1.md) §1.)
-
-## Status
-
-**v0.1 — complete: milestones M0–M8 all landed and verified, plus two
-post-M8 hardening rounds.** The v0.1 plan — milestones with verification
-criteria — is [docs/v0.1.md](docs/v0.1.md); the close-out record with every
-gate result is [docs/release-0.1.md](docs/release-0.1.md).
-
-| milestone | scope | state |
-|---|---|---|
-| M0 | canonical model + cross-language encoding spec | ✅ |
-| M1 | loam object store + seedbed metadata (sqlite) | ✅ |
-| M2 | tree derivation, diff, object API | ✅ |
-| M3 | rootstock git import + differential harness | ✅ |
-| M4 | gRPC server + bed read path | ✅ |
-| M5 | write path: sow, graft, harvest, export | ✅ |
-| M6 | blame + ancestry skip list | ✅ |
-| M7 | MCP surface (log/diff/file/blame) | ✅ |
-| M8 | demo, chaos suite, fuzz sweep, benches, CI, docs | ✅ |
-
-Verification evidence, all recorded in
-[docs/release-0.1.md](docs/release-0.1.md) and
-[docs/corpora.md](docs/corpora.md):
-
-- **North-star demo** (`demo/run-v0.1.sh`) ends **PASS**: import of a
-  50,100-commit history with the `git_map` bijection proven
-  (50,100 ↔ 50,100), sparse `bed clone` in 46 ms, a 1,021-file plot
-  byte-verified against `git show` (all 1,011 materialized files, 10
-  symlinks, 10 exec bits), `bed log --limit 1` answered in 46 ms,
-  export → `git fsck --strict` clean with **all 50,100** exported SHAs
-  matching git's (unsigned history), and MCP answers byte-matched
-  against git oracles with zero working copy.
-- **SIGKILL chaos suite**: every RPC class killed under load and
-  re-verified offline (loam checksum sweep, sqlite `integrity_check`,
-  derived-data rebuild); default 10 × 10 cycles green in `cargo test
-  --workspace`, extended run of 10 × 100 cycles (1,000 kill/restart
-  rounds) green in 188 s.
-- **Fuzz**: six cargo-fuzz targets, sweeps clean (~120–180 s each; a
-  post-M8 re-run added ~330 M execs with zero new crashes); three
-  findings found during the sweeps were fixed and pinned.
-- **Benchmarks**: every M4/M5/M6 budget met — sow latency is
-  size-independent (p50 ratio 1.002 between 10k- and 1M-file repos),
-  1k-file cold `plot add` 1.07 s against the 5 s budget.
-- **Kernel-scale verification**: torvalds/linux `master` (1,485,163
-  commits) imported with an exact bijection, a 1,000-sample content sweep
-  vs `git show` at 100% match, and an incremental re-import proof of
-  **0 new objects in 0.03 s**.
-- **CI** (`.github/workflows/ci.yml`) runs fmt, clippy `-D warnings`,
-  `cargo test --workspace` (chaos suite included), release perf budgets,
-  a fuzz smoke, and the demo on every push/PR.
-
-Out of scope for v0.1 (nursery cache tier, scarecrow daemon, server-side
-merge, GC, offline sow queue, …) is contractual — see the table in
-[docs/v0.1.md](docs/v0.1.md) §1.
-
-## Docs
-
-| doc | contents |
-|---|---|
-| [docs/quickstart.md](docs/quickstart.md) | the ten-minute tour: build → arboretum → clone → plot → sow → harvest → MCP |
-| [docs/architecture.md](docs/architecture.md) | the system in layers: protocol, server, data model, stores, import pipeline, blame, durability |
-| [docs/cli.md](docs/cli.md) | every `bed`, `gardenbed-server`, and `gardenbed-mcp` command, from `--help` |
-| [docs/canonical-encoding.md](docs/canonical-encoding.md) | the byte-level object spec (half of the published protocol, with the `.proto`) |
-| [docs/divergences.md](docs/divergences.md) | every documented divergence from git, with repros |
-| [docs/corpora.md](docs/corpora.md) | pinned verification corpora and the kernel-scale import record |
-| [docs/mcp.md](docs/mcp.md) | the MCP surface: protocol, tools, zero-checkout contract |
-| [docs/release-0.1.md](docs/release-0.1.md) | the M8 close-out: gates, benches, deviations, release checklist |
-| [docs/v0.1.md](docs/v0.1.md) | the v0.1 plan: milestones, decisions (D1–D8), verification criteria |
-| [DESIGN.md](DESIGN.md) | the original design notes |
-
-## Install (planned)
+In one terminal, import the repository and start the server:
 
 ```sh
-cargo install gardenbed   # puts `bed` on your PATH
+./target/release/gardenbed-server import \
+  --from /path/to/git-repo --root /tmp/gardenbed-repo
+
+./target/release/gardenbed-server \
+  --root /tmp/gardenbed-repo --addr 127.0.0.1:9418
 ```
 
-Homebrew formula will be `gardenbed` (brew formula names are global, and
-`brew install bed` already belongs to a hex editor — the formula installs
-the `bed` binary regardless).
+In another terminal, create a working copy and fetch a directory:
+
+```sh
+BIN="$PWD/target/release"
+mkdir -p /tmp/gardenbed-work && cd /tmp/gardenbed-work
+
+"$BIN/bed" clone http://127.0.0.1:9418
+"$BIN/bed" plot add src
+"$BIN/bed" status
+```
+
+Edit files under `src`, then create a changeset and publish it:
+
+```sh
+GARDENBED_AUTHOR="Your Name <you@example.com>" \
+  "$BIN/bed" sow -m "Describe the change"
+
+"$BIN/bed" harvest
+```
+
+If `main` has moved, `bed graft main` replays the current changeset onto
+its new tip. Conflicting changes are reported for you to resolve.
+
+Export published history back to Git:
+
+```sh
+"$BIN/gardenbed-server" export \
+  --root /tmp/gardenbed-repo --into /tmp/gardenbed-export.git
+
+git -C /tmp/gardenbed-export.git fsck --strict
+```
+
+See the [quickstart](docs/quickstart.md) for a longer walkthrough and the
+[command reference](docs/cli.md) for options.
+
+## The commands
+
+| Command | Purpose |
+|---|---|
+| `bed clone` | Connect a new working copy to a server; fetch no working files |
+| `bed plot add` | Fetch and materialize selected paths |
+| `bed status` | Inspect local changes, including while offline |
+| `bed goto` | Switch to a changeset or ref |
+| `bed sow` | Create a changeset from local changes |
+| `bed graft` | Replay the current changeset onto a new parent |
+| `bed harvest` | Fast-forward `main` to the current changeset |
+| `bed log`, `diff`, `file`, `blame` | Query repository content and history |
+
+Checkout updates preserve local edits to files unchanged by the target
+and refuse updates that would overwrite local work. Concurrent publishes
+use compare-and-swap: a losing worker gets a conflict instead of silently
+replacing another worker's update.
+
+## Agent access
+
+`gardenbed-mcp` reads the server's repository directly and exposes four
+tools: `log`, `diff`, `file`, and `blame`. It uses stdio and requires no
+working copy:
+
+```sh
+"$BIN/gardenbed-mcp" --root /tmp/gardenbed-repo
+```
+
+See [MCP configuration and tool schemas](docs/mcp.md).
+
+## Current scope
+
+Gardenbed is an early implementation at version 0.1. It supports a
+single repository per server, filesystem object storage, SQLite metadata,
+sparse working copies, server-side replay, and Git import/export.
+
+Writes require a connection to the server. There is no authentication,
+server-side merge resolution, garbage collection, or offline commit queue
+yet. Blame follows first-parent history and renames. Git roundtrips
+preserve commit IDs for supported histories; signed commits, non-UTF-8
+metadata, and other exceptions are documented in
+[Git interoperability limits](docs/divergences.md).
+
+Verification includes differential tests against Git, process-kill
+recovery tests, fuzz targets, benchmarks, and an end-to-end demo. A Linux
+kernel history of 1.485 million commits has been imported and sampled for
+content fidelity. The [verification record](docs/release-0.1.md) and
+[corpus results](docs/corpora.md) describe what was tested and its limits.
+
+## Development and documentation
+
+```sh
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+The Rust workspace separates the object model, storage, derived data,
+protocol, server, client, Git bridge, and MCP service into crates under
+`crates/`. Start with the [architecture guide](docs/architecture.md) for
+how they fit together.
+
+- [Canonical object encoding](docs/canonical-encoding.md)
+- [Durable publication validation](docs/validation.md)
+- [Design and verification plan](docs/v0.1.md)
+- [Changelog](CHANGELOG.md)
+
+Gardenbed draws on Scion, Sapling/Mononoke, and Jujutsu. The original
+[design notes](DESIGN.md) describe that background and the project's
+naming conventions.
+
+Licensed under [MIT](LICENSE).
