@@ -69,7 +69,7 @@ Usage: bed clone [OPTIONS] <SERVER>
 | `--bed-dir <DIR>` | local state directory (default `./.bed`) |
 | `--repo <REPO>` | repo to tend; the server's choice when omitted |
 | `--ref <REF>` | the ref to plant from. Default `main`, falling back to the arboretum's other common names (`master`, `trunk`) when it does not grow it — pass this flag to name it exactly |
-| `--plot <PATH>...` | plot prefixes to plant immediately (repeat or list several) |
+| `--plot <PATH>...` | plot prefixes to record (repeat or list several); materialize with `bed plot add` |
 
 ```sh
 bed clone http://127.0.0.1:9418

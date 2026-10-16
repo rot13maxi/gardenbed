@@ -951,6 +951,37 @@ async fn heavy_blobs_upload_first_and_never_twice() {
     w.server.shutdown().await;
 }
 
+/// Individually inline-sized blobs must not overflow CreateChangeset's
+/// aggregate gRPC message limit; overflow content streams before publication.
+#[tokio::test]
+async fn many_small_blobs_fit_the_unary_request_budget() {
+    let mut w = setup().await;
+    plant(&w);
+    for i in 0..6u8 {
+        fs::write(w.garden.join(format!("bulk-{i}.bin")), vec![i; 900_000]).unwrap();
+    }
+    let client = w.server.client().await;
+    let before = client.get_stats(REPO).await.expect("stats");
+    let (code, out, stderr) = bed(&w.garden, &["sow", "-m", "many small blobs"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    let after = client.get_stats(REPO).await.expect("stats");
+    assert!(stats_get(&after, "put_blob") > stats_get(&before, "put_blob"));
+    let repo = Repo::open(&w._root).unwrap();
+    let changeset = repo.get_changeset(current_cs(&w.garden)).unwrap();
+    for i in 0..6u8 {
+        let path = format!("bulk-{i}.bin");
+        let change = changeset.changes.iter().find(|c| c.path == path).unwrap();
+        assert_eq!(
+            repo.get_blob(change.blob.unwrap()).unwrap().unwrap(),
+            vec![i; 900_000]
+        );
+    }
+    let (code, out, stderr) = bed(&w.garden, &["status", "--full-scan"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(out.contains("the plot is clean"), "{out}");
+    w.server.shutdown().await;
+}
+
 fn stats_get(stats: &std::collections::BTreeMap<String, u64>, key: &str) -> u64 {
     stats.get(key).copied().unwrap_or(0)
 }

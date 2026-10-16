@@ -50,6 +50,11 @@ use gardenbed_store::ObjectStore as _;
 /// together.
 pub const INLINE_BLOB_LIMIT: usize = 1 << 20;
 
+/// Leave room for changeset metadata and protobuf map overhead beneath
+/// tonic's default 4 MiB unary request limit. Additional small blobs take
+/// the same streamed upload path as individually large blobs.
+const INLINE_TOTAL_LIMIT: usize = 2 << 20;
+
 /// Chunk size for streaming a heavy blob through `PutBlob`.
 const PUT_BLOB_CHUNK: usize = 256 * 1024;
 
@@ -200,18 +205,22 @@ pub async fn sow(
     validate_changeset(&cs, true)
         .map_err(|e| BedError::ConfigInvalid(format!("the sown changeset is not valid: {e}")))?;
 
-    // ---- two-phase upload. `inline` covers every small blob (the server
-    // skips inline content for blobs it already has); heavy blobs go first,
+    // ---- two-phase upload. `inline` covers small blobs within the total
+    // request budget (the server skips content it already has); other blobs go first,
     // cache-write before wire so a killed sow never uploads twice.
     let objects = bed.objects()?;
     let mut inline: Vec<(Id, Vec<u8>)> = Vec::new();
     let mut heavy: Vec<(Id, Vec<u8>)> = Vec::new();
+    let mut inline_bytes = 0usize;
     let mut seen: HashMap<Id, ()> = HashMap::new();
     for w in &writes {
         if seen.insert(w.blob, ()).is_some() {
             continue; // same content at several paths uploads once
         }
-        if w.content.len() <= INLINE_BLOB_LIMIT {
+        if w.content.len() <= INLINE_BLOB_LIMIT
+            && w.content.len() <= INLINE_TOTAL_LIMIT - inline_bytes
+        {
+            inline_bytes += w.content.len();
             inline.push((w.blob, w.content.clone()));
         } else {
             heavy.push((w.blob, w.content.clone()));
