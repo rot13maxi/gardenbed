@@ -91,10 +91,14 @@ fn bench_blame(c: &mut Criterion) {
         t0.elapsed()
     );
 
-    // One Repo for all measurements: the derived data lives in the seedbed
-    // and is read per call — this is the warm-server view of blame.
-    let repo = Repo::open(&root).expect("repo reopens");
-
+    // A fresh Repo per iteration: the engine memoizes finished blame walks
+    // keyed (changeset, path) — content-addressed history is immutable, so
+    // a warm server answers a repeat blame in microseconds. That is real
+    // production behavior, but this bench exists to measure the WALK (the
+    // M6.2 budget: log-log slope, 100k < 200 ms), so every iteration gets
+    // a fresh engine over the same on-disk stores. `Repo::open` is handle
+    // construction only (no re-ingest) and costs microseconds against a
+    // multi-millisecond walk.
     let mut group = c.benchmark_group("blame");
     group.measurement_time(Duration::from_secs(3));
 
@@ -102,7 +106,10 @@ fn bench_blame(c: &mut Criterion) {
     group.sample_size(30);
     let cs_10k = ids[9_999.min(n - 1)];
     group.bench_function("walk_10k", |b| {
-        b.iter(|| repo.blame(cs_10k, TIP).expect("blame walk works"))
+        b.iter(|| {
+            let repo = Repo::open(&root).expect("repo reopens");
+            repo.blame(cs_10k, TIP).expect("blame walk works")
+        })
     });
 
     // The full-chain walk — 100k steps at ~10 µs/step means second-scale
@@ -111,7 +118,10 @@ fn bench_blame(c: &mut Criterion) {
         group.sample_size(10);
         let head = *ids.last().expect("non-empty chain");
         group.bench_function("walk_full", |b| {
-            b.iter(|| repo.blame(head, TIP).expect("blame walk works"))
+            b.iter(|| {
+                let repo = Repo::open(&root).expect("repo reopens");
+                repo.blame(head, TIP).expect("blame walk works")
+            })
         });
     }
 

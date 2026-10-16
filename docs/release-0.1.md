@@ -148,8 +148,8 @@ fsync **on**):
 | `file_read/cold` | blob uncached: one `GetBlob` round-trip + cache write on top | 83.3 ms | p95 < 50 ms (M4.4)* | * see note |
 | `sow/small_repo` | 100-file sow on a 10k-file repo | 54.8 ms | p50 ratio ≤ 2× (M5.1) | ✅ ratio **1.002** |
 | `sow/big_repo` | the identical 100-file delta on a 1M-file repo | 54.9 ms | (same) | ✅ |
-| `blame/walk_10k` | **worst case** — the path is rewritten by *every* commit (bloom can never skip); 10k chain | 475 ms ‡ | see note † | — |
-| `blame/walk_full` | the same worst case walked from the 100k head | 4.75 s ‡ | — | — |
+| `blame/walk_10k` | **worst case** — the path is rewritten by *every* commit (bloom can never skip); 10k chain | 429 ms ‡ | see note † | — |
+| `blame/walk_full` | the same worst case walked from the 100k head | 4.30 s ‡ | — | — |
 
 \* The M4.4 subprocess-path budget (p95 < 50 ms localhost) was verified at
 its own gate before this import started; the recorded bench run shared the
@@ -168,7 +168,13 @@ a changeset, a blob, and a line diff — O(history) by design.
 
 ‡ Re-recorded Oct 16, 2026, quiet host (clean checkout of `6cd6295`,
 loadavg < 1.5): `walk_10k` 474.9 ms, `walk_full` 4.755 s — 8.5 % / 8.7 %
-under the recorded numbers. The same run re-measured every other row
+under the recorded numbers; re-measured again on the landed hardening
+tree (`f393f8c`): **429 ms / 4.30 s** (−9.6 % / −9.5 % vs the original
+records). Methodology note: the blame walk bench builds a **fresh
+`Repo` per iteration** — the engine memoizes finished walks keyed
+(changeset, path) (content-addressed history is immutable), so a shared
+repo would measure microsecond memo hits (53 ns) instead of the walk
+the M6.2 budget governs. The same run re-measured every other row
 within ±1.2 % of its recorded value (sow p50 ratio 0.992 vs 1.002
 recorded), with one exception: `cold_fetch` re-measured 1.20–1.24 s
 (run CIs 1.02–1.40 s; intra-run samples span 0.5–2.4 s). A same-day
