@@ -241,6 +241,40 @@ fn measure<F: FnMut() -> R, R>(mut f: F) -> f64 {
     best
 }
 
+/// Skip-enabled blame wall time, measured per fresh engine.
+///
+/// A fresh engine per rep is what keeps this an honest walk measurement:
+/// the engine memoizes finished blame walks (immutable history makes a
+/// finished walk's answer final), so repeat queries on one engine would
+/// time the memo hit, not the walk — and the M6 gate exists to bound the
+/// walk. The stores are shared (warm), the engine's caches are not.
+fn measure_fresh(
+    objects: &Arc<dyn ObjectStore>,
+    metadata: &Arc<dyn MetadataStore>,
+    tip: Id,
+    path: &str,
+) -> f64 {
+    measure(|| {
+        Engine::new(objects.clone(), metadata.clone())
+            .blame(tip, path)
+            .expect("blame")
+    })
+}
+
+/// The naive no-skip walk (never memoized), same fresh-engine discipline.
+fn measure_naive(
+    objects: &Arc<dyn ObjectStore>,
+    metadata: &Arc<dyn MetadataStore>,
+    tip: Id,
+    path: &str,
+) -> f64 {
+    measure(|| {
+        Engine::new(objects.clone(), metadata.clone())
+            .blame_no_skip(tip, path)
+            .expect("naive blame")
+    })
+}
+
 fn fmt_secs(s: f64) -> String {
     if s < 1e-6 {
         format!("{:.0} ns", s * 1e9)
@@ -289,7 +323,9 @@ fn latency_curve_blame_vs_history_length() {
             )
         };
         let _ids = ingest(&objects, &metadata, &bench.h, true);
-        let engine = Engine::new(objects, metadata);
+        // Clone for the sanity-check engine; the measured reps below build
+        // their own fresh engines from the same shared stores.
+        let engine = Engine::new(objects.clone(), metadata.clone());
         let prep = t0.elapsed().as_secs_f64();
 
         // Semantic sanity at this size: skip == naive, and the expected
@@ -318,18 +354,10 @@ fn latency_curve_blame_vs_history_length() {
         );
         touch_pct = bench.touchers.len() as f64 * 100.0 / bench.mainline as f64;
 
-        let t_flat_skip = measure(|| engine.blame(bench.tip, "flat.txt").expect("blame"));
-        let t_flat_naive = measure(|| {
-            engine
-                .blame_no_skip(bench.tip, "flat.txt")
-                .expect("naive blame")
-        });
-        let t_deep_skip = measure(|| engine.blame(bench.tip, "deep.txt").expect("blame"));
-        let t_deep_naive = measure(|| {
-            engine
-                .blame_no_skip(bench.tip, "deep.txt")
-                .expect("naive blame")
-        });
+        let t_flat_skip = measure_fresh(&objects, &metadata, bench.tip, "flat.txt");
+        let t_flat_naive = measure_naive(&objects, &metadata, bench.tip, "flat.txt");
+        let t_deep_skip = measure_fresh(&objects, &metadata, bench.tip, "deep.txt");
+        let t_deep_naive = measure_naive(&objects, &metadata, bench.tip, "deep.txt");
         rows.push((
             n,
             prep,

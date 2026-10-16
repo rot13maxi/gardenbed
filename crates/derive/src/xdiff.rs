@@ -117,12 +117,12 @@ pub fn diff_lines(a: &[&[u8]], b: &[&[u8]]) -> Option<LineDiff> {
     if a.len() > MAX_DIFF_LINES || b.len() > MAX_DIFF_LINES {
         return None;
     }
-    let (mut cx1, mut cx2) = classify_pair(a, b);
+    let (mut cx1, mut cx2, nclasses) = classify_pair(a, b);
 
     trim_ends(&mut cx1, &mut cx2);
 
-    let (rindex1, ha1) = cleanup_records(&mut cx1, &cx2);
-    let (rindex2, ha2) = cleanup_records(&mut cx2, &cx1);
+    let (rindex1, ha1) = cleanup_records(&mut cx1, &cx2, nclasses);
+    let (rindex2, ha2) = cleanup_records(&mut cx2, &cx1, nclasses);
 
     let mut env = Env {
         effort: 0,
@@ -157,13 +157,53 @@ pub fn diff_lines(a: &[&[u8]], b: &[&[u8]]) -> Option<LineDiff> {
 
 // -------------------------------------------------------- classification
 
+/// Deterministic FNV-1a 64-bit key hashing for the classifier's maps.
+///
+/// Placement only: `HashMap` still compares keys by full byte equality on
+/// probe, so equal lines map to one class and distinct lines never merge —
+/// the diff's semantics ("classes are content-keyed, no hash collisions")
+/// are unchanged. A fixed seed keeps every run (and every wiped-and-rebuilt
+/// cache, M6.3) byte-identical; it only replaces SipHash's per-call setup,
+/// which profiling showed dominating blame on real histories.
+#[derive(Default)]
+struct RecHasher(u64);
+
+impl std::hash::BuildHasher for RecBuild {
+    type Hasher = RecHasher;
+
+    fn build_hasher(&self) -> RecHasher {
+        RecHasher(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RecBuild;
+
+impl std::hash::Hasher for RecHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = self.0;
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
 /// Classifies both files against ONE shared equivalence map (git's
 /// classifier is shared, so class ids are comparable across sides).
-fn classify_pair<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> (Ctx<'a>, Ctx<'a>) {
-    let mut map: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+/// Returns the contexts plus the number of distinct classes (class ids
+/// are dense `0..nclasses`, which [`cleanup_records`] counts in a flat
+/// vector).
+fn classify_pair<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> (Ctx<'a>, Ctx<'a>, u32) {
+    let mut map: std::collections::HashMap<&[u8], u32, RecBuild> =
+        std::collections::HashMap::with_capacity_and_hasher(a.len().max(b.len()), RecBuild);
     fn ctx_of<'a>(
         recs: &[&'a [u8]],
-        map: &mut std::collections::HashMap<&'a [u8], u32>,
+        map: &mut std::collections::HashMap<&'a [u8], u32, RecBuild>,
     ) -> Ctx<'a> {
         let mut cls = Vec::with_capacity(recs.len());
         for r in recs {
@@ -181,7 +221,8 @@ fn classify_pair<'a>(a: &[&'a [u8]], b: &[&'a [u8]]) -> (Ctx<'a>, Ctx<'a>) {
     }
     let cx1 = ctx_of(a, &mut map);
     let cx2 = ctx_of(b, &mut map);
-    (cx1, cx2)
+    let nclasses = map.len() as u32;
+    (cx1, cx2, nclasses)
 }
 
 fn trim_ends(cx1: &mut Ctx, cx2: &mut Ctx) {
@@ -266,19 +307,23 @@ fn clean_mmatch(dis: &[u8], i: usize, s: isize, e: isize) -> bool {
 /// git's `xdl_cleanup_records` for one side: pre-marks lines with no
 /// counterpart changed, drops discardable multimatches from the box, and
 /// returns the reduced index map plus reduced class array.
-fn cleanup_records(cx: &mut Ctx, other: &Ctx) -> (Vec<usize>, Vec<u32>) {
+///
+/// `nclasses` is the dense class-id bound shared by both sides; the
+/// counterpart counts are accumulated in a flat vector over it (exact,
+/// allocation-cheap, no rehashing on the blame hot path).
+fn cleanup_records(cx: &mut Ctx, other: &Ctx, nclasses: u32) -> (Vec<usize>, Vec<u32>) {
     let nrec = cx.nrec();
     if nrec == 0 {
         return (Vec::new(), Vec::new());
     }
-    let mut other_count: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut other_count = vec![0u32; nclasses as usize];
     for &c in &other.cls {
-        *other_count.entry(c).or_insert(0) += 1;
+        other_count[c as usize] += 1;
     }
     let mlim = bogosqrt(nrec as i64).min(1024);
     let mut dis = vec![0u8; nrec];
     for i in cx.dstart..=cx.dend {
-        let nm = other_count.get(&cx.cls[i as usize]).copied().unwrap_or(0);
+        let nm = other_count[cx.cls[i as usize] as usize];
         dis[i as usize] = if nm == 0 {
             0
         } else if i64::from(nm) >= mlim {

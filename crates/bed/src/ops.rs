@@ -21,6 +21,7 @@ use gardenbed_protocol::client::GardenbedClient;
 use gardenbed_protocol::convert::{mode_from_wire, op_from_wire};
 use gardenbed_protocol::pb::{ChangeMsg, ChangesetSummary};
 use gardenbed_store::ObjectStore as _;
+use tokio_stream::StreamExt as _;
 use tonic::Code;
 
 use crate::bed::Bed;
@@ -29,28 +30,49 @@ use crate::render::{self, DiffEntry, LogEntry};
 use crate::rpc::{self, Session};
 use crate::sync;
 
-/// The ref every v0.1 bed grows from: `clone` resolves it, `heads` records
-/// its tip. (v0.1 has no remote-head discovery; see `docs/v0.1.md` §2.)
+/// The ref every v0.1 bed grows from unless `--ref` says otherwise: the
+/// first name the no-flag `clone` resolution probes, the tip `harvest`
+/// consults after a lost race. (v0.1 has no remote-head discovery beyond
+/// `ListRefs`; see `docs/v0.1.md` §2.)
 const DEFAULT_REF: &str = "main";
 
-/// `bed clone <server> [--repo name] [--plot path...]` — plant a new bed.
+/// The refs a no-flag `clone` probes, in order: `main` first — the v0.1
+/// default, and the deterministic winner when several common names exist —
+/// then the common primary-branch names an arboretum might grow instead.
+/// When none resolve, the arboretum's own ref listing (`ListRefs`)
+/// enriches the error with what actually exists.
+const STARTING_REF_PROBES: [&str; 3] = [DEFAULT_REF, "master", "trunk"];
+
+/// `bed clone <server> [--repo name] [--ref name] [--plot path...]` —
+/// plant a new bed.
 ///
 /// Validates everything local (no bed already here, repo name, plot
-/// prefixes), then connects and resolves `main` **before any state is
-/// written** — a server that is down, a repo that does not exist, or a
-/// garden with no `main` leaves zero state behind. On success the full
-/// `.bed` layout is planted with `current_cs` = main's changeset and the
-/// tip recorded in `heads`. **Materializes nothing** (v0.1.md §2):
-/// planting a bed costs one ref lookup, not a checkout. Plot prefixes
-/// handed to `--plot` are recorded in the config; files come with
-/// `bed plot add`.
+/// prefixes), then connects and resolves the starting ref **before any
+/// state is written** — a server that is down, a repo that does not
+/// exist, or a garden with none of the expected refs leaves zero state
+/// behind. On success the full `.bed` layout is planted with `current_cs`
+/// = the ref's changeset and the tip recorded in `heads`.
+/// **Materializes nothing** (v0.1.md §2): planting a bed costs one ref
+/// lookup, not a checkout. Plot prefixes handed to `--plot` are recorded
+/// in the config; files come with `bed plot add`.
+///
+/// The starting ref: `--ref` names it exactly (bare names resolve against
+/// `refs/heads/` server-side; full ref names pass through verbatim). A
+/// ref the arboretum does not have is refused, nothing planted. Without
+/// the flag, `main` is tried first — the v0.1 default, and the
+/// deterministic winner when several common names exist — then the other
+/// common names ([`STARTING_REF_PROBES`]), so an arboretum that only
+/// grows `master` clones without a flag. When none resolve, the error
+/// names what was tried and — via the arboretum's ref listing — what does
+/// exist, pointing at `--ref`.
 ///
 /// With `--repo` omitted the bed is named `garden` (v0.1 arboreta are
 /// single-repo and offer no name discovery; a documented deviation).
-pub async fn clone(
+pub async fn clone_with_ref(
     bed_dir: &Path,
     server: &str,
     repo: Option<&str>,
+    ref_name: Option<&str>,
     plot: Vec<String>,
 ) -> Result<String, BedError> {
     // ---- validation phase: nothing has been written yet ----
@@ -76,20 +98,23 @@ pub async fn clone(
             server: server.to_owned(),
             message: e.to_string(),
         })?;
-    let main = match client.get_ref(&repo, DEFAULT_REF).await {
-        Ok(Some(id)) => id,
-        Ok(None) => {
-            return Err(BedError::MissingRef {
-                name: DEFAULT_REF.to_owned(),
-            });
-        }
-        Err(status) => {
-            return Err(BedError::Rpc {
-                command: "clone",
-                code: status.code(),
-                message: status.message().to_owned(),
-            });
-        }
+    let (ref_name, main) = match ref_name {
+        Some(name) => match client.get_ref(&repo, name).await {
+            Ok(Some(id)) => (name.to_owned(), id),
+            Ok(None) => {
+                return Err(BedError::MissingRef {
+                    name: name.to_owned(),
+                });
+            }
+            Err(status) => {
+                return Err(BedError::Rpc {
+                    command: "clone",
+                    code: status.code(),
+                    message: status.message().to_owned(),
+                });
+            }
+        },
+        None => resolve_starting_ref(&client, &repo).await?,
     };
     // The ref must name a real changeset (a ref to nowhere is refused here,
     // not discovered half-planted).
@@ -116,10 +141,75 @@ pub async fn clone(
 
     Ok(format!(
         "planted a bed for {repo} at {server}\n\
-         the garden grows from {} ({DEFAULT_REF})\n\
+         the garden grows from {} ({ref_name})\n\
          materialized nothing — plant files with `bed plot add <path>`\n",
         main.short()
     ))
+}
+
+/// [`clone_with_ref`] without `--ref`: the starting ref is left to the
+/// no-flag fallback resolution. Kept as the narrow entry point the
+/// benchmark (`crates/bench`) and pre-`--ref` callers use.
+pub async fn clone(
+    bed_dir: &Path,
+    server: &str,
+    repo: Option<&str>,
+    plot: Vec<String>,
+) -> Result<String, BedError> {
+    clone_with_ref(bed_dir, server, repo, None, plot).await
+}
+
+/// Resolves the ref a no-flag `clone` grows from: `main` first ([`DEFAULT_REF`],
+/// the deterministic winner when several common names exist), then the
+/// other common primary-branch names, so an arboretum that only grows
+/// `master` clones without a flag. When nothing resolves, the arboretum's
+/// ref listing (best-effort: its failure cannot change the verdict already
+/// earned from the probes) names what does exist, and the error points at
+/// `--ref`.
+async fn resolve_starting_ref(
+    client: &GardenbedClient,
+    repo: &str,
+) -> Result<(String, Id), BedError> {
+    for name in STARTING_REF_PROBES {
+        match client.get_ref(repo, name).await {
+            Ok(Some(id)) => return Ok((name.to_owned(), id)),
+            Ok(None) => {}
+            Err(status) => {
+                return Err(BedError::Rpc {
+                    command: "clone",
+                    code: status.code(),
+                    message: status.message().to_owned(),
+                });
+            }
+        }
+    }
+    // Best-effort listing: it only ever enriches the error with the
+    // arboretum's own ref names (the full stored spellings `--ref`
+    // accepts), never masks the all-probes-missed verdict.
+    let mut names: Vec<String> = match client.list_refs(repo).await {
+        Ok(stream) => {
+            let mut stream = stream;
+            let mut names = Vec::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(entry) => names.push(entry.name),
+                    Err(_) => break,
+                }
+            }
+            names
+        }
+        Err(_) => Vec::new(),
+    };
+    names.sort();
+    Err(BedError::NoStartingRef {
+        primary: DEFAULT_REF.to_owned(),
+        tried: STARTING_REF_PROBES.join(", "),
+        available: if names.is_empty() {
+            String::new()
+        } else {
+            format!("\n  the arboretum has refs: {}", names.join(", "))
+        },
+    })
 }
 
 /// `bed plot add <paths...> [--concurrency N]` — record the prefixes, then

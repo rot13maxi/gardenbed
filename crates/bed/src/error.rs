@@ -153,6 +153,21 @@ pub enum BedError {
         name: String,
     },
 
+    /// `clone` without `--ref` resolved none of the standard starting
+    /// refs. Names what was probed and — when the arboretum's ref listing
+    /// answered — what actually exists, so the fix is one flag away.
+    #[error("no ref {primary} (tried {tried}); pass --ref{available}")]
+    NoStartingRef {
+        /// The default ref that did not resolve (`main`).
+        primary: String,
+        /// Every ref name the fallback probed, comma-separated in order.
+        tried: String,
+        /// Pre-rendered suffix: empty, or a newline naming the refs the
+        /// arboretum does have (its full stored names, exactly what
+        /// `--ref` accepts).
+        available: String,
+    },
+
     /// The changeset id is not on the arboretum (never sown there, or the
     /// arboretum is a different garden).
     #[error("changeset {0} is not on the arboretum")]

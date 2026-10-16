@@ -217,13 +217,25 @@ async fn clone_with_a_refless_arboretum_leaves_zero_state() {
 
     let (code, _, stderr) = bed(&garden, &["clone", &server.http()]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("no ref \"main\""), "stderr: {stderr}");
+    // The no-flag resolution names what it probed and what exists (here:
+    // nothing), pointing at --ref.
+    assert!(
+        stderr.contains("no ref main (tried main, master, trunk); pass --ref\n"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("the arboretum has refs"),
+        "stderr: {stderr}"
+    );
     assert!(!garden.join(".bed").exists(), "no bed may be planted");
 
     // An unknown repo is the same story.
     let (code, _, stderr) = bed(&garden, &["clone", &server.http(), "--repo", "orchard"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("no ref \"main\""), "stderr: {stderr}");
+    assert!(
+        stderr.contains("no ref main (tried main, master, trunk); pass --ref\n"),
+        "stderr: {stderr}"
+    );
     assert!(!garden.join(".bed").exists(), "no bed may be planted");
 
     server.shutdown().await;

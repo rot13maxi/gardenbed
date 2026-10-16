@@ -6,8 +6,9 @@
 //! types, and the M7 tests pin the rendered text against both the
 //! underlying `Repo` answers and `bed`'s own rendering.
 //!
-//! Every tool takes an optional `cs` — a 64-hex changeset id or a ref
-//! name — resolved through `Repo::get_ref`, defaulting to the `main` ref.
+//! Every tool takes an optional `cs` — a 64-hex changeset id, a ref name,
+//! or a changeset id prefix (8+ hex chars) — resolved through
+//! `Repo::get_ref`, defaulting to the `main` ref.
 //! There is deliberately no working copy anywhere in this path: the whole
 //! toolset answers from the arboretum's loam + seedbed alone (the
 //! zero-checkout contract, v0.1.md §M7.2).
@@ -67,7 +68,7 @@ impl ToolOutcome {
 pub fn descriptors() -> serde_json::Value {
     let cs_prop = serde_json::json!({
         "type": "string",
-        "description": "changeset to answer at: a 64-hex id or a ref name; defaults to the \"main\" ref",
+        "description": "changeset to answer at: a 64-hex id, a ref name, or a changeset id prefix (8+ hex chars, must be unambiguous); defaults to the \"main\" ref",
     });
     serde_json::json!({
         "tools": [
@@ -94,11 +95,11 @@ pub fn descriptors() -> serde_json::Value {
                     "properties": {
                         "a": {
                             "type": "string",
-                            "description": "the older side: 64-hex changeset id or ref name",
+                            "description": "the older side: 64-hex changeset id, ref name, or unambiguous id prefix (8+ hex chars)",
                         },
                         "b": {
                             "type": "string",
-                            "description": "the newer side: 64-hex changeset id or ref name",
+                            "description": "the newer side: 64-hex changeset id, ref name, or unambiguous id prefix (8+ hex chars)",
                         },
                     },
                     "required": ["a", "b"],
@@ -176,11 +177,18 @@ pub fn call_tool(repo: &Repo, name: &str, args: &serde_json::Value) -> ToolOutco
 // ------------------------------------------------------------ shared plumbing
 
 /// Resolves the `cs` argument to a changeset id: absent → the `main` ref;
-/// 64 hex chars → an id; anything else → a ref name. Ref names are looked
-/// up (a missing one errors here); a 64-hex id is passed through and
-/// verified by the Repo call that uses it — a dangling id surfaces the
-/// server's "changeset … not found" from there, never a mysterious
-/// missing-object error deeper in the walk.
+/// 64 hex chars → an id; anything else → a ref name, falling back to a
+/// changeset id prefix (8+ hex chars) through `Repo::get_ref` — the same
+/// shared resolver the server's `GetRef` RPC serves `bed`, so all four
+/// tools accept truncated ids exactly like the CLI. Precedence lives
+/// server-side: an existing ref with that exact name wins over prefix
+/// interpretation. A 64-hex id is passed through and verified by the Repo
+/// call that uses it — a dangling id surfaces the server's "changeset …
+/// not found" from there, never a mysterious missing-object error deeper
+/// in the walk. Ambiguous / too-short / unmatched prefixes surface the
+/// resolver's own errors verbatim (`prefix … is ambiguous (N changesets)`,
+/// `changeset id prefix must be at least 8 hex chars`,
+/// `no ref or changeset matching …`).
 fn resolve_cs(repo: &Repo, cs: Option<&str>) -> Result<Id, String> {
     match cs {
         None => repo
@@ -394,8 +402,9 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 pub fn tool_diff(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
     let (Some(a), Some(b)) = (arg_str(args, "a"), arg_str(args, "b")) else {
         return ToolOutcome::error(
-            "diff needs two changesets: give a and b (64-hex ids or ref names); \
-             a headless MCP tool has no working copy to default from",
+            "diff needs two changesets: give a and b (64-hex ids, ref names, \
+             or 8+ hex id prefixes); a headless MCP tool has no working copy \
+             to default from",
         );
     };
     let a = match resolve_cs(repo, Some(a)) {
@@ -572,5 +581,157 @@ pub fn tool_file(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
             );
             ToolOutcome::text(String::from_utf8_lossy(e.as_bytes()).into_owned())
         }
+    }
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    use super::*;
+    use gardenbed_model::{Change, Changeset, Identity, blob_id};
+    use gardenbed_server::Repo;
+    use serde_json::json;
+    use std::collections::BTreeMap;
+
+    /// One Add/Modify change.
+    fn chg(path: &str, op: Op, content: &[u8], mode: Mode) -> Change {
+        Change {
+            path: path.into(),
+            op,
+            blob: Some(blob_id(content)),
+            src_path: None,
+            mode,
+        }
+    }
+
+    /// A two-commit fixture repo: root (a.txt, dir/b.txt) and a child that
+    /// rewrites a.txt, harvested onto `main`.
+    fn repo_fixture() -> (tempfile::TempDir, Repo, Id, Id) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = Repo::open(dir.path()).expect("repo opens");
+        let identity = |secs: u64| Identity {
+            name: "amy".into(),
+            email: "amy@garden.example".into(),
+            time_secs: 1_700_000_000 + secs,
+            tz_min: 0,
+        };
+        let a: &[u8] = b"hello garden\n";
+        let a2: &[u8] = b"hello garden v2\n";
+        let world: &[u8] = b"world\n";
+        let inline = |blobs: &[&[u8]]| {
+            blobs
+                .iter()
+                .map(|b| (blob_id(b).to_hex(), b.to_vec()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let root = Changeset {
+            parents: vec![],
+            changes: vec![
+                chg("a.txt", Op::Add, a, Mode::Regular),
+                chg("dir/b.txt", Op::Add, world, Mode::Regular),
+            ],
+            message: "root".into(),
+            author: identity(10),
+            committer: identity(10),
+            signature: None,
+        };
+        let root_id = repo
+            .create_changeset(&root, &inline(&[a, world]))
+            .expect("root sows");
+        let child = Changeset {
+            parents: vec![root_id],
+            changes: vec![chg("a.txt", Op::Modify, a2, Mode::Regular)],
+            message: "update a".into(),
+            author: identity(20),
+            committer: identity(20),
+            signature: None,
+        };
+        let child_id = repo
+            .create_changeset(&child, &inline(&[a2]))
+            .expect("child sows");
+        repo.harvest(child_id).expect("main harvested");
+        (dir, repo, root_id, child_id)
+    }
+
+    /// Runs one tool call, asserting it succeeded.
+    fn ok_tool(repo: &Repo, name: &str, args: &serde_json::Value) -> String {
+        let out = call_tool(repo, name, args);
+        assert!(!out.is_error, "{name} failed: {}", out.text);
+        out.text
+    }
+
+    /// Runs one tool call, asserting it failed with `needle` in the text.
+    fn err_tool(repo: &Repo, name: &str, args: &serde_json::Value, needle: &str) {
+        let out = call_tool(repo, name, args);
+        assert!(out.is_error, "{name} unexpectedly succeeded: {}", out.text);
+        assert!(
+            out.text.contains(needle),
+            "want {needle:?} in: {}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn tools_answer_at_an_id_prefix() {
+        let (_dir, repo, root, child) = repo_fixture();
+        let p_root = &root.to_hex()[..8];
+        let p_child = &child.to_hex()[..16]; // bed's short() form
+
+        // `file` at an 8-hex prefix.
+        assert_eq!(
+            ok_tool(&repo, "file", &json!({ "path": "a.txt", "cs": p_root })),
+            "hello garden\n"
+        );
+        // `log` from a 16-hex short form lists the child first.
+        let log = ok_tool(&repo, "log", &json!({ "cs": p_child, "limit": 2 }));
+        assert!(log.contains(&child.to_hex()), "full ids printed: {log}");
+        assert!(log.contains("update a"));
+        // `diff` takes prefixes on both sides.
+        assert_eq!(
+            ok_tool(
+                &repo,
+                "diff",
+                &json!({ "a": p_root, "b": &child.to_hex()[..8] })
+            ),
+            "M a.txt\n"
+        );
+        // `blame` through a prefix attributes the rewritten line to the child.
+        assert_eq!(
+            ok_tool(&repo, "blame", &json!({ "path": "a.txt", "cs": p_child })),
+            format!("1-1 {}\n", child.to_hex())
+        );
+    }
+
+    #[test]
+    fn prefix_errors_are_agent_readable() {
+        let (_dir, repo, _root, _child) = repo_fixture();
+
+        // Too short: the resolver's minimum-length hint.
+        err_tool(
+            &repo,
+            "file",
+            &json!({ "path": "a.txt", "cs": "abc123" }),
+            "changeset id prefix must be at least 8 hex chars",
+        );
+        // Well-formed but matching nothing: neither a ref nor a prefix.
+        err_tool(
+            &repo,
+            "file",
+            &json!({ "path": "a.txt", "cs": "1d050f877" }),
+            "no ref or changeset matching 1d050f877",
+        );
+        // Non-hex names keep the ref-shaped message.
+        err_tool(
+            &repo,
+            "log",
+            &json!({ "cs": "no-such-ref" }),
+            "ref \"no-such-ref\" does not exist on this arboretum",
+        );
+        // A full 64-hex id passes through and is verified by the call.
+        err_tool(
+            &repo,
+            "log",
+            &json!({ "cs": Id::from_bytes([9; 32]).to_hex() }),
+            "changeset",
+        );
     }
 }

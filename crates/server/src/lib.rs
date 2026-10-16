@@ -52,6 +52,19 @@ pub enum ServerError {
     /// A referenced ref does not exist.
     #[error("ref {0:?} not found")]
     RefNotFound(String),
+    /// A `<cs-or-ref>` revspec named neither an existing ref nor, read as
+    /// a changeset id prefix, any stored changeset.
+    #[error("no ref or changeset matching {0}")]
+    RevspecNotFound(String),
+    /// A changeset id prefix matched more than one changeset; the caller
+    /// must send more hex characters.
+    #[error("prefix {spec} is ambiguous ({matches} changesets)")]
+    AmbiguousPrefix {
+        /// The prefix as typed.
+        spec: String,
+        /// How many stored changesets share the prefix.
+        matches: usize,
+    },
     /// Graft hit semantic conflicts; the paths are listed in the message.
     #[error("graft conflicts on: {}", .0.join(", "))]
     GraftConflict(Vec<String>),
@@ -349,23 +362,60 @@ impl Repo {
         Ok(self.metadata.list_refs()?)
     }
 
-    /// A ref's current value; `None` when it does not exist.
+    /// Resolves a client-facing `<cs-or-ref>` argument: a ref's current
+    /// value, or — when no ref matches — the changeset a hex token names.
+    /// `None` only when the token cannot name anything here.
     ///
-    /// Histories imported from git carry their full ref names
-    /// (`refs/heads/main`), while v0.1 clients (bed, MCP, harvest) speak
-    /// bare branch names (`main`). A bare name resolves against its
-    /// `refs/heads/` spelling first, falling back to the name as given —
-    /// so an imported arboretum and a natively grown one answer the same
-    /// question identically.
+    /// This is the shared revspec resolver: it is the one string-bearing
+    /// lookup every id-taking surface funnels through (remote `bed`
+    /// clients through the `GetRef` RPC, the MCP tools through [`Repo`]
+    /// directly), so one fix here teaches `GetChangeset`, `Diff`,
+    /// `Blame`, `file`, `goto` and friends truncated ids at once.
+    /// Resolution order (precedence is deliberate and documented on the
+    /// `GetRef` RPC):
+    ///
+    /// 1. an existing ref with that exact name wins over prefix
+    ///    interpretation — the canonical `refs/heads/<name>` spelling
+    ///    first, then the name as given (imported histories carry full
+    ///    names; native writes land there too);
+    /// 2. a hex token of 8..=63 chars is a **changeset id prefix**:
+    ///    decoded case-insensitively to bytes and ranged over the
+    ///    seedbed's 32-byte ids with one indexed seek
+    ///    (`id >= prefix‖0x00… AND id < prefix+1‖0x00…`). Exactly one
+    ///    match resolves; several fail with
+    ///    [`ServerError::AmbiguousPrefix`] (`invalid_argument`, naming
+    ///    the match count); none with [`ServerError::RevspecNotFound`]
+    ///    (`not_found`, saying the token is neither a ref nor a matching
+    ///    prefix);
+    /// 3. fewer than 8 hex chars is rejected with the minimum-length
+    ///    hint — but only once no ref of that name exists (rule 1);
+    /// 4. a full 64-hex token keeps today's behavior: every client parses
+    ///    it as an id *before* any lookup, so here it is only ever a ref
+    ///    name and stays `None` when no ref is so named.
     pub fn get_ref(&self, name: &str) -> Result<Option<Id>, ServerError> {
         let canonical = branch_ref_name(name);
         if let found @ Some(_) = self.metadata.resolve_ref(&canonical)? {
             return Ok(found);
         }
-        if canonical == name {
-            return Ok(None);
+        if canonical != name
+            && let found @ Some(_) = self.metadata.resolve_ref(name)?
+        {
+            return Ok(found);
         }
-        Ok(self.metadata.resolve_ref(name)?)
+        // Not a ref under either spelling: a hex token may still name a
+        // changeset id (see the doc comment for the precedence rules).
+        match classify_id_hex(name) {
+            HexToken::NotHex | HexToken::Full => Ok(None),
+            HexToken::TooShort => Err(ServerError::Invalid(format!(
+                "changeset id prefix must be at least 8 hex chars: {name:?}"
+            ))),
+            HexToken::Prefix { lo, hi } => prefix_outcome(
+                name,
+                &self
+                    .metadata
+                    .changeset_ids_in_id_range(&lo, hi.as_ref().map(|h| &h[..]))?,
+            ),
+        }
     }
 
     /// Compare-and-swap a ref. Conflicts are results ([`RefCas::Conflict`]),
@@ -563,6 +613,101 @@ fn branch_ref_name(name: &str) -> String {
     }
 }
 
+/// A hex token's id interpretation, applied once it has not matched a ref
+/// (the classification behind [`Repo::get_ref`]'s rules 2-4).
+enum HexToken {
+    /// Not all-hex (empty, other characters, or longer than a full id):
+    /// not an id shape at all.
+    NotHex,
+    /// Exactly 64 hex chars: a full id — never prefix-interpreted here,
+    /// because clients resolve full ids directly against the changeset
+    /// store before anything would treat the token as a ref name.
+    Full,
+    /// All-hex but shorter than 8 chars: too short to resolve as a prefix.
+    TooShort,
+    /// 8..=63 hex chars: the half-open 32-byte id range `[lo, hi)` the
+    /// prefix selects. `hi` is the prefix incremented in its last nibble
+    /// (with carry); `None` when every nibble is `0xF`, where the
+    /// successor overflows and the range is open-ended.
+    Prefix {
+        /// Range start: prefix bytes right-padded with `0x00` to 32.
+        lo: [u8; 32],
+        /// Exclusive range end (the next prefix's start), if representable.
+        hi: Option<[u8; 32]>,
+    },
+}
+
+/// Classifies a token by id shape: all-hex (any case), with a full 64-hex
+/// id kept distinct from resolvable prefixes (8..=63 hex chars).
+fn classify_id_hex(token: &str) -> HexToken {
+    let bytes = token.as_bytes();
+    if bytes.is_empty() || bytes.len() > 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return HexToken::NotHex;
+    }
+    if bytes.len() == 64 {
+        return HexToken::Full;
+    }
+    if bytes.len() < 8 {
+        return HexToken::TooShort;
+    }
+    let nibbles: Vec<u8> = bytes
+        .iter()
+        .map(|b| match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            _ => b - b'A' + 10,
+        })
+        .collect();
+    let lo = pack_nibbles(&nibbles);
+    let hi = {
+        // The exclusive upper bound: the prefix plus one, i.e. the first
+        // nibble that is not 0xF incremented, everything after it zeroed
+        // by the carry — or open-ended when the prefix is all 0xF.
+        let mut inc = nibbles;
+        let mut i = inc.len();
+        loop {
+            if i == 0 {
+                break None;
+            }
+            i -= 1;
+            if inc[i] == 0xF {
+                inc[i] = 0;
+            } else {
+                inc[i] += 1;
+                break Some(pack_nibbles(&inc));
+            }
+        }
+    };
+    HexToken::Prefix { lo, hi }
+}
+
+/// Packs big-endian nibbles (≤ 64) into exactly 32 zero-padded bytes.
+fn pack_nibbles(nibbles: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (i, n) in nibbles.iter().enumerate() {
+        if i % 2 == 0 {
+            out[i / 2] = n << 4;
+        } else {
+            out[i / 2] |= n;
+        }
+    }
+    out
+}
+
+/// The resolution outcome for one scanned id prefix: exactly one match
+/// resolves; none says the token is neither a ref nor a matching prefix;
+/// several name the match count so the caller can lengthen the prefix.
+fn prefix_outcome(spec: &str, matches: &[Id]) -> Result<Option<Id>, ServerError> {
+    match matches {
+        [] => Err(ServerError::RevspecNotFound(spec.to_owned())),
+        [only] => Ok(Some(*only)),
+        many => Err(ServerError::AmbiguousPrefix {
+            spec: spec.to_owned(),
+            matches: many.len(),
+        }),
+    }
+}
+
 /// One write (Add/Modify/rename destination) in the graft replay: `files` is
 /// the flat working set, mutated only when the write is conflict-free.
 /// `pre` is the path's pre-image — the (mode, blob) the changeset's own
@@ -645,10 +790,13 @@ impl From<ServerError> for Status {
             }
             ServerError::Store(_) => Status::internal(e.to_string()),
             ServerError::Codec(_) => Status::invalid_argument(e.to_string()),
-            ServerError::Invalid(_) => Status::invalid_argument(e.to_string()),
+            ServerError::Invalid(_) | ServerError::AmbiguousPrefix { .. } => {
+                Status::invalid_argument(e.to_string())
+            }
             ServerError::ChangesetNotFound(_)
             | ServerError::ObjectNotFound(_)
-            | ServerError::RefNotFound(_) => Status::not_found(e.to_string()),
+            | ServerError::RefNotFound(_)
+            | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
             ServerError::GraftConflict(_) | ServerError::NotFastForward => {
                 Status::failed_precondition(e.to_string())
             }
@@ -951,6 +1099,14 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::GetRefReq>,
     ) -> Result<Response<pb::GetRefResp>, Status> {
+        // The shared revspec resolver (see `Repo::get_ref`): an existing ref
+        // with the exact name wins over prefix interpretation; a hex token
+        // of 8..=63 chars then resolves as a changeset id prefix (one match
+        // → its id; several → `invalid_argument` naming the count; none →
+        // `not_found` saying it matched neither a ref nor a prefix; shorter
+        // → `invalid_argument` with the minimum-length hint). A full
+        // 64-hex token stays a ref name here — clients parse those as ids
+        // before any lookup.
         let req = request.into_inner();
         self.repo_field(&req.repo, "GetRef")?;
         if req.name.is_empty() {
@@ -1024,6 +1180,219 @@ impl Gardenbed for GardenbedService {
         Ok(Response::new(pb::StatsResp {
             counters: self.repo.stats().into_iter().collect(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod revspec_tests {
+    use super::*;
+    use gardenbed_store::MemoryStore;
+
+    fn id(tag: u8) -> Id {
+        Id::from_bytes([tag; 32])
+    }
+
+    /// A `MemoryStore` whose id-prefix scan answers from a canned list:
+    /// the resolver's decisions do not need real SHA-256 ids.
+    struct CannedScan {
+        inner: MemoryStore,
+        matches: std::sync::Mutex<Vec<Id>>,
+    }
+
+    impl MetadataStore for CannedScan {
+        fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
+            self.inner.put_changeset(cs)
+        }
+        fn get_changeset(&self, id: Id) -> Result<Option<(Changeset, Vec<u8>)>, StoreError> {
+            self.inner.get_changeset(id)
+        }
+        fn resolve_ref(&self, name: &str) -> Result<Option<Id>, StoreError> {
+            self.inner.resolve_ref(name)
+        }
+        fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError> {
+            self.inner.list_refs()
+        }
+        fn cas_ref(&self, name: &str, expected: Option<Id>, new: Id) -> Result<RefCas, StoreError> {
+            self.inner.cas_ref(name, expected, new)
+        }
+        fn record_git_mapping(&self, git_sha_hex: &str, cs: Id) -> Result<(), StoreError> {
+            self.inner.record_git_mapping(git_sha_hex, cs)
+        }
+        fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
+            self.inner.cs_for_git(git_sha_hex)
+        }
+        fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
+            self.inner.git_for_cs(cs)
+        }
+        fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
+            self.inner.derived_put(kind, cs, bytes)
+        }
+        fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+            self.inner.derived_get(kind, cs)
+        }
+        fn changeset_ids_in_id_range(
+            &self,
+            _lo: &[u8],
+            _hi_exclusive: Option<&[u8]>,
+        ) -> Result<Vec<Id>, StoreError> {
+            Ok(self.matches.lock().expect("scan lock").clone())
+        }
+    }
+
+    fn canned_repo(matches: Vec<Id>) -> Repo {
+        Repo::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(CannedScan {
+                inner: MemoryStore::new(),
+                matches: std::sync::Mutex::new(matches),
+            }),
+        )
+    }
+
+    /// Exactly one match resolves (rule 2).
+    #[test]
+    fn single_prefix_match_resolves() {
+        let repo = canned_repo(vec![id(7)]);
+        assert_eq!(
+            repo.get_ref("1d050f87").expect("resolve"),
+            Some(id(7)),
+            "an 8-hex prefix resolves when the scan finds one changeset"
+        );
+    }
+
+    /// Several matches refuse, naming the count (rule 2).
+    #[test]
+    fn ambiguous_prefix_names_the_match_count() {
+        let repo = canned_repo(vec![id(1), id(2), id(3)]);
+        let err = repo.get_ref("1d050f87").expect_err("ambiguous");
+        assert_eq!(
+            err.to_string(),
+            "prefix 1d050f87 is ambiguous (3 changesets)"
+        );
+    }
+
+    /// No ref and no matching changeset: the error names both readings
+    /// of the token.
+    #[test]
+    fn unmatched_prefix_says_no_ref_or_changeset() {
+        let repo = canned_repo(vec![]);
+        let err = repo.get_ref("1d050f877").expect_err("unmatched");
+        assert_eq!(err.to_string(), "no ref or changeset matching 1d050f877");
+    }
+
+    /// Fewer than 8 hex chars is rejected with the minimum-length hint —
+    /// but only once no ref of that name exists (rule 1 runs first).
+    #[test]
+    fn too_short_prefix_is_rejected_with_the_hint() {
+        let repo = canned_repo(vec![id(1)]);
+        let err = repo.get_ref("1d05").expect_err("too short");
+        assert!(
+            err.to_string()
+                .contains("changeset id prefix must be at least 8 hex chars"),
+            "hint present: {err}"
+        );
+
+        // A ref with exactly that name still wins.
+        let repo = canned_repo(vec![id(1)]);
+        repo.cas_ref("1d05", None, id(9)).expect("cas");
+        assert_eq!(repo.get_ref("1d05").expect("ref wins"), Some(id(9)));
+    }
+
+    /// Rule 1: an existing ref with that exact name wins over prefix
+    /// interpretation — even when the prefix scan would be ambiguous.
+    #[test]
+    fn existing_ref_wins_over_a_matching_prefix() {
+        let repo = canned_repo(vec![id(1), id(2), id(3)]);
+        repo.cas_ref("deadbeef01", None, id(9)).expect("cas");
+        assert_eq!(
+            repo.get_ref("deadbeef01").expect("ref wins"),
+            Some(id(9)),
+            "the ref answers although the scan would find 3 changesets"
+        );
+    }
+
+    /// A full 64-hex token is never prefix-interpreted here (rule 4:
+    /// clients resolve those as ids before any ref lookup), and a
+    /// non-hex token stays a plain ref name.
+    #[test]
+    fn full_hex_tokens_are_never_prefix_interpreted() {
+        let full = id(5).to_hex();
+        let repo = canned_repo(vec![id(5)]);
+        assert_eq!(
+            repo.get_ref(&full).expect("full id"),
+            None,
+            "a 64-hex token is only ever a ref name in get_ref"
+        );
+        assert_eq!(repo.get_ref("main").expect("plain name"), None);
+    }
+
+    /// The prefix byte-range: case-insensitive decode, odd trailing
+    /// nibble shifted low, exclusive bound = prefix + 1 in nibble space
+    /// (with carry), open-ended when every nibble is 0xF.
+    #[test]
+    fn prefix_bounds_follow_the_bytes() {
+        // Pads a leading byte slice with zeros to a full 32-byte id.
+        let pad = |head: &[u8]| {
+            let mut out = [0u8; 32];
+            out[..head.len()].copy_from_slice(head);
+            out
+        };
+        let bounds = |token: &str| match classify_id_hex(token) {
+            HexToken::Prefix { lo, hi } => Some((lo, hi)),
+            _ => None,
+        };
+        // Uppercase decodes like lowercase; even prefix → hi = prefix + 1.
+        assert_eq!(
+            bounds("1D050F87"),
+            Some((
+                pad(&[0x1d, 0x05, 0x0f, 0x87]),
+                Some(pad(&[0x1d, 0x05, 0x0f, 0x88]))
+            ))
+        );
+        // Odd prefix: the trailing nibble rides low in `lo`, and `hi`
+        // increments that nibble (0x70…0x7f → 0x80).
+        assert_eq!(
+            bounds("1d050f877"),
+            Some((
+                pad(&[0x1d, 0x05, 0x0f, 0x87, 0x70]),
+                Some(pad(&[0x1d, 0x05, 0x0f, 0x87, 0x80]))
+            ))
+        );
+        // Carry through trailing F nibbles.
+        assert_eq!(
+            bounds("1d050fff"),
+            Some((
+                pad(&[0x1d, 0x05, 0x0f, 0xff]),
+                Some(pad(&[0x1d, 0x05, 0x10, 0x00]))
+            ))
+        );
+        // All-F prefix: the successor overflows, the range is open-ended.
+        assert_eq!(
+            bounds("ffffffff"),
+            Some((pad(&[0xff, 0xff, 0xff, 0xff]), None))
+        );
+        // The minimal prefix and a long odd one classify the same way.
+        assert!(matches!(
+            bounds("00000000"),
+            Some((lo, _)) if lo == pad(&[0x00])
+        ));
+        assert!(matches!(bounds(&"a".repeat(63)), Some((_, Some(_)))));
+
+        // Shape classification: 64-hex is Full (never a prefix), shorter
+        // than 8 is TooShort, anything non-hex (or over-long) is NotHex.
+        assert!(matches!(classify_id_hex(&"a".repeat(64)), HexToken::Full));
+        assert!(matches!(
+            classify_id_hex(&"a".repeat(63)),
+            HexToken::Prefix { .. }
+        ));
+        assert!(matches!(
+            classify_id_hex(&"a".repeat(7)),
+            HexToken::TooShort
+        ));
+        assert!(matches!(classify_id_hex(&"a".repeat(65)), HexToken::NotHex));
+        assert!(matches!(classify_id_hex("main"), HexToken::NotHex));
+        assert!(matches!(classify_id_hex(""), HexToken::NotHex));
+        assert!(matches!(classify_id_hex(&"z".repeat(64)), HexToken::NotHex));
     }
 }
 

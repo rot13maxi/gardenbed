@@ -74,6 +74,8 @@
 //!   every still-unattributed line of the current version is attributed
 //!   to the youngest changeset whose blob differs from its base.
 
+use std::sync::Arc;
+
 use gardenbed_model::{Id, Mode, Op, TreeKind};
 use gardenbed_store::StoreError;
 
@@ -103,6 +105,102 @@ enum Step {
     Done,
 }
 
+/// One cached blob: the content plus its record (line) boundaries.
+///
+/// Boundaries are stored as ranges into the content (never as pointers), so
+/// an entry can be evicted while a previously materialized view is still
+/// alive; callers build the `&[&[u8]]` views per diff from the ranges.
+/// Caching the split matters because the walk's invariant makes the *base*
+/// side of consecutive touchers' diffs the same blob — one split serves
+/// many steps.
+struct CachedBlob {
+    content: Arc<Vec<u8>>,
+    /// Half-open `[start, end)` byte range of each record (the last record
+    /// may lack its trailing newline).
+    lines: Arc<Vec<(u32, u32)>>,
+}
+
+/// The walk's blob cache: the last few diffed blobs with their record
+/// splits, keyed by content address.
+///
+/// Consecutive touchers on the first-parent chain share blobs by the walk's
+/// own invariant: between two touchers the path's content is unchanged
+/// (proven by path summaries / bloom skips), so one step's base side is the
+/// next step's base side, and each toucher's new side becomes the next
+/// step's inherited content. The cache halves the blob reads (fetch + zstd
+/// decode + SHA-256 verify) and repeats no record split — profiling showed
+/// those a large share of the walk on real histories. Bounded in entries
+/// and bytes; a miss only costs a re-read.
+struct BlobCache {
+    entries: Vec<(Id, Arc<CachedBlob>)>,
+    bytes: usize,
+    /// Evict oldest-first beyond this many entries.
+    cap_entries: usize,
+    /// Evict oldest-first beyond this many cached bytes.
+    cap_bytes: usize,
+}
+
+impl BlobCache {
+    /// A few entries cover the chain-continuation hits; the byte cap keeps
+    /// a walk over very large files from ballooning.
+    fn new() -> Self {
+        BlobCache {
+            entries: Vec::new(),
+            bytes: 0,
+            cap_entries: 4,
+            cap_bytes: 64 << 20,
+        }
+    }
+
+    fn get(&self, id: Id) -> Option<Arc<CachedBlob>> {
+        self.entries
+            .iter()
+            .find(|(k, _)| *k == id)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn put(&mut self, id: Id, blob: Arc<CachedBlob>) {
+        if self.entries.iter().any(|(k, _)| *k == id) {
+            return;
+        }
+        self.bytes += blob.content.len();
+        self.entries.push((id, blob));
+        while self.entries.len() > self.cap_entries || self.bytes > self.cap_bytes {
+            let Some((_, evicted)) = self.entries.first() else {
+                break;
+            };
+            self.bytes -= evicted.content.len();
+            self.entries.remove(0);
+        }
+    }
+}
+
+/// Splits `content` into git-style records and returns the byte ranges
+/// (mirrors [`crate::xdiff::split_records`] exactly: each line carries its
+/// trailing `\n`, the final line may lack one).
+fn record_ranges(content: &[u8]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    for (i, &b) in content.iter().enumerate() {
+        if b == b'\n' {
+            out.push((start as u32, (i + 1) as u32));
+            start = i + 1;
+        }
+    }
+    if start < content.len() {
+        out.push((start as u32, content.len() as u32));
+    }
+    out
+}
+
+/// Materializes the `&[&[u8]]` record view a diff needs from cached ranges.
+fn records_of<'a>(content: &'a Arc<Vec<u8>>, lines: &'a [(u32, u32)]) -> Vec<&'a [u8]> {
+    lines
+        .iter()
+        .map(|&(s, e)| &content[s as usize..e as usize])
+        .collect()
+}
+
 /// Ascending coalesced blame ranges from the per-final-line interned
 /// attributions (slot 0 is impossible at call time).
 fn coalesce(attr: &[u32], table: &[Id]) -> Vec<BlameRange> {
@@ -127,13 +225,27 @@ impl Engine {
     /// coalesced `(lo, hi, changeset)` ranges, 1-based inclusive,
     /// ascending. See the module docs for the exact semantics.
     ///
+    /// Results are memoized per engine, keyed by `(changeset, path)`.
+    /// History is immutable under content addressing (a stored changeset's
+    /// ancestry and blobs never change), so a completed walk's answer is
+    /// final: the memo only saves re-walking on repeat queries of the same
+    /// path. Bounded in entries and total cached ranges; [`Self::blame_no_skip`]
+    /// deliberately bypasses it so the differential suite always measures a
+    /// fresh walk.
+    ///
     /// Errors with [`StoreError::NotFound`] when the changeset or the
     /// path (at that changeset) does not exist, and with
     /// [`StoreError::Corrupt`] for inconsistent history. A path that is a
     /// directory is "not found", mirroring git. Gitlink paths return an
     /// empty vec (documented divergence: git errors on them).
     pub fn blame(&self, cs_id: Id, path: &str) -> Result<Vec<BlameRange>, StoreError> {
-        self.blame_impl(cs_id, path, true)
+        let key = (cs_id, path.into());
+        if let Some(hit) = self.lock_blame().get(&key) {
+            return Ok(hit.as_ref().clone());
+        }
+        let ranges = self.blame_impl(cs_id, path, true)?;
+        self.lock_blame().put(key, Arc::new(ranges.clone()));
+        Ok(ranges)
     }
 
     /// The naive no-skip walk: identical semantics, but never uses the
@@ -179,11 +291,27 @@ impl Engine {
         let mut table: Vec<Id> = Vec::new();
         let mut attr: Vec<u32> = vec![0; records.len()];
 
-        // Every final line starts unattributed.
+        // Every final line starts unattributed. `remaining` mirrors the
+        // count of `Some` entries in `origin`, so the per-step "anything
+        // left?" check is O(1) instead of a scan over every line (the walk
+        // revisits that check at every step; profiling on real histories
+        // showed the scans adding up). Every origin mutation below keeps
+        // it exact.
         let mut origin: Origin = (0..records.len() as u32).map(Some).collect();
+        let mut remaining = records.len();
+        let mut scratch: Origin = Vec::new();
         let mut cur_cs = cs_id;
         let mut cur_path = path.to_owned();
         let mut steps: u64 = 0;
+        let mut blobs = BlobCache::new();
+        let final_content = Arc::new(content);
+        blobs.put(
+            final_blob,
+            Arc::new(CachedBlob {
+                lines: Arc::new(record_ranges(&final_content)),
+                content: final_content,
+            }),
+        );
 
         loop {
             steps += 1;
@@ -192,7 +320,7 @@ impl Engine {
                     "blame walk exceeded the traversal budget (corrupt graph?)".into(),
                 ));
             }
-            if origin.iter().all(|o| o.is_none()) {
+            if remaining == 0 {
                 break;
             }
             let ps = self.pathsummary_entry(cur_cs)?;
@@ -202,11 +330,11 @@ impl Engine {
                 // cannot rule a touch out.
                 let Some(parent) = ps.first_parent else {
                     // Root changeset: it added everything it has.
-                    attribute_remaining(&mut attr, &mut origin, &mut table, cur_cs);
+                    attribute_remaining(&mut attr, &mut origin, &mut remaining, &mut table, cur_cs);
                     break;
                 };
                 let touches_here = if !ps.truncated {
-                    ps.paths.iter().any(|p| p == &cur_path)
+                    summary_has_path(&ps.paths, &cur_path)
                 } else {
                     let (cs, _) = self
                         .metadata()
@@ -231,8 +359,11 @@ impl Engine {
                     &cs,
                     &cur_path,
                     &mut origin,
+                    &mut scratch,
+                    &mut remaining,
                     &mut attr,
                     &mut table,
+                    &mut blobs,
                 )? {
                     Step::Continue(next_path) => {
                         cur_cs = parent;
@@ -250,7 +381,7 @@ impl Engine {
                 // Maybe touched: check this changeset's own touches
                 // exactly (bounded list, or the changeset when truncated).
                 let touched_here = if !ps.truncated {
-                    ps.paths.iter().any(|p| p == &cur_path)
+                    summary_has_path(&ps.paths, &cur_path)
                 } else {
                     let (cs, _) = self
                         .metadata()
@@ -277,8 +408,11 @@ impl Engine {
                     &cs,
                     &cur_path,
                     &mut origin,
+                    &mut scratch,
+                    &mut remaining,
                     &mut attr,
                     &mut table,
+                    &mut blobs,
                 )? {
                     Step::Continue(next_path) => {
                         cur_cs = parent;
@@ -306,8 +440,11 @@ impl Engine {
     /// parent: resolves the base content (rename-aware), diffs, attributes
     /// diff-added lines (via their final-version line), and hands the
     /// still-unattributed origins to the parent side.
-    // The parameters are the walk's state (who, where, what, bookkeeping);
-    // bundling them would obscure the walk itself.
+    ///
+    /// `blobs` carries the last diffed blob contents across steps and
+    /// `scratch` is recycled into the next origin map (both shaped by the
+    /// walk's own structure: consecutive touchers share one blob, and the
+    /// origin map is rebuilt once per toucher).
     #[allow(clippy::too_many_arguments)]
     fn process_toucher(
         &self,
@@ -316,8 +453,11 @@ impl Engine {
         cs: &gardenbed_model::Changeset,
         cur_path: &str,
         origin: &mut Origin,
+        scratch: &mut Origin,
+        remaining: &mut usize,
         attr: &mut [u32],
         table: &mut Vec<Id>,
+        blobs: &mut BlobCache,
     ) -> Result<Step, StoreError> {
         // The change that produced the current content of cur_path.
         // Prefer the dst change; a rename-away src without a dst would
@@ -405,7 +545,7 @@ impl Engine {
                 },
                 // Added here: all remaining lines attribute to cur_cs.
                 None => {
-                    attribute_remaining(attr, origin, table, cur_cs);
+                    attribute_remaining(attr, origin, remaining, table, cur_cs);
                     return Ok(Step::Done);
                 }
             },
@@ -424,26 +564,29 @@ impl Engine {
             return Ok(Step::Continue(continue_path));
         }
 
-        let base_content = self.objects.get_blob(base_blob)?.ok_or_else(|| {
-            StoreError::Corrupt(format!("blob {base_blob} is referenced but missing"))
-        })?;
-        let new_content = self.objects.get_blob(new_blob)?.ok_or_else(|| {
-            StoreError::Corrupt(format!("blob {new_blob} is referenced but missing"))
-        })?;
-        let old_recs = xdiff::split_records(&base_content);
-        let new_recs = xdiff::split_records(&new_content);
+        let base = blob_cached(self, blobs, base_blob)?;
+        let new = blob_cached(self, blobs, new_blob)?;
+        let old_recs = records_of(&base.content, &base.lines);
+        let new_recs = records_of(&new.content, &new.lines);
 
-        let mut next: Origin = vec![None; old_recs.len()];
+        // Reuse the caller's scratch buffer for the next origin map (the
+        // walk diffs once per toucher; allocating a fresh several-hundred-
+        // KiB buffer each time churned the allocator for nothing).
+        scratch.clear();
+        scratch.resize(old_recs.len(), None);
+
         match xdiff::diff_lines(&old_recs, &new_recs) {
             Some(d) => {
                 // Unchanged old and new lines pair up in order (git's
                 // `xdl_build_script` invariant): the k-th unchanged new
                 // line pairs with the k-th unchanged old line. Diff-added
                 // new lines attribute here — through their final-version
-                // origin — and travel no further.
+                // origin — and travel no further. `carried` counts the
+                // origins that survive into `next` (the new `remaining`).
                 let n_old = old_recs.len();
                 let slot = intern(table, cur_cs);
                 let mut oi = 0usize;
+                let mut carried = 0usize;
                 for (ni, changed) in d.changed_new.iter().enumerate() {
                     if *changed {
                         if let Some(fl) = origin[ni] {
@@ -462,9 +605,13 @@ impl Engine {
                             "diff pairing invariant violated (unchanged count mismatch)".into(),
                         ));
                     }
-                    next[oi] = origin[ni];
+                    scratch[oi] = origin[ni];
+                    if origin[ni].is_some() {
+                        carried += 1;
+                    }
                     oi += 1;
                 }
+                *remaining = carried;
             }
             // Past the documented diff bounds: whole-file attribution.
             None => {
@@ -472,23 +619,66 @@ impl Engine {
                 for fl in origin.iter().flatten() {
                     attr[*fl as usize] = slot;
                 }
+                *remaining = 0;
             }
         }
 
-        *origin = next;
-        if origin.iter().all(|o| o.is_none()) {
+        std::mem::swap(origin, scratch);
+        if *remaining == 0 {
             return Ok(Step::Done);
         }
         Ok(Step::Continue(continue_path))
     }
 }
 
+/// The blob's content and record split for the walk, through `blobs` first:
+/// a hit skips the store read, zstd decode, SHA-256 verification and the
+/// record split entirely; a miss reads and populates the cache. A missing
+/// referenced blob stays corruption.
+fn blob_cached(
+    engine: &Engine,
+    blobs: &mut BlobCache,
+    id: Id,
+) -> Result<Arc<CachedBlob>, StoreError> {
+    if let Some(hit) = blobs.get(id) {
+        return Ok(hit);
+    }
+    let content = engine
+        .objects
+        .get_blob(id)?
+        .ok_or_else(|| StoreError::Corrupt(format!("blob {id} is referenced but missing")))?;
+    let content = Arc::new(content);
+    let lines = Arc::new(record_ranges(&content));
+    let blob = Arc::new(CachedBlob { content, lines });
+    blobs.put(id, blob.clone());
+    Ok(blob)
+}
+
+/// Whether the bounded summary path list contains `path`. The list is
+/// produced deduplicated and ascending by raw bytes
+/// ([`crate::pathsummary`]), so membership is a binary search — the walk
+/// asks this at every candidate step, and the linear scans added up on
+/// long histories.
+fn summary_has_path(paths: &[String], path: &str) -> bool {
+    paths
+        .binary_search_by(|p| p.as_bytes().cmp(path.as_bytes()))
+        .is_ok()
+}
+
 /// Attributes every still-travelling line (those with an origin) to `cs`.
-fn attribute_remaining(attr: &mut [u32], origin: &mut Origin, table: &mut Vec<Id>, cs: Id) {
+/// `remaining` mirrors the `Some` count of `origin` and is kept exact.
+fn attribute_remaining(
+    attr: &mut [u32],
+    origin: &mut Origin,
+    remaining: &mut usize,
+    table: &mut Vec<Id>,
+    cs: Id,
+) {
     let slot = intern(table, cs);
     for fl in origin.iter_mut() {
         if let Some(fl) = fl.take() {
             attr[fl as usize] = slot;
+            *remaining -= 1;
         }
     }
 }

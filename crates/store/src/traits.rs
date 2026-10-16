@@ -102,6 +102,34 @@ pub trait MetadataStore: Send + Sync {
     /// The git SHA recorded for a changeset id, if any.
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError>;
 
+    /// Ids of stored changesets whose 32-byte id sorts in the half-open
+    /// byte range `[lo, hi_exclusive)` — the storage primitive behind
+    /// truncated-id (hex prefix) resolution.
+    ///
+    /// Ids are compared as raw big-endian byte strings: SQLite orders BLOBs
+    /// with `memcmp` (and the changeset id is the primary key, so both
+    /// bounds seek one index range), and the memory backend orders byte
+    /// slices identically. Callers derive the bounds from a user-typed hex
+    /// prefix `p` of `k` nibbles: `lo = p ‖ 0x00…` and
+    /// `hi_exclusive = p+1 ‖ 0x00…` (the prefix incremented in its last
+    /// nibble, with carry; absent when every nibble is `0xF`, where the
+    /// successor overflows and the range is open-ended). The minimum prefix
+    /// is 8 hex chars (4 bytes), so even a million-changeset store matches
+    /// a handful of rows per seek. Results are ascending by id.
+    ///
+    /// The default implementation refuses; backends that can seek by id
+    /// override it (both in-tree backends do).
+    fn changeset_ids_in_id_range(
+        &self,
+        lo: &[u8],
+        hi_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<Id>, StoreError> {
+        let _ = (lo, hi_exclusive);
+        Err(StoreError::Db(
+            "this metadata store cannot scan changeset ids by range".into(),
+        ))
+    }
+
     /// Store bytes in the derived-data cache ("compost"). `kind` is a short
     /// tag naming the derived-data type, e.g. `"skiplist"`. Overwrites any
     /// previous value for the same `(kind, cs)` key.

@@ -734,6 +734,7 @@ dependencies = [
  "gardenbed-store",
  "gix",
  "log",
+ "sha2",
  "thiserror",
 ]
 

@@ -31,7 +31,8 @@ pub use ancestry::SegmentEntry;
 pub use blame::BlameRange;
 pub use pathsummary::{BLOOM_BITS, MAX_SUMMARY_PATHS, PathSummary};
 
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 
 use gardenbed_model::{Change, Changeset, Id, Mode, Tree, TreeEntry, TreeKind};
 use gardenbed_store::{MetadataStore, ObjectStore, StoreError};
@@ -51,10 +52,95 @@ pub const DERIVED_PATHSUMMARY: &str = "pathsummary";
 /// Cheap to share: both stores are behind `Arc` and every method takes
 /// `&self`. Holds trait objects so the server (and any other tier) can keep
 /// one regardless of the backend implementations.
+///
+/// Two process-lifetime caches hang off the engine, both strictly bounded
+/// and keyed by content addresses (which never decode to different bytes):
+/// decoded trees for [`Engine::tree_entry`] and finished blame walks for
+/// [`Engine::blame`]. History is immutable under content addressing, so a
+/// cached answer can never go stale; entries only save recomputation.
+/// Memoized finished blame walks, keyed `(changeset, path)`. History is
+/// immutable under content addressing, so a finished walk's answer is final.
+type BlameMemo = CacheMap<(Id, Box<str>), Arc<Vec<BlameRange>>>;
+
 #[derive(Clone)]
 pub struct Engine {
     objects: Arc<dyn ObjectStore>,
     metadata: Arc<dyn MetadataStore>,
+    /// Decoded trees by tree id (`tree_entry`'s hot path).
+    trees: Arc<Mutex<CacheMap<Id, Arc<Tree>>>>,
+    /// Blame results by `(changeset, path)` (the walk's hot path).
+    blame: Arc<Mutex<BlameMemo>>,
+}
+
+/// A bounded FIFO map used for the engine's decoded-tree and blame caches.
+/// Insertion-ordered eviction keeps the footprint capped; a poisoned lock
+/// is recovered from (the entries themselves stay consistent — a panic can
+/// only strike between a map insert and its queue push, which at worst
+/// delays one eviction).
+struct CacheMap<K, V> {
+    map: HashMap<K, V>,
+    order: VecDeque<K>,
+    cap_entries: usize,
+    cap_bytes: usize,
+    bytes: usize,
+    /// The value's approximate memory weight, for the byte cap.
+    weight: fn(&V) -> usize,
+}
+
+impl<K: Clone + Eq + std::hash::Hash, V: Clone> CacheMap<K, V> {
+    fn new(cap_entries: usize, cap_bytes: usize, weight: fn(&V) -> usize) -> Self {
+        CacheMap {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            cap_entries,
+            cap_bytes,
+            bytes: 0,
+            weight,
+        }
+    }
+
+    fn get(&self, key: &K) -> Option<V> {
+        self.map.get(key).cloned()
+    }
+
+    fn put(&mut self, key: K, value: V) {
+        let w = (self.weight)(&value);
+        if self.map.insert(key.clone(), value).is_none() {
+            self.order.push_back(key);
+            self.bytes += w;
+        }
+        while self.map.len() > self.cap_entries || self.bytes > self.cap_bytes {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(v) = self.map.remove(&oldest) {
+                self.bytes -= (self.weight)(&v);
+            }
+        }
+    }
+}
+
+/// Caps for the decoded-tree cache (`tree_entry`): root trees of a corpus
+/// like git.git are a few KiB each.
+const TREE_CACHE_ENTRIES: usize = 1024;
+const TREE_CACHE_BYTES: usize = 32 << 20;
+/// Caps for the blame-result cache (`blame`): bounded both in walks and in
+/// total cached ranges.
+const BLAME_CACHE_ENTRIES: usize = 256;
+const BLAME_CACHE_BYTES: usize = 32 << 20;
+
+fn blame_weight(ranges: &Arc<Vec<BlameRange>>) -> usize {
+    ranges.len() * std::mem::size_of::<BlameRange>()
+}
+
+fn tree_weight(tree: &Arc<Tree>) -> usize {
+    std::mem::size_of::<Tree>()
+        + tree.entries.capacity() * std::mem::size_of::<TreeEntry>()
+        + tree
+            .entries
+            .iter()
+            .map(|e| e.name.capacity())
+            .sum::<usize>()
 }
 
 impl std::fmt::Debug for Engine {
@@ -66,7 +152,20 @@ impl std::fmt::Debug for Engine {
 impl Engine {
     /// An engine over `objects` (loam) and `metadata` (seedbed).
     pub fn new(objects: Arc<dyn ObjectStore>, metadata: Arc<dyn MetadataStore>) -> Self {
-        Engine { objects, metadata }
+        Engine {
+            objects,
+            metadata,
+            trees: Arc::new(Mutex::new(CacheMap::new(
+                TREE_CACHE_ENTRIES,
+                TREE_CACHE_BYTES,
+                tree_weight,
+            ))),
+            blame: Arc::new(Mutex::new(CacheMap::new(
+                BLAME_CACHE_ENTRIES,
+                BLAME_CACHE_BYTES,
+                blame_weight,
+            ))),
+        }
     }
 
     /// The object store (loam).
@@ -200,7 +299,7 @@ impl Engine {
         for (i, comp) in comps.iter().enumerate() {
             let tree = match cur {
                 None => return Ok(None),
-                Some(id) => Self::load_tree(&*self.objects, id)?,
+                Some(id) => self.decoded_tree(id)?,
             };
             let Some(entry) = tree.entries.iter().find(|e| e.name == *comp) else {
                 return Ok(None);
@@ -214,6 +313,35 @@ impl Engine {
             }
         }
         unreachable!("loop returns on the final component")
+    }
+
+    /// The decoded tree `id`, through the engine's decoded-tree cache:
+    /// consecutive blame/diff steps on neighboring changesets repeatedly
+    /// ask for the same tree ids (a directory's id is stable across commits
+    /// that do not touch it), so a bounded cache turns most loads into
+    /// cache hits. Content addressing makes the entry immortal — the same
+    /// id always decodes to the same entries.
+    fn decoded_tree(&self, id: Id) -> Result<Arc<Tree>, StoreError> {
+        if let Some(tree) = self.lock_trees().get(&id) {
+            return Ok(tree);
+        }
+        let tree = Arc::new(Self::load_tree(&*self.objects, id)?);
+        self.lock_trees().put(id, tree.clone());
+        Ok(tree)
+    }
+
+    fn lock_trees(&self) -> std::sync::MutexGuard<'_, CacheMap<Id, Arc<Tree>>> {
+        match self.trees.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn lock_blame(&self) -> std::sync::MutexGuard<'_, BlameMemo> {
+        match self.blame.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     /// Flattened recursive listing of a tree: `(path, mode, blob id)` per

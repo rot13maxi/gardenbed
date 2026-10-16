@@ -1,9 +1,9 @@
 # gardenbed v0.1 — north-star demo report
 
-- date: 2026-10-14T23:25:47Z
+- date: 2026-10-16T14:39:12Z
 - host: Linux 6.8.0-146-generic x86_64, 16 cores
 - git: git version 2.43.0, sqlite3: 3.45.1
-- workdir: /dev/shm/gardenbed-demo-v0.1.WwS0pi
+- workdir: /dev/shm/gardenbed-demo-v0.1.GP7XZz
 
 Preconditions: cargo, git, sqlite3, jq on PATH; binaries built release.
 
@@ -11,27 +11,27 @@ Preconditions: cargo, git, sqlite3, jq on PATH; binaries built release.
 
 ## 0. build (cargo build --release)
 
-  ✓ release binaries built in 11755 ms
+  ✓ release binaries built in 7586 ms
 ---
 
 ## 1. import — history into the arboretum
 
   ✓ corpus reused: /dev/shm/gardenbed-demo-corpus
   ✓ history has 50100 commits (§0 wants ≥ 50000)
-  (deviation: synthetic corpus — 377 objects, 1940 kilobytes size bar skipped)
+  (deviation: synthetic corpus — 3806 objects, 16248 kilobytes size bar skipped)
   ✓ git_map ↔ git bijection: 50100 changesets for 50100 commits
 
 ---
 
 ## 2. serve (gardenbed-server, ephemeral port)
 
-  ✓ arboretum listening at http://127.0.0.1:37385
+  ✓ arboretum listening at http://127.0.0.1:42983
 
 ---
 
 ## 3. bed clone (sparse bed, materializing nothing)
 
-  ✓ clone in 48 ms (§0 wants < 5000)
+  ✓ clone in 46 ms (§0 wants < 5000)
   ✓ zero working files outside .bed/ (nothing materialized)
 
 ---
@@ -48,7 +48,7 @@ Preconditions: cargo, git, sqlite3, jq on PATH; binaries built release.
 
 ## 5. bed sow (write path: edit → sow → query < 1 s)
 
-  ✓ sow accepted: planted seed bc26fe5964c822e9: 3 change(s) (1 added, 2 modified)
+  ✓ sow accepted: planted seed 385440a20098fc68: 3 change(s) (1 added, 2 modified)
   ✓ log --limit 1 answered in 46 ms (§0 wants < 1000)
   ✓ the sown changeset is the newest history entry
   ✓ bed status after sow: the plot is clean
@@ -78,12 +78,12 @@ Preconditions: cargo, git, sqlite3, jq on PATH; binaries built release.
 
 | phase | ms |
 |---|---|
-| import | 54797 |
-| bed clone | 48 |
-| bed plot add big | 259 |
-| bed sow | 69 |
+| import | 41574 |
+| bed clone | 46 |
+| bed plot add big | 201 |
+| bed sow | 68 |
 | bed log --limit 1 | 46 |
-| export | 16122 |
+| export | 14111 |
 
 ## Verdict
 

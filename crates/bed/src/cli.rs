@@ -41,6 +41,11 @@ pub enum Command {
         /// Repo to tend; the server's choice when omitted.
         #[arg(long)]
         repo: Option<String>,
+        /// The ref to plant from. Default: `main`, falling back to the
+        /// arboretum's other common names (`master`, `trunk`) when it does
+        /// not grow it — pass this flag to name it exactly.
+        #[arg(long = "ref", value_name = "REF")]
+        ref_name: Option<String>,
         /// Plot prefixes to plant immediately (repeat or list several).
         #[arg(long, value_name = "PATH", num_args = 1..)]
         plot: Vec<String>,
@@ -179,9 +184,15 @@ mod tests {
     fn clone_parses_server_repo_and_plots() {
         let cli = parsed(&["clone", "http://host:7400"]);
         match cli.command {
-            Command::Clone { server, repo, plot } => {
+            Command::Clone {
+                server,
+                repo,
+                ref_name,
+                plot,
+            } => {
                 assert_eq!(server, "http://host:7400");
                 assert_eq!(repo, None);
+                assert_eq!(ref_name, None);
                 assert!(plot.is_empty());
             }
             other => panic!("expected Clone, got {other:?}"),
@@ -197,7 +208,9 @@ mod tests {
             "docs",
         ]);
         match cli.command {
-            Command::Clone { server, repo, plot } => {
+            Command::Clone {
+                server, repo, plot, ..
+            } => {
                 assert_eq!(server, "unix:///tmp/a.sock");
                 assert_eq!(repo.as_deref(), Some("x"));
                 assert_eq!(plot, vec!["src", "docs"]);
@@ -209,6 +222,13 @@ mod tests {
         let cli = parsed(&["clone", "s", "--plot", "a", "--plot", "b"]);
         match cli.command {
             Command::Clone { plot, .. } => assert_eq!(plot, vec!["a", "b"]),
+            other => panic!("expected Clone, got {other:?}"),
+        }
+
+        // `--ref` names the starting ref exactly.
+        let cli = parsed(&["clone", "http://host:7400", "--ref", "master"]);
+        match cli.command {
+            Command::Clone { ref_name, .. } => assert_eq!(ref_name.as_deref(), Some("master")),
             other => panic!("expected Clone, got {other:?}"),
         }
     }

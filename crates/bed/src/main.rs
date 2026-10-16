@@ -35,9 +35,20 @@ fn main() {
 
 async fn run(cli: &Cli) -> Result<i32, BedError> {
     match &cli.command {
-        Command::Clone { server, repo, plot } => {
-            let out =
-                gardenbed::ops::clone(&cli.bed_dir, server, repo.as_deref(), plot.clone()).await?;
+        Command::Clone {
+            server,
+            repo,
+            ref_name,
+            plot,
+        } => {
+            let out = gardenbed::ops::clone_with_ref(
+                &cli.bed_dir,
+                server,
+                repo.as_deref(),
+                ref_name.as_deref(),
+                plot.clone(),
+            )
+            .await?;
             print!("{out}");
             Ok(0)
         }

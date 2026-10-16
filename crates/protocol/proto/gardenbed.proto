@@ -264,6 +264,17 @@ message ListRefsReq {
   string repo = 1;
 }
 
+// One ref's value; absent when the ref does not exist. This RPC is also
+// the shared revspec resolver for `<cs-or-ref>` arguments: when no ref
+// matches the name, an all-hex token of 8..=63 chars resolves as a
+// changeset id prefix (case-insensitive; one indexed range seek over the
+// seedbed's 32-byte ids). An existing ref with that exact name wins over
+// prefix interpretation; a full 64-hex token is never prefix-interpreted
+// (clients parse those as ids directly). Exactly one prefix match answers
+// with its id; several fail with INVALID_ARGUMENT naming the match count
+// ("prefix <p> is ambiguous (N changesets)"); none fails with NOT_FOUND
+// ("no ref or changeset matching <p>"); a shorter hex token fails with
+// INVALID_ARGUMENT ("changeset id prefix must be at least 8 hex chars").
 message GetRefReq {
   string repo = 1;
   string name = 2;
@@ -374,7 +385,14 @@ service Gardenbed {
   // Stream all refs of the repo.
   rpc ListRefs(ListRefsReq) returns (stream RefEntry);
 
-  // One ref's value; absent when the ref does not exist.
+  // One ref's value; absent when the ref does not exist. Doubles as the
+  // shared revspec resolver: with no matching ref, a hex token of 8..=63
+  // chars resolves as a changeset id prefix (an existing ref with that
+  // exact name wins; a full 64-hex token is never prefix-interpreted).
+  // One prefix match answers; several fail INVALID_ARGUMENT ("prefix … is
+  // ambiguous (N changesets)"); none fails NOT_FOUND ("no ref or changeset
+  // matching <p>"); a shorter hex token fails INVALID_ARGUMENT with the
+  // "at least 8 hex chars" hint.
   rpc GetRef(GetRefReq) returns (GetRefResp);
 
   // Compare-and-swap one ref; conflicts come back in CasResp.

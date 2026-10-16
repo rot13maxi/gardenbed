@@ -239,6 +239,26 @@ impl MetadataStore for MemoryStore {
     fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
         self.read(|s| s.derived.get(&(kind.to_owned(), cs)).cloned())
     }
+
+    fn changeset_ids_in_id_range(
+        &self,
+        lo: &[u8],
+        hi_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<Id>, StoreError> {
+        self.read(|s| {
+            let mut ids: Vec<Id> = s
+                .changesets
+                .keys()
+                .copied()
+                .filter(|id| {
+                    let bytes = id.as_bytes().as_slice();
+                    bytes >= lo && hi_exclusive.is_none_or(|hi| bytes < hi)
+                })
+                .collect();
+            ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+            ids
+        })
+    }
 }
 
 /// Accepts a 40-character git SHA in either case; returns the lowercase

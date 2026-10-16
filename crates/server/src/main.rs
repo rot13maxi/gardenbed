@@ -243,7 +243,12 @@ async fn serve(
     let addr: SocketAddr = addr_arg
         .parse()
         .map_err(|e| format!("invalid --addr {addr_arg}: {e}"))?;
-    let incoming = TcpIncoming::bind(addr)?;
+    let incoming = TcpIncoming::bind(addr)?
+        // tonic 0.14's low-level serve path bypasses tonic's default-true
+        // nodelay: without this, Nagle delays every unary RPC round trip
+        // (bed blame on a 670-step walk measured ~41 ms per call, 28.4 s
+        // total; with nodelay, 0.66 s — see docs/release-0.1.md).
+        .with_nodelay(Some(true));
     let bound = incoming.local_addr()?;
     // The bound address goes to stdout: it is the contract for tests and
     // scripts that need to learn an ephemeral port.

@@ -148,14 +148,16 @@ fsync **on**):
 | `file_read/cold` | blob uncached: one `GetBlob` round-trip + cache write on top | 83.3 ms | p95 < 50 ms (M4.4)* | * see note |
 | `sow/small_repo` | 100-file sow on a 10k-file repo | 54.8 ms | p50 ratio ≤ 2× (M5.1) | ✅ ratio **1.002** |
 | `sow/big_repo` | the identical 100-file delta on a 1M-file repo | 54.9 ms | (same) | ✅ |
-| `blame/walk_10k` | **worst case** — the path is rewritten by *every* commit (bloom can never skip); 10k chain | 519 ms | see note † | — |
-| `blame/walk_full` | the same worst case walked from the 100k head | 5.21 s | — | — |
+| `blame/walk_10k` | **worst case** — the path is rewritten by *every* commit (bloom can never skip); 10k chain | 475 ms ‡ | see note † | — |
+| `blame/walk_full` | the same worst case walked from the 100k head | 4.75 s ‡ | — | — |
 
 \* The M4.4 subprocess-path budget (p95 < 50 ms localhost) was verified at
-its own gate before this import started; this bench run shares the host
-with the 1.5M-commit linux import (CPU contention, ~29 commits/s), and the
-cold path's extra 41 ms is fetch + hash-verify + cache write under that
-load. Re-record on a quiet host before cutting the tag.
+its own gate before this import started; the recorded bench run shared the
+host with the 1.5M-commit linux import (CPU contention, ~29 commits/s), and
+the cold path's extra ~41 ms is the library path's own fetch + hash-verify
++ cache write. Re-recorded on a quiet host (Oct 16, 2026): 84.3 ms, within
+1.2 % of the recorded 83.3 ms — the gap to the subprocess budget is the
+bench's own work, not host load.
 
 † The M6.2 latency budget (log-log slope < 0.3; 100k blame < 200 ms)
 governs the **skip-enabled** case — a path untouched by recent history —
@@ -163,6 +165,18 @@ which the segment-bloom reduces to 17.3 µs at 100k commits (recorded by
 M6's differential benches). This suite deliberately measures the
 adversarial opposite: every commit touches the path, so every step needs
 a changeset, a blob, and a line diff — O(history) by design.
+
+‡ Re-recorded Oct 16, 2026, quiet host (clean checkout of `6cd6295`,
+loadavg < 1.5): `walk_10k` 474.9 ms, `walk_full` 4.755 s — 8.5 % / 8.7 %
+under the recorded numbers. The same run re-measured every other row
+within ±1.2 % of its recorded value (sow p50 ratio 0.992 vs 1.002
+recorded), with one exception: `cold_fetch` re-measured 1.20–1.24 s
+(run CIs 1.02–1.40 s; intra-run samples span 0.5–2.4 s). A same-day
+control run of the pre-post-M8 code (`08fe8be^`) measured 1.18 s, so
+the gap to the recorded 1.07 s is this bench's run-to-run variance —
+the recorded value sits at the low edge of the distribution — not a
+regression; every measurement stayed under the +20 % CI-gate line and
+4× inside the 5 s budget.
 
 A full second run under deliberately hostile load — the workspace test
 suite compiling on all 16 cores plus the 1.5 M-commit kernel import

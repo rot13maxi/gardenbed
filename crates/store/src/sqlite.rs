@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::TransactionBehavior;
 use rusqlite::params;
+use rusqlite::params_from_iter;
 use sha2::Digest;
 use sha2::Sha256;
 use std::path::Path;
@@ -296,6 +297,35 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .query_row(params![cs.as_bytes()], |r| r.get(0))
             .optional()
             .map_err(db_err)
+    }
+
+    fn changeset_ids_in_id_range(
+        &self,
+        lo: &[u8],
+        hi_exclusive: Option<&[u8]>,
+    ) -> Result<Vec<Id>, StoreError> {
+        let conn = self.lock()?;
+        // `id` is the PRIMARY KEY BLOB, so a unique index backs it and both
+        // bounds seek; the one-bound shape keeps that index seek when the
+        // upper bound overflowed away (an all-F prefix).
+        let mut stmt = conn
+            .prepare_cached(match hi_exclusive {
+                Some(_) => "SELECT id FROM changesets WHERE id >= ?1 AND id < ?2 ORDER BY id",
+                None => "SELECT id FROM changesets WHERE id >= ?1 ORDER BY id",
+            })
+            .map_err(db_err)?;
+        let bound: Vec<&[u8]> = match hi_exclusive {
+            Some(hi) => vec![lo, hi],
+            None => vec![lo],
+        };
+        let rows = stmt
+            .query_map(params_from_iter(bound), |r| r.get::<_, Vec<u8>>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(id_from_blob(&row.map_err(db_err)?)?);
+        }
+        Ok(out)
     }
 
     fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
