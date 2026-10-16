@@ -212,7 +212,6 @@ pub fn import_from_path(
         // them so `total = new + skipped` holds.
         report.commits_skipped = arena.nodes.iter().filter(|n| n.mapped).count() as u64;
     }
-    report.objects_written = counting.written();
 
     // ---- refs: compare-and-swap onto the fresh tips -------------------
     for (name, tip) in &selected {
@@ -245,6 +244,8 @@ pub fn import_from_path(
             }
         }
     }
+    // Legacy frontier certification may recreate missing tree objects.
+    report.objects_written = counting.written();
     report.refs_updated.sort_by(|a, b| a.0.cmp(&b.0));
     report.elapsed = started.elapsed();
     Ok(report)

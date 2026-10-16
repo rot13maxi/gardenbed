@@ -136,3 +136,42 @@ fn unchanged_legacy_reimport_migrates_valid_history_once() {
         initial.commits_new
     );
 }
+
+#[test]
+fn legacy_frontier_repair_counts_recreated_tree_objects() {
+    use gardenbed_store::ObjectStore;
+    let fixture = Fixture::generate(
+        901,
+        &GenOptions {
+            commits: 12,
+            merge_ratio: 0.0,
+            octopus_ratio: 0.0,
+            ..Default::default()
+        },
+    );
+    import(&fixture.repo, &fixture.garden, &Default::default());
+    let (objects, metadata, engine) = open_stores(&fixture.garden);
+    let mut roots = std::collections::BTreeSet::new();
+    for (_, sha) in &fixture.mapping {
+        let id = metadata.cs_for_git(sha).unwrap().unwrap();
+        if let Some(root) = engine.root_tree(id).unwrap() {
+            roots.insert(root.to_hex());
+        }
+    }
+    assert!(!roots.is_empty());
+    for hex in &roots {
+        std::fs::remove_file(objects.objects_dir().join(&hex[..2]).join(&hex[2..])).unwrap();
+    }
+    rusqlite::Connection::open(fixture.garden.join("seedbed.sqlite3"))
+        .unwrap()
+        .execute("DELETE FROM validated_changesets_v1", [])
+        .unwrap();
+    drop((objects, metadata, engine));
+    let repaired = import(&fixture.repo, &fixture.garden, &Default::default());
+    assert_eq!(repaired.commits_new, 0);
+    assert_eq!(repaired.objects_written, roots.len() as u64);
+    let (objects, _, _) = open_stores(&fixture.garden);
+    for hex in roots {
+        assert!(objects.has(hex.parse().unwrap()).unwrap());
+    }
+}

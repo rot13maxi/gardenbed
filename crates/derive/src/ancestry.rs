@@ -642,7 +642,10 @@ impl Engine {
     /// failure here leaves the changeset present with missing (recomputable)
     /// derived data.
     pub fn on_changeset_created(&self, cs_id: Id) -> Result<(), StoreError> {
-        self.derive_tree(cs_id)?;
+        let tree = self.derive_tree(cs_id)?;
+        // A durable certificate can answer derive_tree without consulting
+        // compost. Explicit eager rebuilds must still restore its tree row.
+        self.cache_tree(cs_id, tree)?;
         self.skiplist_entry(cs_id)?;
         self.pathsummary_entry(cs_id)?;
         Ok(())

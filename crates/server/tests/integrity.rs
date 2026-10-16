@@ -482,3 +482,40 @@ fn legacy_certification_rejects_a_changeset_under_the_wrong_content_address() {
     assert_eq!(store.validation_tree(wrong).unwrap(), None);
     assert_eq!(store.validation_tree(real).unwrap(), None);
 }
+
+#[test]
+fn eager_rebuild_restores_certificate_backed_derived_tree_rows() {
+    let store = Arc::new(MemoryStore::new());
+    let repo = Repo::new(store.clone(), store.clone());
+    repo.put_blob(b"content").unwrap();
+    let root = sow(
+        &repo,
+        &changeset(
+            vec![],
+            vec![change(
+                "file",
+                Op::Add,
+                Some(b"content"),
+                Mode::Regular,
+                None,
+            )],
+            "root",
+        ),
+    );
+    let child = sow(&repo, &changeset(vec![root], vec![], "child"));
+    let kinds = ["tree", "skiplist", "pathsummary"];
+    let before: Vec<_> = [root, child]
+        .into_iter()
+        .flat_map(|id| kinds.map(|kind| (id, kind, store.derived_get(kind, id).unwrap().unwrap())))
+        .collect();
+    for (id, kind, _) in &before {
+        store.derived_put(kind, *id, &[]).unwrap();
+    }
+    let engine = gardenbed_derive::Engine::new(store.clone(), store.clone());
+    for id in [root, child] {
+        engine.on_changeset_created(id).unwrap();
+    }
+    for (id, kind, bytes) in before {
+        assert_eq!(store.derived_get(kind, id).unwrap(), Some(bytes));
+    }
+}
