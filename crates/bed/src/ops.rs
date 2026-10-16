@@ -371,11 +371,12 @@ fn bed_state_note(skipped: &[String]) -> String {
 
 /// `bed goto <cs-or-ref>` — move the bed to a changeset and refresh the
 /// plot's working copy to match it (fetch missing, rewrite changed, remove
-/// gone). After a successful goto, `status` is clean.
+/// gone). Local edits survive when the target leaves their paths unchanged;
+/// destructive collisions are refused before any materialization.
 ///
-/// The config's `current_cs` moves only after the whole fetch phase has
-/// succeeded — a server that is down leaves the bed where it stood — and
-/// an interrupted *refresh* is repaired by simply running goto again.
+/// The config's `current_cs` moves only after successful materialization.
+/// A fetch failure or preflight refusal leaves the bed where it stood;
+/// an interrupted refresh is repaired by simply running goto again.
 pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
     let mut bed = Bed::open(bed_dir)?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;

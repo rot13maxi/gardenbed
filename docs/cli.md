@@ -107,6 +107,17 @@ Usage: bed plot list [OPTIONS]
 `plot add` takes repo-relative prefixes (directory or exact file; `.`
 plants the whole garden) and materializes them at the current changeset.
 
+Checkout updates (`plot add`, `goto`, and `graft`) preserve local edits
+when the target leaves that file unchanged. They refuse to overwrite
+local edits or untracked entries; sow or move that work aside before
+retrying. Paths overlapping the active bed state directory and symlink
+ancestors are also refused before files or checkout state change.
+
+The selected state directory may live on another filesystem, including
+through a symlink. Interrupted staging entries are reclaimed on retry
+only when their recorded identity still matches. Unknown or replaced
+temporary-looking files remain visible as untracked and are preserved.
+
 ```sh
 bed plot add src tests        # two prefixes at once
 bed plot add big              # the demo: 1,021 files, byte-verified vs git show
@@ -293,6 +304,11 @@ gRPC API — the printed address is the contract for scripts:
 gardenbed-server --addr 127.0.0.1:9418 --root /tmp/arboretum
 # listening on 127.0.0.1:9418
 ```
+
+Publication uses durable validation certificates. Older databases perform a
+one-time validation of previously uncertified reachable history before moving
+refs; later restarts reuse that frontier. See [publication validation](validation.md)
+for migration behavior and certificate guarantees.
 
 ### gardenbed-server serve
 

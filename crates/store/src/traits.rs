@@ -138,6 +138,33 @@ pub trait MetadataStore: Send + Sync {
     /// Bytes previously stored under `(kind, cs)`, if any.
     fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError>;
 
+    /// A durable v1 validation certificate: `None` means uncertified;
+    /// `Some(None)` certifies an empty tree. Certificates are separate from
+    /// mutable derived data and attest to replay against certified parents,
+    /// complete ancestry validity, and blob availability at validation time.
+    fn validation_tree(&self, _cs: Id) -> Result<Option<Option<Id>>, StoreError> {
+        Ok(None)
+    }
+
+    /// Trusted validator write: atomically store canonical changeset, immutable
+    /// v1 certificate, optional Git mapping, and derived rows. All parents must
+    /// already be certified. The caller MUST validate shape and blobs and replay
+    /// against the first parent's certified tree without trusting derived caches
+    /// (see Engine::validated_tree_for_new). Generic put/ingest/derived_put never
+    /// grant certificates. Re-certifying with a different root is an error.
+    /// Backends without certificate support must refuse this operation.
+    fn put_validated_changeset(
+        &self,
+        _cs: &Changeset,
+        _root_tree: Option<Id>,
+        _derived: &[DerivedRow],
+        _git_sha_hex: Option<&str>,
+    ) -> Result<Id, StoreError> {
+        Err(StoreError::Db(
+            "validation certificates are unsupported by this metadata store".into(),
+        ))
+    }
+
     /// Atomically ingests one new changeset: the changeset row, its git-SHA
     /// mapping and any derived-data cache rows land in a single transaction,
     /// so a crash mid-ingest leaves the commit entirely absent (cleanly

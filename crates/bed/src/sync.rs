@@ -3,23 +3,18 @@
 //!
 //! Shared by `bed plot add` (sync the added prefixes at the current
 //! changeset) and `bed goto` (sync the whole plot at the new changeset).
-//! Both converge: every step is idempotent, so an interrupted run that is
-//! repeated finishes the job — files whose content already matches the
-//! plan are kept (one hash read, no rewrite), missing or drifted files are
-//! written, rows the plan no longer covers are removed together with their
-//! files.
+//! A complete preflight rejects overwrites of unsown work and untracked
+//! collisions before changing files or treestate. Local edits to paths
+//! whose target still equals the indexed baseline are preserved. Repeated
+//! runs accept already-materialized target entries after interruption.
 //!
-//! Materialization rules (v0.1.md §2, harness contract):
-//! * regular/exec files — bytes under `path`, parents created; exec mode
-//!   chmods `0o755`, regular mode normalizes to `0o644`;
-//! * symlinks — the blob's bytes are the link target; an existing entry at
-//!   the path (file or symlink) is replaced;
-//! * gitlinks — submodule pointers are never materialized as files; only
-//!   the treestate row is recorded (mode [`MODE_GITLINK`]), so `status`
-//!   stays clean;
-//! * file↔directory swaps are handled by removing the not-in-plan entries
-//!   first, then writing (a directory that a plan file replaces is removed
-//!   with its contents — the plot's space is bed's to tend).
+//! Filesystem operations are anchored to open directory descriptors and
+//! refuse symlink ancestors. Symlink leaves store the blob's target bytes;
+//! regular files normalize mode to 0o644, executable files to 0o755.
+//! Gitlinks are recorded in treestate without materializing a file.
+//! File↔directory swaps are allowed only when every removed descendant is
+//! clean and tracked; untracked descendants, including empty directories,
+//! are preserved by refusing the operation.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -86,10 +81,17 @@ pub async fn sync_plot(
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect();
-    let disk = crate::checkout_fs::CheckoutFs::open(garden_root)?;
+    let disk = crate::checkout_fs::CheckoutFs::open(
+        garden_root,
+        treestate.path().parent().expect("state directory"),
+    )?;
+    // Only identity-registered staging entries from dead writers are
+    // reclaimed. Substituted names remain ordinary local/untracked work.
+    disk.cleanup_staging()?;
     // Validate the whole operation before changing any file or index row.
     let preserve = preflight(garden_root, plot, &target, treestate, &disk)?;
     let mut outcome = SyncOutcome::default();
+    let mut obsolete = Vec::new();
 
     for path in treestate.all_paths()? {
         if target.contains_key(&path) || !in_plot(&path, plot) {
@@ -102,7 +104,9 @@ pub async fn sync_plot(
         {
             disk.remove(&path)?;
         }
-        treestate.remove(&path)?;
+        // Keep the baseline until replacement entries are in place, so
+        // an interrupted shape transition can still be preflighted.
+        obsolete.push(path);
         outcome.removed += 1;
     }
 
@@ -131,7 +135,6 @@ pub async fn sync_plot(
             outcome.kept += 1;
         } else {
             let content = fetcher.blob(file.blob).await?;
-            disk.remove(path)?;
             disk.write(path, &content, file.mode)?;
             outcome.written += 1;
         }
@@ -140,10 +143,13 @@ pub async fn sync_plot(
             path: path.clone(),
             blob_id: file.blob,
             mode: file.mode_code(),
-            size: meta.st_size as i64,
-            mtime_ns: meta.st_mtime as i64 * 1_000_000_000 + meta.st_mtime_nsec as i64,
+            size: meta.st_size,
+            mtime_ns: meta.st_mtime * 1_000_000_000 + meta.st_mtime_nsec as i64,
             hint: HINT_VERIFIED,
         })?;
+    }
+    for path in obsolete {
+        treestate.remove(&path)?;
     }
     Ok(outcome)
 }
@@ -279,32 +285,34 @@ fn preflight(
             let leaves = disk.leaves(path)?;
             let becomes_directory = target.keys().any(|p| p.starts_with(&format!("{path}/")));
             for leaf in &leaves {
-                if leaf == path && becomes_directory {
+                if leaf == path
+                    && (becomes_directory
+                        || tracked.keys().any(|p| p.starts_with(&format!("{path}/"))))
+                {
+                    // Empty replacement directories left after removing
+                    // old tracked descendants are safe to resume.
                     continue;
                 }
-                if let Some(old) = tracked.get(leaf) {
-                    if disk.entry(leaf)?
+                if let Some(old) = tracked.get(leaf)
+                    && disk.entry(leaf)?
                         == Some(Entry::File {
                             blob: old.blob_id,
                             mode: old.mode,
                         })
-                    {
-                        continue;
-                    }
+                {
+                    continue;
                 }
                 // Completed target descendants are safe during a resume;
                 // unrelated additions and modified descendants are not.
-                if becomes_directory {
-                    if let Some(file) = target.get(leaf) {
-                        if disk.entry(leaf)?
-                            == Some(Entry::File {
-                                blob: file.blob,
-                                mode: file.mode_code(),
-                            })
-                        {
-                            continue;
-                        }
-                    }
+                if becomes_directory
+                    && let Some(file) = target.get(leaf)
+                    && disk.entry(leaf)?
+                        == Some(Entry::File {
+                            blob: file.blob,
+                            mode: file.mode_code(),
+                        })
+                {
+                    continue;
                 }
                 return Err(blocked(leaf, "directory contains local or untracked work"));
             }
@@ -327,15 +335,15 @@ fn materialized_ancestor(
 ) -> Result<bool, BedError> {
     for (position, _) in path.match_indices('/') {
         let ancestor = &path[..position];
-        if let Some(file) = target.get(ancestor) {
-            if file.mode != Mode::Gitlink
-                && disk.entry(ancestor)? == Some(crate::checkout_fs::Entry::File {
+        if let Some(file) = target.get(ancestor)
+            && file.mode != Mode::Gitlink
+            && disk.entry(ancestor)?
+                == Some(crate::checkout_fs::Entry::File {
                     blob: file.blob,
                     mode: file.mode_code(),
                 })
-            {
-                return Ok(true);
-            }
+        {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -355,14 +363,31 @@ mod tests {
     use std::fs;
 
     fn plan(files: &[(&str, &[u8])]) -> BTreeMap<String, PlanFile> {
-        files.iter().map(|(path, bytes)| (path.to_string(), PlanFile {
-            path: path.to_string(), mode: Mode::Regular, blob: blob_id(bytes),
-        })).collect()
+        files
+            .iter()
+            .map(|(path, bytes)| {
+                (
+                    path.to_string(),
+                    PlanFile {
+                        path: path.to_string(),
+                        mode: Mode::Regular,
+                        blob: blob_id(bytes),
+                    },
+                )
+            })
+            .collect()
     }
 
     fn track(ts: &Treestate, path: &str, bytes: &[u8]) {
-        ts.upsert(&TreestateEntry { path: path.into(), blob_id: blob_id(bytes), mode: 0,
-            size: bytes.len() as i64, mtime_ns: 0, hint: HINT_UNVERIFIED }).unwrap();
+        ts.upsert(&TreestateEntry {
+            path: path.into(),
+            blob_id: blob_id(bytes),
+            mode: 0,
+            size: bytes.len() as i64,
+            mtime_ns: 0,
+            hint: HINT_UNVERIFIED,
+        })
+        .unwrap();
     }
 
     #[test]
@@ -372,15 +397,27 @@ mod tests {
         let ts = bed.treestate().unwrap();
         track(&ts, "f", b"base");
         fs::write(dir.path().join("f"), b"local").unwrap();
-        let disk = CheckoutFs::open(dir.path()).unwrap();
+        let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         let plot = vec![".".into()];
-        assert_eq!(preflight(dir.path(), &plot, &plan(&[("f", b"base")]), &ts, &disk).unwrap(), BTreeSet::from(["f".into()]));
+        assert_eq!(
+            preflight(dir.path(), &plot, &plan(&[("f", b"base")]), &ts, &disk).unwrap(),
+            BTreeSet::from(["f".into()])
+        );
         assert!(preflight(dir.path(), &plot, &plan(&[("f", b"target")]), &ts, &disk).is_err());
         assert!(preflight(dir.path(), &plot, &plan(&[]), &ts, &disk).is_err());
         fs::remove_file(dir.path().join("f")).unwrap();
         assert!(preflight(dir.path(), &plot, &plan(&[("f", b"target")]), &ts, &disk).is_err());
         fs::write(dir.path().join("untracked"), b"local").unwrap();
-        assert!(preflight(dir.path(), &plot, &plan(&[("untracked", b"target")]), &ts, &disk).is_err());
+        assert!(
+            preflight(
+                dir.path(),
+                &plot,
+                &plan(&[("untracked", b"target")]),
+                &ts,
+                &disk
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -391,7 +428,7 @@ mod tests {
         track(&ts, "d/f", b"base");
         fs::create_dir(dir.path().join("d")).unwrap();
         fs::write(dir.path().join("d/f"), b"base").unwrap();
-        let disk = CheckoutFs::open(dir.path()).unwrap();
+        let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         let plot = vec![".".into()];
         let target = plan(&[("d", b"replacement")]);
         assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
@@ -407,13 +444,21 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bed = Bed::init(&dir.path().join(".bed"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
-        let disk = CheckoutFs::open(dir.path()).unwrap();
+        let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         let plot = vec![".".into()];
         track(&ts, "d/f", b"base");
         fs::write(dir.path().join("d"), b"replacement").unwrap();
         let target = plan(&[("d", b"replacement")]);
         assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
         assert!(materialized_ancestor("d/f", &target, &disk).unwrap());
+        // A crash after removing the old descendants but before installing
+        // the new file retains baseline rows and an empty directory.
+        fs::remove_file(dir.path().join("d")).unwrap();
+        fs::create_dir(dir.path().join("d")).unwrap();
+        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        fs::remove_dir(dir.path().join("d")).unwrap();
+        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        fs::write(dir.path().join("d"), b"replacement").unwrap();
         ts.remove("d/f").unwrap();
         track(&ts, "d", b"replacement");
         fs::remove_file(dir.path().join("d")).unwrap();
@@ -429,9 +474,18 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         let bed = Bed::init(&dir.path().join("custom"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
-        let disk = CheckoutFs::open(dir.path()).unwrap();
+        let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         let plot = vec![".".into()];
-        assert!(preflight(dir.path(), &plot, &plan(&[("custom/config.toml", b"bad")]), &ts, &disk).is_err());
+        assert!(
+            preflight(
+                dir.path(),
+                &plot,
+                &plan(&[("custom/config.toml", b"bad")]),
+                &ts,
+                &disk
+            )
+            .is_err()
+        );
         assert!(preflight(dir.path(), &plot, &plan(&[("custom", b"bad")]), &ts, &disk).is_err());
         fs::write(outside.path().join("f"), b"outside").unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();

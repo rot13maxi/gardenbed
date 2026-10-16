@@ -151,6 +151,11 @@ pub fn scan_paths(
 ) -> Result<Vec<ScanItem>, BedError> {
     let mut items: Vec<ScanItem> = Vec::new();
     let state_prefixes = crate::sync::state_prefixes(root, treestate)?;
+    let disk = crate::checkout_fs::CheckoutFs::open(
+        root,
+        treestate.path().parent().expect("state directory"),
+    )?;
+    let (_staging_scan_lock, staged_paths) = disk.staging_scan()?;
 
     let tracked_paths = treestate.all_paths()?;
     let tracked: HashSet<String> = tracked_paths.iter().cloned().collect();
@@ -247,7 +252,7 @@ pub fn scan_paths(
             };
             // Skip the selected state directory regardless of its name
             // or whether it is itself a symlink.
-            if crate::sync::is_state_path(&rel, &state_prefixes) {
+            if crate::sync::is_state_path(&rel, &state_prefixes) || staged_paths.contains(&rel) {
                 continue;
             }
             if entry.file_type()?.is_dir() {
@@ -765,5 +770,4 @@ mod tests {
         assert!(report.modified.is_empty());
         assert!(report.deleted.is_empty());
     }
-
 }

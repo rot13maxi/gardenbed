@@ -31,6 +31,7 @@ struct MemoryInner {
     git_by_cs: HashMap<Id, String>,
     /// Derived-data cache keyed by `(kind, changeset id)`.
     derived: HashMap<(String, Id), Vec<u8>>,
+    validated_v1: HashMap<Id, Option<Id>>,
 }
 
 /// An entirely in-memory store implementing both [`ObjectStore`] and
@@ -238,6 +239,70 @@ impl MetadataStore for MemoryStore {
 
     fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
         self.read(|s| s.derived.get(&(kind.to_owned(), cs)).cloned())
+    }
+
+    fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
+        self.read(|s| s.validated_v1.get(&cs).copied())
+    }
+
+    fn put_validated_changeset(
+        &self,
+        cs: &Changeset,
+        root_tree: Option<Id>,
+        derived: &[crate::traits::DerivedRow],
+        git_sha_hex: Option<&str>,
+    ) -> Result<Id, StoreError> {
+        let canonical = cs
+            .canonical_bytes()
+            .map_err(|e| StoreError::Invalid(e.to_string()))?;
+        let id = cs.id().map_err(|e| StoreError::Invalid(e.to_string()))?;
+        let sha = git_sha_hex.map(normalize_git_sha).transpose()?;
+        self.write(|s| {
+            for parent in &cs.parents {
+                if !s.validated_v1.contains_key(parent) {
+                    return Err(StoreError::Invalid(format!(
+                        "parent {parent} is not certified"
+                    )));
+                }
+            }
+            if let Some((_, previous)) = s.changesets.get(&id)
+                && *previous != canonical
+            {
+                return Err(StoreError::ImmutabilityViolation(id));
+            }
+            if let Some(previous) = s.validated_v1.get(&id)
+                && *previous != root_tree
+            {
+                return Err(StoreError::ImmutabilityViolation(id));
+            }
+            if let Some(sha) = sha.as_ref()
+                && (s
+                    .git_by_sha
+                    .get(sha)
+                    .is_some_and(|existing| *existing != id)
+                    || s.git_by_cs.get(&id).is_some_and(|existing| existing != sha))
+            {
+                return Err(StoreError::Invalid("Git mapping is not a bijection".into()));
+            }
+            for row in derived {
+                if row.kind.is_empty() || row.kind.len() > 64 {
+                    return Err(StoreError::Invalid(
+                        "derived-data kind must be 1..=64 characters".into(),
+                    ));
+                }
+            }
+            s.changesets.insert(id, (cs.clone(), canonical));
+            s.validated_v1.insert(id, root_tree);
+            if let Some(sha) = sha {
+                s.git_by_sha.insert(sha.clone(), id);
+                s.git_by_cs.insert(id, sha);
+            }
+            for row in derived {
+                s.derived
+                    .insert((row.kind.clone(), row.cs), row.bytes.clone());
+            }
+            Ok(id)
+        })
     }
 
     fn changeset_ids_in_id_range(

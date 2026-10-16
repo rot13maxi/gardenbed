@@ -199,11 +199,27 @@ All local state lives under `--bed-dir` (default `./.bed`):
   Resumability and idempotence fall out of content addressing, not retry
   logic (v0.1.md §M4 right-thing signal).
 - **Two-phase sow**: scan the plot, read changed files, then upload —
-  blobs ≤ 1 MiB ride inline on `CreateChangeset`, heavier ones stream via
-  `PutBlob` first. A SIGKILL between the two leaves orphaned blobs that
+  blobs ≤ 1 MiB ride inline on `CreateChangeset` within a 2 MiB aggregate
+  content budget; heavier blobs and overflow stream via `PutBlob` first.
+  A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
 - **Status** uses mtime/size as hints and hashes only suspects;
   `--full-scan` forces the correctness path.
+- **Atomic checkout** stages complete files and symlinks before replacing
+  working entries. When the selected state directory and destination are
+  on different mounts, staging happens beside the destination so the final
+  rename stays on one mount. Linux regular files prefer `O_TMPFILE`; the
+  fallback creates a named entry exclusively. A state journal records its
+  exact path, device, inode and kind before file bytes are written.
+  Status/sow hold a shared staging lock throughout the scan; destination
+  writers hold the exclusive lock through publication. Recovery also
+  checks the per-stage writer lock and identity before deleting debris.
+  Registered temporary entries never become repository content, and
+  substituted or unregistered entries are neither ignored nor deleted.
+  A crash during symlink creation or named-file bootstrap can leave an
+  unregistered temporary-looking entry; it remains ordinary untracked
+  work rather than being assumed disposable. Checkout directory traversal
+  uses open directory descriptors and refuses symlink ancestors.
 
 ## 7. Import pipeline (rootstock)
 

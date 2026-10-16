@@ -180,6 +180,73 @@ impl Engine {
 
     // ------------------------------------------------------------ trees
 
+    /// Replay directly against an explicit tree, without reading mutable
+    /// derived caches. Used by validation certificates and legacy migration.
+    pub fn apply_changeset_to_tree(
+        &self,
+        base: Option<Id>,
+        cs: &Changeset,
+    ) -> Result<Option<Id>, StoreError> {
+        apply::apply_changeset(&*self.objects, base, cs)
+    }
+
+    /// Validate a candidate against certified parents. No generic derived
+    /// cache participates in this proof. The returned root can be committed
+    /// with `MetadataStore::put_validated_changeset` after derived rows are
+    /// prepared with `derived_rows_for_validated_tree`.
+    pub fn validated_tree_for_new(&self, cs: &Changeset) -> Result<Option<Id>, StoreError> {
+        gardenbed_model::codec::validate_changeset(cs, true).map_err(codec_err)?;
+        let mut base = None;
+        for (index, parent) in cs.parents.iter().enumerate() {
+            let root = self
+                .metadata
+                .validation_tree(*parent)?
+                .ok_or_else(|| StoreError::Invalid(format!("parent {parent} is not certified")))?;
+            if index == 0 {
+                base = root;
+            }
+        }
+        for change in &cs.changes {
+            if let Some(blob) = change.blob
+                && change.mode != Mode::Gitlink
+                && !self.objects.has(blob)?
+            {
+                return Err(StoreError::Invalid(format!(
+                    "referenced blob {blob} is missing"
+                )));
+            }
+        }
+        self.apply_changeset_to_tree(base, cs)
+    }
+
+    /// Validate legacy history bottom-up until durable v1 certificates form
+    /// a frontier. Every parent, including non-first parents, is checked.
+    /// Valid ancestors are certified immediately, so retries and restarts
+    /// resume at that frontier. No history-sized process cache is retained.
+    pub fn certify_history(&self, head: Id) -> Result<(), StoreError> {
+        let mut pending = vec![(head, false)];
+        while let Some((id, ready)) = pending.pop() {
+            if self.metadata.validation_tree(id)?.is_some() {
+                continue;
+            }
+            let cs = self.get_changeset(id)?;
+            if cs.id().map_err(codec_err)? != id {
+                return Err(StoreError::Corrupt(format!(
+                    "changeset content does not match addressed id {id}"
+                )));
+            }
+            if !ready {
+                pending.push((id, true));
+                pending.extend(cs.parents.iter().map(|parent| (*parent, false)));
+                continue;
+            }
+            let root = self.validated_tree_for_new(&cs)?;
+            self.metadata
+                .put_validated_changeset(&cs, root, &[], None)?;
+        }
+        Ok(())
+    }
+
     /// The root tree of changeset `cs_id`: `apply(changes(cs), tree(first
     /// parent))`. `None` when the changeset's tree is empty (no files
     /// anywhere in history).
@@ -429,6 +496,13 @@ impl Engine {
     /// empty tree) on hit, `None` on miss. A cached id whose object has
     /// vanished is treated as a miss (recompute), never trusted blindly.
     fn cached_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
+        if let Some(certified) = self.metadata.validation_tree(cs)? {
+            return match certified {
+                None => Ok(Some(None)),
+                Some(root) if self.objects.has(root)? => Ok(Some(Some(root))),
+                Some(_) => Ok(None), // Missing object: recompute from history.
+            };
+        }
         match self.metadata.derived_get(DERIVED_TREE, cs)? {
             None => Ok(None),
             Some(bytes) if bytes.is_empty() => Ok(Some(None)),
@@ -471,8 +545,21 @@ impl Engine {
         cs_id: Id,
         cs: &Changeset,
     ) -> Result<Vec<gardenbed_store::DerivedRow>, StoreError> {
+        let (root, _) = self.derive_tree_for_new(cs_id, cs)?;
+        self.derived_rows_for_validated_tree(cs_id, cs, root)
+    }
+
+    /// Prepare derived rows using an already replayed root. This avoids a
+    /// second tree application on native and import validation paths. This
+    /// method only prepares caches; it does not grant a validation certificate.
+    pub fn derived_rows_for_validated_tree(
+        &self,
+        cs_id: Id,
+        cs: &Changeset,
+        root: Option<Id>,
+    ) -> Result<Vec<gardenbed_store::DerivedRow>, StoreError> {
         let mut rows = Vec::with_capacity(3);
-        let (_, tree_payload) = self.derive_tree_for_new(cs_id, cs)?;
+        let tree_payload = cache_payload(root);
         rows.push(gardenbed_store::DerivedRow {
             kind: DERIVED_TREE.to_owned(),
             cs: cs_id,

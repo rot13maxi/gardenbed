@@ -21,9 +21,9 @@
 //! parents are dropped. Full imports never re-root — every reachable
 //! parent is either ingested (earlier in topological order) or mapped.
 //!
-//! Object writes happen strictly before the changeset that references
-//! them, and the mapping row precedes the derived-data pass, so a crash
-//! leaves only recomputable state behind.
+//! Object writes and validation happen before atomic metadata ingestion:
+//! changeset, Git mapping, derived rows and durable validation certificate
+//! land together. Interrupted imports resume at the last certified frontier.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -182,8 +182,14 @@ pub fn import_from_path(
             // on_changeset_created path.
             let canonical = cs.canonical_bytes()?;
             let cs_id = Id::from_bytes(Sha256::digest(&canonical).into());
-            let rows = engine.derived_rows_for_new(cs_id, &cs)?;
-            metadata.ingest_changeset(&canonical, &sha_hex, &rows)?;
+            // Normally parents were certified atomically by earlier ingests.
+            // Mapped legacy frontiers are migrated once, including all parents.
+            for parent in &cs.parents {
+                engine.certify_history(*parent)?;
+            }
+            let root = engine.validated_tree_for_new(&cs)?;
+            let rows = engine.derived_rows_for_validated_tree(cs_id, &cs, root)?;
+            metadata.put_validated_changeset(&cs, root, &rows, Some(&sha_hex))?;
             arena.nodes[*idx as usize].cs = Some(cs_id);
             report.commits_new += 1;
             if report.commits_new % 25_000 == 0 {
@@ -206,7 +212,6 @@ pub fn import_from_path(
         // them so `total = new + skipped` holds.
         report.commits_skipped = arena.nodes.iter().filter(|n| n.mapped).count() as u64;
     }
-    report.objects_written = counting.written();
 
     // ---- refs: compare-and-swap onto the fresh tips -------------------
     for (name, tip) in &selected {
@@ -222,6 +227,9 @@ pub fn import_from_path(
             log::debug!("ref {name}: tip outside the import slice; not recorded");
             continue;
         };
+        // Also certify an unchanged mapped tip on legacy re-import. A Git
+        // mapping or generic derived row is never itself a validation proof.
+        engine.certify_history(target)?;
         let current = metadata.resolve_ref(name)?;
         if current == Some(target) {
             continue; // already there: unchanged re-import
@@ -236,6 +244,8 @@ pub fn import_from_path(
             }
         }
     }
+    // Legacy frontier certification may recreate missing tree objects.
+    report.objects_written = counting.written();
     report.refs_updated.sort_by(|a, b| a.0.cmp(&b.0));
     report.elapsed = started.elapsed();
     Ok(report)
