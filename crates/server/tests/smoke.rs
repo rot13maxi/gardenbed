@@ -304,12 +304,12 @@ async fn server_smoke_end_to_end() {
     );
 
     // ----------------------------------------------------------- graft
-    // An unrelated branch root; grafting the child onto it replays its
-    // changes as a fresh single-parent changeset.
+    // An independent branch retaining the modified file's pre-image;
+    // grafting the child replays its changes as a single-parent changeset.
     let c = b"unrelated\n".to_vec();
     let cs_branch = Changeset {
         parents: vec![],
-        changes: vec![add("other.txt", &c)],
+        changes: vec![add("a.txt", &a), add("other.txt", &c)],
         message: "branch".into(),
         author: identity("cat", 30),
         committer: identity("cat", 30),
@@ -766,9 +766,7 @@ async fn graft_three_way_edge_cases() {
     assert_eq!(got_a.parents, vec![id_target_a], "one parent: the target");
 
     // (b) Rename interplay: the renamed source was ALSO modified on the
-    // new main. The rename's source must merely exist (v0.1 semantics:
-    // no text merge, the replayed rename carries its own blob), so this
-    // graft succeeds and the modification rides out with the rename.
+    // new main. Replaying must refuse to discard the concurrent edit.
     let cs_rename = cs(
         vec![id_root],
         vec![chg(
@@ -795,30 +793,12 @@ async fn graft_three_way_edge_cases() {
         50,
     );
     let id_main_mod = sow(&client, repo, &cs_main_mod, &[b"ren v2\n"]).await;
-    let grafted_b = client
+    let error = client
         .graft(repo, id_rename, id_main_mod)
         .await
-        .expect("rename replays over a modified source");
-    let tree_b = client
-        .get_tree(
-            repo,
-            client
-                .root_tree(repo, grafted_b)
-                .await
-                .expect("tree")
-                .expect("non-empty"),
-        )
-        .await
-        .expect("entries");
-    assert!(
-        tree_entry_blob(&tree_b, "ren.txt").is_none(),
-        "the source path is gone"
-    );
-    assert_eq!(
-        tree_entry_blob(&tree_b, "renamed.txt"),
-        Some(blob_id(b"ren\n")),
-        "the replayed rename carries its own (pre-main) blob"
-    );
+        .expect_err("rename must preserve concurrent source edits");
+    assert_eq!(error.code(), Code::FailedPrecondition);
+    assert!(error.message().contains("ren.txt"));
 
     // (c) Delete-then-re-add the same content, both directions. Re-add:
     // the changeset re-adds a path its own parent deleted, onto a target

@@ -14,10 +14,10 @@
 //! (`not_found`), bad input (`invalid_argument`), and semantic precondition
 //! violations (`failed_precondition`).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use gardenbed_derive::{BlameRange, Engine};
 use gardenbed_model::codec::validate_changeset;
@@ -120,6 +120,7 @@ pub struct Repo {
     metadata: Arc<dyn MetadataStore>,
     engine: Engine,
     stats: Stats,
+    validated_history: Mutex<HashSet<Id>>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -146,15 +147,15 @@ impl Repo {
             metadata,
             engine,
             stats: Stats::default(),
+            validated_history: Mutex::new(HashSet::new()),
         }
     }
 
     // -------------------------------------------------------- write path
 
     /// Sows a changeset: validates parents and blob references, stores any
-    /// inline blobs, stores the changeset (canonical bytes are written by
-    /// the seedbed), then eagerly materializes derived data (tree + skip
-    /// list, D3). Returns the changeset's id.
+    /// inline blobs, validates tree application and computes derived data
+    /// before storing the changeset. Returns the changeset's id.
     ///
     /// Blob resolution per change: a blob already in loam passes as-is;
     /// otherwise it must ride in `inline_blobs` (keyed by its 64-hex id),
@@ -171,9 +172,7 @@ impl Repo {
         // single authority on changeset shape.
         validate_changeset(cs, true)?;
         for p in &cs.parents {
-            if self.metadata.get_changeset(*p)?.is_none() {
-                return Err(ServerError::ChangesetNotFound(*p));
-            }
+            self.validate_history(*p)?;
         }
 
         // Resolve blob references: loam hit, inline hit (verified, ≤ 1 MiB),
@@ -214,15 +213,48 @@ impl Repo {
             resolved.insert(blob, true);
         }
 
-        // The canonical encoding (and therefore the id) is written by the
-        // seedbed; re-putting an identical changeset is idempotent.
-        let cs_id = self.metadata.put_changeset(cs)?;
-
-        // Eager materialization (D3). Stored first, derived second: a
-        // failure here leaves the changeset present with recomputable
-        // derived data, never a dangling reference.
-        self.engine.on_changeset_created(cs_id)?;
+        // Derive against the parents before making the changeset visible.
+        // Failed semantic validation may leave unreferenced immutable objects,
+        // but never a changeset that a caller can subsequently publish.
+        let cs_id = cs.id()?;
+        let rows = self.engine.derived_rows_for_new(cs_id, cs)?;
+        self.metadata.put_changeset(cs)?;
+        for row in rows {
+            self.metadata.derived_put(&row.kind, row.cs, &row.bytes)?;
+        }
+        self.validated_history.lock().unwrap().insert(cs_id);
         Ok(cs_id)
+    }
+
+    /// Validate the complete DAG, including non-first parents from older
+    /// stores. Immutable validated history is memoized for this Repo, so
+    /// subsequent publications only inspect newly encountered ancestors.
+    fn validate_history(&self, head: Id) -> Result<(), ServerError> {
+        let mut validated = self.validated_history.lock().unwrap();
+        let mut pending = vec![(head, false)];
+        while let Some((id, ready)) = pending.pop() {
+            if validated.contains(&id) {
+                continue;
+            }
+            let cs = self.get_changeset(id)?;
+            if !ready {
+                pending.push((id, true));
+                pending.extend(cs.parents.iter().map(|parent| (*parent, false)));
+                continue;
+            }
+            validate_changeset(&cs, true)?;
+            for change in &cs.changes {
+                if let Some(blob) = change.blob
+                    && change.mode != Mode::Gitlink
+                    && !self.objects.has(blob)?
+                {
+                    return Err(ServerError::ObjectNotFound(blob));
+                }
+            }
+            self.root_tree(id)?;
+            validated.insert(id);
+        }
+        Ok(())
     }
 
     // --------------------------------------------------------- read path
@@ -433,6 +465,7 @@ impl Repo {
         expected: Option<Id>,
         new: Id,
     ) -> Result<RefCas, ServerError> {
+        self.validate_history(new)?;
         let canonical = branch_ref_name(name);
         let target = if self.metadata.resolve_ref(&canonical)?.is_some() {
             canonical
@@ -451,24 +484,10 @@ impl Repo {
     /// new changeset `parents = [new_parent]` carrying the same changes,
     /// message, identities and signature, and eagerly materializes it.
     ///
-    /// Conflict semantics (documented, deliberate):
-    /// * a write (Add/Modify/rename destination) onto a path that exists
-    ///   with the *same* blob and mode is a no-op; with a *different* blob
-    ///   or mode it is a conflict;
-    /// * a write whose path sits under an existing file path is a conflict;
-    ///   a write that swallows existing paths under it replaces them (the
-    ///   delta-apply's file↔directory semantics);
-    /// * a Delete or rename source that does not exist is a conflict;
-    /// * all conflicting paths are collected and reported together as one
-    ///   [`ServerError::GraftConflict`].
-    ///
-    /// The replayed changes must apply cleanly: the stored changeset is
-    /// derived by the engine exactly like any other (lenient apply), so the
-    /// conflict checker only admits changes whose lenient application gives
-    /// the same tree. A write onto a path the new parent already has is
-    /// admitted when that copy is the pre-image (untouched between the
-    /// changeset's parent and the new parent) — otherwise it is a conflict,
-    /// because replaying would silently clobber a concurrent change.
+    /// Writes replay when the target matches the pre-image or desired result;
+    /// removals require an unchanged pre-image. Directory replacements also
+    /// compare all descendants, preventing loss of concurrent subtree edits.
+    /// Conflicts are checked against immutable trees before any application.
     pub fn graft(&self, cs_id: Id, new_parent: Id) -> Result<Id, ServerError> {
         let cs = self.get_changeset(cs_id)?;
         // The new parent must exist and its tree must be derivable (a
@@ -476,7 +495,7 @@ impl Repo {
         let base = self.root_tree(new_parent)?;
 
         // The flat working set of the new parent: path → (mode, blob).
-        let mut files: BTreeMap<String, (Mode, Id)> = self
+        let files: BTreeMap<String, (Mode, Id)> = self
             .engine
             .flatten_tree(base)?
             .into_iter()
@@ -502,37 +521,18 @@ impl Repo {
         for c in &cs.changes {
             match c.op {
                 gardenbed_model::Op::Add | gardenbed_model::Op::Modify => {
-                    check_write(
-                        &mut files,
-                        pre.get(&c.path),
-                        &c.path,
-                        c.blob,
-                        c.mode,
-                        &mut conflicts,
-                    );
+                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
                 }
                 gardenbed_model::Op::Delete => {
-                    if files.remove(&c.path).is_none() {
-                        conflicts.push(format!("delete of missing path {:?}", c.path));
-                    }
+                    check_removal(&files, &pre, &c.path, &mut conflicts);
                 }
                 gardenbed_model::Op::Rename => {
                     let Some(src) = c.src_path.as_deref() else {
                         conflicts.push(format!("rename {:?} without a src_path", c.path));
                         continue;
                     };
-                    if files.remove(src).is_none() {
-                        conflicts.push(format!("rename of missing path {src:?}"));
-                        continue;
-                    }
-                    check_write(
-                        &mut files,
-                        pre.get(src),
-                        &c.path,
-                        c.blob,
-                        c.mode,
-                        &mut conflicts,
-                    );
+                    check_removal(&files, &pre, src, &mut conflicts);
+                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
                 }
             }
         }
@@ -708,58 +708,59 @@ fn prefix_outcome(spec: &str, matches: &[Id]) -> Result<Option<Id>, ServerError>
     }
 }
 
-/// One write (Add/Modify/rename destination) in the graft replay: `files` is
-/// the flat working set, mutated only when the write is conflict-free.
-/// `pre` is the path's pre-image — the (mode, blob) the changeset's own
-/// parent had at this path (the rename source for a rename destination).
-/// Overwriting an existing path is a conflict unless the write is a no-op
-/// (same content and mode) or the existing copy *is* the pre-image (the
-/// three-way rule: the file is untouched between the changeset's parent and
-/// the new parent, so replaying the change is as safe as it originally was).
+/// Compare immutable pre-images before applying any of the replay's changes.
+/// This also covers explicit deletes swallowed by an earlier directory-to-file
+/// replacement, and rename destinations independently of their sources.
+fn check_removal(
+    files: &BTreeMap<String, (Mode, Id)>,
+    pre: &BTreeMap<String, (Mode, Id)>,
+    path: &str,
+    conflicts: &mut Vec<String>,
+) {
+    if files.get(path).is_none() || files.get(path) != pre.get(path) {
+        conflicts.push(format!("removal of missing or changed path {path:?}"));
+    }
+}
+
 fn check_write(
-    files: &mut BTreeMap<String, (Mode, Id)>,
-    pre: Option<&(Mode, Id)>,
+    files: &BTreeMap<String, (Mode, Id)>,
+    pre: &BTreeMap<String, (Mode, Id)>,
     path: &str,
     blob: Option<Id>,
     mode: Mode,
     conflicts: &mut Vec<String>,
 ) {
     let Some(blob) = blob else {
-        conflicts.push(format!("write to {:?} without a blob", path));
+        conflicts.push(format!("write to {path:?} without a blob"));
         return;
     };
-    match files.get(path) {
-        // Same content and mode: the write is a no-op.
-        Some(existing) if *existing == (mode, blob) => {}
-        // The copy the changeset was made against: replay over it.
-        Some(existing) if pre == Some(existing) => {
-            files.insert(path.to_owned(), (mode, blob));
+    let existing = files.get(path);
+    if existing == Some(&(mode, blob)) {
+        return; // Exact desired result: no path or subtree is overwritten.
+    }
+    if existing != pre.get(path) {
+        conflicts.push(format!("{path:?} was changed or deleted"));
+    }
+    let mut ancestor = path;
+    while let Some((parent, _)) = ancestor.rsplit_once('/') {
+        if let Some(value) = files.get(parent)
+            && pre.get(parent) != Some(value)
+        {
+            conflicts.push(format!("{path:?} sits under a concurrently changed file"));
         }
-        // Different content or mode: a hard conflict.
-        Some(_) => conflicts.push(format!("{path:?} already exists with different content")),
-        None => {
-            // A path under an existing file cannot be created.
-            let under_file = files.keys().any(|q| {
-                path.len() > q.len()
-                    && path.starts_with(q.as_str())
-                    && path.as_bytes().get(q.len()) == Some(&b'/')
-            });
-            if under_file {
-                conflicts.push(format!("{path:?} sits under an existing file"));
-                return;
-            }
-            // The write replaces anything beneath it (file↔directory swap,
-            // matching the delta-apply's replacement semantics).
-            let swallowed: Vec<String> = files
-                .keys()
-                .filter(|q| q.starts_with(path) && q.as_bytes().get(path.len()) == Some(&b'/'))
-                .cloned()
-                .collect();
-            for q in swallowed {
-                files.remove(&q);
-            }
-            files.insert(path.to_owned(), (mode, blob));
-        }
+        ancestor = parent;
+    }
+    // Replacing a directory must not erase concurrent additions, edits,
+    // mode changes, or deletions anywhere in the swallowed subtree.
+    let prefix = format!("{path}/");
+    let descendants = |map: &BTreeMap<String, (Mode, Id)>| {
+        map.range(prefix.clone()..)
+            .take_while(|(p, _)| p.starts_with(&prefix))
+            .map(|(p, value)| (p.clone(), *value))
+            .collect::<BTreeMap<_, _>>()
+    };
+    if descendants(files) != descendants(pre) {
+        conflicts.push(format!("directory {path:?} was changed"));
     }
 }
 
