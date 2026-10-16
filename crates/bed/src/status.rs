@@ -150,6 +150,7 @@ pub fn scan_paths(
     full_scan: bool,
 ) -> Result<Vec<ScanItem>, BedError> {
     let mut items: Vec<ScanItem> = Vec::new();
+    let state_prefixes = crate::sync::state_prefixes(root, treestate)?;
 
     let tracked_paths = treestate.all_paths()?;
     let tracked: HashSet<String> = tracked_paths.iter().cloned().collect();
@@ -159,7 +160,7 @@ pub fn scan_paths(
     // landed on the path). Gitlink rows are skipped: submodule pointers are
     // never materialized as files, so their absence is their normal state.
     for path in &tracked_paths {
-        if !in_plot(path, plot) {
+        if !in_plot(path, plot) || crate::sync::is_state_path(path, &state_prefixes) {
             continue;
         }
         let entry = match treestate.lookup(path)? {
@@ -169,16 +170,53 @@ pub fn scan_paths(
         if entry.mode == MODE_GITLINK {
             continue;
         }
+        // Ancestor replacements hide tracked descendants. Never inspect
+        // them through a symlink: the directory walk below reports the
+        // replacement itself as a tracked edit or an untracked entry.
+        let mut hidden = false;
+        for (position, _) in path.match_indices('/') {
+            match fs::symlink_metadata(root.join(&path[..position])) {
+                Ok(meta) if meta.is_dir() => {}
+                Ok(_) => {
+                    hidden = true;
+                    break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) =>
+                {
+                    hidden = true;
+                    break;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if hidden {
+            items.push(ScanItem {
+                path: path.clone(),
+                delta: ScanDelta::Deleted,
+            });
+            continue;
+        }
         match fs::symlink_metadata(root.join(path)) {
             Ok(m) if m.is_file() || m.is_symlink() => {}
             Ok(_) => items.push(ScanItem {
                 path: path.clone(),
                 delta: ScanDelta::Deleted,
             }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => items.push(ScanItem {
-                path: path.clone(),
-                delta: ScanDelta::Deleted,
-            }),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                items.push(ScanItem {
+                    path: path.clone(),
+                    delta: ScanDelta::Deleted,
+                })
+            }
             Err(e) => return Err(e.into()),
         }
     }
@@ -207,11 +245,12 @@ pub fn scan_paths(
             } else {
                 format!("{dir}/{name}")
             };
+            // Skip the selected state directory regardless of its name
+            // or whether it is itself a symlink.
+            if crate::sync::is_state_path(&rel, &state_prefixes) {
+                continue;
+            }
             if entry.file_type()?.is_dir() {
-                // The bed's own state directory is not garden content.
-                if rel == ".bed" {
-                    continue;
-                }
                 if dir_may_hold_plotted(&rel, plot) {
                     stack.push(rel);
                 }
@@ -695,4 +734,36 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn directory_replacements_delete_tracked_descendants_without_following_links() {
+        for link in [false, true] {
+            let g = Garden::planted(&[("src/f", b"base")]);
+            fs::remove_dir_all(g.dir.path().join("src")).unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            if link {
+                fs::write(outside.path().join("f"), b"external").unwrap();
+                std::os::unix::fs::symlink(outside.path(), g.dir.path().join("src")).unwrap();
+            } else {
+                fs::write(g.dir.path().join("src"), b"replacement").unwrap();
+            }
+            let ts = g.bed.treestate().unwrap();
+            let report = scan_status(g.dir.path(), &[".".into()], &ts, true).unwrap();
+            assert_eq!(report.deleted, ["src/f"]);
+            assert_eq!(report.untracked, ["src"]);
+            assert!(report.modified.is_empty());
+        }
+    }
+
+    #[test]
+    fn custom_state_directory_is_excluded_from_status_and_sow_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = crate::bed::Bed::init(&dir.path().join("state"), "s", "r").unwrap();
+        let ts = bed.treestate().unwrap();
+        fs::write(dir.path().join("normal"), b"garden").unwrap();
+        let report = scan_status(dir.path(), &[".".into()], &ts, true).unwrap();
+        assert_eq!(report.untracked, ["normal"]);
+        assert!(report.modified.is_empty());
+        assert!(report.deleted.is_empty());
+    }
+
 }

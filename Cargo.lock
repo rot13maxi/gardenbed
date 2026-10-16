@@ -829,6 +829,7 @@ dependencies = [
  "gardenbed-store",
  "libc",
  "rusqlite",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",
