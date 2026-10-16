@@ -142,6 +142,7 @@ v0.1 keeps **zero silent divergences** from git: every deviation is
 documented with a repro in [docs/divergences.md](docs/divergences.md) —
 signed commits export unsigned, non-UTF-8 commit bytes transcode lossily,
 unmodeled headers are dropped, pre-canonical `100664` tree modes
-canonicalize, and blame attributes blank hunk-edge lines per our own diff
-rather than xdiff's. Everything else round-trips byte-exactly.
+canonicalize, blame attributes blank hunk-edge lines per our own diff
+rather than xdiff's, and `bed diff` renders renames as delete + add
+(divergences.md §6). Everything else round-trips byte-exactly.
 

@@ -162,6 +162,52 @@ every non-blank line in the corpus attributed identically. Matching git
 line-for-line would require reimplementing xdiff's heuristics in the
 derive diff; if exact parity ever matters, that is the fix.
 
+## 6. `bed diff` renders renames as delete + add
+
+**What:** `bed diff` never pairs renames at the render level: a rename
+changeset renders as a delete + an add — two `diff --git` blocks (one
+`deleted file mode`, one `new file mode`) — never git's
+`similarity index 100%` / `rename from` / `rename to` form. The renderer
+consumes the server's tree diff, which runs with rename detection off
+(`Add`/`Modify`/`Delete` per path), and classifies each path by presence
+alone — `DiffOp` has no rename classification — so no rename is ever
+available to pair; the renderer's documented parity target is
+`git diff-tree -r --no-renames` (`crates/bed/src/render.rs`). The MCP
+`diff` tool answers from the same tree diffs, so a rename shows as `D`
+and `A` letters there too.
+
+**Cost:** purely output fidelity — review parity. Compared with
+`git diff-tree -M` on the QA regression pass's rename pairs, entry
+counts differ (1,318 vs 1,321 and 4,794 vs 5,128 entries), and
+`grep '^rename from '` over `bed diff` output finds 0 hits, so review
+tooling (or a human) diffing bed's output against rename-aware git sees
+a different shape for every moved file. What is *not* affected: the
+trees and the changesets — imported changesets record renames as git's
+own `-M` detection reported them (the D8 import mechanism,
+`docs/v0.1.md` §3), `sow` pairs a pure rename — a deleted path and an
+added path with the identical blob id — into one canonical `Op::Rename`
+carrying `src_path` (op `3 rename` in the canonical encoding spec's
+`change` table, `docs/canonical-encoding.md`), and patches built from
+the delete + add rendering reapply cleanly with `git apply` (verified in
+the same pass). The identity half of this shape is already catalogued
+under "Explicitly *not* divergences" below: rename vs. delete+add builds
+the same tree and the same commit SHA. Only the rendered diff differs.
+
+**Why not fixed:** render-level similarity pairing is not implemented in
+v0.1 — the diff parity contract was written against `--no-renames` from
+the start. Import-level rename detection is a separate mechanism (D8)
+and does exist; only the render level lacks it. The fix is render-local:
+pair identical-blob delete + add entries at render time (the
+deterministic rule `sow` already applies), or reuse the changeset's
+recorded `Rename` ops for changeset-scoped diffs instead of re-deriving
+from trees — a v0.2 candidate.
+
+**Repro:** sow a pure rename (or import a history containing one) and
+run `bed diff <cs>` — that changeset against its first parent. The old
+path renders as a `deleted file mode` block and the new path as a
+`new file mode` block, while `git diff-tree -M --name-status` on the
+same pair shows the two paths as a single rename entry.
+
 ## Explicitly *not* divergences
 
 These shapes differ from git's most literal rendering but produce
