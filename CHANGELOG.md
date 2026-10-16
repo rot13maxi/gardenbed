@@ -96,6 +96,24 @@ milestone plan with per-milestone verification criteria is
   (`prefix <p> is ambiguous (N changesets)`), too-short tokens get the
   minimum-length hint, and unmatched tokens say they matched neither a
   ref nor a prefix.
+- **Diff rendering is git-apply-safe**: binary blobs render git's
+  one-liner (`Binary files a/<p> and b/<p> differ`, `/dev/null` on the
+  absent side) instead of lossy U+FFFD text hunks; submodule gitlinks
+  render mode lines only — never hunks, never a synthetic
+  `Subproject commit` line; a payload-free header can no longer leak its
+  path into the next entry's parse. Plain, mode-only, empty-file, and
+  unicode-path diffs render byte-identically to before; binary entries
+  are refused by `git apply` exactly as they are in git's own plain
+  patches (full-index binary patches are out of scope for v0.1).
+- **`plot add` cannot touch bed's own state**: a prefix at or inside
+  `.bed` is refused before any connection or state write
+  (`refusing to plot .bed — bed tends its own state there`); broader
+  plans exclude `.bed`-component paths with a printed note, so a repo
+  that ships `.bed/` files can neither hijack nor corrupt bed state, and
+  the plot summary stays truthful about what was materialized.
+- **SIGPIPE**: `bed log | head` and friends die silently on a closed
+  pipe (signal 13) like git and rg, instead of panicking with
+  `failed printing to stdout: Broken pipe`.
 
 ### Performance
 

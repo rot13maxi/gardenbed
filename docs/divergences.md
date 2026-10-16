@@ -208,6 +208,32 @@ path renders as a `deleted file mode` block and the new path as a
 `new file mode` block, while `git diff-tree -M --name-status` on the
 same pair shows the two paths as a single rename entry.
 
+## 7. Gitlink pointer changes render as a binary-differ line
+
+**What:** a submodule pointer change in `bed diff` renders the gitlink's
+mode lines (`new file mode 160000` / `deleted file mode 160000` /
+`old mode` + `new mode` for a typechange) plus git's binary one-liner
+`Binary files a/<p> and b/<p> differ` — not git's
+`@@ -1 +1 @@` hunk with `-Subproject commit <sha>` / `+Subproject commit
+<sha>`. Gitlink blobs in the canonical model are synthetic padded ids
+(the import convention, `docs/canonical-encoding.md`), not git's
+submodule SHAs, so emitting a `Subproject commit` line would write bytes
+git would then apply as a *wrong* pointer target.
+
+**Cost:** review parity, and one patch consequence: `git apply` refuses
+the pointer-change entry (`cannot apply binary patch … without full
+index line`) where git's own `Subproject commit` form applies. The
+refusal is per-entry and parse-safe — other entries in the same patch
+still apply (the pre-fix renderer leaked the gitlink's path into the
+next entry's parse and poisoned the whole patch). Gitlink
+additions/deletions render mode lines only and apply cleanly. The
+faithful oracle for pointer targets remains `git diff --submodule` /
+`git submodule status`.
+
+**Why not fixed:** an honest `Subproject commit` line needs git's real
+submodule SHAs imported and stored as first-class ids — model work, not
+render work. A v0.2 candidate alongside rename pairing (§6).
+
 ## Explicitly *not* divergences
 
 These shapes differ from git's most literal rendering but produce

@@ -685,3 +685,235 @@ async fn rpc_errors_render_the_short_grpc_code_variant() {
         "a failed graft leaves the bed where it stood"
     );
 }
+
+// --------------------------------------------- ISSUE-1: `.bed` is never garden content
+// A repo that ships its own `.bed/` (a planted file, a nested tree) must
+// never have it materialized into the live bed's state directory: `plot
+// add .bed` is refused outright, and a root prefix excludes every
+// `.bed`-shaded path from materialization with a printed note.
+
+/// Seeds a one-changeset repo whose tree grows normal files *and* ships a
+/// `.bed/` of its own — `.bed/planted.txt` and the nested `.bed/sub/x` —
+/// the hijack shape Issue 1 describes. Returns the changeset id.
+fn seed_bed_shaded_repo(root: &Path) -> Id {
+    let repo = Repo::open(root).expect("repo opens");
+    let ident = |secs: u64| Identity {
+        name: "Seeder".into(),
+        email: "seed@bed.example".into(),
+        time_secs: secs,
+        tz_min: 0,
+    };
+    // Canonical sortedness: ".bed/planted.txt" < ".bed/sub/x" <
+    // "docs/readme.md" < "src/lib.rs".
+    let (c_planted, b_planted) = seed_add(".bed/planted.txt", b"planted by the repo itself\n");
+    let (c_nested, b_nested) = seed_add(".bed/sub/x", b"nested\n");
+    let (c_readme, b_readme) = seed_add("docs/readme.md", b"# hello\n");
+    let (c_lib, b_lib) = seed_add("src/lib.rs", b"pub fn bed() {}\n");
+    let blobs = [
+        (c_planted.blob.unwrap(), b_planted),
+        (c_nested.blob.unwrap(), b_nested),
+        (c_readme.blob.unwrap(), b_readme),
+        (c_lib.blob.unwrap(), b_lib),
+    ];
+    let cs1 = Changeset {
+        parents: Vec::new(),
+        changes: vec![c_planted, c_nested, c_readme, c_lib],
+        message: "seed the garden, shipping a .bed of its own".into(),
+        author: ident(1_700_000_000),
+        committer: ident(1_700_000_000),
+        signature: None,
+    };
+    let mut inline = std::collections::BTreeMap::new();
+    for (id, content) in blobs {
+        inline.insert(id.to_hex(), content);
+    }
+    repo.create_changeset(&cs1, &inline).expect("cs1 ingests")
+}
+
+/// [`clone_world`] over the bed-shaded repo: one ref (`main` → the
+/// changeset that ships `.bed/planted.txt` and `.bed/sub/x`), one garden.
+async fn bed_shaded_world() -> CloneWorld {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let arb_root = dir.path().join("arboretum");
+    let cs1 = seed_bed_shaded_repo(&arb_root);
+    {
+        let repo = Repo::open(&arb_root).expect("repo opens");
+        repo.cas_ref("main", None, cs1)
+            .expect("ref created (it must not exist yet)");
+    }
+    let garden = dir.path().join("garden");
+    fs::create_dir_all(&garden).expect("garden dir");
+    let server = common::Arboretum::spawn(&arb_root).await;
+    CloneWorld {
+        _dir: dir,
+        garden,
+        server,
+        cs1,
+        cs2: cs1,
+    }
+}
+
+/// The observable state a refused or excluding command must leave
+/// untouched: config and heads bytes, the treestate's row count, the file
+/// names inside `.bed`, and every path in the working copy outside
+/// `.bed`. (Treestate *contents* are intentionally not hashed — sqlite
+/// may churn bytes on a clean open/close — names and rows are what a
+/// materialization would change.)
+#[derive(Debug, PartialEq, Eq)]
+struct BedState {
+    config: String,
+    heads: String,
+    treestate_rows: i64,
+    bed_files: Vec<String>,
+    worktree: Vec<String>,
+}
+
+fn bed_state(garden: &Path) -> BedState {
+    fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            let path = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path(), &path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut bed_files = Vec::new();
+    walk(&garden.join(".bed"), "", &mut bed_files);
+    let mut worktree = Vec::new();
+    for entry in fs::read_dir(garden).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        if name == ".bed" {
+            continue;
+        }
+        if entry.file_type().unwrap().is_dir() {
+            walk(&entry.path(), &name, &mut worktree);
+        } else {
+            worktree.push(name);
+        }
+    }
+    bed_files.sort();
+    worktree.sort();
+    let bed = Bed::open(&garden.join(".bed")).unwrap();
+    BedState {
+        config: fs::read_to_string(garden.join(".bed/config.toml")).unwrap(),
+        heads: fs::read_to_string(garden.join(".bed/heads")).unwrap(),
+        treestate_rows: bed.treestate().unwrap().count().unwrap(),
+        bed_files,
+        worktree,
+    }
+}
+
+#[tokio::test]
+async fn plot_add_refuses_the_bed_state_prefix_and_changes_nothing() {
+    let w = bed_shaded_world().await;
+    let (code, _, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // `.bed` itself is refused — it is the bed's own state directory, and
+    // plotting it would let repo files land inside the live state.
+    let before = bed_state(&w.garden);
+    let (code, stdout, stderr) = bed_in(&w.garden, &["plot", "add", ".bed"]);
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stderr.contains(r#"invalid plot prefix ".bed""#),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("refusing to plot .bed — bed tends its own state there"),
+        "stderr: {stderr}"
+    );
+
+    // Anything inside `.bed` is refused for the same reason, naming the
+    // prefix as typed.
+    let (code, stdout, stderr) = bed_in(&w.garden, &["plot", "add", ".bed/planted.txt"]);
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("refusing to plot .bed/planted.txt — bed tends its own state there"),
+        "stderr: {stderr}"
+    );
+
+    // Zero state change across both refusals — and nothing was recorded.
+    assert_eq!(
+        before,
+        bed_state(&w.garden),
+        "a refused plot add must change nothing"
+    );
+    let (code, out, _) = bed_in(&w.garden, &["plot", "list"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("the plot is empty"), "out: {out}");
+}
+
+#[tokio::test]
+async fn plot_add_root_materializes_everything_but_the_bed_state() {
+    let w = bed_shaded_world().await;
+    let (code, _, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    // `plot add .` materializes the repo — except the shipped `.bed/`
+    // content, which is excluded with a printed note.
+    let (code, out, stderr) = bed_in(&w.garden, &["plot", "add", "."]);
+    assert_eq!(code, 0, "stderr: {stderr}\n{out}");
+    assert!(out.contains("plotted .\n"), "out: {out}");
+    assert!(
+        out.contains(
+            "note: skipped .bed/planted.txt, .bed/sub/x — bed tends its \
+             own state there"
+        ),
+        "out: {out}"
+    );
+    assert!(
+        out.contains("(2 file(s) in the plot)"),
+        "only the materializable files count: {out}"
+    );
+
+    // Everything else the repo grows is materialized…
+    assert!(w.garden.join("docs/readme.md").is_file());
+    assert!(w.garden.join("src/lib.rs").is_file());
+    // …but none of the repo's `.bed/` content reached the live state dir:
+    // no planted file, and no `.bed/sub` directory was created either.
+    assert!(
+        !w.garden.join(".bed/planted.txt").exists(),
+        "the repo's .bed/planted.txt must not appear in the bed"
+    );
+    assert!(
+        !w.garden.join(".bed/sub").exists(),
+        "the repo's nested .bed/sub must not appear in the bed"
+    );
+
+    // The bed is unharmed and reports clean: config parses, the current
+    // changeset is untouched, and status knows nothing of the skipped
+    // paths (they were never materialized, so nothing to report).
+    let (code, out, stderr) = bed_in(&w.garden, &["status"]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert_eq!(current_cs(&w.garden), w.cs1);
+}
+
+#[test]
+fn clone_refuses_to_plot_the_bed_state_dir_before_connecting() {
+    let dir = planted_bed();
+    // Validation precedes connection *and* the already-a-bed check: the
+    // state-dir refusal is what fires, nothing else is touched.
+    let (code, stdout, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1", "--plot", ".bed"]);
+    assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stderr.contains("refusing to plot .bed — bed tends its own state there"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("already a bed") && !stderr.contains("cannot reach the arboretum"),
+        "no later failure may mask the refusal: {stderr}"
+    );
+}

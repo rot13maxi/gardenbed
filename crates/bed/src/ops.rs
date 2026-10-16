@@ -85,7 +85,9 @@ pub async fn clone_with_ref(
     };
     let mut prefixes = Vec::with_capacity(plot.len());
     for raw in &plot {
-        prefixes.push(crate::plot::normalize_prefix(raw)?);
+        let prefix = crate::plot::normalize_prefix(raw)?;
+        refuse_bed_state_prefix(raw, &prefix)?;
+        prefixes.push(prefix);
     }
     if bed_dir.join("config.toml").exists() {
         return Err(BedError::AlreadyABed(bed_dir.to_path_buf()));
@@ -220,6 +222,13 @@ async fn resolve_starting_ref(
 /// The config only gains the new prefixes once the fetch has succeeded, so
 /// a server that is down leaves the plot list (and everything else)
 /// unchanged.
+///
+/// The state-dir rule: a prefix that is `.bed` or lies inside it is
+/// refused outright ([`refuse_bed_state_prefix`]), and repo files that
+/// merely shadow that name (they can arrive under a root prefix) are
+/// excluded from materialization with a printed note
+/// ([`exclude_bed_state`]) — no repo file is ever planted inside the
+/// bed's own state directory.
 pub async fn plot_add(
     bed_dir: &Path,
     paths: &[String],
@@ -229,6 +238,7 @@ pub async fn plot_add(
     let mut added: Vec<String> = Vec::new();
     for raw in paths {
         let prefix = crate::plot::normalize_prefix(raw)?;
+        refuse_bed_state_prefix(raw, &prefix)?;
         if !bed.config().plot.contains(&prefix) {
             bed.config_mut().plot.push(prefix.clone());
             added.push(prefix);
@@ -254,9 +264,9 @@ pub async fn plot_add(
         })
         .collect();
 
-    if !added.is_empty() {
-        bed.save_config()?;
-    }
+    // Repo files that name `.bed` must never land in the bed's state
+    // directory: exclude them from materialization and say so.
+    let (plan_files, bed_state) = exclude_bed_state(plan_files);
 
     let treestate = bed.treestate()?;
     let outcome = sync::sync_plot(
@@ -267,6 +277,9 @@ pub async fn plot_add(
         &treestate,
     )
     .await?;
+    if !added.is_empty() {
+        bed.save_config()?;
+    }
 
     let mut out = String::new();
     for (prefix, matched) in added.iter().zip(&prefix_matches) {
@@ -283,13 +296,77 @@ pub async fn plot_add(
     if added.is_empty() {
         out.push_str("those prefixes are already in the plot — re-tending them\n");
     }
+    out.push_str(&bed_state_note(&bed_state));
     out.push_str(&format!(
         "fetched {} tree(s) and {} blob(s) from the arboretum ({} file(s) in the plot)\n",
-        stats.trees_fetched, stats.blobs_fetched, stats.files
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        stats.files - bed_state.len()
     ));
     out.push_str(&outcome.summarize());
     out.push('\n');
     Ok(out)
+}
+
+/// The state-dir rule: `.bed` is the bed's own machinery (config,
+/// treestate, object cache, heads), never garden content. A prefix that
+/// is `.bed` or lies inside it would point the materializer straight at
+/// the state directory — a repo that ships `.bed/config.toml`,
+/// `.bed/treestate`, or `.bed/heads` could hijack or corrupt the bed —
+/// so such a prefix is refused in the same voice as every other
+/// impossible prefix. Any component matching counts: the name `.bed` is
+/// reserved wherever it appears in a repo path.
+fn refuse_bed_state_prefix(raw: &str, prefix: &str) -> Result<(), BedError> {
+    if prefix.split('/').any(|comp| comp == ".bed") {
+        Err(BedError::PlotPrefix {
+            raw: raw.to_owned(),
+            reason: format!("refusing to plot {prefix} — bed tends its own state there"),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+/// Splits the `.bed`-shaded paths out of a materialization plan: any path
+/// with a `.bed` component would be planted under a `.bed` directory in
+/// the garden — at the root that IS the live state directory, and a repo
+/// shipping `.bed/config.toml`, `.bed/treestate`, or `.bed/heads` would
+/// hijack or corrupt the bed. Such paths are excluded from
+/// materialization rather than refusing the whole command — `bed plot
+/// add .` keeps tending every other file the repo grows — and the caller
+/// reports what was skipped ([`bed_state_note`]). Returns the plan that
+/// may be materialized plus the skipped paths, in plan order.
+fn exclude_bed_state(plan: Vec<rpc::PlanFile>) -> (Vec<rpc::PlanFile>, Vec<String>) {
+    let mut kept = Vec::with_capacity(plan.len());
+    let mut skipped = Vec::new();
+    for file in plan {
+        if file.path.split('/').any(|comp| comp == ".bed") {
+            skipped.push(file.path);
+        } else {
+            kept.push(file);
+        }
+    }
+    (kept, skipped)
+}
+
+/// The note naming what [`exclude_bed_state`] kept out of the garden.
+/// Empty when nothing was skipped; the list is capped so a repo shipping
+/// a large `.bed/` tree cannot flood one line.
+fn bed_state_note(skipped: &[String]) -> String {
+    const LISTED: usize = 8;
+    if skipped.is_empty() {
+        return String::new();
+    }
+    let names = if skipped.len() <= LISTED {
+        skipped.join(", ")
+    } else {
+        format!(
+            "{}, and {} more",
+            skipped[..LISTED].join(", "),
+            skipped.len() - LISTED
+        )
+    };
+    format!("note: skipped {names} — bed tends its own state there\n")
 }
 
 /// `bed goto <cs-or-ref>` — move the bed to a changeset and refresh the
@@ -310,10 +387,9 @@ pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
     let root = session.root_tree(cs, "goto").await?;
     let prefixes = bed.config().plot.clone();
     let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
-
-    // Move the bed, then bring the working copy along.
-    bed.config_mut().current_cs = Some(cs.to_hex());
-    bed.save_config()?;
+    // `.bed`-shaded repo paths never reach the state directory; say what
+    // was skipped.
+    let (plan, bed_state) = exclude_bed_state(plan);
 
     let treestate = bed.treestate()?;
     let outcome = sync::sync_plot(
@@ -324,14 +400,17 @@ pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
         &treestate,
     )
     .await?;
+    bed.config_mut().current_cs = Some(cs.to_hex());
+    bed.save_config()?;
 
     let where_from = parsed.as_ref_name().unwrap_or("changeset").to_owned();
     Ok(format!(
-        "the bed now grows from {} ({}) — fetched {} tree(s), {} blob(s)\n{}\n",
+        "the bed now grows from {} ({}) — fetched {} tree(s), {} blob(s)\n{}{}\n",
         cs.short(),
         where_from,
         stats.trees_fetched,
         stats.blobs_fetched,
+        bed_state_note(&bed_state),
         outcome.summarize()
     ))
 }
@@ -436,13 +515,12 @@ pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError>
     };
 
     // Move the bed like `goto` does: plan the plot at the grafted
-    // changeset, then fetch + sync.
+    // changeset, then fetch + sync. `.bed`-shaded repo paths never reach
+    // the state directory; say what was skipped.
     let root = session.root_tree(grafted, "graft").await?;
     let prefixes = bed.config().plot.clone();
     let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
-    bed.config_mut().current_cs = Some(grafted.to_hex());
-    bed.save_config()?;
-
+    let (plan, bed_state) = exclude_bed_state(plan);
     let treestate = bed.treestate()?;
     let outcome = sync::sync_plot(
         &bed.garden_root(),
@@ -452,16 +530,19 @@ pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError>
         &treestate,
     )
     .await?;
+    bed.config_mut().current_cs = Some(grafted.to_hex());
+    bed.save_config()?;
     bed.heads().repoint(current, grafted)?;
 
     Ok(format!(
         "grafted {} onto {} as {}\n\
-         fetched {} tree(s), {} blob(s)\n{}\n",
+         fetched {} tree(s), {} blob(s)\n{}{}\n",
         current.short(),
         parent.short(),
         grafted.short(),
         stats.trees_fetched,
         stats.blobs_fetched,
+        bed_state_note(&bed_state),
         outcome.summarize(),
     ))
 }

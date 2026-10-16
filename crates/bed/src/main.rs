@@ -18,6 +18,14 @@ use gardenbed::plot;
 use gardenbed::revspec::CsOrRef;
 
 fn main() {
+    // A closed pipe is a graceful end, not a crash: `bed log | head` must
+    // die silently the way git and rg do (SIGPIPE's default disposition,
+    // shell reports 141) instead of panicking on the next print — Rust
+    // ignores SIGPIPE at startup, which turns every later `print!` into a
+    // `failed printing to stdout` panic. Must happen before the runtime
+    // (and any thread) exists; signal dispositions are process-wide.
+    #[cfg(unix)]
+    restore_default_sigpipe().expect("reset SIGPIPE to its default disposition");
     let cli = Cli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -31,6 +39,29 @@ fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// Restores the default `SIGPIPE` disposition (`SIG_DFL`): a write to a
+/// closed pipe kills the process silently, exactly like git and rg,
+/// instead of surfacing as an `io::Error` that `print!` turns into a
+/// panic. Unix only — Windows has no `SIGPIPE`; its console writes fail
+/// with ordinary errors there, so nothing to restore.
+///
+/// Runs once, at the very top of `main`, before the tokio runtime spawns
+/// any worker thread (dispositions are process-wide, but only main runs
+/// here — no thread can have changed it yet).
+#[cfg(unix)]
+fn restore_default_sigpipe() -> std::io::Result<()> {
+    // SAFETY: `signal` only resets the disposition of one signal
+    // (`SIGPIPE`) to the OS default; it touches no other memory or state
+    // and, for SIGPIPE on a conforming unix, cannot fail (the only error
+    // is EINVAL for an invalid signal number, which this is not).
+    // `SIG_ERR` is the sentinel `signal` returns on failure.
+    let previous = unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    if previous == libc::SIG_ERR {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 async fn run(cli: &Cli) -> Result<i32, BedError> {
@@ -216,4 +247,19 @@ fn validate_path_arg(raw: &str) -> Result<(), BedError> {
         raw: raw.to_owned(),
         reason: e.to_string(),
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::restore_default_sigpipe;
+
+    /// The startup reset must always succeed — and stay idempotent, since
+    /// a main that ran it once (a real invocation) and a test process
+    /// share the same entry point. If this fails, a closed pipe would
+    /// panic `bed` instead of killing it silently.
+    #[test]
+    fn sigpipe_reset_succeeds_and_is_idempotent() {
+        restore_default_sigpipe().unwrap();
+        restore_default_sigpipe().unwrap();
+    }
 }

@@ -23,6 +23,29 @@
 //! align hunks differently; the path/op classification above is the parity
 //! contract. Files whose last line lacks a trailing newline get git's
 //! `\ No newline at end of file` marker.
+//!
+//! Two entry classes render git's payload-free forms instead of hunks:
+//!
+//! - **Binary blobs** — content with a NUL byte in its first 8 KiB (git's
+//!   buffer-text check) renders the single line
+//!   `Binary files a/<path> and b/<path> differ`, with git's `/dev/null`
+//!   convention for the absent side of adds and deletes. Like git,
+//!   mode-only changes (identical blob on both sides) render no binary
+//!   line. (git applies binary patches only from `--binary` payloads;
+//!   bed prints the same informational line plain `git diff` does.)
+//! - **Gitlinks** — mode lines only, never content hunks: the import's
+//!   gitlink blob ids are synthetic padded ids, *not* git's submodule
+//!   SHAs, so no honest `Subproject commit <sha>` line exists to print.
+//!   A gitlink add/delete keeps its `new file mode` / `deleted file mode`
+//!   line (git apply accepts those); a surviving gitlink→gitlink pointer
+//!   change has no mode lines to print, so its change rides the
+//!   `Binary files … differ` line.
+//!
+//! A payload-free entry whose header would carry neither mode lines nor
+//! `---`/`+++` markers (a plain content modification, or the gitlink
+//! pointer change) also prints the `---`/`+++` markers: git apply only
+//! consumes a header it can pair with a payload or metadata, and a bare
+//! `diff --git` header leaks its name into the *next* entry's parse.
 
 use gardenbed_model::Mode;
 
@@ -205,6 +228,38 @@ pub fn git_mode(mode: Mode) -> &'static str {
     }
 }
 
+/// How many leading bytes the binary probe samples. git's buffer-text
+/// check (`BUFFER_TEXT_CHECK`) samples its `FIRST_FEW_BYTES` = 8000; bed
+/// samples 8 KiB — the same heuristic class: a NUL byte in the prefix
+/// means the content is not text.
+const BINARY_PROBE_BYTES: usize = 8192;
+
+/// git's buffer-text heuristic: content with a NUL byte in its first
+/// 8 KiB is not text (rendering it as hunks would transcode raw bytes
+/// through `String::from_utf8_lossy` — U+FFFD garbage, and a patch
+/// `git apply` rejects as corrupt).
+fn is_binary(content: &[u8]) -> bool {
+    content[..content.len().min(BINARY_PROBE_BYTES)].contains(&0)
+}
+
+/// git's exact single-line form for an entry whose content is not
+/// rendered: `Binary files a/<path> and b/<path> differ`, with git's
+/// `/dev/null` convention for an absent side (deletes name `a/<path>` and
+/// `/dev/null`; adds `/dev/null` and `b/<path>`).
+fn binary_differ_line(path: &str, has_old: bool, has_new: bool) -> String {
+    let old = if has_old {
+        format!("a/{path}")
+    } else {
+        "/dev/null".to_owned()
+    };
+    let new = if has_new {
+        format!("b/{path}")
+    } else {
+        "/dev/null".to_owned()
+    };
+    format!("Binary files {old} and {new} differ\n")
+}
+
 /// Renders a full diff. `content_of` fetches old/new blob bytes on demand
 /// (cache-first at the caller); entries render in the order given.
 pub fn render_diff(
@@ -225,6 +280,13 @@ fn render_diff_entry(
     out: &mut String,
 ) -> Result<(), BedError> {
     out.push_str(&format!("diff --git a/{} b/{}\n", entry.path, entry.path));
+    // git's `old mode` / `new mode` / `new file mode` / `deleted file mode`
+    // lines. Their presence decides how git apply parses a payload-free
+    // entry: a header that carries neither extended headers nor `---`/
+    // `+++` markers is not consumed as a patch — its name leaks into the
+    // next entry's parse ("inconsistent old filename") — so payload-free
+    // entries without mode lines also print the `---`/`+++` markers.
+    let mut mode_lines = true;
     match entry.op {
         DiffOp::Add => {
             let mode = entry.new.map(|s| s.mode).unwrap_or(Mode::Regular);
@@ -242,30 +304,66 @@ fn render_diff_entry(
                 if let Some(s) = entry.new {
                     out.push_str(&format!("new mode {}\n", git_mode(s.mode)));
                 }
+            } else {
+                mode_lines = false;
             }
         }
     }
 
-    // Content hunks. Gitlinks have no local content; symlinks diff as
-    // their target bytes; adds and deletes diff against nothing.
+    // Content hunks. Gitlinks and non-text content never render as hunks
+    // (see the module doc); symlinks diff as their target bytes; adds and
+    // deletes diff against nothing.
+    let old_gitlink = entry.old.is_some_and(|s| s.mode == Mode::Gitlink);
+    let new_gitlink = entry.new.is_some_and(|s| s.mode == Mode::Gitlink);
+    if old_gitlink || new_gitlink {
+        // The import's gitlink blob ids are synthetic padded ids, not git's
+        // submodule SHAs — any `Subproject commit <sha>` line would be
+        // wrong bytes, so gitlink entries render mode lines only. A
+        // surviving pointer change (gitlink on both sides) has no mode
+        // lines and no hunks to show: the change rides git's
+        // `Binary files … differ` line, with the `---`/`+++` markers git's
+        // own gitlink diffs carry keeping the entry parseable.
+        if old_gitlink && new_gitlink {
+            out.push_str(&format!("--- a/{}\n+++ b/{}\n", entry.path, entry.path));
+            out.push_str(&binary_differ_line(&entry.path, true, true));
+        }
+        return Ok(());
+    }
+
     let old_content = match entry.old {
-        Some(DiffSide {
-            mode: Mode::Gitlink,
-            ..
-        })
-        | None => None,
+        None => None,
         Some(side) => Some(content_of(side.blob)?),
     };
     let new_content = match entry.new {
-        Some(DiffSide {
-            mode: Mode::Gitlink,
-            ..
-        })
-        | None => None,
+        None => None,
         Some(side) => Some(content_of(side.blob)?),
     };
+    // Non-text content renders git's single informational line instead of
+    // lossy hunks. Only when the contents actually differ: a mode-only
+    // change (identical blob on both sides) keeps git's mode-lines-only
+    // form. One side absent (add/delete) means the surviving content is
+    // all there is — its binary-ness decides.
+    let contents_differ = match (entry.old, entry.new) {
+        (Some(old), Some(new)) => old.blob != new.blob,
+        _ => true,
+    };
+    if contents_differ
+        && (old_content.as_deref().is_some_and(is_binary)
+            || new_content.as_deref().is_some_and(is_binary))
+    {
+        if !mode_lines {
+            out.push_str(&format!("--- a/{}\n+++ b/{}\n", entry.path, entry.path));
+        }
+        out.push_str(&binary_differ_line(
+            &entry.path,
+            entry.old.is_some(),
+            entry.new.is_some(),
+        ));
+        return Ok(());
+    }
+
     match (&old_content, &new_content) {
-        (None, None) => {} // pure pointer change: mode lines carry it
+        (None, None) => {} // unreachable for classified entries; bare header
         (old, new) => {
             out.push_str("--- ");
             out.push_str(
@@ -744,6 +842,283 @@ mod tests {
         assert!(h.contains("-b\r\n"), "{h}");
         // Mode-only change (identical bytes) renders no hunks at all.
         assert_eq!(hunk_of("x\n", "x\n"), "");
+    }
+
+    // --------------------------------------------- binary and gitlink rules
+
+    /// A gitlink blob id as the import stores it: synthetic padded bytes,
+    /// not a git submodule SHA.
+    fn gitlink_id(byte: u8) -> gardenbed_model::Id {
+        let mut padded = [0u8; 32];
+        padded[12..].copy_from_slice(&[byte; 20]);
+        gardenbed_model::blob_id(&padded)
+    }
+
+    fn diff_entry(
+        path: &str,
+        op: DiffOp,
+        old: Option<(gardenbed_model::Id, Mode)>,
+        new: Option<(gardenbed_model::Id, Mode)>,
+    ) -> DiffEntry {
+        DiffEntry {
+            path: path.to_owned(),
+            op,
+            old: old.map(|(blob, mode)| DiffSide { blob, mode }),
+            new: new.map(|(blob, mode)| DiffSide { blob, mode }),
+        }
+    }
+
+    #[test]
+    fn binary_entries_render_git_differ_line() {
+        let text = gardenbed_model::blob_id(b"one\ntwo\n");
+        let bin_old = gardenbed_model::blob_id(b"icns\0\0\x01\x02old");
+        let bin_new = gardenbed_model::blob_id(b"icns\0\0\x01\x02NEW");
+        let store = [
+            (text, b"one\ntwo\n".to_vec()),
+            (bin_old, b"icns\0\0\x01\x02old".to_vec()),
+            (bin_new, b"icns\0\0\x01\x02NEW".to_vec()),
+        ];
+        let content_of = move |id: gardenbed_model::Id| {
+            store
+                .iter()
+                .find(|(k, _)| *k == id)
+                .map(|(_, v)| v.clone())
+                .ok_or(BedError::BlobHashMismatch(id))
+        };
+
+        // Modified: `Binary files a/x and b/x differ` — a plain modify has
+        // no mode lines to carry the header, so the `---`/`+++` markers
+        // keep the entry one git apply parses cleanly.
+        let out = render_diff(
+            &[diff_entry(
+                "x.icns",
+                DiffOp::Modify,
+                Some((bin_old, Mode::Regular)),
+                Some((bin_new, Mode::Regular)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/x.icns b/x.icns\n--- a/x.icns\n+++ b/x.icns\n\
+             Binary files a/x.icns and b/x.icns differ\n"
+        );
+
+        // Deleted: git's `/dev/null` convention for the gone side.
+        let out = render_diff(
+            &[diff_entry(
+                "x.icns",
+                DiffOp::Delete,
+                Some((bin_old, Mode::Exec)),
+                None,
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/x.icns b/x.icns\ndeleted file mode 100755\n\
+             Binary files a/x.icns and /dev/null differ\n"
+        );
+
+        // Added: `/dev/null` on the old side.
+        let out = render_diff(
+            &[diff_entry(
+                "x.icns",
+                DiffOp::Add,
+                None,
+                Some((bin_new, Mode::Regular)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/x.icns b/x.icns\nnew file mode 100644\n\
+             Binary files /dev/null and b/x.icns differ\n"
+        );
+
+        // A content change that also flips the mode keeps git's mode lines
+        // ahead of the binary line.
+        let out = render_diff(
+            &[diff_entry(
+                "x.icns",
+                DiffOp::Modify,
+                Some((bin_old, Mode::Regular)),
+                Some((bin_new, Mode::Exec)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/x.icns b/x.icns\nold mode 100644\nnew mode 100755\n\
+             Binary files a/x.icns and b/x.icns differ\n"
+        );
+
+        // A type change to/from a binary side renders the same single line
+        // (git splits the two halves into its own two sections; bed keeps
+        // one entry per path — the documented shape divergence).
+        let out = render_diff(
+            &[diff_entry(
+                "link",
+                DiffOp::TypeChange,
+                Some((text, Mode::Regular)),
+                Some((bin_new, Mode::Symlink)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/link b/link\nold mode 100644\nnew mode 120000\n\
+             Binary files a/link and b/link differ\n"
+        );
+    }
+
+    #[test]
+    fn binary_mode_only_change_stays_mode_lines_only() {
+        // Identical blob on both sides (mode flip): git prints no binary
+        // line here, and bed's earlier mode-only form is preserved.
+        let bin = gardenbed_model::blob_id(b"\0\0binary\0");
+        let store = [(bin, b"\0\0binary\0".to_vec())];
+        let content_of = move |id: gardenbed_model::Id| {
+            store
+                .iter()
+                .find(|(k, _)| *k == id)
+                .map(|(_, v)| v.clone())
+                .ok_or(BedError::BlobHashMismatch(id))
+        };
+        let out = render_diff(
+            &[diff_entry(
+                "x.dat",
+                DiffOp::Modify,
+                Some((bin, Mode::Regular)),
+                Some((bin, Mode::Exec)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        // Byte-identical to the pre-fix form: mode lines plus the ---
+        // /+++ markers (no hunks), never a binary line.
+        assert_eq!(
+            out,
+            "diff --git a/x.dat b/x.dat\nold mode 100644\nnew mode 100755\n\
+             --- a/x.dat\n+++ b/x.dat\n"
+        );
+    }
+
+    #[test]
+    fn binary_probe_samples_first_8kib() {
+        // NUL inside the first 8 KiB → binary.
+        let mut inside = vec![b'a'; 8192];
+        inside[8191] = 0;
+        assert!(is_binary(&inside));
+        // NUL just past it → text.
+        let mut past = vec![b'a'; 8193];
+        past[8192] = 0;
+        assert!(!is_binary(&past));
+        assert!(is_binary(b"\0leading nul"));
+        assert!(!is_binary(b"plain text\n"));
+    }
+
+    #[test]
+    fn gitlink_entries_render_mode_lines_only() {
+        let sub_old = gitlink_id(0x19);
+        let sub_new = gitlink_id(0x5a);
+        let file = gardenbed_model::blob_id(b"file bytes\n");
+        let fetched = std::cell::RefCell::new(Vec::new());
+        let content_of = |id: gardenbed_model::Id| {
+            fetched.borrow_mut().push(id);
+            if id == file {
+                Ok(b"file bytes\n".to_vec())
+            } else {
+                Err(BedError::BlobHashMismatch(id))
+            }
+        };
+
+        // Add: git's `new file mode 160000` alone — git apply accepts it.
+        let out = render_diff(
+            &[diff_entry(
+                "sub",
+                DiffOp::Add,
+                None,
+                Some((sub_new, Mode::Gitlink)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(out, "diff --git a/sub b/sub\nnew file mode 160000\n");
+
+        // Delete: `deleted file mode 160000` alone.
+        let out = render_diff(
+            &[diff_entry(
+                "sub",
+                DiffOp::Delete,
+                Some((sub_old, Mode::Gitlink)),
+                None,
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(out, "diff --git a/sub b/sub\ndeleted file mode 160000\n");
+
+        // Surviving pointer change: no mode lines exist (both sides are
+        // 160000) and no honest Subproject sha to print — the binary line
+        // carries the change, with the markers git's own gitlink diffs
+        // use so the entry parses as a patch.
+        let out = render_diff(
+            &[diff_entry(
+                "sub",
+                DiffOp::Modify,
+                Some((sub_old, Mode::Gitlink)),
+                Some((sub_new, Mode::Gitlink)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/sub b/sub\n--- a/sub\n+++ b/sub\n\
+             Binary files a/sub and b/sub differ\n"
+        );
+
+        // Type changes to/from a gitlink render mode lines only — never
+        // content hunks.
+        let out = render_diff(
+            &[diff_entry(
+                "sub",
+                DiffOp::TypeChange,
+                Some((sub_old, Mode::Gitlink)),
+                Some((file, Mode::Regular)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/sub b/sub\nold mode 160000\nnew mode 100644\n"
+        );
+        let out = render_diff(
+            &[diff_entry(
+                "sub",
+                DiffOp::TypeChange,
+                Some((file, Mode::Regular)),
+                Some((sub_new, Mode::Gitlink)),
+            )],
+            &content_of,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            "diff --git a/sub b/sub\nold mode 100644\nnew mode 160000\n"
+        );
+
+        // No blob was ever fetched: gitlink entries render from tree
+        // metadata alone (the synthetic gitlink blobs are not even in the
+        // local store), even when the other side is a regular file.
+        assert!(fetched.borrow().is_empty(), "{:?}", fetched.borrow());
     }
 
     // ---------------------------------------------------------- blame

@@ -827,6 +827,7 @@ dependencies = [
  "gardenbed-protocol",
  "gardenbed-server",
  "gardenbed-store",
+ "libc",
  "rusqlite",
  "serde",
  "tempfile",

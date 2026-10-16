@@ -38,6 +38,13 @@ tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "channel"] }
 toml = "1"
 
+# Unix only: `bed` restores the default SIGPIPE disposition at startup so
+# a closed pipe (`bed log | head`) dies silently like git, not with a
+# `failed printing to stdout` panic (Rust ignores SIGPIPE by default).
+# Windows has no SIGPIPE; nothing to restore there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
 # Dev-only: the arboretum, for ingesting fixtures and spawning the real
