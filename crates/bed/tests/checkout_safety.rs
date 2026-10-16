@@ -50,9 +50,20 @@ fn create(repo: &Repo, parents: Vec<Id>, files: &[(&str, Op, &[u8])]) -> Id {
 }
 
 async fn world(extra: Option<&str>, state_name: &str) -> World {
+    world_with_external_state(extra, state_name, None).await
+}
+
+async fn world_with_external_state(
+    extra: Option<&str>,
+    state_name: &str,
+    external: Option<&std::path::Path>,
+) -> World {
     let root = tempfile::tempdir().unwrap();
     let garden = root.path().join("garden");
     fs::create_dir(&garden).unwrap();
+    if let Some(external) = external {
+        std::os::unix::fs::symlink(external, garden.join(state_name)).unwrap();
+    }
     let store_root = root.path().join("server");
     let repo = Repo::open(&store_root).unwrap();
     let mut files = vec![
@@ -155,5 +166,92 @@ async fn repository_cannot_overwrite_custom_bed_state() {
     let (code, out, err) = bed(&w.garden, &["--bed-dir", "state", "status", "--full-scan"]);
     assert_eq!(code, 0, "{err}");
     assert!(!out.contains("config.toml"), "{out}");
+    w.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusals_and_recovery() {
+    let state = match tempfile::tempdir_in("/dev/shm") {
+        Ok(state) => state,
+        Err(error) => {
+            eprintln!("cross-device CLI test unavailable: {error}");
+            return;
+        }
+    };
+    let mut w = world_with_external_state(None, ".bed", Some(state.path())).await;
+    use std::os::unix::fs::MetadataExt as _;
+    if fs::metadata(&w.garden).unwrap().dev() == fs::metadata(state.path()).unwrap().dev() {
+        w.server.shutdown().await;
+        eprintln!("cross-device CLI test unavailable: devices are identical");
+        return;
+    }
+    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"base");
+    std::os::unix::fs::symlink("a", w.garden.join("link")).unwrap();
+    let (code, _, err) = bed(&w.garden, &["sow", "-m", "symlink"]);
+    assert_eq!(code, 0, "{err}");
+    let saved = gardenbed::bed::Bed::open(&w.garden.join(".bed"))
+        .unwrap()
+        .config()
+        .current_cs
+        .clone()
+        .unwrap();
+    let (code, _, err) = bed(&w.garden, &["goto", &w.target.to_hex()]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!w.garden.join("link").exists());
+    let (code, _, err) = bed(&w.garden, &["goto", &saved]);
+    assert_eq!(code, 0, "{err}");
+    assert_eq!(
+        fs::read_link(w.garden.join("link")).unwrap(),
+        std::path::Path::new("a")
+    );
+    fs::write(w.garden.join("a"), b"unsown").unwrap();
+    let config = fs::read(state.path().join("config.toml")).unwrap();
+    let (code, _, err) = bed(&w.garden, &["goto", &w.target.to_hex()]);
+    assert_ne!(code, 0);
+    assert!(err.contains("local changes"), "{err}");
+    assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"unsown");
+    assert_eq!(fs::read(state.path().join("config.toml")).unwrap(), config);
+    fs::write(w.garden.join("a"), b"base").unwrap();
+
+    // Simulate a partial stage retained by a killed writer. Only the
+    // registered device/inode pair is excluded from status and sow.
+    let stage = ".bed-checkout-recovery";
+    fs::write(w.garden.join(stage), b"partial stage bytes").unwrap();
+    let meta = fs::symlink_metadata(w.garden.join(stage)).unwrap();
+    let record = format!(
+        "version = 1\npath = \"{stage}\"\ndevice = \"{:x}\"\ninode = \"{:x}\"\nsymlink = false\n",
+        meta.dev(),
+        meta.ino()
+    );
+    fs::write(state.path().join("checkout-stage-recovery"), record).unwrap();
+    fs::write(w.garden.join("normal"), b"real work").unwrap();
+    let (code, out, err) = bed(&w.garden, &["status", "--full-scan"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(out.contains("normal"));
+    assert!(!out.contains(stage), "{out}");
+    let (code, _, err) = bed(&w.garden, &["sow", "-m", "real work"]);
+    assert_eq!(code, 0, "{err}");
+    let current = gardenbed::bed::Bed::open(&w.garden.join(".bed"))
+        .unwrap()
+        .config()
+        .current_cs
+        .clone()
+        .unwrap();
+    let repo = Repo::open(&w._root.path().join("server")).unwrap();
+    let cs = repo.get_changeset(current.parse().unwrap()).unwrap();
+    assert_eq!(
+        cs.changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect::<Vec<_>>(),
+        ["normal"]
+    );
+    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    assert_eq!(code, 0, "{err}");
+    assert!(!w.garden.join(stage).exists());
+    assert!(!state.path().join("checkout-stage-recovery").exists());
+    assert_eq!(fs::read(w.garden.join("normal")).unwrap(), b"real work");
     w.server.shutdown().await;
 }

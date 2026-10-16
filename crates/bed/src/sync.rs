@@ -85,6 +85,9 @@ pub async fn sync_plot(
         garden_root,
         treestate.path().parent().expect("state directory"),
     )?;
+    // Only identity-registered staging entries from dead writers are
+    // reclaimed. Substituted names remain ordinary local/untracked work.
+    disk.cleanup_staging()?;
     // Validate the whole operation before changing any file or index row.
     let preserve = preflight(garden_root, plot, &target, treestate, &disk)?;
     let mut outcome = SyncOutcome::default();

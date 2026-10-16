@@ -113,6 +113,11 @@ local edits or untracked entries; sow or move that work aside before
 retrying. Paths overlapping the active bed state directory and symlink
 ancestors are also refused before files or checkout state change.
 
+The selected state directory may live on another filesystem, including
+through a symlink. Interrupted staging entries are reclaimed on retry
+only when their recorded identity still matches. Unknown or replaced
+temporary-looking files remain visible as untracked and are preserved.
+
 ```sh
 bed plot add src tests        # two prefixes at once
 bed plot add big              # the demo: 1,021 files, byte-verified vs git show
