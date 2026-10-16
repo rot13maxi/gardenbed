@@ -300,6 +300,11 @@ gardenbed-server --addr 127.0.0.1:9418 --root /tmp/arboretum
 # listening on 127.0.0.1:9418
 ```
 
+Publication uses durable validation certificates. Older databases perform a
+one-time validation of previously uncertified reachable history before moving
+refs; later restarts reuse that frontier. See [publication validation](validation.md)
+for migration behavior and certificate guarantees.
+
 ### gardenbed-server serve
 
 ```text

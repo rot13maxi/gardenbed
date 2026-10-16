@@ -27,6 +27,10 @@ CREATE TABLE IF NOT EXISTS changesets (
     id        BLOB PRIMARY KEY,
     canonical BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS validated_changesets_v1 (
+    cs        BLOB PRIMARY KEY REFERENCES changesets(id),
+    root_tree BLOB NOT NULL CHECK(length(root_tree) IN (0, 32))
+);
 CREATE TABLE IF NOT EXISTS refs (
     name TEXT PRIMARY KEY,
     cs   BLOB NOT NULL
@@ -100,6 +104,131 @@ impl SqliteMetadataStore {
             }
             Err(e) => Err(e), // dropping `tx` rolls back
         }
+    }
+}
+
+impl SqliteMetadataStore {
+    fn write_changeset(
+        &self,
+        canonical: &[u8],
+        git_sha_hex: Option<&str>,
+        derived: &[crate::traits::DerivedRow],
+        validated_tree: Option<Option<Id>>,
+    ) -> Result<Id, StoreError> {
+        use sha2::Digest;
+        let sha = git_sha_hex.map(normalize_git_sha).transpose()?;
+        let cs = Changeset::decode(canonical)
+            .map_err(|e| StoreError::Invalid(format!("invalid canonical changeset: {e}")))?;
+        let id = Id::from_bytes(sha2::Sha256::digest(canonical).into());
+        // One immediate transaction for changeset + git mapping + derived
+        // rows: a crash lands either the whole commit or none of it, and
+        // the per-commit WAL traffic (and its shm lock churn) shrinks from
+        // one transaction per row to one per commit.
+        self.in_tx(|tx| {
+            if validated_tree.is_some() {
+                for parent in &cs.parents {
+                    let certified: bool = tx
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM validated_changesets_v1 WHERE cs = ?1)",
+                            params![parent.as_bytes()],
+                            |r| r.get(0),
+                        )
+                        .map_err(db_err)?;
+                    if !certified {
+                        return Err(StoreError::Invalid(format!(
+                            "parent {parent} is not certified"
+                        )));
+                    }
+                }
+            }
+            let existing: Option<Vec<u8>> = tx
+                .prepare_cached("SELECT canonical FROM changesets WHERE id = ?1")
+                .map_err(db_err)?
+                .query_row(params![id.as_bytes()], |r| r.get(0))
+                .optional()
+                .map_err(db_err)?;
+            match existing {
+                Some(bytes) if bytes == canonical => {} // idempotent re-put
+                Some(_) => return Err(StoreError::ImmutabilityViolation(id)),
+                None => {
+                    tx.prepare_cached("INSERT INTO changesets(id, canonical) VALUES(?1, ?2)")
+                        .map_err(db_err)?
+                        .execute(params![id.as_bytes(), canonical])
+                        .map_err(db_err)?;
+                }
+            }
+            if let Some(sha) = sha.as_ref() {
+                // Mapping bijection, mirroring record_git_mapping's checks.
+                let by_sha: Option<Vec<u8>> = tx
+                    .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
+                    .map_err(db_err)?
+                    .query_row(params![sha], |r| r.get(0))
+                    .optional()
+                    .map_err(db_err)?;
+                let by_cs: Option<String> = tx
+                    .prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
+                    .map_err(db_err)?
+                    .query_row(params![id.as_bytes()], |r| r.get(0))
+                    .optional()
+                    .map_err(db_err)?;
+                match (by_sha, by_cs) {
+                    (Some(bytes), Some(existing_sha))
+                        if id_from_blob(&bytes)? == id && existing_sha == *sha => {}
+                    (Some(bytes), _) => {
+                        let other = id_from_blob(&bytes)?;
+                        return Err(StoreError::Invalid(format!(
+                            "git sha {sha} already maps to changeset {}",
+                            other.to_hex()
+                        )));
+                    }
+                    (_, Some(existing_sha)) => {
+                        return Err(StoreError::Invalid(format!(
+                            "changeset {} already mapped from git sha {existing_sha}",
+                            id.to_hex()
+                        )));
+                    }
+                    (None, None) => {
+                        tx.prepare_cached("INSERT INTO git_map(git_sha, cs) VALUES(?1, ?2)")
+                            .map_err(db_err)?
+                            .execute(params![sha, id.as_bytes()])
+                            .map_err(db_err)?;
+                    }
+                }
+            }
+            for row in derived {
+                check_kind(&row.kind)?;
+                tx.prepare_cached(
+                    "INSERT OR REPLACE INTO derived(kind, cs, bytes) VALUES(?1, ?2, ?3)",
+                )
+                .map_err(db_err)?
+                .execute(params![row.kind, row.cs.as_bytes(), row.bytes])
+                .map_err(db_err)?;
+            }
+            if let Some(root) = validated_tree {
+                let payload = root.map(|id| id.as_bytes().to_vec()).unwrap_or_default();
+                let previous: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT root_tree FROM validated_changesets_v1 WHERE cs = ?1",
+                        params![id.as_bytes()],
+                        |r| r.get(0),
+                    )
+                    .optional()
+                    .map_err(db_err)?;
+                if let Some(previous) = previous {
+                    if previous != payload {
+                        return Err(StoreError::ImmutabilityViolation(id));
+                    }
+                } else {
+                    tx.execute(
+                        "INSERT INTO validated_changesets_v1(cs, root_tree) VALUES(?1, ?2)",
+                        params![id.as_bytes(), payload],
+                    )
+                    .map_err(db_err)?;
+                }
+            }
+            Ok(())
+        })?;
+        Ok(id)
     }
 }
 
@@ -356,78 +485,41 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         git_sha_hex: &str,
         derived: &[crate::traits::DerivedRow],
     ) -> Result<Id, StoreError> {
-        use sha2::Digest;
-        let sha = normalize_git_sha(git_sha_hex)?;
-        let id = Id::from_bytes(sha2::Sha256::digest(canonical).into());
-        // One immediate transaction for changeset + git mapping + derived
-        // rows: a crash lands either the whole commit or none of it, and
-        // the per-commit WAL traffic (and its shm lock churn) shrinks from
-        // one transaction per row to one per commit.
-        self.in_tx(|tx| {
-            let existing: Option<Vec<u8>> = tx
-                .prepare_cached("SELECT canonical FROM changesets WHERE id = ?1")
-                .map_err(db_err)?
-                .query_row(params![id.as_bytes()], |r| r.get(0))
-                .optional()
-                .map_err(db_err)?;
-            match existing {
-                Some(bytes) if bytes == canonical => {} // idempotent re-put
-                Some(_) => return Err(StoreError::ImmutabilityViolation(id)),
-                None => {
-                    tx.prepare_cached("INSERT INTO changesets(id, canonical) VALUES(?1, ?2)")
-                        .map_err(db_err)?
-                        .execute(params![id.as_bytes(), canonical])
-                        .map_err(db_err)?;
+        self.write_changeset(canonical, Some(git_sha_hex), derived, None)
+    }
+
+    fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
+        let conn = self.lock()?;
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT root_tree FROM validated_changesets_v1 WHERE cs = ?1",
+                params![cs.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        bytes
+            .map(|bytes| {
+                if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    id_from_blob(&bytes).map(Some)
                 }
-            }
-            // Mapping bijection, mirroring record_git_mapping's checks.
-            let by_sha: Option<Vec<u8>> = tx
-                .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
-                .map_err(db_err)?
-                .query_row(params![sha], |r| r.get(0))
-                .optional()
-                .map_err(db_err)?;
-            let by_cs: Option<String> = tx
-                .prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
-                .map_err(db_err)?
-                .query_row(params![id.as_bytes()], |r| r.get(0))
-                .optional()
-                .map_err(db_err)?;
-            match (by_sha, by_cs) {
-                (Some(bytes), Some(existing_sha))
-                    if id_from_blob(&bytes)? == id && existing_sha == sha => {}
-                (Some(bytes), _) => {
-                    let other = id_from_blob(&bytes)?;
-                    return Err(StoreError::Invalid(format!(
-                        "git sha {sha} already maps to changeset {}",
-                        other.to_hex()
-                    )));
-                }
-                (_, Some(existing_sha)) => {
-                    return Err(StoreError::Invalid(format!(
-                        "changeset {} already mapped from git sha {existing_sha}",
-                        id.to_hex()
-                    )));
-                }
-                (None, None) => {
-                    tx.prepare_cached("INSERT INTO git_map(git_sha, cs) VALUES(?1, ?2)")
-                        .map_err(db_err)?
-                        .execute(params![sha, id.as_bytes()])
-                        .map_err(db_err)?;
-                }
-            }
-            for row in derived {
-                check_kind(&row.kind)?;
-                tx.prepare_cached(
-                    "INSERT OR REPLACE INTO derived(kind, cs, bytes) VALUES(?1, ?2, ?3)",
-                )
-                .map_err(db_err)?
-                .execute(params![row.kind, row.cs.as_bytes(), row.bytes])
-                .map_err(db_err)?;
-            }
-            Ok(())
-        })?;
-        Ok(id)
+            })
+            .transpose()
+    }
+
+    fn put_validated_changeset(
+        &self,
+        cs: &Changeset,
+        root_tree: Option<Id>,
+        derived: &[crate::traits::DerivedRow],
+        git_sha_hex: Option<&str>,
+    ) -> Result<Id, StoreError> {
+        let canonical = cs
+            .canonical_bytes()
+            .map_err(|e| StoreError::Invalid(e.to_string()))?;
+        self.write_changeset(&canonical, git_sha_hex, derived, Some(root_tree))
     }
 }
 

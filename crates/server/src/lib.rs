@@ -14,10 +14,10 @@
 //! (`not_found`), bad input (`invalid_argument`), and semantic precondition
 //! violations (`failed_precondition`).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use gardenbed_derive::{BlameRange, Engine};
 use gardenbed_model::codec::validate_changeset;
@@ -120,7 +120,6 @@ pub struct Repo {
     metadata: Arc<dyn MetadataStore>,
     engine: Engine,
     stats: Stats,
-    validated_history: Mutex<HashSet<Id>>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -147,7 +146,6 @@ impl Repo {
             metadata,
             engine,
             stats: Stats::default(),
-            validated_history: Mutex::new(HashSet::new()),
         }
     }
 
@@ -217,44 +215,20 @@ impl Repo {
         // Failed semantic validation may leave unreferenced immutable objects,
         // but never a changeset that a caller can subsequently publish.
         let cs_id = cs.id()?;
-        let rows = self.engine.derived_rows_for_new(cs_id, cs)?;
-        self.metadata.put_changeset(cs)?;
-        for row in rows {
-            self.metadata.derived_put(&row.kind, row.cs, &row.bytes)?;
-        }
-        self.validated_history.lock().unwrap().insert(cs_id);
+        let root = self.engine.validated_tree_for_new(cs)?;
+        let rows = self
+            .engine
+            .derived_rows_for_validated_tree(cs_id, cs, root)?;
+        self.metadata
+            .put_validated_changeset(cs, root, &rows, None)?;
         Ok(cs_id)
     }
 
-    /// Validate the complete DAG, including non-first parents from older
-    /// stores. Immutable validated history is memoized for this Repo, so
-    /// subsequent publications only inspect newly encountered ancestors.
+    /// Durable validation certificates bound publication work to new history.
     fn validate_history(&self, head: Id) -> Result<(), ServerError> {
-        let mut validated = self.validated_history.lock().unwrap();
-        let mut pending = vec![(head, false)];
-        while let Some((id, ready)) = pending.pop() {
-            if validated.contains(&id) {
-                continue;
-            }
-            let cs = self.get_changeset(id)?;
-            if !ready {
-                pending.push((id, true));
-                pending.extend(cs.parents.iter().map(|parent| (*parent, false)));
-                continue;
-            }
-            validate_changeset(&cs, true)?;
-            for change in &cs.changes {
-                if let Some(blob) = change.blob
-                    && change.mode != Mode::Gitlink
-                    && !self.objects.has(blob)?
-                {
-                    return Err(ServerError::ObjectNotFound(blob));
-                }
-            }
-            self.root_tree(id)?;
-            validated.insert(id);
-        }
-        Ok(())
+        self.engine
+            .certify_history(head)
+            .map_err(|e| ServerError::for_changeset(e, head))
     }
 
     // --------------------------------------------------------- read path
@@ -1252,6 +1226,18 @@ mod revspec_tests {
         }
         fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
             self.inner.derived_get(kind, cs)
+        }
+        fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
+            self.inner.validation_tree(cs)
+        }
+        fn put_validated_changeset(
+            &self,
+            cs: &Changeset,
+            root: Option<Id>,
+            rows: &[gardenbed_store::DerivedRow],
+            git: Option<&str>,
+        ) -> Result<Id, StoreError> {
+            self.inner.put_validated_changeset(cs, root, rows, git)
         }
         fn changeset_ids_in_id_range(
             &self,
