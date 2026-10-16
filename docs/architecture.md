@@ -199,8 +199,9 @@ All local state lives under `--bed-dir` (default `./.bed`):
   Resumability and idempotence fall out of content addressing, not retry
   logic (v0.1.md §M4 right-thing signal).
 - **Two-phase sow**: scan the plot, read changed files, then upload —
-  blobs ≤ 1 MiB ride inline on `CreateChangeset`, heavier ones stream via
-  `PutBlob` first. A SIGKILL between the two leaves orphaned blobs that
+  blobs ≤ 1 MiB ride inline on `CreateChangeset` within a 2 MiB aggregate
+  content budget; heavier blobs and overflow stream via `PutBlob` first.
+  A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
 - **Status** uses mtime/size as hints and hashes only suspects;
   `--full-scan` forces the correctness path.

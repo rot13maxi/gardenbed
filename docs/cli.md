@@ -107,6 +107,12 @@ Usage: bed plot list [OPTIONS]
 `plot add` takes repo-relative prefixes (directory or exact file; `.`
 plants the whole garden) and materializes them at the current changeset.
 
+Checkout updates (`plot add`, `goto`, and `graft`) preserve local edits
+when the target leaves that file unchanged. They refuse to overwrite
+local edits or untracked entries; sow or move that work aside before
+retrying. Paths overlapping the active bed state directory and symlink
+ancestors are also refused before files or checkout state change.
+
 ```sh
 bed plot add src tests        # two prefixes at once
 bed plot add big              # the demo: 1,021 files, byte-verified vs git show
