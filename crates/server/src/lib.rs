@@ -1184,6 +1184,30 @@ impl Gardenbed for GardenbedService {
     }
 }
 
+/// A real published changeset for ref-writing fixtures: ref CAS validates
+/// its target against the full DAG (`validate_history`), so refs in tests
+/// must point at changesets that actually exist and derive cleanly — an
+/// empty root, or a child of `parents`.
+#[cfg(test)]
+fn fixture_changeset(repo: &Repo, parents: Vec<Id>, message: &str) -> Id {
+    let identity = gardenbed_model::Identity {
+        name: "test".into(),
+        email: "test@example.com".into(),
+        time_secs: 1,
+        tz_min: 0,
+    };
+    let cs = Changeset {
+        parents,
+        changes: vec![],
+        message: message.into(),
+        author: identity.clone(),
+        committer: identity,
+        signature: None,
+    };
+    repo.create_changeset(&cs, &BTreeMap::new())
+        .expect("fixture changeset publishes")
+}
+
 #[cfg(test)]
 mod revspec_tests {
     use super::*;
@@ -1293,10 +1317,12 @@ mod revspec_tests {
             "hint present: {err}"
         );
 
-        // A ref with exactly that name still wins.
+        // A ref with exactly that name still wins — and, like every ref,
+        // must name a published changeset.
         let repo = canned_repo(vec![id(1)]);
-        repo.cas_ref("1d05", None, id(9)).expect("cas");
-        assert_eq!(repo.get_ref("1d05").expect("ref wins"), Some(id(9)));
+        let head = fixture_changeset(&repo, vec![], "ref target");
+        repo.cas_ref("1d05", None, head).expect("cas");
+        assert_eq!(repo.get_ref("1d05").expect("ref wins"), Some(head));
     }
 
     /// Rule 1: an existing ref with that exact name wins over prefix
@@ -1304,10 +1330,11 @@ mod revspec_tests {
     #[test]
     fn existing_ref_wins_over_a_matching_prefix() {
         let repo = canned_repo(vec![id(1), id(2), id(3)]);
-        repo.cas_ref("deadbeef01", None, id(9)).expect("cas");
+        let head = fixture_changeset(&repo, vec![], "ref target");
+        repo.cas_ref("deadbeef01", None, head).expect("cas");
         assert_eq!(
             repo.get_ref("deadbeef01").expect("ref wins"),
-            Some(id(9)),
+            Some(head),
             "the ref answers although the scan would find 3 changesets"
         );
     }
@@ -1401,10 +1428,6 @@ mod revspec_tests {
 mod ref_normalization_tests {
     use super::*;
 
-    fn id(tag: u8) -> Id {
-        Id::from_bytes([tag; 32])
-    }
-
     fn repo() -> (tempfile::TempDir, Repo) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = Repo::open(dir.path()).expect("repo opens");
@@ -1416,16 +1439,17 @@ mod ref_normalization_tests {
     #[test]
     fn bare_ref_writes_land_under_refs_heads() {
         let (_dir, repo) = repo();
+        let head = fixture_changeset(&repo, vec![], "root");
         assert!(matches!(
-            repo.cas_ref("main", None, id(1)).expect("cas"),
+            repo.cas_ref("main", None, head).expect("cas"),
             RefCas::Won { .. }
         ));
         assert_eq!(
             repo.list_refs().expect("refs"),
-            vec![("refs/heads/main".to_owned(), id(1))]
+            vec![("refs/heads/main".to_owned(), head)]
         );
-        assert_eq!(repo.get_ref("main").expect("get"), Some(id(1)));
-        assert_eq!(repo.get_ref("refs/heads/main").expect("get"), Some(id(1)));
+        assert_eq!(repo.get_ref("main").expect("get"), Some(head));
+        assert_eq!(repo.get_ref("refs/heads/main").expect("get"), Some(head));
     }
 
     /// An imported history's full-name ref answers bare-name lookups, and a
@@ -1433,24 +1457,28 @@ mod ref_normalization_tests {
     #[test]
     fn bare_names_resolve_and_move_imported_refs() {
         let (_dir, repo) = repo();
-        // The import path stores full names (rootstock does exactly this).
-        repo.cas_ref("refs/heads/main", None, id(1))
+        // The import path stores full names (rootstock does exactly this),
+        // and every ref target is a published changeset.
+        let r1 = fixture_changeset(&repo, vec![], "root");
+        repo.cas_ref("refs/heads/main", None, r1)
             .expect("imported ref");
-        assert_eq!(repo.get_ref("main").expect("fallback"), Some(id(1)));
+        assert_eq!(repo.get_ref("main").expect("fallback"), Some(r1));
 
+        let r2 = fixture_changeset(&repo, vec![r1], "second");
         assert!(matches!(
-            repo.cas_ref("main", Some(id(1)), id(2)).expect("cas"),
+            repo.cas_ref("main", Some(r1), r2).expect("cas"),
             RefCas::Won { .. }
         ));
         assert_eq!(
             repo.list_refs().expect("refs"),
-            vec![("refs/heads/main".to_owned(), id(2))]
+            vec![("refs/heads/main".to_owned(), r2)]
         );
 
         // CAS semantics are unchanged: a stale expectation still conflicts.
+        let r3 = fixture_changeset(&repo, vec![r2], "third");
         assert!(matches!(
-            repo.cas_ref("main", Some(id(1)), id(3)).expect("cas"),
-            RefCas::Conflict { current } if current == id(2)
+            repo.cas_ref("main", Some(r1), r3).expect("cas"),
+            RefCas::Conflict { current } if current == r2
         ));
     }
 
@@ -1459,17 +1487,22 @@ mod ref_normalization_tests {
     #[test]
     fn legacy_bare_rows_still_resolve() {
         let (_dir, repo) = repo();
+        // The legacy row goes straight into the metadata store (bypassing
+        // the Repo-level validation a pre-validation writer would have
+        // skipped) but still names a real published changeset.
+        let r1 = fixture_changeset(&repo, vec![], "root");
         repo.metadata
-            .cas_ref("main", None, id(1))
+            .cas_ref("main", None, r1)
             .expect("legacy bare row");
-        assert_eq!(repo.get_ref("main").expect("fallback"), Some(id(1)));
+        assert_eq!(repo.get_ref("main").expect("fallback"), Some(r1));
+        let r2 = fixture_changeset(&repo, vec![r1], "second");
         assert!(matches!(
-            repo.cas_ref("main", Some(id(1)), id(2)).expect("cas"),
+            repo.cas_ref("main", Some(r1), r2).expect("cas"),
             RefCas::Won { .. }
         ));
         assert_eq!(
             repo.list_refs().expect("refs"),
-            vec![("main".to_owned(), id(2))]
+            vec![("main".to_owned(), r2)]
         );
     }
 }
