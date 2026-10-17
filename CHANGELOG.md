@@ -7,6 +7,34 @@ tags, and the verification record for a release lives in
 
 ## Unreleased
 
+### Added
+
+- Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
+  and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
+  `gardenbed-store` `StorageConfig` (TOML) to select them.
+- `gardenbed-server --storage <config.toml>` (plus `GARDENBED_STORAGE` env
+  fallback) for `serve`, `import`, and `export`: stateless replicas over
+  off-box Postgres + S3 instead of local `--root` mode, which stays the
+  default.
+- `tools/scale/compose.yaml`: a Postgres + MinIO (`pgsty/minio`) + N-replica
+  server deployment (see `tools/scale/README.md`); `crates/server/tests/scale.rs`
+  proves read-your-writes, single-winner CAS, and idempotent creates across
+  replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
+
+### Added
+
+- Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
+  and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
+  `gardenbed-store` `StorageConfig` (TOML) to select them.
+- `gardenbed-server --storage <config.toml>` (plus `GARDENBED_STORAGE` env
+  fallback) for `serve`, `import`, and `export`: stateless replicas over
+  off-box Postgres + S3 instead of local `--root` mode, which stays the
+  default.
+- `tools/scale/compose.yaml`: a Postgres + MinIO (`pgsty/minio`) + N-replica
+  server deployment (see `tools/scale/README.md`); `crates/server/tests/scale.rs`
+  proves read-your-writes, single-winner CAS, and idempotent creates across
+  replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
+
 ### Changed
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
