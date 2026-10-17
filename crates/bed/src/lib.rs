@@ -14,6 +14,7 @@ pub mod commit;
 pub mod config;
 pub mod error;
 pub mod heads;
+pub mod mount;
 pub mod ops;
 pub mod render;
 pub mod revspec;
