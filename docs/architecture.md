@@ -221,6 +221,59 @@ All local state lives under `--state-dir` (default `./.bed`):
   work rather than being assumed disposable. Checkout directory traversal
   uses open directory descriptors and refuses symlink ancestors.
 
+## 6a. Virtualized checkout (FUSE mount)
+
+`gardenbed::mount` exposes the current changeset as a read-only FUSE
+filesystem: the **whole** repository tree is visible and readable at the
+mountpoint with no sparse selection, while `.bed/objects` stays bounded
+by what was actually touched (a file's blob is materialized on first
+`stat`, a symlink's on first `lstat`; listing alone fetches only trees).
+Virtualization is lazy materialization through the existing
+content-addressed fetch path — not a second checkout mechanism:
+
+- `getattr`/`readdir` walk the changeset's derived trees via the
+  want-list fetch path (`Fetcher::tree`, cache-first); `read` pulls the
+  blob through `Fetcher::blob` (hash-verified, cached). Reading a file
+  through the mount and `bed file` use the identical path and cache.
+- **Snapshot semantics**: the mount reflects the current changeset at
+  mount time; it does not track ref movement. A remount switches
+  changesets (resolving `current_cs` fresh) — the v0.3 story.
+- **Deterministic metadata**: every entry's timestamps are the
+  changeset's committer time (the only timestamp the object model
+  records); directories report size 4096 and `nlink = 2 + subdirs`;
+  regular files report `nlink = 1` and their **true size**, fetched
+  cache-first on first `stat` — a buffered read is clamped to the
+  reported size, so it must be real; a file's blob is materialized
+  when it is first stat'ed. Symlinks report target lengths; gitlinks
+  list as read-only empty files (opaque upstream pointers, never
+  stored objects). Exec bits surface as `0555`, regular files as
+  `0444`.
+- **Read-only by construction**: every mutating operation answers
+  `EROFS`. Writing a file, creating, removing, renaming, chmod — all
+  fail with the read-only-filesystem error.
+- **No root required**: mounting goes through `fusermount3` (the
+  setuid helper ships with fuse3); `/dev/fuse` being world-writable on
+  ordinary hosts is what makes this work.
+- **Async/sync bridge**: fuser callbacks are synchronous but the fetch
+  path is async. The mount owns a dedicated single-threaded tokio
+  runtime that creates the `Session` and resolves the snapshot before
+  anything is mounted; callbacks hand their reply object to that
+  runtime through an unbounded channel and return, and the runtime
+  fills and sends the reply when the fetch completes. No callback ever
+  blocks on the runtime and the runtime never waits on a callback —
+  no cross-wait, no deadlock.
+- **Unmount**: `MountHandle::unmount` (unmount → stop the bridge →
+  join the serving thread) or an external `fusermount -u`; both leave
+  an ordinary, removable directory behind.
+
+The FUSE-dependent tests gate on availability (`/dev/fuse` +
+`fusermount3`): hosts without them skip with
+`mount test skipped: /dev/fuse unavailable`; hosts with them run the
+full suite — whole-tree listing, byte fidelity vs `bed file`, the
+on-demand proof (server `GetStats` counters corroborate that only read
+blobs were fetched), concurrent readers, a 200-iteration seeded read
+loop, `EROFS` for every mutation, and both unmount paths.
+
 ## 7. Import pipeline (git)
 
 1. A URL is mirror-cloned to `<root>/git-mirror.git` and refreshed
