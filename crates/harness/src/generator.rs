@@ -781,6 +781,329 @@ pub fn generate(seed: u64, opts: &GenOptions) -> GeneratedHistory {
     }
 }
 
+// ---------------------------------------------------------- divergent
+
+/// A generated history with a genuine two-headed fork: a shared linear
+/// base, then two independently edited side branches from the same
+/// branch point.
+#[derive(Clone, Debug)]
+pub struct DivergentHistory {
+    /// The full history: `changesets[..=base_index]` is the shared base
+    /// chain; `ours_index` and `theirs_index` index into the same vec
+    /// (parents always precede children, so the whole vec is directly
+     /// ingestable/materializable).
+    pub history: GeneratedHistory,
+    /// Index of the branch-point changeset (both sides' parent).
+    pub base_index: usize,
+    /// Index of the ours-side tip.
+    pub ours_index: usize,
+    /// Index of the theirs-side tip.
+    pub theirs_index: usize,
+}
+
+impl DivergentHistory {
+    /// Id of the branch point.
+    pub fn base_id(&self) -> Id {
+        self.history.changesets[self.base_index].id().expect("generated cs encodes")
+    }
+    /// Id of the ours tip.
+    pub fn ours_id(&self) -> Id {
+        self.history.changesets[self.ours_index].id().expect("generated cs encodes")
+    }
+    /// Id of the theirs tip.
+    pub fn theirs_id(&self) -> Id {
+        self.history.changesets[self.theirs_index].id().expect("generated cs encodes")
+    }
+}
+
+/// Generates a deterministic divergent pair (M9 differential input).
+///
+/// The base is a short *linear* history (`generate` with renames and
+/// merges off, `commits` clamped to 1..=8) so the fork has exactly one
+/// merge base. Each side then applies 1–6 independent random edits to
+/// its own copy of the branch-point working set:
+///
+/// - **modify**: derive new content from the file's *current* content
+///   (delete/duplicate/reorder/insert lines) so both sides editing the
+///   same file produce overlapping hunks — the interesting merge shape;
+/// - **mode flip**: flip regular↔exec on an existing file;
+/// - **delete**: drop an existing path;
+/// - **add**: create a new file (pool path or nested), any mode incl.
+///   symlink (fresh line-pool content).
+///
+/// Rename-free by construction (content never moves between paths), so
+/// git's rename detection finds nothing and the documented
+/// rename-blindness divergence cannot fire. D/F-safe: adds only use
+/// paths free of prefix conflicts with the live set. Pure function of
+/// `(seed, opts)`; both sides' changesets use distinct committer
+/// timestamps (monotonic, above the base chain's) so `merge_base`
+/// tie-breaks deterministically to the branch point.
+pub fn generate_divergent(seed: u64, opts: &GenOptions) -> DivergentHistory {
+    let base_opts = GenOptions {
+        commits: opts.commits.clamp(1, 8),
+        merge_ratio: 0.0,
+        octopus_ratio: 0.0,
+        rename_ratio: 0.0,
+        ..opts.clone()
+    };
+    let base = generate(seed, &base_opts);
+    let mut changesets: Vec<Changeset> = base.changesets.clone();
+    let base_index = changesets.len() - 1;
+    // The branch-point working set comes from replaying the (linear,
+    // rename-free) base chain — `files_at` is exactly that.
+    let files = files_at(&base, base_index);
+    let mut work: BTreeMap<String, (Id, Mode, bool)> = BTreeMap::new();
+    for (path, (blob, mode)) in files {
+        // crlf detection: the content knows.
+        let crlf = base
+            .blob(&blob)
+            .map(|c| c.windows(2).any(|w| w == b"\r\n"))
+            .unwrap_or(false);
+        work.insert(path, (blob, mode, crlf));
+    }
+
+    // A fresh generator seeded off the branch point drives the side
+    // edits; its blob map is pre-seeded with the base chain's contents
+    // so modify-derivations can read current bytes.
+    let mut g = Generator::new(seed ^ 0x9e37_79b9_7f4a_7c15, opts);
+    g.blobs = base.blob_contents.iter().cloned().collect();
+    // Keep line numbering beyond the base chain's (uniqueness across
+    // the whole history keeps diff/merge shapes distinguishable).
+    g.line_no = g
+        .blobs
+        .values()
+        .map(|c| c.split(|b| *b == b'\n').count() as u64)
+        .sum();
+
+    let base_len = changesets.len();
+    let ours_start = base_len;
+    let theirs_start = base_len + 3;
+    let mut tick = changesets.len() as u64;
+    for side in 0..2 {
+        let mut side_work = work.clone();
+        let start = if side == 0 { ours_start } else { theirs_start };
+        for k in 0..3 {
+            tick += 1;
+            let changes = side_edits(&mut g, &mut side_work, opts);
+            let (author, committer) = g.make_identities(start as u32 + k as u32);
+            // Distinct, strictly increasing committer seconds so
+            // merge-base tie-breaking is deterministic and picks the
+            // branch point (the newest *common* ancestor).
+            let committer = Identity { time_secs: 1_800_000_000 + tick * 3600, ..committer };
+            let parent_idx = if k == 0 { base_index } else { start + k - 1 };
+            let cs = Changeset {
+                parents: vec![changesets[parent_idx].id().expect("generated cs encodes")],
+                changes,
+                message: format!("divergent side {side} commit {k}"),
+                author,
+                committer,
+                signature: None,
+            };
+            changesets.push(cs);
+        }
+    }
+    let head = changesets.last().expect("always non-empty").id().expect("encodes");
+    let mut blob_contents: Vec<(Id, Vec<u8>)> = g.blobs.into_iter().collect();
+    blob_contents.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    blob_contents.dedup_by(|a, b| a.0 == b.0);
+    let history = GeneratedHistory {
+        changesets,
+        blob_contents,
+        head,
+    };
+    DivergentHistory {
+        history,
+        base_index,
+        ours_index: ours_start + 2,
+        theirs_index: theirs_start + 2,
+    }
+}
+
+/// One round of side edits against a live working set. Mutates `work`
+/// in place and records every blob into `g.blobs` so the returned
+/// changeset is fully ingestable.
+fn side_edits(g: &mut Generator, work: &mut BTreeMap<String, (Id, Mode, bool)>, opts: &GenOptions) -> Vec<Change> {
+    let n_ops = g.rng.random_range(1..=6usize);
+    let mut changes: Vec<Change> = Vec::new();
+    let mut used: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..n_ops {
+        let pick: f64 = g.rng.random();
+        let live: Vec<String> = work.keys().cloned().collect();
+        let del_ratio = clamp01(opts.delete_ratio.max(0.15));
+        if live.is_empty() || pick < 0.30 {
+            // add
+            // Pick a fresh path: try every unused pool candidate that is
+            // conflict-free against THIS side's live set (the generator's
+            // own `work` is empty here — the side edits maintain their
+            // own working set), falling back to a synthesized path.
+            // Bounded: each iteration consumes a candidate, and
+            // `synthesized_path` always succeeds.
+            let mut cands = g.fresh_paths();
+            cands.reverse(); // pop() took the tail; scan all deterministically
+            let mut path: Option<String> = None;
+            for cand in cands {
+                if !used.contains(&cand) && !conflicts_with(work.keys(), &cand) {
+                    path = Some(cand);
+                    break;
+                }
+            }
+            let path = match path {
+                Some(p) => p,
+                None => loop {
+                    let cand = g.synthesized_path();
+                    if !used.contains(&cand) && !conflicts_with(work.keys(), &cand) {
+                        break cand;
+                    }
+                },
+            };
+            let mode = g.roll_mode();
+            let (blob, content) = g.fresh_blob_for_mode(mode, opts.crlf_content, None);
+            g.blobs.insert(blob, content);
+            used.insert(path.clone());
+            work.insert(path.clone(), (blob, mode, opts.crlf_content));
+            changes.push(Change {
+                path,
+                op: Op::Add,
+                blob: Some(blob),
+                src_path: None,
+                mode,
+            });
+        } else if pick < 0.30 + del_ratio * 0.5 {
+            // delete
+            let path = live[g.rng.random_range(0..live.len())].clone();
+            if used.contains(&path) {
+                continue;
+            }
+            used.insert(path.clone());
+            work.remove(&path);
+            changes.push(Change {
+                path,
+                op: Op::Delete,
+                blob: None,
+                src_path: None,
+                mode: Mode::Regular,
+            });
+        } else if pick < 0.30 + del_ratio * 0.5 + 0.15 {
+            // mode flip (regular <-> exec only; never touch linklikes)
+            let candidates: Vec<String> = live
+                .iter()
+                .filter(|p| {
+                    matches!(work[*p].1, Mode::Regular | Mode::Exec) && !used.contains(*p)
+                })
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let path = candidates[g.rng.random_range(0..candidates.len())].clone();
+            let (blob, mode, crlf) = work[&path];
+            let new_mode = if mode == Mode::Regular { Mode::Exec } else { Mode::Regular };
+            used.insert(path.clone());
+            work.insert(path.clone(), (blob, new_mode, crlf));
+            changes.push(Change {
+                path,
+                op: Op::Modify,
+                blob: Some(blob),
+                src_path: None,
+                mode: new_mode,
+            });
+        } else {
+            // modify: derive new content from the file's current bytes
+            // (line delete/dup/reorder/insert) so overlapping edits on
+            // the same file across sides are the common shape.
+            let candidates: Vec<String> = live
+                .iter()
+                .filter(|p| {
+                    let (b, m, _) = work[*p];
+                    matches!(m, Mode::Regular | Mode::Exec) && g.blobs.contains_key(&b) && !used.contains(*p)
+                })
+                .cloned()
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let path = candidates[g.rng.random_range(0..candidates.len())].clone();
+            let (old_blob, mode, crlf) = work[&path];
+            let old = g.blobs.get(&old_blob).cloned().expect("content known");
+            let edited = edit_content(g, &old, crlf);
+            if edited == old {
+                continue; // nothing changed; skip this op
+            }
+            let blob = blob_id(&edited);
+            g.blobs.insert(blob, edited);
+            used.insert(path.clone());
+            work.insert(path.clone(), (blob, mode, crlf));
+            changes.push(Change {
+                path,
+                op: Op::Modify,
+                blob: Some(blob),
+                src_path: None,
+                mode,
+            });
+        }
+    }
+    changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    changes
+}
+
+/// Randomly edits line content: drop, duplicate, swap adjacent, or
+/// insert fresh unique lines. Keeps the original line ending style.
+fn edit_content(g: &mut Generator, old: &[u8], crlf: bool) -> Vec<u8> {
+    let eol: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    // Split preserving nothing; rebuild with the uniform ending.
+    let text = String::from_utf8_lossy(old);
+    let mut lines: Vec<String> = text
+        .lines()
+        .map(|l| l.trim_end_matches(['\r']).to_owned())
+        .collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    let n = lines.len();
+    let op = g.rng.random_range(0..4u8);
+    match op {
+        0 => {
+            // drop one line (never the last one if it's the only one)
+            if n > 1 {
+                let i = g.rng.random_range(0..n);
+                lines.remove(i);
+            }
+        }
+        1 => {
+            // duplicate one line
+            let i = g.rng.random_range(0..n);
+            let l = lines[i].clone();
+            lines.insert(i, l);
+        }
+        2 => {
+            // swap two adjacent lines
+            if n > 1 {
+                let i = g.rng.random_range(0..n - 1);
+                lines.swap(i, i + 1);
+            }
+        }
+        _ => {
+            // insert 1-3 fresh unique lines
+            let k = g.rng.random_range(1..=3usize);
+            let at = g.rng.random_range(0..=lines.len());
+            let mut fresh = Vec::new();
+            for _ in 0..k {
+                g.line_no += 1;
+                let pick = LINE_POOL[g.rng.random_range(0..LINE_POOL.len())];
+                fresh.push(format!("{:06}: {}", g.line_no, pick));
+            }
+            for (off, l) in fresh.into_iter().enumerate() {
+                lines.insert(at + off, l);
+            }
+        }
+    }
+    let mut out = lines.join(if crlf { "\r\n" } else { "\n" }).into_bytes();
+    if old.ends_with(b"\n") || old.ends_with(b"\r\n") {
+        out.extend_from_slice(eol);
+    }
+    out
+}
+
 /// Id of a generated changeset. Generated changesets are canonically
 /// valid by construction, so this cannot fail; a failure would be a
 /// harness bug (reproducible via the deterministic seed) rather than bad
@@ -880,5 +1203,53 @@ mod tests {
         }
         // Head is the last changeset's id.
         assert_eq!(h.head, h.changesets.last().unwrap().id().unwrap());
+    }
+
+    #[test]
+    fn divergent_history_is_valid_deterministic_and_forked() {
+        let opts = GenOptions {
+            commits: 6,
+            rename_ratio: 0.0,
+            merge_ratio: 0.0,
+            max_files: 12,
+            max_dirs: 3,
+            unicode_paths: true,
+            crlf_content: true,
+            empty_files: true,
+            ..Default::default()
+        };
+        let d = generate_divergent(42, &opts);
+        // Structure: base chain + 3 ours commits + 3 theirs commits.
+        assert_eq!(d.ours_index, d.base_index + 3);
+        assert_eq!(d.theirs_index, d.base_index + 6);
+        assert_eq!(d.history.changesets.len(), d.base_index + 7);
+        // Both sides fork from the same parent.
+        let parent = |i: usize| d.history.changesets[i].parents[0];
+        assert_eq!(parent(d.ours_index - 2), d.history.changesets[d.base_index].id().unwrap());
+        assert_eq!(parent(d.theirs_index - 2), d.history.changesets[d.base_index].id().unwrap());
+        // Canonical encoding holds for the side commits.
+        for cs in &d.history.changesets[d.base_index + 1..] {
+            let bytes = cs.canonical_bytes().expect("side changeset encodes");
+            let back = Changeset::decode(&bytes).expect("side changeset decodes");
+            assert_eq!(&back, cs);
+        }
+        // Every referenced blob is present.
+        for cs in &d.history.changesets {
+            for c in &cs.changes {
+                if let Some(b) = c.blob {
+                    assert!(d.history.blob(&b).is_some(), "blob {b} missing");
+                }
+            }
+        }
+        // Determinism: same seed, byte-identical.
+        let d2 = generate_divergent(42, &opts);
+        assert_eq!(
+            d.history.changesets.last().unwrap().id().unwrap(),
+            d2.history.changesets.last().unwrap().id().unwrap()
+        );
+        // The two tips genuinely diverge (different trees or different
+        // ids at minimum — a fork with identical tips would be a
+        // generator bug).
+        assert_ne!(d.ours_id(), d.theirs_id());
     }
 }

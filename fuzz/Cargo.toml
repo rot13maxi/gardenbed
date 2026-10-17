@@ -57,3 +57,10 @@ path = "fuzz_targets/fuzz_mcp_line.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_merge3"
+path = "fuzz_targets/fuzz_merge3.rs"
+test = false
+doc = false
+bench = false

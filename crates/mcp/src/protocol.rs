@@ -141,6 +141,67 @@ pub fn error_line(id: &Value, code: i64, message: impl AsRef<str>) -> String {
     .to_string()
 }
 
+/// Cap on one stdin protocol line (1 MiB). MCP messages are tiny; a line
+/// past this is a broken or hostile client, and the server must answer it
+/// with `-32600` and skip it rather than buffering it without bound.
+pub const MAX_LINE_LEN: usize = 1 << 20;
+
+/// Reads one newline-terminated (or EOF-terminated) line into `buf`
+/// (terminator stripped), never buffering more than [`MAX_LINE_LEN`]
+/// bytes: bytes past the cap are counted and discarded.
+///
+/// Returns `Ok(None)` at EOF with nothing read, `Ok(Some(true))` for a
+/// line within the cap, `Ok(Some(false))` for an oversized line (fully
+/// skipped, including its remainder up to the newline).
+pub fn read_capped_line<R: std::io::BufRead>(
+    reader: &mut R,
+    buf: &mut String,
+) -> std::io::Result<Option<bool>> {
+    buf.clear();
+    let mut raw: Vec<u8> = Vec::new();
+    let mut oversized = false;
+    let mut got_any = false;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(a) => a,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break; // EOF
+        }
+        got_any = true;
+        match available.iter().position(|&b| b == b'\n') {
+            Some(i) => {
+                if oversized || raw.len() + i > MAX_LINE_LEN {
+                    oversized = true;
+                } else {
+                    raw.extend_from_slice(&available[..i]);
+                }
+                reader.consume(i + 1);
+                break;
+            }
+            None => {
+                let n = available.len();
+                if raw.len() + n > MAX_LINE_LEN {
+                    oversized = true;
+                }
+                if !oversized {
+                    raw.extend_from_slice(available);
+                }
+                reader.consume(n);
+            }
+        }
+    }
+    if !got_any {
+        return Ok(None); // clean EOF: nothing was read
+    }
+    // A protocol line is JSON; lossy decoding only affects lines that were
+    // already rejected by the parser.
+    *buf = String::from_utf8_lossy(&raw).into_owned();
+    Ok(Some(!oversized))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

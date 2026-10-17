@@ -437,3 +437,64 @@ pub fn git_hash_object(repo: &Path, content: &[u8]) -> std::io::Result<String> {
 pub fn git_show(repo: &Path, sha: &str, path: &str) -> std::io::Result<Vec<u8>> {
     run_git(repo, &["show", &format!("{sha}:{path}")])
 }
+
+// ------------------------------------------------------- merge-tree
+
+/// Outcome of `git merge-tree --write-tree` between two commits.
+#[derive(Clone, Debug)]
+pub enum GitMergeTree {
+    /// Exit 0: a clean merge. `tree` is the written tree's sha.
+    Clean { tree: String },
+    /// Exit 1: conflicts. `tree` is the best-effort merged tree git
+    /// still wrote (with conflict markers in conflicted blobs);
+    /// `paths` are the conflicted paths (deduplicated by git under
+    /// `--name-only`), byte-ascending because git emits them in tree
+    /// order.
+    Conflict { tree: String, paths: Vec<String> },
+}
+
+/// `git merge-tree --write-tree -z --name-only <ours> <theirs>` — the
+/// M9 differential oracle. Exit code carries the classification (0 =
+/// clean, 1 = conflicts, anything else = a real error); stdout is
+/// `<tree-sha>` NUL, then the conflicted paths NUL-terminated, then an
+/// empty NUL-terminated token before any informational messages (which
+/// `-z` and `--name-only` suppress anyway).
+///
+/// A custom runner is needed because [`run_git`] treats any non-zero
+/// exit as an error; exit 1 is *success* for this subcommand's protocol.
+pub fn git_merge_tree(
+    repo: &Path,
+    ours: &str,
+    theirs: &str,
+) -> std::io::Result<GitMergeTree> {
+    let out = git_cmd(repo, &["merge-tree", "--write-tree", "-z", "--name-only", ours, theirs])
+        .output()?;
+    let status = out.status.code().unwrap_or(-1);
+    if status != 0 && status != 1 {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(std::io::Error::other(format!(
+            "git merge-tree failed (exit {status}): {}",
+            stderr.trim_end()
+        )));
+    }
+    // NUL-split the payload; the first token is the tree sha, the
+    // remaining tokens up to (and excluding) the trailing empty token
+    // are the conflicted paths.
+    let tokens: Vec<&[u8]> = out.stdout.split(|b| *b == 0).collect();
+    let first = tokens
+        .first()
+        .copied()
+        .unwrap_or(&[])
+        .to_vec();
+    let tree = parse_sha40(&String::from_utf8_lossy(&first))?;
+    let paths: Vec<String> = tokens[1..]
+        .iter()
+        .take_while(|t| !t.is_empty())
+        .map(|t| String::from_utf8_lossy(t).into_owned())
+        .collect();
+    if status == 0 {
+        Ok(GitMergeTree::Clean { tree })
+    } else {
+        Ok(GitMergeTree::Conflict { tree, paths })
+    }
+}
