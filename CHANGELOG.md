@@ -41,6 +41,11 @@ tags, and the verification record for a release lives in
   keep it on disk; the working-copy root and the state directory are
   never candidates; the sparse selection itself stays recorded in the
   config regardless of disk state.
+- `bed sparse list` marks selected prefixes that match nothing at the
+  current changeset (suffix ` (empty at this changeset)`), computed
+  offline from the treestate's materialized rows — a dead selection no
+  longer reads like live coverage. Recording empty selections ahead of
+  history is unchanged by design.
 
 ### Changed
 

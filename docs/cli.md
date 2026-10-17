@@ -125,6 +125,12 @@ bed sparse list                 # which prefixes this working copy materializes
 bed sparse remove tests/
 ```
 
+`sparse list` stays fully offline. A selected prefix that matches nothing
+at the current changeset is listed with the suffix
+`(empty at this changeset)` — selected ahead of history by design, it
+fills as the paths land in later changesets, but the marker keeps a dead
+selection from reading like live coverage.
+
 ### bed switch
 
 ```text
