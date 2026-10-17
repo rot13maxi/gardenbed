@@ -391,12 +391,25 @@ impl GardenbedClient {
         wire_id(&resp.id, "RebaseResp.id")
     }
 
-    /// Fast-forwards ref "main" to `cs_id`; returns the changeset "main"
-    /// now points at (v0.1.md D5).
-    pub async fn publish(&self, repo: &str, cs_id: model::Id) -> Result<model::Id, Status> {
+    /// Fast-forwards a ref to `cs_id` and returns the changeset the ref now
+    /// points at (v0.1.md D5).
+    ///
+    /// `ref_name` selects the ref (e.g. `"feature"`); `None` means `"main"`,
+    /// exactly the v0.1 request shape (the wire field is left unset).
+    /// `force` permits a non-descendant move of a non-main ref — the
+    /// deliberate rewind escape hatch.
+    pub async fn publish(
+        &self,
+        repo: &str,
+        cs_id: model::Id,
+        ref_name: Option<&str>,
+        force: bool,
+    ) -> Result<model::Id, Status> {
         let req = pb::PublishReq {
             repo: repo.to_owned(),
             cs_id: id_to_bytes(cs_id),
+            r#ref: ref_name.unwrap_or_default().to_owned(),
+            force,
         };
         let mut inner = self.inner.clone();
         let resp = inner.publish(req).await?.into_inner();

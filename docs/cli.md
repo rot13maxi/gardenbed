@@ -51,7 +51,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `diff` | diff the working copy (when dirty by modified/deleted tracked files) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
-| `publish` | fast-forward `main` to the current changeset |
+| `publish` | fast-forward a ref (default `main`) to the current changeset |
 | `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
 
@@ -295,12 +295,26 @@ bed rebase main
 Usage: bed publish [OPTIONS]
 ```
 
-Fast-forwards `main` to the current changeset (a compare-and-swap: one
+Fast-forwards a ref to the current changeset (a compare-and-swap: one
 winner per race; a loser is told the new tip).
+
+| flag | meaning |
+|---|---|
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
+| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form) |
+| `--force` | permit a non-fast-forward (rewind) move of a named ref |
+
+A named ref is the lane-agent form: agents committing off-main publish
+their branch so a fresh clone's `bed switch <branch>` resolves to the new
+tip. A lane ref gets the same rewind guard as `import`: a non-descendant
+move is refused (the error names the ref, both tips, and what falls off)
+unless `--force` is passed.
 
 ```sh
 bed publish
 # published b273e12d1c6f11ee — `main` now points to it
+bed publish --ref feat/scale-out
+# published 9d1c4b7e2a5f8d3c — `feat/scale-out` now points to it
 ```
 
 ### bed blame
