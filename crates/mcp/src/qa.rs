@@ -14,7 +14,7 @@
 //!   100% correctness required. The integration test runs both — that is
 //!   how the example is wired into CI.
 //!
-//! Every answer is computed by *composing the four tools* the way a real
+//! Every answer is computed by *composing the five tools* the way a real
 //! agent would (blame → log to attribute an author; log → diff to filter
 //! commits touching a path), never by reaching into gardenbed internals —
 //! that is what makes the suite a fair proxy for a real MCP client.

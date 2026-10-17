@@ -18,6 +18,7 @@ gardenbed-model.workspace = true
 # (`gardenbed_server::Repo`) in-process — parity with the CLI's server is
 # by construction, and the server opens with no working copy anywhere.
 gardenbed-server = { path = "../server" }
+gardenbed-derive = { path = "../derive" }
 serde_json = "1"
 # `qa` lives in the library (the integration test and the example both
 # run its scripted agent), so its fixture machinery rides here: the

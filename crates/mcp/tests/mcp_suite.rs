@@ -10,7 +10,7 @@
 //!   checked against `git diff-tree --name-status`, blame against
 //!   `git blame --first-parent`, `file` against `git show`.
 //! - **M7.2 zero-checkout** — the agent's sandbox (and the fixture tree)
-//!   contains no `.bed` directory before *or after* serving; all four
+//!   contains no `.bed` directory before *or after* serving; all five
 //!   tools answer from `--root` alone.
 //! - **M7.3 scripted QA agent** — the demo (the example's exact code
 //!   path) and the full ≥20-question canned suite pass at 100% against
@@ -150,7 +150,7 @@ fn m7_4_protocol_conformance_in_process() {
     assert_eq!(ping["id"], json!(2));
     assert_eq!(ping["result"], json!({}));
 
-    // tools/list: exactly the four tools, each with an object inputSchema;
+    // tools/list: exactly the five tools, each with an object inputSchema;
     // diff requires both sides (a headless tool has no working copy).
     let list = resp(handle_line(
         &repo,
@@ -161,7 +161,7 @@ fn m7_4_protocol_conformance_in_process() {
         .iter()
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
-    assert_eq!(names, vec!["log", "diff", "blame", "file"]);
+    assert_eq!(names, vec!["log", "diff", "blame", "file", "copies"]);
     for t in tools {
         assert_eq!(t["inputSchema"]["type"], json!("object"), "for {t}");
         assert!(t["description"].is_string(), "for {t}");
@@ -170,6 +170,8 @@ fn m7_4_protocol_conformance_in_process() {
     assert_eq!(diff["inputSchema"]["required"], json!(["a", "b"]));
     let blame = tools.iter().find(|t| t["name"] == "blame").unwrap();
     assert_eq!(blame["inputSchema"]["required"], json!(["path"]));
+    let copies = tools.iter().find(|t| t["name"] == "copies").unwrap();
+    assert_eq!(copies["inputSchema"]["required"], json!(["cs"]));
     let log = tools.iter().find(|t| t["name"] == "log").unwrap();
     assert!(log["inputSchema"]["properties"]["limit"].is_object());
 
@@ -488,6 +490,101 @@ fn m7_1_parity_with_repo_engine_and_bed() {
     let _ = mcp.shutdown().expect("server exits");
 }
 
+// ---------------------------------------------------------------- copies
+
+#[test]
+fn copies_tool_answers_json_facts_and_errors() {
+    let fixture = gardenbed_mcp::qa::qualifying_fixture(12);
+    let repo = Repo::open(&fixture.root).expect("fixture repo opens");
+
+    // In-process: every changeset's tool answer must equal the repo's own
+    // cuttings entry, rendered as JSON.
+    for (i, (cs, _sha)) in fixture.mapping.iter().enumerate() {
+        let answer = handle_line(
+            &repo,
+            &json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": "copies", "arguments": { "cs": cs.to_hex() } },
+            })
+            .to_string(),
+        );
+        let v = resp(answer);
+        assert!(v.get("error").is_none(), "copies answers at cs{i}");
+        assert!(
+            v["result"].get("isError").is_none(),
+            "copies succeeds at cs{i}"
+        );
+        let text = v["result"]["content"][0]["text"].as_str().expect("text");
+        let parsed: Value = serde_json::from_str(text).expect("copies answers JSON");
+        assert_eq!(parsed["changeset"], json!(cs.to_hex()));
+
+        let want = repo.copies(*cs).expect("repo cuttings");
+        let want_entries: Vec<Value> = want
+            .entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "path": e.path,
+                    "from": e.src,
+                    "kind": match e.kind {
+                        gardenbed_derive::CuttingKind::Rename => "rename",
+                        gardenbed_derive::CuttingKind::Copy => "copy",
+                    },
+                })
+            })
+            .collect();
+        assert_eq!(
+            parsed["entries"],
+            json!(want_entries),
+            "tool JSON == Repo::copies at cs{i}"
+        );
+    }
+
+    // The cs argument is required.
+    let answer = handle_line(
+        &repo,
+        &json!({
+            "jsonrpc": "2.0", "id": 2,
+            "method": "tools/call",
+            "params": { "name": "copies", "arguments": {} },
+        })
+        .to_string(),
+    );
+    let v = resp(answer);
+    assert_eq!(v["result"]["isError"], json!(true));
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("copies needs a \"cs\" argument"),
+        "missing-cs error names the argument and the next step"
+    );
+
+    // An unknown changeset is an isError result, protocol stays up.
+    let answer = handle_line(
+        &repo,
+        &json!({
+            "jsonrpc": "2.0", "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "copies",
+                "arguments": { "cs": "f".repeat(64) }
+            },
+        })
+        .to_string(),
+    );
+    let v = resp(answer);
+    assert_eq!(v["result"]["isError"], json!(true));
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not found"),
+        "unknown cs names the missing changeset"
+    );
+}
+
 // ---------------------------------------------------------------- M7.2 zero checkout
 
 #[test]
@@ -508,7 +605,7 @@ fn m7_2_zero_checkout_all_tools_from_root_alone() {
         McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
     mcp.handshake().expect("handshake");
 
-    // All four tools answer — with the cwd holding nothing at all.
+    // All five tools answer — with the cwd holding nothing at all.
     let log = mcp
         .call_tool("log", json!({ "limit": 2 }))
         .expect("log call");

@@ -372,6 +372,14 @@ impl Repo {
             .map_err(|e| ServerError::for_changeset(e, cs_id))
     }
 
+    /// The exact-blob copy/rename facts of `cs_id` against its first
+    /// parent (see the `cuttings` derived kind).
+    pub fn copies(&self, cs_id: Id) -> Result<gardenbed_derive::Cuttings, ServerError> {
+        self.engine
+            .cuttings_entry(cs_id)
+            .map_err(|e| ServerError::for_changeset(e, cs_id))
+    }
+
     // -------------------------------------------------------------- refs
 
     /// All refs as `(name, id)`, sorted by name.
