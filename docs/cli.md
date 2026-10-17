@@ -48,7 +48,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `status` | show local changes under selected paths |
 | `file` | print one file's content at a changeset (or the current one) |
 | `log` | show changeset history, newest first |
-| `diff` | diff two changesets (default: current vs first parent) |
+| `diff` | diff the working copy (when dirty) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
 | `publish` | fast-forward `main` to the current changeset |
@@ -204,13 +204,27 @@ bed log --cs master --limit 1
 Usage: bed diff [OPTIONS] [A] [B]
 ```
 
-Diffs two changesets (default: the current changeset vs its first
-parent). `A` is the older side; with `B` omitted, diffs `A` against its
-first parent. Both take a `<cs-or-ref>`.
+With no arguments, `bed diff` is context-aware: a **dirty** working copy
+diffs the local bytes of every modified or deleted tracked file under
+the sparse selection against the current changeset (untracked files are
+not part of it — git parity; a deleted file renders as a removal to
+`/dev/null`); a **clean** working copy diffs the current changeset
+against its first parent. With arguments, both are always changesets:
+`A` is the older side; with `B` omitted, diffs `A` against its first
+parent. Both take a `<cs-or-ref>`.
+
+Every diff prints a one-line header naming what is being diffed, so the
+two modes are distinguishable at a glance:
 
 ```sh
-bed diff                     # current changeset vs its first parent
+bed diff                     # working copy vs current changeset (dirty),
+                             # else current changeset vs its first parent
 bed diff main master
+```
+
+```text
+diff of working copy against 57169571952de2bf
+diff of 57169571952de2bf against its first parent
 ```
 
 ### bed commit

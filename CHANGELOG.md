@@ -30,6 +30,18 @@ tags, and the verification record for a release lives in
   end-to-end suite (`e2e/`) that drives a real browser through every
   page against the seeded repository.
 
+### Fixed
+
+- `bed switch` now prunes directories its removals left empty (dogfood:
+  switching off a changeset that introduced `crates/web` left the empty
+  `crates/web/{src,static,tests}` behind, so a workspace glob `crates/*`
+  matched a member with no `Cargo.toml` and `cargo check` failed). A
+  directory is pruned only when it contains nothing at all — untracked
+  or ignored content, other directories, or a sparse-selected prefix
+  keep it on disk; the working-copy root and the state directory are
+  never candidates; the sparse selection itself stays recorded in the
+  config regardless of disk state.
+
 ### Changed
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
@@ -45,6 +57,14 @@ tags, and the verification record for a release lives in
   state uses `index.sqlite3` and a `sparse` configuration field. This is a
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
+- No-argument `bed diff` is context-aware and always self-describing: a
+  dirty working copy diffs local bytes against the current changeset
+  (untracked files excluded, git parity; deleted files render as removal
+  to `/dev/null`), while a clean one keeps the current-changeset-vs-
+  first-parent diff. Both modes print a one-line header naming what is
+  being diffed (`diff of working copy against <cs>` /
+  `diff of <cs> against its first parent`); explicit `bed diff A [B]`
+  still means changesets, now with the same header line.
 
 ## [0.1.0] - 2026-10-16
 

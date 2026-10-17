@@ -995,3 +995,89 @@ async fn many_small_blobs_fit_the_unary_request_budget() {
 fn stats_get(stats: &std::collections::BTreeMap<String, u64>, key: &str) -> u64 {
     stats.get(key).copied().unwrap_or(0)
 }
+
+// ------------------------------------------------------------ diff
+
+/// No-argument `bed diff` is context-aware and always says what it
+/// diffed: a dirty working copy diffs local bytes against the current
+/// changeset; a clean one falls back to the committed current-vs-parent
+/// diff. Both modes are distinguishable at a glance by the header, and
+/// the explicit `A B` form is unchanged (its body is the pinned
+/// regression shape — only the header line is new).
+#[tokio::test]
+async fn no_arg_diff_names_working_copy_when_dirty_and_changesets_when_clean() {
+    let mut w = setup().await;
+    plant(&w);
+    // w.head is cs2: "tend the readme" modified docs/readme.md and added
+    // src/extra.rs, both against cs1.
+
+    // Clean tree: the no-arg diff is cs2 vs cs1, header names changesets.
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "{err}");
+    let cs2 = current_cs(&w.garden);
+    assert!(
+        out.starts_with(&format!(
+            "diff of {} against its first parent\n",
+            cs2.short()
+        )),
+        "header names the changeset: {out}"
+    );
+    let clean_body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(
+        clean_body.contains("docs/readme.md") && clean_body.contains("src/extra.rs"),
+        "committed diff body: {clean_body}"
+    );
+
+    // Dirty tree: the no-arg diff is the working copy against cs2, header
+    // names the working copy. Untracked files are not part of it.
+    fs::write(
+        w.garden.join("src/lib.rs"),
+        b"pub fn bed() { /* local edit */ }\n",
+    )
+    .unwrap();
+    fs::write(w.garden.join("src/untracked.rs"), b"not part of the diff\n").unwrap();
+    fs::remove_file(w.garden.join("notes/todo.txt")).unwrap();
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!("diff of working copy against {}\n", cs2.short())),
+        "header names the working copy: {out}"
+    );
+    assert!(
+        !out.contains("untracked.rs"),
+        "untracked files are not diffed: {out}"
+    );
+    let body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(
+        body.contains("diff --git a/src/lib.rs b/src/lib.rs"),
+        "edit rendered: {body}"
+    );
+    assert!(
+        body.contains("diff --git a/notes/todo.txt b/notes/todo.txt"),
+        "local deletion rendered: {body}"
+    );
+    assert!(
+        body.contains("+++ /dev/null"),
+        "deletion renders to /dev/null: {body}"
+    );
+
+    // Explicit A B form: unchanged semantics, plus the header line. The
+    // body must be byte-identical to the clean no-arg body (both are the
+    // cs1→cs2 diff).
+    let cs1 = {
+        // cs1 is the only parent of cs2.
+        w.repo
+            .get_changeset(cs2)
+            .unwrap()
+            .parents
+            .first()
+            .copied()
+            .unwrap()
+    };
+    let (code, out, err) = bed(&w.garden, &["diff", &cs1.to_hex(), &cs2.to_hex()]);
+    assert_eq!(code, 0, "{err}");
+    let explicit_body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(explicit_body, clean_body, "explicit A B body is unchanged");
+
+    w.server.shutdown().await;
+}
