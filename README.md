@@ -114,6 +114,21 @@ working copy:
 
 See [MCP configuration and tool schemas](docs/mcp.md).
 
+## Web GUI
+
+`gardenbed-web` serves a read-only web interface over the repository —
+history, refs, changeset detail, tree browsing, file view with blame, and
+diff compare — with the UI embedded in the binary:
+
+```sh
+"$BIN/gardenbed-web" --root /tmp/gardenbed-repo
+# listening on 127.0.0.1:8430
+```
+
+No working copy and no frontend build step required. A `seed` subcommand
+writes a deterministic demo repository for trying it out; the Playwright
+suite in `e2e/` verifies every page end to end. See [docs/web.md](docs/web.md).
+
 ## Current scope
 
 Gardenbed is an early implementation at version 0.1. It supports a
