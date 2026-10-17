@@ -187,7 +187,19 @@ impl PostgresMetadataStore {
                 }
             }
             if let Some(sha) = sha.as_deref() {
-                // Mapping bijection, mirroring record_git_mapping.
+                // Mapping bijection. Insert-first: under READ COMMITTED
+                // two concurrent identical writers can both see the
+                // mapping absent (a SELECT-then-INSERT race), so the
+                // insert — not the select — must be the claim; the
+                // reads then only verify. Same shape as
+                // `record_git_mapping`.
+                tx.execute(
+                    "INSERT INTO git_map(git_sha, cs) VALUES($1, $2) \
+                     ON CONFLICT DO NOTHING",
+                    &[&sha, &id.as_bytes().to_vec()],
+                )
+                .await
+                .map_err(pg_err)?;
                 let by_sha = tx
                     .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[&sha])
                     .await
@@ -217,14 +229,9 @@ impl PostgresMetadataStore {
                             existing_sha.get::<_, String>(0)
                         )));
                     }
-                    (None, None) => {
-                        tx.execute(
-                            "INSERT INTO git_map(git_sha, cs) VALUES($1, $2)",
-                            &[&sha, &id.as_bytes().to_vec()],
-                        )
-                        .await
-                        .map_err(pg_err)?;
-                    }
+                    // Unreachable: the insert above guarantees a row for
+                    // at least one of the two lookups.
+                    (None, None) => {}
                 }
             }
             for (kind, cs_id, bytes) in &derived {
@@ -449,7 +456,7 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
             // resulting row: under READ COMMITTED two concurrent identical
             // calls can both see the mapping absent (a SELECT-then-INSERT
             // race), so the insert — not the select — must be the claim.
-            // The same shape as `write_changeset`'s mapping block.
+            // `write_changeset`'s mapping block uses this same shape.
             tx.execute(
                 "INSERT INTO git_map(git_sha, cs) VALUES($1, $2) \
                  ON CONFLICT DO NOTHING",
