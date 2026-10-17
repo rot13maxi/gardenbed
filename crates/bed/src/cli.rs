@@ -131,6 +131,22 @@ pub enum Command {
         force: bool,
     },
 
+    /// Merge a changeset or ref into the current changeset (the
+    /// server-side two-parent merge). Conflicts abort listing every
+    /// conflicting path; nothing is stored until they are resolved in
+    /// the working copy.
+    Merge {
+        /// The other parent: changeset id or ref.
+        target: String,
+        /// The merge changeset's message (default: `merge <target>`).
+        #[arg(short = 'm', long, value_name = "MESSAGE")]
+        message: Option<String>,
+        /// Author as one `Name <email>` identity (default: the
+        /// GARDENBED_AUTHOR environment variable, else the working copy's own).
+        #[arg(long, value_name = "NAME <EMAIL>")]
+        author: Option<String>,
+    },
+
     /// Show first-parent line attribution, following renames.
     Blame {
         /// The file's repo-relative path.
