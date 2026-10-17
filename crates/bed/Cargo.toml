@@ -38,6 +38,8 @@ tokio = { version = "1", default-features = false, features = [
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "channel"] }
 toml = "1"
+fuser = "0.18.0"
+parking_lot = "0.12.5"
 
 # Unix only: `bed` restores the default SIGPIPE disposition at startup so
 # a closed pipe (`bed log | head`) dies silently like git, not with a
