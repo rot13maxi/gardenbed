@@ -8,9 +8,8 @@
 //! dogfood scenario: import, publish work that is ahead of git, re-import
 //! the moved-back tip.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 /// Runs `git` in `dir` with a hermetic environment, returning stdout.
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -34,42 +33,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
-        .trim()
-        .to_owned()
-}
-
-/// One `git commit-tree` with a fixed identity, message on stdin.
-fn commit_tree(dir: &Path, tree: &str, parent: Option<&str>, message: &str) -> String {
-    let mut cmd = Command::new("git");
-    cmd.current_dir(dir);
-    for (k, _) in std::env::vars_os() {
-        if k.to_string_lossy().starts_with("GIT_") {
-            cmd.env_remove(&k);
-        }
-    }
-    cmd.env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .args(["commit-tree", tree]);
-    if let Some(p) = parent {
-        cmd.args(["-p", p]);
-    }
-    cmd.env("GIT_AUTHOR_NAME", "CLI Test")
-        .env("GIT_AUTHOR_EMAIL", "cli@example.com")
-        .env("GIT_COMMITTER_NAME", "CLI Test")
-        .env("GIT_COMMITTER_EMAIL", "cli@example.com")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    let mut child = cmd.spawn().expect("commit-tree spawns");
-    child
-        .stdin
-        .as_mut()
-        .expect("stdin")
-        .write_all(message.as_bytes())
-        .expect("message");
-    let out = child.wait_with_output().expect("commit-tree output");
-    assert!(out.status.success(), "commit-tree failed");
     String::from_utf8(out.stdout)
         .expect("utf8")
         .trim()
