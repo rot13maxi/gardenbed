@@ -41,6 +41,9 @@ every commit records it and reviewers filter by author.
 - Before publishing: `cargo fmt --all && cargo clippy -p <pkg> --all-targets -- -D warnings`
 - Hit a bed bug or papercut? Report to wG:p9 (`herdr agent prompt wG:p9 "..."`) with the
   exact command + error. Fixing bed is the point of this dogfood. Don't silently work around.
+- A checkout belongs to ONE agent. Never run bed commands (switch/sparse/commit/publish) in
+  another agent's checkout — a surprise current_cs move looks exactly like data loss to the
+  owner. Coordinators verify in throwaway clones under /tmp, never in live checkouts.
 
 ## Git interop
 - All 12 git branch refs are imported; `bed switch <branch>` works
