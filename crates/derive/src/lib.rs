@@ -47,6 +47,100 @@ pub const DERIVED_SKIPLIST: &str = "skiplist";
 /// segment-skip data: bounded touched-path set + segment bloom).
 pub const DERIVED_PATHSUMMARY: &str = "pathsummary";
 
+/// One registered derived-data kind — the single registration point a
+/// kind passes through. Both eager paths iterate the registry
+/// ([`derived_kinds`]): [`Engine::on_changeset_created`] runs each `eager`
+/// hook in order, and [`Engine::derived_rows_for_validated_tree`] runs
+/// each `for_new` hook. Adding a kind is one module plus one entry in
+/// [`DERIVED_KINDS`]; no other wiring exists to miss.
+pub struct DerivedKind {
+    /// The kind tag persisted in the `derived` table.
+    pub name: &'static str,
+    /// Eagerly computes and persists this kind's entry for an
+    /// already-stored changeset (idempotent; the kind's lazy getter's
+    /// compute-and-write half doubles as this hook).
+    pub(crate) eager: fn(&Engine, Id) -> Result<(), StoreError>,
+    /// Contributes this kind's rows for a not-yet-stored changeset to the
+    /// shared [`DerivedFlow`] (batched import), in registry order.
+    pub(crate) for_new: fn(&Engine, &mut DerivedFlow<'_>) -> Result<(), StoreError>,
+}
+
+// ---------------------------------------------------------- kind hooks
+
+/// Tree eager hook: derive (or restore from a certificate) and cache.
+fn tree_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    let tree = engine.derive_tree(cs_id)?;
+    // A durable certificate can answer derive_tree without consulting
+    // derived data. Explicit eager rebuilds must still restore its tree row.
+    engine.cache_tree(cs_id, tree)
+}
+
+/// Tree batched hook: the already-replayed root is the whole payload.
+fn tree_for_new(_engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    flow.push(DERIVED_TREE, cache_payload(flow.root));
+    Ok(())
+}
+
+/// Skiplist eager hook: the lazy getter computes and persists.
+fn skiplist_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    engine.skiplist_entry(cs_id).map(|_| ())
+}
+
+/// Skiplist batched hook: the head's entry is computed for the caller to
+/// store with the changeset row (batched import), never written here.
+fn skiplist_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    let bytes = flow.segment_entry(engine)?.encode();
+    flow.push(DERIVED_SKIPLIST, bytes);
+    Ok(())
+}
+
+/// Pathsummary eager hook: the lazy getter computes and persists.
+fn pathsummary_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    engine.pathsummary_entry(cs_id).map(|_| ())
+}
+
+/// Pathsummary batched hook: consumes the skiplist kind's segment entry
+/// from the flow (computed once, shared — never recomputed).
+fn pathsummary_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    let bytes = {
+        let cs = flow.cs;
+        let seg = flow.segment_entry(engine)?;
+        pathsummary::pathsummary_entry_for_new(engine, cs, seg)?.encode()
+    };
+    flow.push(DERIVED_PATHSUMMARY, bytes);
+    Ok(())
+}
+
+/// The derived-data kind registry, in eager-write and row order: tree,
+/// skiplist, pathsummary. The order is part of the batched-import
+/// contract (the row list keeps this exact sequence); the skiplist's
+/// segment entry flows to the pathsummary through [`DerivedFlow`], so it
+/// is computed exactly once per flow.
+static DERIVED_KINDS: &[DerivedKind] = &[
+    DerivedKind {
+        name: DERIVED_TREE,
+        eager: tree_eager,
+        for_new: tree_for_new,
+    },
+    DerivedKind {
+        name: DERIVED_SKIPLIST,
+        eager: skiplist_eager,
+        for_new: skiplist_for_new,
+    },
+    DerivedKind {
+        name: DERIVED_PATHSUMMARY,
+        eager: pathsummary_eager,
+        for_new: pathsummary_for_new,
+    },
+];
+
+/// The registered derived-data kinds, in eager-write order — the order
+/// [`Engine::on_changeset_created`] writes them and
+/// [`Engine::derived_rows_for_validated_tree`] lists them.
+pub fn derived_kinds() -> &'static [DerivedKind] {
+    DERIVED_KINDS
+}
+
 /// The derived data engine over one repository's stores.
 ///
 /// Cheap to share: both stores are behind `Arc` and every method takes
@@ -558,26 +652,51 @@ impl Engine {
         cs: &Changeset,
         root: Option<Id>,
     ) -> Result<Vec<gardenbed_store::DerivedRow>, StoreError> {
-        let mut rows = Vec::with_capacity(3);
-        let tree_payload = cache_payload(root);
-        rows.push(gardenbed_store::DerivedRow {
-            kind: DERIVED_TREE.to_owned(),
-            cs: cs_id,
-            bytes: tree_payload,
+        let mut flow = DerivedFlow {
+            cs_id,
+            cs,
+            root,
+            rows: Vec::with_capacity(DERIVED_KINDS.len()),
+            segment: None,
+        };
+        for kind in DERIVED_KINDS {
+            (kind.for_new)(self, &mut flow)?;
+        }
+        Ok(flow.rows)
+    }
+}
+
+/// The shared state of one batched-import derivation: the changeset, the
+/// already-replayed root, the rows accumulated so far (registry order),
+/// and the lazily-shared skiplist segment entry (computed at most once,
+/// consumed by both the skiplist and the pathsummary kinds).
+pub(crate) struct DerivedFlow<'a> {
+    cs_id: Id,
+    cs: &'a Changeset,
+    root: Option<Id>,
+    rows: Vec<gardenbed_store::DerivedRow>,
+    segment: Option<ancestry::SegmentEntry>,
+}
+
+impl DerivedFlow<'_> {
+    /// Appends one row (registry order; the batched-import contract).
+    fn push(&mut self, kind: &str, bytes: Vec<u8>) {
+        self.rows.push(gardenbed_store::DerivedRow {
+            kind: kind.to_owned(),
+            cs: self.cs_id,
+            bytes,
         });
-        let seg = ancestry::skiplist_entry_for_new(self, cs_id, cs)?;
-        rows.push(gardenbed_store::DerivedRow {
-            kind: DERIVED_SKIPLIST.to_owned(),
-            cs: cs_id,
-            bytes: seg.encode(),
-        });
-        let summary = pathsummary::pathsummary_entry_for_new(self, cs, &seg)?;
-        rows.push(gardenbed_store::DerivedRow {
-            kind: DERIVED_PATHSUMMARY.to_owned(),
-            cs: cs_id,
-            bytes: summary.encode(),
-        });
-        Ok(rows)
+    }
+
+    /// The changeset's segment entry, computed once per flow and shared
+    /// by every kind that needs it (skiplist row + pathsummary).
+    fn segment_entry(&mut self, engine: &Engine) -> Result<&ancestry::SegmentEntry, StoreError> {
+        if self.segment.is_none() {
+            self.segment = Some(ancestry::skiplist_entry_for_new(
+                engine, self.cs_id, self.cs,
+            )?);
+        }
+        Ok(self.segment.as_ref().expect("just set"))
     }
 }
 

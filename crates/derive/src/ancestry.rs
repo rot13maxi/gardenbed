@@ -635,19 +635,17 @@ impl Engine {
     }
 
     /// Eagerly derives what should exist as soon as a changeset is created
-    /// (D3): its tree, its skip-list entry and its path summary.
+    /// (D3): every registered derived-data kind's entry (registry order:
+    /// tree, skiplist, pathsummary — see [`crate::derived_kinds`]).
     ///
     /// Idempotent and crash-safe: every step writes a deterministically
     /// recomputable cache value. Callers store the changeset first; a
     /// failure here leaves the changeset present with missing (recomputable)
     /// derived data.
     pub fn on_changeset_created(&self, cs_id: Id) -> Result<(), StoreError> {
-        let tree = self.derive_tree(cs_id)?;
-        // A durable certificate can answer derive_tree without consulting
-        // derived data. Explicit eager rebuilds must still restore its tree row.
-        self.cache_tree(cs_id, tree)?;
-        self.skiplist_entry(cs_id)?;
-        self.pathsummary_entry(cs_id)?;
+        for kind in crate::DERIVED_KINDS {
+            (kind.eager)(self, cs_id)?;
+        }
         Ok(())
     }
 }
