@@ -566,6 +566,50 @@ fn fixture_file_dir_both_changed_conflicts() {
     assert_eq!(conflicts, vec!["f/x".to_owned()]);
 }
 
+/// A directory deleted on one side and untouched inside on the other:
+/// the deletion lands cleanly (their unchanged inner files are not
+/// resurrected). Regression test: the walk once treated a None root
+/// tree as "ours deleted the subtree", spurious-conflicting theirs'
+/// root-level add against ours' emptied root (git merge-tree merges
+/// this clean).
+#[test]
+fn deleted_directory_untouched_inside_lands() {
+    let (engine, ids) = fixture(&[
+        &[("dir/a", "a\n"), ("dir/b", "b\n")],                 // base
+        &[],                                                   // ours: empties root
+        &[("dir/a", "a\n"), ("dir/b", "b\n"), ("top", "t\n")], // theirs: adds top
+    ]);
+    let changes = merged_paths(&engine, ids[0], ids[1], ids[2]).unwrap();
+    // theirs' top arrives; nothing of dir/ comes back.
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].path, "top");
+    let merged = merged_files(&engine, ids[1], &changes);
+    assert_eq!(merged.keys().collect::<Vec<_>>(), vec!["top"]);
+}
+
+/// A directory added wholesale on one side: every inner file arrives
+/// as its own change (tree merges walk to file granularity).
+/// Regression test: the adopt-theirs arm once fell through to `take`,
+/// whose blob `expect` panicked on a Dir entry (theirs adds a
+/// directory where base and ours have nothing).
+#[test]
+fn added_directory_arrives_wholesale() {
+    let (engine, ids) = fixture(&[
+        &[("keep", "k\n")],                       // base
+        &[("keep", "k\n"), ("ours-only", "o\n")], // ours
+        &[
+            ("keep", "k\n"),
+            ("dir/x", "x\n"),
+            ("dir/y", "y\n"),
+            ("dir/sub/z", "z\n"),
+        ], // theirs
+    ]);
+    let changes = merged_paths(&engine, ids[0], ids[1], ids[2]).unwrap();
+    let mut paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(paths, vec!["dir/sub/z", "dir/x", "dir/y"]);
+}
+
 #[test]
 fn fixture_unrelated_and_uptodate_at_engine_level() {
     // Two roots: no merge base representation at the engine level is
