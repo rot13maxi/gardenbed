@@ -17,9 +17,11 @@
 //!   (treated as if commented out). Re-inclusion interacts with
 //!   directory pruning and rule ordering; without it, "any match in any
 //!   active `.gitignore` means ignored" is exactly right.
-//! - **Character classes (`[…]`)** and backslash escapes other than a
-//!   leading `\#` — they parse as their literal bytes and simply never
-//!   match a path worth ignoring.
+//! - **Backslash escapes other than a leading `\#`** — a `\` inside a
+//!   pattern is taken as a literal byte, not an escape. Bracket
+//!   expressions (`[…]`, including ranges like `*.[oa]` and POSIX
+//!   `[:class:]` forms) ARE supported — [`gix_glob`]'s wildmatch
+//!   implements them with git parity.
 //! - `core.excludesFile` and `.git/info/exclude` — bed has no git
 //!   configuration to read them from.
 //!

@@ -68,8 +68,9 @@ tags, and the verification record for a release lives in
   copy (root plus one per directory walked) and hide matching untracked
   files — the dogfood gap where every cargo `target/` landed in status
   and rode into commits. Supported subset: blank lines, `#` comments,
-  trailing `/` (dir-only), `*` `?` `**` globs, and a leading `/` anchor.
-  Deliberately unsupported: `!` negation, character classes, and
+  trailing `/` (dir-only), `*` `?` `**` globs, a leading `/` anchor, and
+  bracket expressions (`[…]` character ranges like `*.[oa]` and POSIX
+  `[:class:]` forms). Deliberately unsupported: `!` negation and
   global excludes. Git semantics are kept where they matter: ignore
   never un-tracks (tracked files keep reporting changes, and tracked
   content defeats directory pruning), an ignored directory with no
@@ -77,8 +78,8 @@ tags, and the verification record for a release lives in
   stat), and untracked `.gitignore` files themselves still report.
   Matching uses `gix-glob` (already in the workspace lock via the
   `gardenbed-git` dependency). Verified against `git check-ignore`
-  behavior and by integration tests (`crates/bed/tests/gitignore.rs`)
-  against a real server process.
+  behavior (including bracket expressions) and by integration tests
+  (`crates/bed/tests/gitignore.rs`) against a real server process.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
