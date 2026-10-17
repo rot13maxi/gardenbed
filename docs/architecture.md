@@ -341,7 +341,7 @@ Unrelated histories (no merge base) fail naming the operation.
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
   unpublished, unreadable, and reaped by the next rename into that shard.
 
-## 10. Horizontal scale-out
+## 11. Horizontal scale-out
 
 The server tier scales horizontally by moving state off-box: metadata
 into PostgreSQL, objects into S3. Every replica is identical and
