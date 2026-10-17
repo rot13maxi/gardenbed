@@ -115,9 +115,26 @@ pub fn merge3(base: Option<&[u8]>, ours: Option<&[u8]>, theirs: Option<&[u8]>) -
         .collect();
     let shared_regions: Vec<Region> = ours_regions.iter().filter(|r| shared(r)).cloned().collect();
     if conflicts_with(&ours_kept, &theirs_unique) {
-        return Merge3Outcome::Conflict;
+        // XDL_MERGE_ZEALOUS post-pass (git's `xdl_refine_conflicts`,
+        // mode 4): before declaring a conflict, git re-diffs the two
+        // sides' postimage slices of each overlapping cluster; a cluster
+        // whose sides replaced the region with the SAME bytes is not a
+        // conflict — the identical change applies once. This is a
+        // strict generalization of the shared-region filter above: the
+        // spans may differ (one side's diff shaped the same replacement
+        // differently) while the replacement bytes over the cluster
+        // agree.
+        if !clusters_clean(&ours_kept, &theirs_unique) {
+            return Merge3Outcome::Conflict;
+        }
+        // Every overlapping cluster resolved to identical bytes on both
+        // sides (mode 4): fall through to the same interleave as the
+        // non-overlapping case. Git renders a mode-4 cluster with
+        // either side's postimage; over the cluster they are equal, and
+        // ours' region is what the interleave below emits.
     }
-    // Non-overlapping: interleave the region sets in base order.
+    // Non-overlapping (or zealous-resolved): interleave the region sets
+    // in base order.
     let mut all: Vec<Region> = ours_kept
         .into_iter()
         .chain(theirs_unique)
@@ -225,6 +242,38 @@ fn regions_base<'a>(base: &[&'a [u8]], side: &[&'a [u8]], diff: &xdiff::LineDiff
         });
     }
     regions
+}
+
+/// XDL_MERGE_ZEALOUS refinement of the overlapping region pairs (git's
+/// `xdl_refine_conflicts`, the mode-4 pass): a conflict cluster is
+/// resolved when both sides' replacement bytes over the cluster are
+/// record-for-record equal — the sides made the same change, just with
+/// differently-shaped base spans.
+///
+/// The comparison is per overlapping pair (a region of ours vs a region
+/// of theirs, spanning the same base lines); a cluster mixing more than
+/// one region per side always differs on at least one record (the base
+/// lines one side kept, the other replaced), which matches git's
+/// re-diff outcome for such clusters.
+fn clusters_clean(ours: &[Region], theirs: &[Region]) -> bool {
+    for o in ours {
+        for t in theirs {
+            // Overlapping or touching spans (the same predicate as
+            // `conflicts_with`).
+            if o.base_lo <= t.base_hi && t.base_lo <= o.base_hi {
+                // Both replacement runs must be non-empty to compare
+                // (git skips refining one-sided-empty changes: an empty
+                // replacement is a deletion, not a re-shaped edit).
+                if o.lines.is_empty() || t.lines.is_empty() {
+                    return false;
+                }
+                if o.lines != t.lines {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// True if any region of `a` conflicts with any region of `b` in base
