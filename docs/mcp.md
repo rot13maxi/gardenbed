@@ -1,7 +1,7 @@
 # gardenbed-mcp — the MCP surface
 
-`gardenbed-mcp` exposes repository `log`, `diff`, `blame`, and `file`
-queries over the Model Context Protocol. It opens the repository's object
+`gardenbed-mcp` exposes repository `log`, `diff`, `blame`, `file`, and
+`copies` queries over the Model Context Protocol. It opens the repository's object
 store and metadata database directly; no working copy or `.bed` directory
 is needed. Tool calls do not create changesets or update refs.
 
@@ -55,7 +55,7 @@ Hand-rolled with `serde_json` alone — no MCP SDK
 | `initialize` | `{protocolVersion, capabilities: {tools: {}}, serverInfo: {name: "gardenbed-mcp", version}}`. The client's `protocolVersion` is echoed back verbatim when present (gardenbed-mcp serves one revision and trusts the client to know it); otherwise `2025-06-18`. |
 | `notifications/initialized` | nothing — notifications are never answered |
 | `ping` | empty result `{}` |
-| `tools/list` | the four tools with JSON-Schema `inputSchema`s |
+| `tools/list` | the five tools with JSON-Schema `inputSchema`s |
 | `tools/call` | `{content: [{type: "text", text}], isError?}` |
 | anything else with an `id` | JSON-RPC error `-32601` (method not found) |
 | malformed line (not valid JSON) | JSON-RPC error `-32700` bound to `id: null`; **the server keeps serving** |
@@ -134,6 +134,29 @@ text. Content that is not valid UTF-8 is rendered **lossily**, with a
 warning on stderr (v0.1: the tool returns text blocks only — a documented
 divergence).
 
+### `copies` — `{cs}` (required)
+
+The exact-blob copy and rename facts of one changeset against its first
+parent, as JSON:
+
+```json
+{
+  "changeset": "<64-hex id>",
+  "entries": [
+    { "path": "moved.txt", "from": "a.txt", "kind": "rename" },
+    { "path": "copy/of-b.txt", "from": "b.txt", "kind": "copy" }
+  ]
+}
+```
+
+A **rename** is a changeset rename whose blob is unchanged from its source
+path's blob in the first parent's tree (a pure move). A **copy** is an
+added path whose blob already exists at another path in the first
+parent's tree; the reported source is the lexicographically smallest such
+path. A changeset with no facts answers an empty `entries` array. A
+missing `cs` argument or an unknown changeset is an `isError` result
+naming the argument and the next step.
+
 ## 4. Parity by construction
 
 The MCP tools call the same `gardenbed_server::Repo` methods the CLI's
@@ -153,9 +176,9 @@ tests pin this three ways (`crates/mcp/tests/mcp_suite.rs`):
 2. **M7.2 zero-checkout** — the suite spawns the real binary with its
    working directory an empty sandbox and asserts no `.bed` directory
    exists anywhere in the sandbox or the fixture tree, before *and*
-   after all four tools answer.
+   after all five tools answer.
 3. **M7.3 scripted QA agent** — `examples/qa_agent.rs` /
-   `crates/mcp/src/qa.rs`: an MCP client that composes the four tools the
+   `crates/mcp/src/qa.rs`: an MCP client that composes the five tools the
    way a real agent would (blame → log to attribute an author; log →
    diff to find commits touching a path) over a generated history whose
    ground truth is real git; ≥ 20 canned questions, 100% required.
@@ -177,13 +200,14 @@ cargo run -p gardenbed-mcp --example qa_agent
 | submodule pointers are described, not read (`file`) or blamed (`blame`) | the pointer is not a object store object; git errors on `git blame` for one |
 | non-UTF-8 file content renders lossily (with a stderr warning) | tools return text blocks in v0.1 |
 | `file` on a gitlink names the upstream commit, `git show` prints the raw pointer bytes | the commit is what an agent wants |
+| `copies` reports exact-blob facts only (source = smallest matching path, first parent only); git's rename/copy detection is similarity-based and searches whole commits | exact equality is deterministic and content-addressed; similarity thresholds are not reproducible derived data |
 
 ## 6. Library layout
 
 | Module | Role |
 |---|---|
 | `crates/mcp/src/protocol.rs` | wire shapes: parse, response/error rendering, JSON-RPC codes |
-| `crates/mcp/src/tools.rs` | the four tools over `gardenbed_server::Repo`, their schemas, renderers |
+| `crates/mcp/src/tools.rs` | the five tools over `gardenbed_server::Repo`, their schemas, renderers |
 | `crates/mcp/src/lib.rs` | `handle_line` — the whole server behavior in one function |
 | `crates/mcp/src/main.rs` | the binary: args, in-process `Repo`, stdin loop |
 | `crates/mcp/src/qa.rs` | the scripted agent, fixture machinery, MCP process client |
