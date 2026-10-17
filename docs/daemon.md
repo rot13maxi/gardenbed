@@ -72,7 +72,9 @@ addressing, not out of a cache-invalidation protocol.
 
 The **full Gardenbed RPC surface** (`GetTree`, `GetBlob`, `Log`, `Diff`,
 `Blame`, `CreateChangeset`, `PutBlob`, `CasRef`, `Rebase`, `Publish`, …),
-forwarded verbatim to the upstream — with two divergences:
+forwarded verbatim to the upstream — including a client's `authorization`
+metadata (an authed upstream sees the same bearer token `bed` sent) — with
+two divergences:
 
 - **`GetTree`/`GetBlob` are cache-first**: answered from the shared
   object store when present, else fetched upstream once and written
