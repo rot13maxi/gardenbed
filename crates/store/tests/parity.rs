@@ -29,15 +29,23 @@
 //! The docker compose file `tools/scale/compose.yaml` (slice B) brings
 //! up Postgres on 55432 and MinIO on 55900 with these credentials.
 
+// The parity suite exercises the `scale` backends; it is meaningless in
+// a --no-default-features build and does not compile there.
+#![cfg(feature = "scale")]
+
 mod common;
 
 use common::{id_of, sample_changeset, sample_tree};
 use gardenbed_model::Id;
+use gardenbed_model::TreeEntry;
+use gardenbed_model::TreeKind;
 use gardenbed_model::blob_id;
 use gardenbed_store::{
     DerivedRow, MetadataStore, ObjectStore, PostgresMetadataStore, RefCas, S3ObjectStore,
     StoreError,
 };
+use sha2::Digest;
+use sha2::Sha256;
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::thread;
@@ -430,8 +438,25 @@ fn assert_roundtrip(store: &dyn ObjectStore, content: &[u8]) {
     assert_eq!(store.put_blob(content).expect("re-put"), id);
 }
 
+/// A tree unique to this run — `sample_tree()` is deterministic, so its
+/// key would collide with tampered leftovers from a previous run against
+/// the same shared bucket (trees never heal, by design).
+fn run_tree() -> (gardenbed_model::Tree, Id, Vec<u8>) {
+    let (mut tree, _, _) = sample_tree();
+    let TreeEntry { blob, .. } = tree
+        .entries
+        .iter_mut()
+        .find(|e| e.kind == TreeKind::File)
+        .expect("sample tree has a file entry");
+    *blob.as_mut().expect("file entry has a blob") =
+        gardenbed_model::blob_id(&run_salt().to_le_bytes());
+    let bytes = tree.canonical_bytes().expect("tree encodes");
+    let id = Id::from_bytes(Sha256::digest(&bytes).into());
+    (tree, id, bytes)
+}
+
 fn tree_roundtrip(store: &dyn ObjectStore) {
-    let (tree, tree_id, canonical) = sample_tree();
+    let (tree, tree_id, canonical) = run_tree();
     store.put_tree(tree_id, &canonical).expect("put_tree");
     let got = store.get_tree(tree_id).expect("get_tree");
     assert_eq!(got.as_deref(), Some(canonical.as_slice()));
@@ -442,7 +467,7 @@ fn tree_roundtrip(store: &dyn ObjectStore) {
 }
 
 fn tree_hash_mismatch_rejected(store: &dyn ObjectStore) {
-    let (_tree, tree_id, _canonical) = sample_tree();
+    let (_tree, tree_id, _canonical) = run_tree();
     let wrong = format!("not the canonical bytes of {tree_id}").into_bytes();
     assert!(matches!(
         store.put_tree(tree_id, &wrong),
@@ -466,7 +491,7 @@ fn type_confusion_is_corrupt(store: &dyn ObjectStore) {
         store.get_tree(blob_id),
         Err(StoreError::Corrupt(_))
     ));
-    let (_tree, tree_id, canonical) = sample_tree();
+    let (_tree, tree_id, canonical) = run_tree();
     store.put_tree(tree_id, &canonical).expect("put_tree");
     assert!(matches!(
         store.get_blob(tree_id),
@@ -557,6 +582,49 @@ fn pg_cas_race_from_absent_ref() {
 }
 
 #[test]
+fn pg_git_mapping_concurrent_idempotence() {
+    let Some((store, _s3, tag)) = live() else {
+        eprintln!("skipping parity tests: live-service env vars are not set");
+        return;
+    };
+    let store = Arc::new(store);
+    // A fresh (sha, cs) pair per run: concurrent identical callers all
+    // race the same INSERT. The cs need not exist as a changeset row
+    // (git_map carries no FK), which keeps this a pure mapping test.
+    let salt = run_salt();
+    let sha = {
+        let mut v = [0u8; 20];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = tag_bytes(&format!("{tag}race"))
+                .wrapping_add(salt.to_le_bytes()[i % 8])
+                .wrapping_add(i as u8);
+        }
+        hex(&v)
+    };
+    let cs = id_of(0x6C1 ^ hash_tag(&tag));
+    let callers = 8;
+    let barrier = Arc::new(Barrier::new(callers));
+    let handles: Vec<_> = (0..callers)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let sha = sha.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                store.record_git_mapping(&sha, cs)
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("caller thread").expect(
+            "every concurrent identical record_git_mapping returns Ok — \
+             the SQLite backend's idempotence contract (HIGH-1 regression)",
+        );
+    }
+    assert_eq!(store.cs_for_git(&sha).unwrap(), Some(cs));
+    assert_eq!(store.git_for_cs(cs).unwrap(), Some(sha));
+}
+#[test]
 fn s3_object_parity() {
     let Some((_pg, store, _tag)) = live() else {
         eprintln!("skipping parity tests: live-service env vars are not set");
@@ -579,28 +647,145 @@ fn s3_put_same_id_with_different_bytes_is_violation() {
         eprintln!("skipping parity tests: live-service env vars are not set");
         return;
     };
-    // The S3 analogue of crafting the envelope path: seed the
-    // content-addressed key with a valid envelope of different content
-    // (bypassing the conditional put), then put the true content.
+    // Seed a conflicting object at the key the store would choose, via a
+    // second raw object_store client over the same bucket (bypassing the
+    // conditional put — the analogue of writing garbage straight to the
+    // shard directory in the fs test). Two shapes:
+    //
+    // 1. a VALID envelope of different content at a blob's key:
+    //    put_blob must refuse (ImmutabilityViolation), get_blob must
+    //    refuse to hand back the wrong bytes (Corrupt — the envelope
+    //    decodes but hashes to a different id), and the tampered object
+    //    must NOT be overwritten.
+    // 2. garbage (no valid envelope): put_blob heals it (fs.rs parity —
+    //    the caller's content hashes to the id, so overwriting restores
+    //    the invariant), and get_blob before the heal is Corrupt.
     let content = b"original content";
     let id = store.put_blob(content).expect("first put");
-    let key = format!("{}/{}", &id.to_hex()[..2], &id.to_hex()[2..]);
-    // Overwrite via a fresh unconditional path is not public API, so the
-    // violation is exercised through the store's own machinery: putting
-    // different bytes under the same *tree* id (a put_tree with the hash
-    // check passing is impossible for different bytes), plus the blob
-    // case via a second store instance over the same bucket with a
-    // pre-seeded object — here: tree path covers the semantic.
-    let _ = key;
 
-    let (_tree, tree_id, canonical) = sample_tree();
+    let raw_client = raw_s3_client();
+    let key = format!("{}/{}", &id.to_hex()[..2], &id.to_hex()[2..]);
+
+    // --- 1. valid envelope, different content ----------------------
+    let other = b"tampered but well-formed content";
+    assert_ne!(gardenbed_model::blob_id(other), id);
+    let tampered = envelope_bytes(other);
+    put_raw(&raw_client, &key, tampered.clone());
+    let refused = store.put_blob(content);
+    assert!(
+        matches!(refused, Err(StoreError::ImmutabilityViolation(_))),
+        "putting the true content over a valid conflicting envelope is a violation, got {refused:?}"
+    );
+    assert!(
+        matches!(store.get_blob(id), Err(StoreError::Corrupt(_))),
+        "the tampered object never comes back as the addressed bytes"
+    );
+    // No overwrite: the raw bytes at the key are still the tampered ones.
+    assert_eq!(get_raw(&raw_client, &key), tampered);
+
+    // --- 2. structurally corrupt bytes: heal -----------------------
+    put_raw(&raw_client, &key, b"not an envelope at all".to_vec());
+    assert!(
+        matches!(store.get_blob(id), Err(StoreError::Corrupt(_))),
+        "garbage at the key reads as Corrupt before the heal"
+    );
+    assert_eq!(
+        store.put_blob(content).expect("put over garbage heals"),
+        id,
+        "a structurally corrupt envelope is healed by the verified put"
+    );
+    assert_eq!(store.get_blob(id).unwrap().unwrap(), content);
+
+    // --- tree shape: conflicting canonical bytes at a tree key ------
+    let (_tree, tree_id, canonical) = run_tree();
     store.put_tree(tree_id, &canonical).expect("put_tree");
-    // Different bytes hashing to the same id is impossible by SHA-256,
-    // so the S3 immutability path is: put_tree rejects mismatches
-    // before any write (Invalid, above), and the conditional put
-    // guarantees different bytes can never land at one key. The blob
-    // variant needs a tampered object at the key; without raw S3 write
-    // access from the test we assert the idempotent path instead.
-    assert_eq!(store.put_blob(content).expect("identical re-put"), id);
-    assert_eq!(store.put_blob(content).expect("second re-put"), id);
+    let tree_key = format!("{}/{}", &tree_id.to_hex()[..2], &tree_id.to_hex()[2..]);
+    // Trees are bare canonical bytes (no envelope); a conflicting object
+    // at a tree key is a violation — trees never heal (`healable =
+    // false`), because there is no envelope to judge structural
+    // corruption by.
+    put_raw(&raw_client, &tree_key, b"tree tamper".to_vec());
+    assert!(
+        matches!(
+            store.put_tree(tree_id, &canonical),
+            Err(StoreError::ImmutabilityViolation(_))
+        ),
+        "trees never heal: a conflicting object at a tree key is a violation"
+    );
+    assert!(matches!(
+        store.get_tree(tree_id),
+        Err(StoreError::Corrupt(_))
+    ));
+}
+
+/// A second S3 client over the same live bucket, built from the same
+/// `GARDENBED_TEST_S3_*` env — raw access to the keys the store owns.
+fn raw_s3_client() -> Arc<dyn object_store::ObjectStore> {
+    use object_store::aws::AmazonS3Builder;
+    let endpoint = std::env::var("GARDENBED_TEST_S3_ENDPOINT").unwrap();
+    let bucket = std::env::var("GARDENBED_TEST_S3_BUCKET")
+        .or_else(|_| std::env::var("GARDENBED_TEST_BUCKET"))
+        .unwrap();
+    let mut builder = AmazonS3Builder::new()
+        .with_endpoint(&endpoint)
+        .with_bucket_name(&bucket)
+        .with_region(
+            std::env::var("GARDENBED_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
+        )
+        .with_access_key_id(std::env::var("GARDENBED_TEST_S3_ACCESS_KEY").unwrap())
+        .with_secret_access_key(std::env::var("GARDENBED_TEST_S3_SECRET_KEY").unwrap())
+        .with_allow_http(true);
+    let path_style = std::env::var("GARDENBED_TEST_S3_PATH_STYLE")
+        .map(|v| v != "false" && v != "0")
+        .unwrap_or(true);
+    builder = builder.with_virtual_hosted_style_request(!path_style);
+    Arc::new(builder.build().expect("raw client builds"))
+}
+
+/// Runs one future on a throwaway runtime — the raw client is test-side
+/// scaffolding, not store code, so a fresh runtime per call is fine.
+fn raw_block_on<T>(fut: impl Future<Output = T>) -> T {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("raw client runtime")
+        .block_on(fut)
+}
+
+/// Unconditional raw put — the tamper path the store never exposes.
+fn put_raw(client: &dyn object_store::ObjectStore, key: &str, bytes: Vec<u8>) {
+    use object_store::PutPayload;
+    raw_block_on(client.put(
+        &object_store::path::Path::from(key),
+        PutPayload::from(bytes),
+    ))
+    .expect("raw put");
+}
+
+/// Raw read of exactly what sits at the key.
+fn get_raw(client: &dyn object_store::ObjectStore, key: &str) -> Vec<u8> {
+    let bytes = raw_block_on(async {
+        client
+            .get(&object_store::path::Path::from(key))
+            .await
+            .expect("raw get")
+            .bytes()
+            .await
+            .expect("raw get body")
+    });
+    bytes.to_vec()
+}
+
+/// A valid GBLO1 envelope for `content` — the same on-disk shape the fs
+/// and S3 backends write (magic + raw_len + one zstd frame).
+fn envelope_bytes(content: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut out = Vec::new();
+    out.write_all(b"GBLO1").unwrap();
+    out.write_all(&(content.len() as u64).to_le_bytes())
+        .unwrap();
+    let mut encoder = zstd::Encoder::new(Vec::new(), 3).unwrap();
+    encoder.write_all(content).unwrap();
+    out.write_all(&encoder.finish().unwrap()).unwrap();
+    out
 }

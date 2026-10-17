@@ -72,7 +72,9 @@ services:
         condition: service_healthy
       createbuckets:
         condition: service_completed_successfully
-    command: ["serve", "--storage", "/etc/gardenbed/storage.toml"]
+    # Bind all interfaces: docker-proxy dials the container's IP, so the
+    # default 127.0.0.1:9418 would refuse published-port traffic.
+    command: ["serve", "--addr", "0.0.0.0:9418", "--storage", "/etc/gardenbed/storage.toml"]
     volumes:
       - ./storage.toml:/etc/gardenbed/storage.toml:ro
     deploy:
