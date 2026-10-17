@@ -7,7 +7,7 @@ documented here with a repro. Silent disagreement is a release blocker.
 Each entry states what happens, why, what it costs, and how to reproduce
 it. Anything *not* on this list must round-trip exactly: unsigned git
 history imports, exports, and re-imports with byte-identical commit SHAs
-(verified in `crates/rootstock/tests/export.rs`).
+(verified in `crates/git/tests/export.rs`).
 
 ---
 
@@ -54,7 +54,7 @@ Import `sigrepo` (the changeset's `signature` is captured), export it back
 to git: `signed_dropped == 1`, the exported commit's SHA differs from
 `$SHA`, and `git cat-file` on it shows no `gpgsig` header while the tree
 matches. Covered by `signed_commits_drop_their_signature` in
-`crates/rootstock/tests/export.rs`.
+`crates/git/tests/export.rs`.
 
 ## 2. Non-UTF-8 commit bytes are transcoded lossily
 
@@ -94,7 +94,7 @@ commit has no `encoding` header.
 
 **What:** very old git (April 2005, around the "new git world order"
 re-import of the linux history) wrote regular-file tree entries with the
-group-writable mode `100664`. gardenbed's mode table has no `664`: the
+group-writable mode `100664`. Gardenbed's mode table has no `664`: the
 importer canonicalizes any `100xxxx` blob entry by its exec bit —
 `100664` and `100644` both import as `Mode::Regular` (the rule the tree
 parser has always applied). Commits that **only** normalize such modes
@@ -102,13 +102,13 @@ parser has always applied). Commits that **only** normalize such modes
 own diff machinery: `canon_mode` collapses `100664` ≡ `100644` before
 comparing, so `git diff-tree -r --name-status` — and even `--raw` —
 prints nothing for them. The importer therefore classifies these commits
-with a raw, mode-aware tree comparison (`rootstock`'s
+with a raw, mode-aware tree comparison (`git`'s
 `raw_first_parent_diff`): a pure mode fixup becomes a **zero-change
 changeset** inheriting the parent tree; content changes under those
 modes and structural changes come out exactly as git would shape them;
 no renames are invented.
 
-**Cost:** for pre-canonical history, gardenbed's derived tree ids differ
+**Cost:** for pre-canonical history, Gardenbed's derived tree ids differ
 from git's raw tree SHAs **by construction** — ours are canonical, git's
 carry the historical mode bytes. Tree-level comparisons for such commits
 (`git cat-file` on tree objects, non-recursive raw diffs) must normalize
@@ -130,7 +130,7 @@ change the wire format for a mode that disappeared from git twenty years
 ago. Documented and handled explicitly (fallback, never a silent skip).
 
 **Repro:** `pre_canonical_100664_mode_fixups_import_via_raw_fallback` in
-`crates/rootstock/tests/edgecases.rs` — hand-crafted trees via
+`crates/git/tests/edgecases.rs` — hand-crafted trees via
 `git hash-object -t tree -w --stdin --literally` (modern git fsck-checks
 fresh tree objects and refuses `100664` without the flag; objects that
 already contain the mode are accepted by plain `git fsck`, warning only).
@@ -144,7 +144,7 @@ diffing each first-parent step with the store's own minimal diff. git's
 xdiff applies additional hunk-placement heuristics (indent heuristic,
 compaction). When a commit inserts a block next to a blank line, the two
 diffs are both minimal but place the blank on opposite sides of the hunk:
-xdiff appends the inserted blank *after* the block, gardenbed's diff keeps
+xdiff appends the inserted blank *after* the block, Gardenbed's diff keeps
 the pre-existing blank where it was and inserts the block before it. For
 the file's *content* the two encodings are identical; for *attribution*,
 an identical blank line may be blamed on a different (equally valid)
@@ -180,11 +180,11 @@ and `A` letters there too.
 `git diff-tree -M` on the QA regression pass's rename pairs, entry
 counts differ (1,318 vs 1,321 and 4,794 vs 5,128 entries), and
 `grep '^rename from '` over `bed diff` output finds 0 hits, so review
-tooling (or a human) diffing bed's output against rename-aware git sees
+tooling (or a human) diffing working copy's output against rename-aware git sees
 a different shape for every moved file. What is *not* affected: the
 trees and the changesets — imported changesets record renames as git's
 own `-M` detection reported them (the D8 import mechanism,
-`docs/v0.1.md` §3), `sow` pairs a pure rename — a deleted path and an
+`docs/v0.1.md` §3), `commit` pairs a pure rename — a deleted path and an
 added path with the identical blob id — into one canonical `Op::Rename`
 carrying `src_path` (op `3 rename` in the canonical encoding spec's
 `change` table, `docs/canonical-encoding.md`), and patches built from
@@ -198,11 +198,11 @@ v0.1 — the diff parity contract was written against `--no-renames` from
 the start. Import-level rename detection is a separate mechanism (D8)
 and does exist; only the render level lacks it. The fix is render-local:
 pair identical-blob delete + add entries at render time (the
-deterministic rule `sow` already applies), or reuse the changeset's
+deterministic rule `commit` already applies), or reuse the changeset's
 recorded `Rename` ops for changeset-scoped diffs instead of re-deriving
 from trees — a v0.2 candidate.
 
-**Repro:** sow a pure rename (or import a history containing one) and
+**Repro:** commit a pure rename (or import a history containing one) and
 run `bed diff <cs>` — that changeset against its first parent. The old
 path renders as a `deleted file mode` block and the new path as a
 `new file mode` block, while `git diff-tree -M --name-status` on the
@@ -241,8 +241,8 @@ byte-identical trees **and identical commit SHAs** — commit objects
 encode no diff information, so the change shape below a commit is
 invisible to git's identity:
 
-* **Rename vs. delete+add.** The generator sows pure renames (identical
-  blob id) as one `Rename`; moved-and-edited files sow as a delete+add
+* **Rename vs. delete+add.** The generator commits pure renames (identical
+  blob id) as one `Rename`; moved-and-edited files commit as a delete+add
   pair (no similarity heuristic). Import keeps git's `-M` renames;
   export emits fast-import `M` + `D` for a rename, never `R`. All three
   shapes build the same tree and the same commit SHA.

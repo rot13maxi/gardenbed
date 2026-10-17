@@ -19,7 +19,7 @@ use gardenbed_harness::{GenOptions, files_at, generate, git_blame_first_parent, 
 use gardenbed_model::{Id, Mode};
 use gardenbed_store::{MemoryStore, ObjectStore, StoreError};
 
-/// Fresh in-memory stores (loam + seedbed) for one history.
+/// Fresh in-memory stores (objects + metadata) for one history.
 fn fresh_stores() -> (
     Arc<dyn ObjectStore>,
     Arc<dyn gardenbed_store::MetadataStore>,

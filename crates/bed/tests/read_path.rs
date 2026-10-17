@@ -1,6 +1,6 @@
-//! The M4 read path, end to end against a real arboretum: byte fidelity
+//! The M4 read path, end to end against a real server: byte fidelity
 //! (incl. symlinks, exec bits, submodule pointers), `log`/`diff` parity
-//! with git as the oracle, sparse plots, goto, idempotent reruns, and the
+//! with git as the oracle, sparse sparses, switch, idempotent reruns, and the
 //! offline failure contract (validate + connect before any local write).
 //!
 //! Each test spawns the real `gardenbed-server` binary and ingests a
@@ -24,17 +24,17 @@ use gardenbed_harness::oracle;
 use gardenbed_model::{Id, Mode};
 use tempfile::TempDir;
 
-use common::{Arboretum, bed, bed_raw};
+use common::{Server, bed, bed_raw};
 
-/// One running arboretum with an ingested synthetic history, a git
+/// One running server with an ingested synthetic history, a git
 /// materialization of the same history (the oracle), and a garden the
 /// tests plant beds in.
 struct Garden {
-    /// Temp root holding the arboretum, the git oracle, and the garden.
+    /// Temp root holding the server, the git oracle, and the repository.
     _dir: TempDir,
     /// The garden: bed commands run here; working files live here.
     garden: PathBuf,
-    server: Arboretum,
+    server: Server,
     history: GeneratedHistory,
     /// `(changeset id, git sha)` aligned with `history.changesets`.
     mapping: Vec<(Id, String)>,
@@ -43,7 +43,7 @@ struct Garden {
 }
 
 impl Garden {
-    fn bed_dir(&self) -> PathBuf {
+    fn state_dir(&self) -> PathBuf {
         self.garden.join(".bed")
     }
     fn cs_id(&self, index: usize) -> Id {
@@ -87,14 +87,14 @@ async fn setup() -> Garden {
 
 async fn setup_with(history: GeneratedHistory) -> Garden {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arboretum_root = dir.path().join("arboretum");
+    let server_root = dir.path().join("server");
     let git_repo = dir.path().join("git-oracle");
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir created");
-    let head = common::ingest(&history, &arboretum_root);
+    let head = common::ingest(&history, &server_root);
     let materialized = materialize(&history, &git_repo).expect("git oracle materializes");
     assert_eq!(materialized.mapping.last().map(|(id, _)| *id), Some(head));
-    let server = Arboretum::spawn(&arboretum_root).await;
+    let server = Server::spawn(&server_root).await;
     Garden {
         _dir: dir,
         garden,
@@ -105,7 +105,7 @@ async fn setup_with(history: GeneratedHistory) -> Garden {
     }
 }
 
-/// The working-copy files the plot should hold at `index`, as
+/// The working-copy files the sparse selection should hold at `index`, as
 /// `path → (blob content, mode)`.
 fn expected_files(history: &GeneratedHistory, index: usize) -> BTreeMap<String, (Vec<u8>, Mode)> {
     files_at(history, index)
@@ -120,7 +120,7 @@ fn expected_files(history: &GeneratedHistory, index: usize) -> BTreeMap<String, 
         .collect()
 }
 
-/// A plot prefix guaranteed to own at least one file at `index`.
+/// A sparse prefix guaranteed to own at least one file at `index`.
 fn some_prefix(history: &GeneratedHistory, index: usize) -> String {
     for path in files_at(history, index).keys() {
         if let Some((dir, _)) = path.rsplit_once('/') {
@@ -131,7 +131,7 @@ fn some_prefix(history: &GeneratedHistory, index: usize) -> String {
 }
 
 /// Relative paths of all entries (files, symlinks) under `root`, excluding
-/// the bed itself (`.bed` is pruned wherever it appears).
+/// the working copy itself (`.bed` is pruned wherever it appears).
 fn files_under(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, rel: &str, out: &mut Vec<String>) {
         for entry in fs::read_dir(dir).unwrap() {
@@ -170,18 +170,21 @@ async fn clone_plants_layout_and_materializes_nothing() {
     let mut g = setup().await;
     let (code, out, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("planted a bed for garden"), "out: {out}");
-    assert!(out.contains("materialized nothing"), "out: {out}");
+    assert!(
+        out.contains("created working copy for default"),
+        "out: {out}"
+    );
+    assert!(out.contains("no files materialized"), "out: {out}");
 
-    // The full layout exists; the garden grows from main's changeset.
-    let bed_dir = g.bed_dir();
-    assert!(bed_dir.join("config.toml").is_file());
-    assert!(bed_dir.join("treestate").is_file());
-    assert!(bed_dir.join("objects").is_dir());
-    assert!(bed_dir.join("heads").is_file());
+    // The full layout exists; current changeset: main's changeset.
+    let state_dir = g.state_dir();
+    assert!(state_dir.join("config.toml").is_file());
+    assert!(state_dir.join("index.sqlite3").is_file());
+    assert!(state_dir.join("objects").is_dir());
+    assert!(state_dir.join("heads").is_file());
 
     let head = g.cs_hex(g.head_index());
-    let config = fs::read_to_string(bed_dir.join("config.toml")).unwrap();
+    let config = fs::read_to_string(state_dir.join("config.toml")).unwrap();
     assert!(
         config.contains(&format!("current_cs = \"{head}\"")),
         "config: {config}"
@@ -191,10 +194,10 @@ async fn clone_plants_layout_and_materializes_nothing() {
         "config: {config}"
     );
 
-    let heads = fs::read_to_string(bed_dir.join("heads")).unwrap();
+    let heads = fs::read_to_string(state_dir.join("heads")).unwrap();
     assert_eq!(heads.trim(), head, "heads records the tip");
 
-    // Nothing materialized, no plot, and status says so.
+    // Nothing materialized, no sparse, and status says so.
     assert!(
         files_under(&g.garden).is_empty(),
         "files: {:?}",
@@ -202,18 +205,18 @@ async fn clone_plants_layout_and_materializes_nothing() {
     );
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is empty"), "out: {out}");
+    assert!(out.contains("no sparse paths selected"), "out: {out}");
 
     g.server.shutdown().await;
 }
 
 #[tokio::test]
-async fn clone_with_a_refless_arboretum_leaves_zero_state() {
+async fn clone_with_a_refless_server_leaves_zero_state() {
     // A server over a fresh root: no repo, no refs.
     let dir = tempfile::tempdir().unwrap();
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).unwrap();
-    let mut server = Arboretum::spawn(&dir.path().join("arboretum")).await;
+    let mut server = Server::spawn(&dir.path().join("server")).await;
 
     let (code, _, stderr) = bed(&garden, &["clone", &server.http()]);
     assert_eq!(code, 1);
@@ -223,10 +226,7 @@ async fn clone_with_a_refless_arboretum_leaves_zero_state() {
         stderr.contains("no ref main (tried main, master, trunk); pass --ref\n"),
         "stderr: {stderr}"
     );
-    assert!(
-        !stderr.contains("the arboretum has refs"),
-        "stderr: {stderr}"
-    );
+    assert!(!stderr.contains("the server has refs"), "stderr: {stderr}");
     assert!(!garden.join(".bed").exists(), "no bed may be planted");
 
     // An unknown repo is the same story.
@@ -249,7 +249,7 @@ async fn clone_with_a_refless_arboretum_leaves_zero_state() {
 fn assert_fidelity(g: &Garden, index: usize) {
     let expected = expected_files(&g.history, index);
     let ids = files_at(&g.history, index);
-    let ts = gardenbed::bed::Bed::open(&g.bed_dir())
+    let ts = gardenbed::workspace::WorkingCopy::open(&g.state_dir())
         .unwrap()
         .treestate()
         .unwrap();
@@ -292,7 +292,7 @@ fn assert_fidelity(g: &Garden, index: usize) {
             }
         }
 
-        // The treestate row records exactly what was planted.
+        // The treestate row records exactly what was initialized.
         let row = ts
             .lookup(path)
             .expect("treestate lookup works")
@@ -313,27 +313,27 @@ fn assert_fidelity(g: &Garden, index: usize) {
         .map(|(path, _)| path.clone())
         .collect();
     let on_disk = files_under(&g.garden);
-    assert_eq!(on_disk, tracked, "the garden holds exactly the plot");
+    assert_eq!(on_disk, tracked, "the repository holds exactly the sparse");
 
     assert_eq!(ts.count().unwrap() as usize, expected.len(), "row count");
 
     let (code, out, stderr) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
     let (code, out, _) = bed(&g.garden, &["status", "--full-scan"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 }
 
 #[tokio::test]
-async fn plot_add_dot_materializes_everything_faithfully() {
+async fn sparse_add_dot_materializes_everything_faithfully() {
     let mut g = setup().await;
     let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    let (code, out, stderr) = bed(&g.garden, &["plot", "add", "."]);
+    let (code, out, stderr) = bed(&g.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("plotted ."), "out: {out}");
+    assert!(out.contains("selected ."), "out: {out}");
     assert!(out.contains("materialized"), "out: {out}");
 
     assert_fidelity(&g, g.head_index());
@@ -355,15 +355,15 @@ async fn plot_add_dot_materializes_everything_faithfully() {
 }
 
 #[tokio::test]
-async fn sparse_plot_materializes_only_its_prefix() {
+async fn sparse_sparse_materializes_only_its_prefix() {
     let mut g = setup().await;
     let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let prefix = some_prefix(&g.history, g.head_index());
-    let (code, out, stderr) = bed(&g.garden, &["plot", "add", &prefix]);
+    let (code, out, stderr) = bed(&g.garden, &["sparse", "add", &prefix]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains(&format!("plotted {prefix}")), "out: {out}");
+    assert!(out.contains(&format!("selected {prefix}")), "out: {out}");
 
     // Only the prefix's files are on disk; status is clean.
     let expected = expected_files(&g.history, g.head_index());
@@ -377,16 +377,16 @@ async fn sparse_plot_materializes_only_its_prefix() {
 
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
     // A prefix that names nothing in the tree is allowed to plant ahead:
     // recorded, materialized as nothing, still clean.
-    let (code, out, _) = bed(&g.garden, &["plot", "add", "future/rows"]);
+    let (code, out, _) = bed(&g.garden, &["sparse", "add", "future/rows"]);
     assert_eq!(code, 0, "{out}");
-    assert!(out.contains("plotted future/rows"), "out: {out}");
+    assert!(out.contains("selected future/rows"), "out: {out}");
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
     g.server.shutdown().await;
 }
@@ -458,13 +458,10 @@ async fn file_serves_bytes_symlinks_and_refuses_gitlinks() {
     assert_eq!(code, 1);
     assert!(stderr.contains("no file at"), "stderr: {stderr}");
 
-    // A changeset id that is not on the arboretum is refused cleanly.
+    // A changeset id that is not on the server is refused cleanly.
     let (code, _, stderr) = bed(&g.garden, &["file", &plain_path, "--cs", &"ab".repeat(32)]);
     assert_eq!(code, 1);
-    assert!(
-        stderr.contains("is not on the arboretum"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("is not on the server"), "stderr: {stderr}");
 
     g.server.shutdown().await;
 }
@@ -473,7 +470,7 @@ async fn file_serves_bytes_symlinks_and_refuses_gitlinks() {
 
 /// Builds the exact `bed log` output git's log implies: the server's
 /// date-ordered walk should reproduce git's order, identities and
-/// messages, and bed's renderer (unit-tested) shapes them.
+/// messages, and working copy's renderer (unit-tested) shapes them.
 fn expected_log(g: &Garden, rev_index: usize, limit: usize) -> String {
     let sha_to_index: HashMap<&str, usize> = g
         .mapping
@@ -535,7 +532,7 @@ async fn log_matches_git_on_two_histories() {
 
 // ----------------------------------------------------------- diff (M4.2)
 
-/// Parses bed's rendered diff into git `--name-status` shape: `(letter,
+/// Parses working copy's rendered diff into git `--name-status` shape: `(letter,
 /// path)`. The letter is derived from the header lines: `new file mode` →
 /// A, `deleted file mode` → D, otherwise old/new mode lines that change
 /// the entry *type* → T, else M.
@@ -694,24 +691,24 @@ async fn diff_matches_git_name_status_over_many_pairs() {
     g.server.shutdown().await;
 }
 
-// ------------------------------------------------------------ goto
+// ------------------------------------------------------------ switch
 
 #[tokio::test]
-async fn goto_moves_the_bed_and_status_stays_clean() {
+async fn switch_moves_the_bed_and_status_stays_clean() {
     let mut g = setup().await;
     let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let prefix = some_prefix(&g.history, g.head_index());
-    let (code, out, stderr) = bed(&g.garden, &["plot", "add", &prefix]);
+    let (code, out, stderr) = bed(&g.garden, &["sparse", "add", &prefix]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains(&format!("plotted {prefix}")), "out: {out}");
+    assert!(out.contains(&format!("selected {prefix}")), "out: {out}");
     let head = g.head_index();
 
-    // Move to an older changeset: the plot is refreshed to match it.
+    // Move to an older changeset: the sparse selection is refreshed to match it.
     let older = head / 2;
-    let (code, out, stderr) = bed(&g.garden, &["goto", &g.cs_hex(older)]);
+    let (code, out, stderr) = bed(&g.garden, &["switch", &g.cs_hex(older)]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("grows from"), "out: {out}");
+    assert!(out.contains("working copy at"), "out: {out}");
 
     let want: Vec<String> = expected_files(&g.history, older)
         .into_iter()
@@ -721,19 +718,19 @@ async fn goto_moves_the_bed_and_status_stays_clean() {
     assert_eq!(
         files_under(&g.garden),
         want,
-        "the plot matches the older changeset"
+        "the sparse matches the older changeset"
     );
-    let config = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
+    let config = fs::read_to_string(g.state_dir().join("config.toml")).unwrap();
     assert!(
         config.contains(&format!("current_cs = \"{}\"", g.cs_hex(older))),
         "config: {config}"
     );
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
     // Refs work; going back to main restores the head state.
-    let (code, _, stderr) = bed(&g.garden, &["goto", "main"]);
+    let (code, _, stderr) = bed(&g.garden, &["switch", "main"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let want: Vec<String> = expected_files(&g.history, head)
         .into_iter()
@@ -743,23 +740,20 @@ async fn goto_moves_the_bed_and_status_stays_clean() {
     assert_eq!(files_under(&g.garden), want, "back at the head changeset");
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
-    // A failing goto (unknown ref) moves nothing.
-    let config_before = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
-    let (code, _, stderr) = bed(&g.garden, &["goto", "no-such-ref"]);
+    // A failing switch (unknown ref) moves nothing.
+    let config_before = fs::read_to_string(g.state_dir().join("config.toml")).unwrap();
+    let (code, _, stderr) = bed(&g.garden, &["switch", "no-such-ref"]);
     assert_eq!(code, 1);
     assert!(stderr.contains("no ref"), "stderr: {stderr}");
-    let config_after = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
-    assert_eq!(config_before, config_after, "a failed goto moves nothing");
+    let config_after = fs::read_to_string(g.state_dir().join("config.toml")).unwrap();
+    assert_eq!(config_before, config_after, "a failed switch moves nothing");
 
-    // An id that is not on the arboretum too.
-    let (code, _, stderr) = bed(&g.garden, &["goto", &"cd".repeat(32)]);
+    // An id that is not on the server too.
+    let (code, _, stderr) = bed(&g.garden, &["switch", &"cd".repeat(32)]);
     assert_eq!(code, 1);
-    assert!(
-        stderr.contains("is not on the arboretum"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("is not on the server"), "stderr: {stderr}");
 
     g.server.shutdown().await;
 }
@@ -767,14 +761,14 @@ async fn goto_moves_the_bed_and_status_stays_clean() {
 // ------------------------------------------------------- idempotence
 
 #[tokio::test]
-async fn reruns_fetch_nothing_and_leave_the_plot_faithful() {
+async fn reruns_fetch_nothing_and_leave_the_sparse_faithful() {
     let mut g = setup().await;
     let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let client = g.server.client().await;
     let (t0, b0) = g.server.counted(&client).await;
 
-    let (code, out, stderr) = bed(&g.garden, &["plot", "add", "."]);
+    let (code, out, stderr) = bed(&g.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(out.contains("fetched"), "out: {out}");
     let (t1, b1) = g.server.counted(&client).await;
@@ -786,21 +780,21 @@ async fn reruns_fetch_nothing_and_leave_the_plot_faithful() {
         "first fetch pulls exactly the want-list"
     );
 
-    // Re-adding the whole plot: cache-first fetch pulls zero, files kept.
-    let (code, out, stderr) = bed(&g.garden, &["plot", "add", "."]);
+    // Re-adding the whole sparse: cache-first fetch pulls zero, files kept.
+    let (code, out, stderr) = bed(&g.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(out.contains("0 tree(s) and 0 blob(s)"), "out: {out}");
     let (t2, b2) = g.server.counted(&client).await;
     assert_eq!((t2, b2), (t1, b1), "the rerun fetched nothing");
 
-    // A goto to where the bed already stands costs nothing either.
-    let (code, out, stderr) = bed(&g.garden, &["goto", "main"]);
+    // A switch to where the working copy already stands costs nothing either.
+    let (code, out, stderr) = bed(&g.garden, &["switch", "main"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(out.contains("fetched 0 tree(s), 0 blob(s)"), "out: {out}");
     let (t3, b3) = g.server.counted(&client).await;
-    assert_eq!((t3, b3), (t1, b1), "goto fetched nothing");
+    assert_eq!((t3, b3), (t1, b1), "switch fetched nothing");
 
-    // And the garden is still exactly right.
+    // And the working copy is still exactly right.
     assert_fidelity(&g, g.head_index());
 
     g.server.shutdown().await;
@@ -814,13 +808,13 @@ async fn server_down_fails_cleanly_never_half_states() {
     let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let prefix = some_prefix(&g.history, g.head_index());
-    let (code, _, stderr) = bed(&g.garden, &["plot", "add", &prefix]);
+    let (code, _, stderr) = bed(&g.garden, &["sparse", "add", &prefix]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     g.server.shutdown().await;
 
-    let config_before = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
-    let ts = gardenbed::bed::Bed::open(&g.bed_dir())
+    let config_before = fs::read_to_string(g.state_dir().join("config.toml")).unwrap();
+    let ts = gardenbed::workspace::WorkingCopy::open(&g.state_dir())
         .unwrap()
         .treestate()
         .unwrap();
@@ -830,13 +824,13 @@ async fn server_down_fails_cleanly_never_half_states() {
     // status works fully offline.
     let (code, out, _) = bed(&g.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
     // Server-backed commands fail with the connect error and leave
     // everything exactly as it stood.
     let cases: &[&[&str]] = &[
-        &["goto", "main"],
-        &["plot", "add", "another/dir"],
+        &["switch", "main"],
+        &["sparse", "add", "another/dir"],
         &["file", &prefix],
         &["log"],
         &["diff"],
@@ -845,12 +839,12 @@ async fn server_down_fails_cleanly_never_half_states() {
         let (code, stdout, stderr) = bed(&g.garden, args);
         assert_eq!(code, 1, "args {args:?}: stdout {stdout:?}");
         assert!(
-            stderr.contains("cannot reach the arboretum"),
+            stderr.contains("cannot reach the server"),
             "args {args:?}: stderr {stderr:?}"
         );
     }
 
-    let config_after = fs::read_to_string(g.bed_dir().join("config.toml")).unwrap();
+    let config_after = fs::read_to_string(g.state_dir().join("config.toml")).unwrap();
     assert_eq!(config_before, config_after, "config untouched");
     assert_eq!(rows_before, ts.count().unwrap(), "treestate untouched");
     assert_eq!(

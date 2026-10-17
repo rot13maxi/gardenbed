@@ -121,7 +121,7 @@ format, version, zero parents, zero changes, empty message, empty author
 `changeset-root-empty.hex` is this payload, and `changeset-root-empty.id`
 its SHA-256.
 
-## 6. Stored object envelope (loam) — informative
+## 6. Stored object envelope (objects) — informative
 
 On disk, blobs are stored under their `Blob::id` as:
 `"GBLO1"` magic (5 bytes), `raw_len:u64` little-endian, one zstd frame of

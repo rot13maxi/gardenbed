@@ -857,12 +857,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "gardenbed-daemon"
+version = "0.1.0"
+
+[[package]]
 name = "gardenbed-derive"
 version = "0.1.0"
 dependencies = [
  "gardenbed-harness",
  "gardenbed-model",
  "gardenbed-store",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
+name = "gardenbed-git"
+version = "0.1.0"
+dependencies = [
+ "gardenbed-derive",
+ "gardenbed-harness",
+ "gardenbed-model",
+ "gardenbed-store",
+ "gix",
+ "log",
+ "rusqlite",
+ "sha2",
  "tempfile",
  "thiserror",
 ]
@@ -915,36 +935,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "gardenbed-rootstock"
-version = "0.1.0"
-dependencies = [
- "gardenbed-derive",
- "gardenbed-harness",
- "gardenbed-model",
- "gardenbed-store",
- "gix",
- "log",
- "rusqlite",
- "sha2",
- "tempfile",
- "thiserror",
-]
-
-[[package]]
-name = "gardenbed-scarecrow"
-version = "0.1.0"
-
-[[package]]
 name = "gardenbed-server"
 version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
  "gardenbed-derive",
+ "gardenbed-git",
  "gardenbed-harness",
  "gardenbed-model",
  "gardenbed-protocol",
- "gardenbed-rootstock",
  "gardenbed-store",
  "log",
  "prost",

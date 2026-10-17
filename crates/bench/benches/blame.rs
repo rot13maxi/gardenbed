@@ -1,7 +1,7 @@
 //! `bed blame <path>` — the engine's first-parent lineage blame (D7),
 //! measured through the server library (`Repo::blame`, the exact walk the
 //! gRPC `Blame` handler runs; the wire and rendering costs ride on top and
-//! are covered by bed's read-path budgets).
+//! are covered by working copy's read-path budgets).
 //!
 //! The fixture is a first-parent chain of `GARDENBED_BENCH_BLAME_COMMITS`
 //! (default 100k) changesets, each rewriting `log/tip.txt`'s first line —
@@ -83,7 +83,7 @@ fn build_blame_chain(root: &std::path::Path, n: usize) -> Vec<gardenbed_model::I
 fn bench_blame(c: &mut Criterion) {
     let n = world::env_usize("GARDENBED_BENCH_BLAME_COMMITS", 100_000, 10_000);
     let dir = world::temp_root();
-    let root = dir.path().join("arboretum");
+    let root = dir.path().join("server");
     let t0 = Instant::now();
     let ids = build_blame_chain(&root, n);
     println!(

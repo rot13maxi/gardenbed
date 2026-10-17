@@ -239,7 +239,7 @@ pub(crate) fn parse_diff_tree_z(out: &[u8]) -> std::io::Result<Vec<DiffEntry>> {
 
 /// `git diff-tree` of one commit against its first parent (root commits
 /// diff against the empty tree via `--root`; merges diff against the
-/// first parent via `--diff-merges=first-parent`, matching gardenbed's
+/// first parent via `--diff-merges=first-parent`, matching Gardenbed's
 /// changeset semantics). With `detect_renames`, rename/copy detection
 /// (`-M`) is on and `R`/`C` entries carry `src_path`.
 pub fn git_diff_tree(

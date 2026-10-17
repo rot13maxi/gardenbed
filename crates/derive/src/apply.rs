@@ -1,6 +1,6 @@
 //! Incremental tree application ("only touched directories are re-created").
 //!
-//! A [`WorkingSet`] opens (loads from loam) only the directories a change
+//! A [`WorkingSet`] opens (loads from objects) only the directories a change
 //! touches. Untouched subtrees stay as opaque tree ids in their parent's
 //! entry and are never loaded or re-encoded, so both reads and writes scale
 //! with the change, not the repo. Content addressing does the rest: an

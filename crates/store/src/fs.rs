@@ -1,4 +1,4 @@
-//! `loam` — the filesystem content-addressed object store.
+//! `objects` — the filesystem content-addressed object store.
 //!
 //! Layout under the store root (2-level sharding by lowercase hex id):
 //!
@@ -59,7 +59,7 @@ const ZSTD_LEVEL: i32 = 3;
 /// Process-unique counter so concurrent tmp writes never collide.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// The filesystem (loam) object store.
+/// The filesystem (objects) object store.
 ///
 /// Durability: writes are fully fsynced by default. `GARDENBED_FSYNC=off`
 /// (read once at [`FsObjectStore::open`]) relaxes durability to
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn envelope_roundtrips_and_verifies() {
-        let content = b"loam is the good earth";
+        let content = b"stored object contents";
         let id = blob_id(content);
         let env = encode_envelope(content).unwrap();
         assert_eq!(&env[..5], b"GBLO1");

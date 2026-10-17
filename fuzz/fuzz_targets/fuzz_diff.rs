@@ -3,7 +3,7 @@
 //!
 //! The input seeds a deterministic RNG; the target builds two random flat
 //! file sets (paths from a small pool, so file↔directory swaps and shared
-//! subtrees occur), sows each as a changeset chain (root A, child B with
+//! subtrees occur), commits each as a changeset chain (root A, child B with
 //! B's full content), diffs `A → B` with the engine, and then asserts the
 //! re-apply property: applying the diff as a child changeset of A must
 //! converge on exactly B's tree. Errors (a diff that cannot re-apply) are

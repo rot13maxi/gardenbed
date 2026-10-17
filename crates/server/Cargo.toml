@@ -18,7 +18,7 @@ gardenbed-model.workspace = true
 # Path deps until the orchestrator adds them to `[workspace.dependencies]`.
 gardenbed-store = { path = "../store" }
 gardenbed-derive = { path = "../derive" }
-gardenbed-rootstock = { path = "../rootstock" }
+gardenbed-git = { path = "../git" }
 gardenbed-protocol = { path = "../protocol" }
 log = "0.4"
 prost = "0.14"
@@ -43,7 +43,7 @@ tonic = { version = "0.14.6", default-features = false, features = [
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
-# The chaos suite verifies object checksums and seedbed integrity offline
+# The chaos suite verifies object checksums and metadata integrity offline
 # (same codec versions as the stores they inspect).
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"

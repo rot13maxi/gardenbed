@@ -56,7 +56,7 @@ BIN="$PWD/target/release"
 mkdir -p /tmp/gardenbed-work && cd /tmp/gardenbed-work
 
 "$BIN/bed" clone http://127.0.0.1:9418
-"$BIN/bed" plot add src
+"$BIN/bed" sparse add src
 "$BIN/bed" status
 ```
 
@@ -64,12 +64,12 @@ Edit files under `src`, then create a changeset and publish it:
 
 ```sh
 GARDENBED_AUTHOR="Your Name <you@example.com>" \
-  "$BIN/bed" sow -m "Describe the change"
+  "$BIN/bed" commit -m "Describe the change"
 
-"$BIN/bed" harvest
+"$BIN/bed" publish
 ```
 
-If `main` has moved, `bed graft main` replays the current changeset onto
+If `main` has moved, `bed rebase main` replays the current changeset onto
 its new tip. Conflicting changes are reported for you to resolve.
 
 Export published history back to Git:
@@ -89,12 +89,12 @@ See the [quickstart](docs/quickstart.md) for a longer walkthrough and the
 | Command | Purpose |
 |---|---|
 | `bed clone` | Connect a new working copy to a server; fetch no working files |
-| `bed plot add` | Fetch and materialize selected paths |
+| `bed sparse add` | Fetch and materialize selected paths |
 | `bed status` | Inspect local changes, including while offline |
-| `bed goto` | Switch to a changeset or ref |
-| `bed sow` | Create a changeset from local changes |
-| `bed graft` | Replay the current changeset onto a new parent |
-| `bed harvest` | Fast-forward `main` to the current changeset |
+| `bed switch` | Switch to a changeset or ref |
+| `bed commit` | Create a changeset from local changes |
+| `bed rebase` | Replay the current changeset onto a new parent |
+| `bed publish` | Fast-forward `main` to the current changeset |
 | `bed log`, `diff`, `file`, `blame` | Query repository content and history |
 
 Checkout updates preserve local edits to files unchanged by the target
@@ -152,7 +152,7 @@ how they fit together.
 - [Changelog](CHANGELOG.md)
 
 Gardenbed draws on Scion, Sapling/Mononoke, and Jujutsu. The original
-[design notes](DESIGN.md) describe that background and the project's
-naming conventions.
+[design notes](DESIGN.md) describe that background. See [Terminology](docs/terminology.md) for the
+terms used in the current interface.
 
 Licensed under [MIT](LICENSE).

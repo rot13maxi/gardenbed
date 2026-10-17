@@ -48,7 +48,7 @@ libc = "0.2"
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
-# Dev-only: the arboretum, for ingesting fixtures and spawning the real
+# Dev-only: the server, for ingesting fixtures and spawning the real
 # server binary in integration tests. A runtime dependency would be wrong
 # for a thin client.
 gardenbed-server = { path = "../server" }

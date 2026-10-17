@@ -1,5 +1,9 @@
 # Corpora — pinned snapshots
 
+Historical record: command names, package names, and storage paths in this
+document describe the recorded version. See [current terminology](terminology.md)
+and the [CLI reference](cli.md) for the current interface.
+
 Real corpora used by differential verification (M3, M5, M6, M8) and the
 v0.1 north-star demo. A snapshot is pinned by the HEAD SHA recorded at
 clone time; re-clone with the commands below and record the new pin.

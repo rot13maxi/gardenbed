@@ -130,18 +130,18 @@ const LINE_POOL: &[&str] = &[
     "a seed is small, self-contained, and grows when planted",
     "trees are derived, cached objects, never authoritative",
     "the first parent is significant for blame",
-    "loam: the good earth everything grows from",
+    "objects: the good earth everything grows from",
     "want-list negotiation for every object fetch",
     "commit cost scales with change size, not repo size",
     "blobs are content-addressed by sha-256 of raw bytes",
-    "sparse plots need no materialized working copy",
+    "sparse sparses need no materialized working copy",
     "refs move by compare-and-swap on a single row",
-    "derived data is compost: recycle history into answers",
+    "derived data is derived data: recycle history into answers",
     "git is a peer we translate losslessly, not a legacy format",
     "timestamps keep git-native seconds plus tz offset",
     "canonical encoding is a spec, not an implementation detail",
     "a cutting took root elsewhere: that is rename detection",
-    "the scarecrow stands in the bed and watches",
+    "the daemon stands in the working copy and watches",
 ];
 
 const ASCII_NAMES: &[&str] = &[
@@ -170,7 +170,13 @@ const UNICODE_NAMES: &[&str] = &[
     "emoji🌱.txt",
 ];
 const DIR_POOL: &[&str] = &[
-    "garden", "orchard", "bed", "plot", "compost", "loam", "trellis",
+    "garden",
+    "orchard",
+    "bed",
+    "sparse",
+    "derived data",
+    "objects",
+    "trellis",
 ];
 const UNICODE_DIRS: &[&str] = &["日本語", "grün", "форест"];
 
@@ -416,7 +422,7 @@ impl Generator {
                 Mode::Gitlink => self.make_gitlink(),
                 Mode::Symlink => {
                     self.serial += 1;
-                    let content = format!("plot/target_{}.txt", self.serial).into_bytes();
+                    let content = format!("sparse/target_{}.txt", self.serial).into_bytes();
                     (blob_id(&content), content)
                 }
                 Mode::Regular | Mode::Exec => {

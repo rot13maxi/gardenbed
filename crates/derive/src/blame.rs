@@ -64,7 +64,7 @@
 //! ## Bounds and edge cases
 //!
 //! * Empty files blame to no ranges (git prints nothing).
-//! * Gitlink (submodule) paths have no blob content in loam; blame
+//! * Gitlink (submodule) paths have no blob content in objects; blame
 //!   returns an empty vec (git errors on them — documented divergence).
 //! * Symlinks blame their single target line like any other content.
 //! * Deleted-then-readded paths blame the current content's lineage (the
@@ -272,7 +272,7 @@ impl Engine {
             return Err(StoreError::NotFound);
         }
         if entry.mode == Mode::Gitlink {
-            // Submodule pointers have no blob content in loam; git blames
+            // Submodule pointers have no blob content in objects; git blames
             // them with a fatal error. Return the documented empty answer.
             return Ok(Vec::new());
         }

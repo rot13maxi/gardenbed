@@ -12,7 +12,7 @@ use std::path::Path;
 use gardenbed_model::{Id, Mode, blob_id};
 use rustix::fs::{self, AtFlags, FileType, OFlags};
 
-use crate::error::BedError;
+use crate::error::ClientError;
 use crate::treestate::{MODE_EXEC, MODE_REGULAR, MODE_SYMLINK};
 
 pub(crate) struct CheckoutFs {
@@ -71,12 +71,12 @@ struct StageJournal {
     record: StageRecord,
 }
 
-fn io(error: rustix::io::Errno) -> BedError {
+fn io(error: rustix::io::Errno) -> ClientError {
     std::io::Error::from(error).into()
 }
 
 impl CheckoutFs {
-    pub(crate) fn open(root: &Path, state_dir: &Path) -> Result<Self, BedError> {
+    pub(crate) fn open(root: &Path, state_dir: &Path) -> Result<Self, ClientError> {
         Ok(Self {
             root: fs::open(
                 root,
@@ -93,7 +93,7 @@ impl CheckoutFs {
         })
     }
 
-    fn parent(&self, path: &str, create: bool) -> Result<Option<(OwnedFd, String)>, BedError> {
+    fn parent(&self, path: &str, create: bool) -> Result<Option<(OwnedFd, String)>, ClientError> {
         let mut parts = path.split('/').peekable();
         let mut dir = rustix::io::fcntl_dupfd_cloexec(&self.root, 0).map_err(io)?;
         while let Some(part) = parts.next() {
@@ -112,7 +112,7 @@ impl CheckoutFs {
                 }
                 Err(rustix::io::Errno::NOENT) => return Ok(None),
                 Err(e) => {
-                    return Err(BedError::CheckoutBlocked {
+                    return Err(ClientError::CheckoutBlocked {
                         path: path.to_owned(),
                         reason: format!("ancestor {part:?} is not a real directory ({e})"),
                     });
@@ -123,7 +123,7 @@ impl CheckoutFs {
         unreachable!("validated repository paths are nonempty")
     }
 
-    pub(crate) fn entry(&self, path: &str) -> Result<Option<Entry>, BedError> {
+    pub(crate) fn entry(&self, path: &str) -> Result<Option<Entry>, ClientError> {
         let Some((dir, name)) = self.parent(path, false)? else {
             return Ok(None);
         };
@@ -175,7 +175,7 @@ impl CheckoutFs {
 
     /// Every leaf below a directory, without following symlinks. Empty
     /// directories are leaves as well so untracked directories survive.
-    pub(crate) fn leaves(&self, path: &str) -> Result<Vec<String>, BedError> {
+    pub(crate) fn leaves(&self, path: &str) -> Result<Vec<String>, ClientError> {
         let Some((parent, name)) = self.parent(path, false)? else {
             return Ok(Vec::new());
         };
@@ -191,19 +191,19 @@ impl CheckoutFs {
         Ok(leaves)
     }
 
-    pub(crate) fn remove(&self, path: &str) -> Result<(), BedError> {
+    pub(crate) fn remove(&self, path: &str) -> Result<(), ClientError> {
         let Some((parent, name)) = self.parent(path, false)? else {
             return Ok(());
         };
         remove_at(&parent, name.as_str())
     }
 
-    pub(crate) fn write(&self, path: &str, content: &[u8], mode: Mode) -> Result<(), BedError> {
+    pub(crate) fn write(&self, path: &str, content: &[u8], mode: Mode) -> Result<(), ClientError> {
         let (parent, name) = self.parent(path, true)?.expect("parents created");
         if !same_rename_domain(&parent, &self.staging) {
             return self.write_cross_device(path, &parent, &name, content, mode);
         }
-        // Stage inside the bed state directory: interrupted writes leave
+        // Stage inside the working copy state directory: interrupted writes leave
         // harmless cache debris, never partially overwrite working files.
         // EXCL also prevents a racing link from redirecting the write.
         static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -237,7 +237,7 @@ impl CheckoutFs {
                 Err(error) => return Err(io(error)),
                 Ok(fd) => {
                     temp = candidate;
-                    let result = (|| -> Result<(), BedError> {
+                    let result = (|| -> Result<(), ClientError> {
                         if let Some(fd) = fd {
                             let mut file = File::from(fd);
                             file.write_all(content)?;
@@ -266,7 +266,7 @@ impl CheckoutFs {
     /// The shared scan lock prevents a scanner from observing the brief
     /// destination-temp creation→identity-registration interval. Writers
     /// hold the exclusive lock until their destination entry is published.
-    pub(crate) fn staging_scan(&self) -> Result<(File, BTreeSet<String>), BedError> {
+    pub(crate) fn staging_scan(&self) -> Result<(File, BTreeSet<String>), ClientError> {
         let lock = self.staging_lock(fs::FlockOperation::LockShared)?;
         let mut paths = BTreeSet::new();
         for (_, _, record) in self.journals()? {
@@ -279,7 +279,7 @@ impl CheckoutFs {
 
     /// Reclaim only registered, inactive stage entries whose identities
     /// still match. Locks held by surviving writers are never stolen.
-    pub(crate) fn cleanup_staging(&self) -> Result<(), BedError> {
+    pub(crate) fn cleanup_staging(&self) -> Result<(), ClientError> {
         let _lock = self.staging_lock(fs::FlockOperation::LockExclusive)?;
         for (name, file, record) in self.journals()? {
             match fs::flock(&file, fs::FlockOperation::NonBlockingLockExclusive) {
@@ -297,7 +297,7 @@ impl CheckoutFs {
         Ok(())
     }
 
-    fn staging_lock(&self, operation: fs::FlockOperation) -> Result<File, BedError> {
+    fn staging_lock(&self, operation: fs::FlockOperation) -> Result<File, ClientError> {
         let fd = fs::openat(
             &self.staging,
             "checkout-staging.lock",
@@ -313,7 +313,7 @@ impl CheckoutFs {
         Ok(file)
     }
 
-    fn register_stage(&self, record: StageRecord, name: &str) -> Result<StageJournal, BedError> {
+    fn register_stage(&self, record: StageRecord, name: &str) -> Result<StageJournal, ClientError> {
         let fd = fs::openat(
             &self.staging,
             name,
@@ -335,7 +335,7 @@ impl CheckoutFs {
         })
     }
 
-    fn journals(&self) -> Result<Vec<(String, File, StageRecord)>, BedError> {
+    fn journals(&self) -> Result<Vec<(String, File, StageRecord)>, ClientError> {
         let mut journals = Vec::new();
         let mut entries = fs::Dir::read_from(&self.staging).map_err(io)?;
         for entry in &mut entries {
@@ -385,7 +385,7 @@ impl CheckoutFs {
         Ok(journals)
     }
 
-    fn owned_stage(&self, record: &StageRecord) -> Result<bool, BedError> {
+    fn owned_stage(&self, record: &StageRecord) -> Result<bool, ClientError> {
         let Ok(Some((parent, name))) = self.parent(&record.path, false) else {
             return Ok(false);
         };
@@ -396,7 +396,7 @@ impl CheckoutFs {
         }
     }
 
-    fn remove_journal(&self, name: &str, file: &File) -> Result<(), BedError> {
+    fn remove_journal(&self, name: &str, file: &File) -> Result<(), ClientError> {
         let identity = StageRecord::new(String::new(), &fs::fstat(file).map_err(io)?);
         unlink_owned(&self.staging, name, &identity)
     }
@@ -408,7 +408,7 @@ impl CheckoutFs {
         name: &str,
         content: &[u8],
         mode: Mode,
-    ) -> Result<(), BedError> {
+    ) -> Result<(), ClientError> {
         let _lock = self.staging_lock(fs::FlockOperation::LockExclusive)?;
         static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         loop {
@@ -449,7 +449,7 @@ impl CheckoutFs {
                     return Err(error);
                 }
             };
-            let result = (|| -> Result<(), BedError> {
+            let result = (|| -> Result<(), ClientError> {
                 if let Some(fd) = fd {
                     let mut file = File::from(fd);
                     file.write_all(content)?;
@@ -465,7 +465,7 @@ impl CheckoutFs {
                 let current =
                     fs::statat(parent, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(io)?;
                 if !journal.record.matches(&current) {
-                    return Err(BedError::CheckoutBlocked {
+                    return Err(ClientError::CheckoutBlocked {
                         path: path.into(),
                         reason: "staged entry was replaced while materializing".into(),
                     });
@@ -488,7 +488,7 @@ impl CheckoutFs {
         }
     }
 
-    pub(crate) fn stat(&self, path: &str) -> Result<fs::Stat, BedError> {
+    pub(crate) fn stat(&self, path: &str) -> Result<fs::Stat, ClientError> {
         let (parent, name) = self
             .parent(path, false)?
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
@@ -570,7 +570,7 @@ fn link_destination_stage(file: &File, parent: &OwnedFd, name: &str) -> rustix::
     }
 }
 
-fn unlink_owned(parent: &OwnedFd, name: &str, record: &StageRecord) -> Result<(), BedError> {
+fn unlink_owned(parent: &OwnedFd, name: &str, record: &StageRecord) -> Result<(), ClientError> {
     match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) if record.matches(&stat) => {
             fs::unlinkat(parent, name, AtFlags::empty()).map_err(io)
@@ -580,7 +580,7 @@ fn unlink_owned(parent: &OwnedFd, name: &str, record: &StageRecord) -> Result<()
     }
 }
 
-fn collect_leaves(dir: &OwnedFd, path: &str, leaves: &mut Vec<String>) -> Result<(), BedError> {
+fn collect_leaves(dir: &OwnedFd, path: &str, leaves: &mut Vec<String>) -> Result<(), ClientError> {
     let mut entries = fs::Dir::read_from(dir).map_err(io)?;
     let before = leaves.len();
     for entry in &mut entries {
@@ -610,7 +610,7 @@ fn collect_leaves(dir: &OwnedFd, path: &str, leaves: &mut Vec<String>) -> Result
     Ok(())
 }
 
-fn remove_at(parent: &OwnedFd, name: impl rustix::path::Arg + Copy) -> Result<(), BedError> {
+fn remove_at(parent: &OwnedFd, name: impl rustix::path::Arg + Copy) -> Result<(), ClientError> {
     let stat = match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(rustix::io::Errno::NOENT) => return Ok(()),

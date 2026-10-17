@@ -1,15 +1,15 @@
-//! bed's read path to the arboretum (v0.1.md §2): connect, resolve
+//! working copy's read path to the server (v0.1.md §2): connect, resolve
 //! `<cs-or-ref>` arguments, and fetch objects **want-list**.
 //!
 //! Everything here is content-addressed: every request names an id bed is
-//! missing, and every fetch is **cache-first** — `.bed/objects` (loam's
+//! missing, and every fetch is **cache-first** — `.bed/objects` (the object store's
 //! `FsObjectStore`, reused as-is) is consulted before any RPC. That is what
 //! makes interrupted sessions resume exactly: a rerun requests only what
 //! the first run never received, and the server's request counters prove
 //! nothing crosses the wire twice.
 //!
-//! The want-list plan ([`plan_plot`]) resolves `RootTree(cs)` server-side,
-//! then walks the subtrees under each plot prefix, fetching missing trees
+//! The want-list plan ([`plan_sparse`]) resolves `RootTree(cs)` server-side,
+//! then walks the subtrees under each sparse prefix, fetching missing trees
 //! with bounded parallelism and collecting the file entries to materialize.
 //! Blobs are fetched afterwards, deduplicated by id, with the same bound.
 //! Tree payloads are cached locally as canonical bytes, so a rerun's walk
@@ -28,18 +28,18 @@ use gardenbed_store::ObjectStore as _;
 use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 
-use crate::bed::Bed;
-use crate::error::BedError;
+use crate::error::ClientError;
 use crate::revspec::CsOrRef;
 use crate::treestate::MODE_EXEC;
 use crate::treestate::MODE_GITLINK;
 use crate::treestate::MODE_REGULAR;
 use crate::treestate::MODE_SYMLINK;
+use crate::workspace::WorkingCopy;
 
 /// Default bound on concurrent object fetches (`--concurrency`).
 pub const DEFAULT_CONCURRENCY: usize = 8;
 
-/// One materializable file of the plot at a changeset.
+/// One materializable file of the sparse selection at a changeset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanFile {
     /// Repo-relative, forward-slash path.
@@ -62,19 +62,19 @@ impl PlanFile {
     }
 }
 
-/// The result of a want-list fetch: the plot's files plus how many objects
+/// The result of a want-list fetch: the selected paths' files plus how many objects
 /// this run actually pulled over the wire.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FetchStats {
-    /// Trees fetched from the arboretum this run (cache misses).
+    /// Trees fetched from the server this run (cache misses).
     pub trees_fetched: u64,
-    /// Blobs fetched from the arboretum this run (cache misses).
+    /// Blobs fetched from the server this run (cache misses).
     pub blobs_fetched: u64,
-    /// File entries collected under the plot prefixes.
+    /// File entries collected under the selected paths prefixes.
     pub files: usize,
 }
 
-/// A connected session with one arboretum over one repo.
+/// A connected session with one server over one repo.
 ///
 /// Cheap to clone; every object fetch goes through the shared [`Fetcher`].
 pub struct Session {
@@ -85,18 +85,18 @@ pub struct Session {
 }
 
 impl Session {
-    /// Opens a bed and connects to its arboretum, with the default fetch
+    /// Opens a working copy and connects to its server, with the default fetch
     /// concurrency.
     ///
     /// The connection is real (`Endpoint::connect`), so a server that is
     /// down fails here — before any local state is touched.
-    pub async fn open(bed: &Bed) -> Result<Self, BedError> {
+    pub async fn open(bed: &WorkingCopy) -> Result<Self, ClientError> {
         Self::open_with(bed, DEFAULT_CONCURRENCY).await
     }
 
     /// [`Session::open`] with an explicit bound on concurrent object
     /// fetches (`--concurrency`).
-    pub async fn open_with(bed: &Bed, concurrency: usize) -> Result<Self, BedError> {
+    pub async fn open_with(bed: &WorkingCopy, concurrency: usize) -> Result<Self, ClientError> {
         Self::connect(
             bed.config().repo.as_str(),
             bed.objects()?,
@@ -113,13 +113,14 @@ impl Session {
         objects: gardenbed_store::FsObjectStore,
         endpoint: &str,
         concurrency: usize,
-    ) -> Result<Self, BedError> {
-        let client = GardenbedClient::connect(endpoint)
-            .await
-            .map_err(|e| BedError::Connect {
-                server: endpoint.to_owned(),
-                message: e.to_string(),
-            })?;
+    ) -> Result<Self, ClientError> {
+        let client =
+            GardenbedClient::connect(endpoint)
+                .await
+                .map_err(|e| ClientError::Connect {
+                    server: endpoint.to_owned(),
+                    message: e.to_string(),
+                })?;
         let fetcher = Arc::new(Fetcher::new(client.clone(), repo, objects, concurrency));
         Ok(Session {
             client,
@@ -134,52 +135,54 @@ impl Session {
     }
 
     /// Resolves a `<cs-or-ref>` argument to a changeset id that exists on
-    /// the arboretum: a 64-hex token is looked up as an id, anything else
+    /// the server: a 64-hex token is looked up as an id, anything else
     /// as a ref name. Both paths verify existence, so every caller gets a
-    /// clean [`BedError`] instead of a raw gRPC status later.
-    pub async fn resolve(&self, spec: &CsOrRef, command: &'static str) -> Result<Id, BedError> {
+    /// clean [`ClientError`] instead of a raw gRPC status later.
+    pub async fn resolve(&self, spec: &CsOrRef, command: &'static str) -> Result<Id, ClientError> {
         let id = match spec {
             CsOrRef::Id(id) => *id,
             CsOrRef::Ref(name) => {
                 let value = rpc(&self.client.get_ref(&self.repo, name).await, command)?;
-                value.ok_or_else(|| BedError::MissingRef {
+                value.ok_or_else(|| ClientError::MissingRef {
                     name: name.to_owned(),
                 })?
             }
         };
-        // Existence check: a wrong id should say "not on the arboretum",
+        // Existence check: a wrong id should say "not on the server",
         // not surface as a mysterious missing-object error later.
         self.get_changeset(id, command).await?;
         Ok(id)
     }
 
-    /// The bed's current changeset (config `current_cs`), verified on the
-    /// arboretum.
+    /// The working copy's current changeset (config `current_cs`), verified on the
+    /// server.
     pub async fn resolve_current_cs(
         &self,
-        bed: &Bed,
+        bed: &WorkingCopy,
         command: &'static str,
-    ) -> Result<Id, BedError> {
+    ) -> Result<Id, ClientError> {
         let hex = bed
             .config()
             .current_cs
             .as_deref()
-            .ok_or(BedError::NoCurrentCs)?;
-        let id = Id::from_str(hex).map_err(|_| BedError::NoCurrentCs)?;
+            .ok_or(ClientError::NoCurrentCs)?;
+        let id = Id::from_str(hex).map_err(|_| ClientError::NoCurrentCs)?;
         self.get_changeset(id, command).await?;
         Ok(id)
     }
 
-    /// One changeset, with server errors mapped to bed's voice.
+    /// One changeset, with server errors mapped to working copy's voice.
     pub async fn get_changeset(
         &self,
         id: Id,
         command: &'static str,
-    ) -> Result<gardenbed_model::Changeset, BedError> {
+    ) -> Result<gardenbed_model::Changeset, ClientError> {
         match self.client.get_changeset(&self.repo, id).await {
             Ok(cs) => Ok(cs),
-            Err(status) if status.code() == tonic::Code::NotFound => Err(BedError::MissingCs(id)),
-            Err(status) => Err(BedError::Rpc {
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                Err(ClientError::MissingCs(id))
+            }
+            Err(status) => Err(ClientError::Rpc {
                 command,
                 code: status.code(),
                 message: status.message().to_owned(),
@@ -188,11 +191,17 @@ impl Session {
     }
 
     /// The changeset's root tree id (`None` = the empty tree).
-    pub async fn root_tree(&self, cs: Id, command: &'static str) -> Result<Option<Id>, BedError> {
+    pub async fn root_tree(
+        &self,
+        cs: Id,
+        command: &'static str,
+    ) -> Result<Option<Id>, ClientError> {
         match self.client.root_tree(&self.repo, cs).await {
             Ok(tree) => Ok(tree),
-            Err(status) if status.code() == tonic::Code::NotFound => Err(BedError::MissingCs(cs)),
-            Err(status) => Err(BedError::Rpc {
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                Err(ClientError::MissingCs(cs))
+            }
+            Err(status) => Err(ClientError::Rpc {
                 command,
                 code: status.code(),
                 message: status.message().to_owned(),
@@ -205,26 +214,26 @@ impl Session {
         &self,
         cs: Id,
         command: &'static str,
-    ) -> Result<Option<Id>, BedError> {
+    ) -> Result<Option<Id>, ClientError> {
         let cs_obj = self.get_changeset(cs, command).await?;
         Ok(cs_obj.parents.first().copied())
     }
 
     /// The log from `cs`, newest first. A missing head changeset maps to
-    /// [`BedError::MissingCs`]; stream failures to [`BedError::Rpc`].
+    /// [`ClientError::MissingCs`]; stream failures to [`ClientError::Rpc`].
     pub async fn log(
         &self,
         cs: Id,
         limit: u32,
         command: &'static str,
-    ) -> Result<Vec<gardenbed_protocol::pb::ChangesetSummary>, BedError> {
+    ) -> Result<Vec<gardenbed_protocol::pb::ChangesetSummary>, ClientError> {
         let stream = match self.client.log(&self.repo, cs, limit).await {
             Ok(stream) => stream,
             Err(status) if status.code() == tonic::Code::NotFound => {
-                return Err(BedError::MissingCs(cs));
+                return Err(ClientError::MissingCs(cs));
             }
             Err(status) => {
-                return Err(BedError::Rpc {
+                return Err(ClientError::Rpc {
                     command,
                     code: status.code(),
                     message: status.message().to_owned(),
@@ -240,14 +249,14 @@ impl Session {
         a: Id,
         b: Id,
         command: &'static str,
-    ) -> Result<Vec<gardenbed_protocol::pb::ChangeMsg>, BedError> {
+    ) -> Result<Vec<gardenbed_protocol::pb::ChangeMsg>, ClientError> {
         let stream = match self.client.diff(&self.repo, a, b).await {
             Ok(stream) => stream,
             Err(status) if status.code() == tonic::Code::NotFound => {
-                return Err(BedError::MissingCs(a));
+                return Err(ClientError::MissingCs(a));
             }
             Err(status) => {
-                return Err(BedError::Rpc {
+                return Err(ClientError::Rpc {
                     command,
                     code: status.code(),
                     message: status.message().to_owned(),
@@ -260,21 +269,21 @@ impl Session {
     /// First-parent lineage blame ranges of `path` at `cs` (v0.1.md D7),
     /// collected from the streamed RPC. Callers pre-validate the path
     /// (`locate_entry`), so a `not_found` here means the changeset is not
-    /// on the arboretum — mapped to [`BedError::MissingCs`]; stream
-    /// failures map to [`BedError::Rpc`].
+    /// on the server — mapped to [`ClientError::MissingCs`]; stream
+    /// failures map to [`ClientError::Rpc`].
     pub async fn blame(
         &self,
         cs: Id,
         path: &str,
         command: &'static str,
-    ) -> Result<Vec<gardenbed_protocol::pb::BlameRange>, BedError> {
+    ) -> Result<Vec<gardenbed_protocol::pb::BlameRange>, ClientError> {
         let stream = match self.client.blame(&self.repo, cs, path).await {
             Ok(stream) => stream,
             Err(status) if status.code() == tonic::Code::NotFound => {
-                return Err(BedError::MissingCs(cs));
+                return Err(ClientError::MissingCs(cs));
             }
             Err(status) => {
-                return Err(BedError::Rpc {
+                return Err(ClientError::Rpc {
                     command,
                     code: status.code(),
                     message: status.message().to_owned(),
@@ -292,7 +301,7 @@ impl Session {
         cs: Id,
         path: &str,
         command: &'static str,
-    ) -> Result<Option<gardenbed_model::TreeEntry>, BedError> {
+    ) -> Result<Option<gardenbed_model::TreeEntry>, ClientError> {
         let Some(root) = self.root_tree(cs, command).await? else {
             return Ok(None);
         };
@@ -308,7 +317,7 @@ impl Session {
             }
             match entry.kind {
                 TreeKind::Dir => {
-                    cur = entry.tree.ok_or(BedError::BlobHashMismatch(cur))?;
+                    cur = entry.tree.ok_or(ClientError::BlobHashMismatch(cur))?;
                 }
                 // A file cannot contain anything below it.
                 TreeKind::File => return Ok(None),
@@ -322,10 +331,10 @@ impl Session {
 async fn drain<T>(
     mut stream: tonic::Streaming<T>,
     command: &'static str,
-) -> Result<Vec<T>, BedError> {
+) -> Result<Vec<T>, ClientError> {
     let mut out = Vec::new();
     while let Some(item) = stream.next().await {
-        out.push(item.map_err(|status| BedError::Rpc {
+        out.push(item.map_err(|status| ClientError::Rpc {
             command,
             code: status.code(),
             message: status.message().to_owned(),
@@ -334,11 +343,14 @@ async fn drain<T>(
     Ok(out)
 }
 
-/// Maps a ready `Result<_, tonic::Status>` onto bed's error voice.
-fn rpc<T: Clone>(result: &Result<T, tonic::Status>, command: &'static str) -> Result<T, BedError> {
+/// Maps a ready `Result<_, tonic::Status>` onto working copy's error voice.
+fn rpc<T: Clone>(
+    result: &Result<T, tonic::Status>,
+    command: &'static str,
+) -> Result<T, ClientError> {
     match result {
         Ok(t) => Ok(t.clone()),
-        Err(status) => Err(BedError::Rpc {
+        Err(status) => Err(ClientError::Rpc {
             command,
             code: status.code(),
             message: status.message().to_owned(),
@@ -358,9 +370,9 @@ pub struct Fetcher {
     /// Per-id locks: concurrent requests for the same tree id collapse into
     /// one fetch (the second waiter re-checks the cache and finds it).
     tree_locks: tokio::sync::Mutex<std::collections::HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
-    /// Trees fetched from the arboretum this run (cache misses).
+    /// Trees fetched from the server this run (cache misses).
     trees_fetched: AtomicU64,
-    /// Blobs fetched from the arboretum this run (cache misses).
+    /// Blobs fetched from the server this run (cache misses).
     blobs_fetched: AtomicU64,
 }
 
@@ -401,9 +413,9 @@ impl Fetcher {
     /// latecomers take the id's lock, re-find the tree in the cache, and
     /// return without an RPC. Every tree is therefore fetched at most once
     /// per run, whatever the walk shape.
-    pub async fn tree(&self, id: Id) -> Result<Tree, BedError> {
+    pub async fn tree(&self, id: Id) -> Result<Tree, ClientError> {
         if let Some(bytes) = self.objects.get_tree(id)? {
-            return Tree::decode(&bytes).map_err(|_| BedError::BlobHashMismatch(id));
+            return Tree::decode(&bytes).map_err(|_| ClientError::BlobHashMismatch(id));
         }
         let lock = {
             let mut locks = self.tree_locks.lock().await;
@@ -412,7 +424,7 @@ impl Fetcher {
         let _gate = lock.lock().await;
         // Someone may have fetched it while we waited for the lock.
         if let Some(bytes) = self.objects.get_tree(id)? {
-            return Tree::decode(&bytes).map_err(|_| BedError::BlobHashMismatch(id));
+            return Tree::decode(&bytes).map_err(|_| ClientError::BlobHashMismatch(id));
         }
         let _permit = self
             .bound
@@ -423,14 +435,14 @@ impl Fetcher {
             .client
             .get_tree(&self.repo, id)
             .await
-            .map_err(|status| BedError::Rpc {
+            .map_err(|status| ClientError::Rpc {
                 command: "fetch",
                 code: status.code(),
                 message: status.message().to_owned(),
             })?;
         let bytes = tree
             .canonical_bytes()
-            .map_err(|_| BedError::BlobHashMismatch(id))?;
+            .map_err(|_| ClientError::BlobHashMismatch(id))?;
         self.objects.put_tree(id, &bytes)?;
         self.trees_fetched.fetch_add(1, Relaxed);
         Ok(tree)
@@ -438,7 +450,7 @@ impl Fetcher {
 
     /// Raw blob content by id — local cache first, then a streamed
     /// `GetBlob`, reassembled and hash-verified before it is cached.
-    pub async fn blob(&self, id: Id) -> Result<Vec<u8>, BedError> {
+    pub async fn blob(&self, id: Id) -> Result<Vec<u8>, ClientError> {
         if let Some(content) = self.objects.get_blob(id)? {
             return Ok(content);
         }
@@ -451,14 +463,14 @@ impl Fetcher {
             .client
             .get_blob(&self.repo, id)
             .await
-            .map_err(|status| BedError::Rpc {
+            .map_err(|status| ClientError::Rpc {
                 command: "fetch",
                 code: status.code(),
                 message: status.message().to_owned(),
             })?;
         let mut content = Vec::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|status| BedError::Rpc {
+            let chunk = chunk.map_err(|status| ClientError::Rpc {
                 command: "fetch",
                 code: status.code(),
                 message: status.message().to_owned(),
@@ -466,7 +478,7 @@ impl Fetcher {
             content.extend_from_slice(&chunk.data);
         }
         if gardenbed_model::blob_id(&content) != id {
-            return Err(BedError::BlobHashMismatch(id));
+            return Err(ClientError::BlobHashMismatch(id));
         }
         self.objects.put_blob(&content)?;
         self.blobs_fetched.fetch_add(1, Relaxed);
@@ -475,7 +487,7 @@ impl Fetcher {
 
     /// Fetches every missing blob in `ids` (deduplicated by content
     /// address, bounded parallelism). Cached blobs cost nothing.
-    pub async fn blobs(self: &Arc<Self>, ids: &HashSet<Id>) -> Result<(), BedError> {
+    pub async fn blobs(self: &Arc<Self>, ids: &HashSet<Id>) -> Result<(), ClientError> {
         let mut missing = Vec::new();
         for id in ids {
             if !self.objects.has(*id)? {
@@ -494,25 +506,25 @@ impl Fetcher {
     }
 }
 
-/// Walks the subtrees under each plot prefix at the root tree `root`,
+/// Walks the subtrees under each sparse prefix at the root tree `root`,
 /// fetching every missing tree it passes and collecting the file entries
 /// under the prefixes.
 ///
 /// Prefixes match at component boundaries exactly like
-/// [`crate::plot::in_plot`]: `"src"` selects the `src` subtree, a bare file
+/// [`crate::sparse::in_sparse`]: `"src"` selects the `src` subtree, a bare file
 /// prefix (`"Cargo.toml"`) selects that one entry, and `"."` selects the
 /// whole tree. A prefix that names nothing in this tree simply yields no
-/// entries (planting ahead of the garden is allowed).
+/// entries (creating ahead of the working copy is allowed).
 ///
 /// Returns the plan — file entries deduplicated by path, sorted by path
 /// bytes — plus fetch statistics. Every blob under the plan is fetched
 /// (cache-first) before the plan is returned, so materialization never
 /// touches the network.
-pub async fn plan_plot(
+pub async fn plan_sparse(
     session: &Session,
     root: Option<Id>,
     prefixes: &[String],
-) -> Result<(Vec<PlanFile>, FetchStats), BedError> {
+) -> Result<(Vec<PlanFile>, FetchStats), ClientError> {
     let mut files: Vec<PlanFile> = Vec::new();
     let mut seen_paths: BTreeSet<String> = BTreeSet::new();
     let mut blob_ids: HashSet<Id> = HashSet::new();
@@ -548,7 +560,7 @@ pub async fn plan_plot(
             let last = i + 1 == comps.len();
             match entry.kind {
                 TreeKind::Dir => {
-                    let id = entry.tree.ok_or(BedError::BlobHashMismatch(cur))?;
+                    let id = entry.tree.ok_or(ClientError::BlobHashMismatch(cur))?;
                     if last {
                         push(id, prefix.clone(), &mut queue, &mut queued);
                     }
@@ -557,7 +569,7 @@ pub async fn plan_plot(
                 TreeKind::File => {
                     if last {
                         // An exact-file prefix: one entry, no subtree.
-                        let blob = entry.blob.ok_or(BedError::BlobHashMismatch(cur))?;
+                        let blob = entry.blob.ok_or(ClientError::BlobHashMismatch(cur))?;
                         if seen_paths.insert(prefix.clone()) {
                             files.push(PlanFile {
                                 path: prefix.clone(),
@@ -565,7 +577,7 @@ pub async fn plan_plot(
                                 blob,
                             });
                         }
-                        // Gitlink pointers are never loam objects.
+                        // Gitlink pointers are never objects objects.
                         if entry.mode != Mode::Gitlink {
                             blob_ids.insert(blob);
                         }
@@ -597,11 +609,11 @@ pub async fn plan_plot(
                 };
                 match entry.kind {
                     TreeKind::Dir => {
-                        let id = entry.tree.ok_or(BedError::BlobHashMismatch(tree_id))?;
+                        let id = entry.tree.ok_or(ClientError::BlobHashMismatch(tree_id))?;
                         push(id, path.clone(), &mut queue, &mut queued);
                     }
                     TreeKind::File => {
-                        let blob = entry.blob.ok_or(BedError::BlobHashMismatch(tree_id))?;
+                        let blob = entry.blob.ok_or(ClientError::BlobHashMismatch(tree_id))?;
                         if seen_paths.insert(path.clone()) {
                             files.push(PlanFile {
                                 path,
@@ -611,7 +623,7 @@ pub async fn plan_plot(
                         }
                         // A gitlink's blob field is an opaque upstream
                         // pointer, not a content address — it is never a
-                        // loam object and must not be fetched.
+                        // objects object and must not be fetched.
                         if entry.mode != Mode::Gitlink {
                             blob_ids.insert(blob);
                         }

@@ -1,5 +1,5 @@
-//! `seedbed` — the SQLite metadata store: changesets, refs, the git-SHA
-//! mapping table, and the derived-data cache (compost).
+//! `metadata` — the SQLite metadata store: changesets, refs, the git-SHA
+//! mapping table, and the derived-data cache.
 //!
 //! Opened in WAL mode with a 5 s busy timeout so readers never block writers
 //! and contending writers queue instead of failing. All mutations are
@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS derived (
 );
 ";
 
-/// The SQLite (seedbed) metadata store.
+/// The SQLite (metadata) metadata store.
 ///
 /// Cloning-free sharing: wrap in an `Arc` and share across threads; all
 /// access serializes on one connection guarded by a mutex, and every
@@ -84,7 +84,7 @@ impl SqliteMetadataStore {
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.conn
             .lock()
-            .map_err(|_| StoreError::Db("seedbed connection lock poisoned".into()))
+            .map_err(|_| StoreError::Db("metadata connection lock poisoned".into()))
     }
 
     /// Runs `f` in one immediate transaction; commits on `Ok`, rolls back on

@@ -13,7 +13,7 @@ or the recorded demo run.
   on a usage error (unknown subcommand or flag, missing required
   argument). `gardenbed-server` likewise exits `0`/`1`/`2` (`--root` is
   required for the top-level binary). `gardenbed-mcp` exits `0` on clean
-  EOF, `1` when the arboretum will not open (reason on stderr); its
+  EOF, `1` when the server will not open (reason on stderr); its
   stdout carries the MCP protocol and nothing else.
 - **`<cs-or-ref>` arguments** (wherever an id or ref is taken) accept a
   64-hex changeset id, a ref name, or an **8+-hex prefix** of a changeset
@@ -22,37 +22,37 @@ or the recorded demo run.
   shorter tokens with the minimum-length hint (see
   [docs/architecture.md](architecture.md) §2).
 - **Ref names**: stored full (`refs/heads/main`), accepted bare (`main`)
-  — the arboretum resolves both spellings.
-- Every `bed` subcommand takes `--bed-dir <DIR>` (default `./.bed`) —
-  where the bed's local state lives (config, treestate, object cache,
+  — the server resolves both spellings.
+- Every `bed` subcommand takes `--state-dir <DIR>` (default `./.bed`) —
+  where the working copy's local state lives (config, index, object cache,
   heads). It is omitted from the per-command tables below.
 
 ## bed
 
 ```text
-tend your gardenbed — a sparse, server-backed working copy
+Source control with sparse, server-backed working copies
 
 Usage: bed [OPTIONS] <COMMAND>
 ```
 
 | option | meaning |
 |---|---|
-| `--bed-dir <DIR>` | where this bed's local state lives (default `./.bed`) |
+| `--state-dir <DIR>` | where this working copy's local state lives (default `./.bed`) |
 | `-h, --help` / `-V, --version` | help / `bed 0.1.0` |
 
 | command | one-line description |
 |---|---|
-| `clone` | plant a new bed: fetch an arboretum's roots, materializing nothing |
-| `plot` | tend the plot: which path prefixes this bed materializes |
-| `goto` | move the bed to a changeset id or ref |
-| `status` | compare the working files under the plot against the treestate |
+| `clone` | create a working copy connected to a server; materialize no files |
+| `sparse` | select which repository paths to materialize |
+| `switch` | move the working copy to a changeset id or ref |
+| `status` | show local changes under selected paths |
 | `file` | print one file's content at a changeset (or the current one) |
-| `log` | history from a changeset or ref, newest first — every parent lineage, date-ordered, like `git log`'s default walk |
+| `log` | show changeset history, newest first |
 | `diff` | diff two changesets (default: current vs first parent) |
-| `sow` | sow the plot's changes as a new changeset |
-| `graft` | replay the current changeset onto a new parent (server-side rebase) |
-| `harvest` | fast-forward `main` to the current changeset |
-| `blame` | first-parent lineage blame of a path (docs/v0.1.md D7) |
+| `commit` | record local changes as a changeset on the server |
+| `rebase` | replay the current changeset onto a new parent (server-side rebase) |
+| `publish` | fast-forward `main` to the current changeset |
+| `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
 
 ### bed clone
@@ -61,55 +61,55 @@ Usage: bed [OPTIONS] <COMMAND>
 Usage: bed clone [OPTIONS] <SERVER>
 ```
 
-`<SERVER>` — the arboretum to plant from: `http(s)://host:port` or
+`<SERVER>` — the repository server endpoint: `http(s)://host:port` or
 `unix:///path/to/socket`.
 
 | flag | meaning |
 |---|---|
-| `--bed-dir <DIR>` | local state directory (default `./.bed`) |
-| `--repo <REPO>` | repo to tend; the server's choice when omitted |
-| `--ref <REF>` | the ref to plant from. Default `main`, falling back to the arboretum's other common names (`master`, `trunk`) when it does not grow it — pass this flag to name it exactly |
-| `--plot <PATH>...` | plot prefixes to record (repeat or list several); materialize with `bed plot add` |
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
+| `--repo <REPO>` | repository name (default: `default`) |
+| `--ref <REF>` | starting ref; defaults to `main`, then `master` or `trunk` |
+| `--sparse <PATH>...` | sparse prefixes to record (repeat or list several); materialize with `bed sparse add` |
 
 ```sh
 bed clone http://127.0.0.1:9418
-# planted a bed for garden at http://127.0.0.1:9418
-# the garden grows from b273e12d1c6f11ee (main)
-# materialized nothing — plant files with `bed plot add <path>`
+# created working copy for default at http://127.0.0.1:9418
+# current changeset: b273e12d1c6f11ee (main)
+# no files materialized — select paths with `bed sparse add <path>`
 
-bed clone http://127.0.0.1:9418 --ref master --plot src docs
+bed clone http://127.0.0.1:9418 --ref master --sparse src docs
 ```
 
-A ref the arboretum does not have is refused — nothing is planted:
-`the arboretum has no ref "feature"`. With none of the standard names,
+A ref the server does not have is refused — no working copy is created:
+`the server has no ref "feature"`. With none of the standard names,
 clone errors with `no ref main (tried main, master, trunk); pass --ref`,
 naming the refs that do exist.
 
-### bed plot
+### bed sparse
 
 ```text
-Usage: bed plot [OPTIONS] <COMMAND>
+Usage: bed sparse [OPTIONS] <COMMAND>
 ```
 
 `add` fetches and materializes; `list` and `remove` are fully offline.
 
 ```text
-Usage: bed plot add [OPTIONS] <PATH>...
-Usage: bed plot remove [OPTIONS] <PATH>...
-Usage: bed plot list [OPTIONS]
+Usage: bed sparse add [OPTIONS] <PATH>...
+Usage: bed sparse remove [OPTIONS] <PATH>...
+Usage: bed sparse list [OPTIONS]
 ```
 
 | flag | command | meaning |
 |---|---|---|
-| `--bed-dir <DIR>` | all | local state directory (default `./.bed`) |
-| `--concurrency <N>` | `add` | bound on concurrent object fetches from the arboretum (default `8`) |
+| `--state-dir <DIR>` | all | local state directory (default `./.bed`) |
+| `--concurrency <N>` | `add` | bound on concurrent object fetches from the server (default `8`) |
 
-`plot add` takes repo-relative prefixes (directory or exact file; `.`
-plants the whole garden) and materializes them at the current changeset.
+`sparse add` takes repo-relative prefixes (directory or exact file; `.`
+selects the whole repository) and materializes them at the current changeset.
 
-Checkout updates (`plot add`, `goto`, and `graft`) preserve local edits
+Checkout updates (`sparse add`, `switch`, and `rebase`) preserve local edits
 when the target leaves that file unchanged. They refuse to overwrite
-local edits or untracked entries; sow or move that work aside before
+local edits or untracked entries; commit or move that work aside before
 retrying. Paths overlapping the active bed state directory and symlink
 ancestors are also refused before files or checkout state change.
 
@@ -119,24 +119,24 @@ only when their recorded identity still matches. Unknown or replaced
 temporary-looking files remain visible as untracked and are preserved.
 
 ```sh
-bed plot add src tests        # two prefixes at once
-bed plot add big              # the demo: 1,021 files, byte-verified vs git show
-bed plot list                 # which prefixes this bed materializes
-bed plot remove tests/
+bed sparse add src tests        # two prefixes at once
+bed sparse add big              # the demo: 1,021 files, byte-verified vs git show
+bed sparse list                 # which prefixes this working copy materializes
+bed sparse remove tests/
 ```
 
-### bed goto
+### bed switch
 
 ```text
-Usage: bed goto [OPTIONS] <CS_OR_REF>
+Usage: bed switch [OPTIONS] <CS_OR_REF>
 ```
 
-Moves the bed to a changeset id or ref; `<CS_OR_REF>` is a `<cs-or-ref>`.
+Moves the working copy to a changeset id or ref; `<CS_OR_REF>` is a `<cs-or-ref>`.
 
 ```sh
-bed goto main
-# the bed now grows from b273e12d1c6f11ee (main) — fetched 0 tree(s), 0 blob(s)
-bed goto 9c42adff129515b7        # 8+-hex prefixes work
+bed switch main
+# working copy at b273e12d1c6f11ee (main) — fetched 0 tree(s), 0 blob(s)
+bed switch 9c42adff129515b7        # 8+-hex prefixes work
 ```
 
 ### bed status
@@ -150,11 +150,11 @@ hashed.
 
 | flag | meaning |
 |---|---|
-| `--bed-dir <DIR>` | local state directory (default `./.bed`) |
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
 | `--full-scan` | hash every tracked file, ignoring the hints |
 
 ```sh
-bed status                   # the plot is clean — nothing modified, deleted, or untracked.
+bed status                   # working copy is clean — nothing modified, deleted, or untracked.
 bed status --full-scan
 ```
 
@@ -169,7 +169,7 @@ Prints one file's content at a changeset (default: the current one).
 
 | flag | meaning |
 |---|---|
-| `--bed-dir <DIR>` | local state directory (default `./.bed`) |
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
 | `--cs <ID-OR-REF>` | changeset id or ref to read from (default: the current one) |
 
 ```sh
@@ -189,7 +189,7 @@ date-ordered, exactly like `git log`'s default walk. Ids render as the
 
 | flag | meaning |
 |---|---|
-| `--bed-dir <DIR>` | local state directory (default `./.bed`) |
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
 | `--limit <N>` | show at most N changesets (default: all). Like `git log`, 0 means "no limit", not "show none" |
 | `--cs <ID-OR-REF>` | where to start (default: the current changeset) |
 
@@ -213,32 +213,32 @@ bed diff                     # current changeset vs its first parent
 bed diff main master
 ```
 
-### bed sow
+### bed commit
 
 ```text
-Usage: bed sow [OPTIONS] --message <MESSAGE>
+Usage: bed commit [OPTIONS] --message <MESSAGE>
 ```
 
-Sows the plot's changes as a new changeset (scans the working files
-under the plot, uploads blobs — > 1 MiB via `PutBlob`, ≤ 1 MiB inline —
+Commits the selected paths' changes as a new changeset (scans the working files
+under the selected paths, uploads blobs — > 1 MiB via `PutBlob`, ≤ 1 MiB inline —
 and stores the changeset).
 
 | flag | meaning |
 |---|---|
 | `-m, --message <MESSAGE>` | the changeset's message (required) |
-| `--author <NAME <EMAIL>>` | author as one `Name <email>` identity (default: the `GARDENBED_AUTHOR` environment variable, else the bed's own) |
+| `--author <NAME <EMAIL>>` | author as one `Name <email>` identity (default: the `GARDENBED_AUTHOR` environment variable, else the working copy's own) |
 
 ```sh
-export GARDENBED_AUTHOR="A. Gardener <gardener@example.com>"
-bed sow -m "tend the roses"
-# planted seed b273e12d1c6f11ee: 1 change(s) (1 modified)
-# the bed now grows from b273e12d1c6f11ee (was 984213bc33e9f924)
+export GARDENBED_AUTHOR="Your Name <you@example.com>"
+bed commit -m "Describe the change"
+# created changeset b273e12d1c6f11ee: 1 change(s) (1 modified)
+# working copy at b273e12d1c6f11ee (was 984213bc33e9f924)
 ```
 
-### bed graft
+### bed rebase
 
 ```text
-Usage: bed graft [OPTIONS] <NEW_PARENT>
+Usage: bed rebase [OPTIONS] <NEW_PARENT>
 ```
 
 Replays the current changeset onto a new parent (server-side rebase).
@@ -246,23 +246,23 @@ Replays the current changeset onto a new parent (server-side rebase).
 every conflicting path.
 
 ```sh
-bed graft main
-# grafted <cs> onto <new-parent> as <replayed-cs>
+bed rebase main
+# rebased <cs> onto <new-parent> as <replayed-cs>
 # fetched <N> tree(s), <M> blob(s)
 ```
 
-### bed harvest
+### bed publish
 
 ```text
-Usage: bed harvest [OPTIONS]
+Usage: bed publish [OPTIONS]
 ```
 
 Fast-forwards `main` to the current changeset (a compare-and-swap: one
 winner per race; a loser is told the new tip).
 
 ```sh
-bed harvest
-# harvested b273e12d1c6f11ee — `main` now grows from it
+bed publish
+# published b273e12d1c6f11ee — `main` now points to it
 ```
 
 ### bed blame
@@ -276,7 +276,7 @@ each line renders `<16-hex id> (<author> <date> <lineno>) <content>`.
 
 | flag | meaning |
 |---|---|
-| `--bed-dir <DIR>` | local state directory (default `./.bed`) |
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
 | `--cs <ID-OR-REF>` | changeset id or ref to blame at (default: the current one) |
 
 ```sh
@@ -287,7 +287,7 @@ bed blame --cs master Makefile
 ## gardenbed-server
 
 ```text
-The gardenbed arboretum (authoritative server)
+Gardenbed repository server
 
 Usage: gardenbed-server [OPTIONS] [COMMAND]
 ```
@@ -295,13 +295,13 @@ Usage: gardenbed-server [OPTIONS] [COMMAND]
 | option | meaning |
 |---|---|
 | `--addr <ADDR>` | listen address (`host:port`; `:0` picks an ephemeral port), default `127.0.0.1:9418` |
-| `--root <ROOT>` | repository directory; must be a non-empty path (created if missing) — holds `<root>/loam` and `<root>/seedbed.sqlite3` |
+| `--root <ROOT>` | repository directory; must be a non-empty path (created if missing) — holds `<root>/objects` and `<root>/metadata.sqlite3` |
 
 Without a subcommand, the top-level `--addr`/`--root` flags serve the
 gRPC API — the printed address is the contract for scripts:
 
 ```sh
-gardenbed-server --addr 127.0.0.1:9418 --root /tmp/arboretum
+gardenbed-server --addr 127.0.0.1:9418 --root /tmp/gardenbed-repo
 # listening on 127.0.0.1:9418
 ```
 
@@ -325,24 +325,24 @@ default when no subcommand is given.
 Usage: gardenbed-server import [OPTIONS] --from <FROM> --root <ROOT>
 ```
 
-Imports a git repository's history into the gardenbed stores.
+Imports a git repository's history into the Gardenbed stores.
 
 | flag | meaning |
 |---|---|
-| `--from <FROM>` | git repository: a local path (bare or working tree) or a URL. URLs are cloned (mirror) into `<root>/rootstock-mirror.git` and refreshed on re-use |
+| `--from <FROM>` | git repository: a local path (bare or working tree) or a URL. URLs are cloned (mirror) into `<root>/git-mirror.git` and refreshed on re-use |
 | `--root <ROOT>` | gardenbed repository directory (created if missing) |
 | `--limit <LIMIT>` | ingest only the newest N commits (topological suffix; slice boundaries are re-rooted as full-tree root changesets) |
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
 
 ```sh
-gardenbed-server import --from /path/to/git-repo --root /tmp/arboretum \
+gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed-repo \
     --ref refs/heads/master --renames on
 # 2 commits (2 new, 0 skipped), 9 objects, 1 ref(s) moved, 0.24s (8 commits/s)
 ```
 
 `demo/run-v0.1.sh` runs the same import against the deterministic demo
-corpus (`$CORPUS` → `$ARBORETUM`).
+corpus (`$CORPUS` → `$SERVER_ROOT`).
 
 ### gardenbed-server export
 
@@ -356,13 +356,13 @@ report; `--mapping FILE` writes it as TSV for verification.
 
 | flag | meaning |
 |---|---|
-| `--root <ROOT>` | gardenbed repository directory (holds `loam/` and `seedbed.sqlite3`) |
+| `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
 | `--into <INTO>` | destination git repository: created as a bare sha1 repository when missing, accepted as-is when present |
-| `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the seedbed |
+| `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
 
 ```sh
-gardenbed-server export --root /tmp/arboretum --into /tmp/export.git \
+gardenbed-server export --root /tmp/gardenbed-repo --into /tmp/export.git \
     --mapping /tmp/mapping.tsv
 # 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
 git -C /tmp/export.git fsck --strict   # clean
@@ -378,8 +378,8 @@ Usage: gardenbed-mcp [OPTIONS] --root <DIR>
 
 | flag | meaning |
 |---|---|
-| `--root <DIR>` (required) | the arboretum's data directory (its `loam/` object store and `seedbed.sqlite3` metadata database) |
-| `--repo <NAME>` | repo name; accepted and validated for forward compatibility (v0.1 arboreta are single-repo; the API carries a repo field from day one, docs/v0.1.md §1) |
+| `--root <DIR>` (required) | the server's data directory (its `objects/` object store and `metadata.sqlite3` metadata database) |
+| `--repo <NAME>` | repo name; accepted and validated for forward compatibility (v0.1 servers are single-repo; the API carries a repo field from day one, docs/v0.1.md §1) |
 
 Newline-delimited JSON-RPC 2.0 on stdin/stdout, one response line per
 request; diagnostics go to stderr only. Serves tools `log`, `diff`,
@@ -387,7 +387,7 @@ request; diagnostics go to stderr only. Serves tools `log`, `diff`,
 
 ```sh
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  | gardenbed-mcp --root /tmp/arboretum
+  | gardenbed-mcp --root /tmp/gardenbed-repo
 
-gardenbed-mcp --root /tmp/arboretum --repo garden < requests.jsonl
+gardenbed-mcp --root /tmp/gardenbed-repo --repo default < requests.jsonl
 ```

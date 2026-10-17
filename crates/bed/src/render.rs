@@ -10,7 +10,7 @@
 //!     <message line>                      ← every message line, indented 4
 //! ```
 //!
-//! entries separated by one blank line. The id is bed's 16-hex short form;
+//! entries separated by one blank line. The id is working copy's 16-hex short form;
 //! the date renders git-natively (epoch seconds + tz offset, never
 //! normalized) in an ISO-like shape rather than git's locale words.
 //!
@@ -49,7 +49,7 @@
 
 use gardenbed_model::Mode;
 
-use crate::error::BedError;
+use crate::error::ClientError;
 
 /// One log entry, as the server streamed it (structurally `git log`).
 pub struct LogEntry {
@@ -67,7 +67,7 @@ pub struct LogEntry {
     pub message: String,
 }
 
-/// Renders one log entry in bed's git-log-like shape.
+/// Renders one log entry in working copy's git-log-like shape.
 pub fn render_log_entry(entry: &LogEntry, out: &mut String) {
     out.push_str(&entry.id.short());
     out.push_str("  ");
@@ -264,8 +264,8 @@ fn binary_differ_line(path: &str, has_old: bool, has_new: bool) -> String {
 /// (cache-first at the caller); entries render in the order given.
 pub fn render_diff(
     entries: &[DiffEntry],
-    content_of: &dyn Fn(gardenbed_model::Id) -> Result<Vec<u8>, BedError>,
-) -> Result<String, BedError> {
+    content_of: &dyn Fn(gardenbed_model::Id) -> Result<Vec<u8>, ClientError>,
+) -> Result<String, ClientError> {
     let mut out = String::new();
     for entry in entries {
         render_diff_entry(entry, content_of, &mut out)?;
@@ -276,9 +276,9 @@ pub fn render_diff(
 /// Renders one changed path.
 fn render_diff_entry(
     entry: &DiffEntry,
-    content_of: &dyn Fn(gardenbed_model::Id) -> Result<Vec<u8>, BedError>,
+    content_of: &dyn Fn(gardenbed_model::Id) -> Result<Vec<u8>, ClientError>,
     out: &mut String,
-) -> Result<(), BedError> {
+) -> Result<(), ClientError> {
     out.push_str(&format!("diff --git a/{} b/{}\n", entry.path, entry.path));
     // git's `old mode` / `new mode` / `new file mode` / `deleted file mode`
     // lines. Their presence decides how git apply parses a payload-free
@@ -883,7 +883,7 @@ mod tests {
                 .iter()
                 .find(|(k, _)| *k == id)
                 .map(|(_, v)| v.clone())
-                .ok_or(BedError::BlobHashMismatch(id))
+                .ok_or(ClientError::BlobHashMismatch(id))
         };
 
         // Modified: `Binary files a/x and b/x differ` — a plain modify has
@@ -980,7 +980,7 @@ mod tests {
     #[test]
     fn binary_mode_only_change_stays_mode_lines_only() {
         // Identical blob on both sides (mode flip): git prints no binary
-        // line here, and bed's earlier mode-only form is preserved.
+        // line here, and working copy's earlier mode-only form is preserved.
         let bin = gardenbed_model::blob_id(b"\0\0binary\0");
         let store = [(bin, b"\0\0binary\0".to_vec())];
         let content_of = move |id: gardenbed_model::Id| {
@@ -988,7 +988,7 @@ mod tests {
                 .iter()
                 .find(|(k, _)| *k == id)
                 .map(|(_, v)| v.clone())
-                .ok_or(BedError::BlobHashMismatch(id))
+                .ok_or(ClientError::BlobHashMismatch(id))
         };
         let out = render_diff(
             &[diff_entry(
@@ -1034,7 +1034,7 @@ mod tests {
             if id == file {
                 Ok(b"file bytes\n".to_vec())
             } else {
-                Err(BedError::BlobHashMismatch(id))
+                Err(ClientError::BlobHashMismatch(id))
             }
         };
 

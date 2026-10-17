@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 gardenbed-model.workspace = true
-# The MCP tools answer through the arboretum's own service layer
+# The MCP tools answer through the server's own service layer
 # (`gardenbed_server::Repo`) in-process — parity with the CLI's server is
 # by construction, and the server opens with no working copy anywhere.
 gardenbed-server = { path = "../server" }

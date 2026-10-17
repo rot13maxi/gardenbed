@@ -4,13 +4,13 @@
 # An automated acceptance run of the whole loop, asserting every step a
 # human would otherwise have to eyeball:
 #
-#   1. import   — a git history (≥ 50k commits) into the arboretum, with a
-#                 changeset↔git bijection proven in the seedbed;
-#   2. serve    — the arboretum on an ephemeral port;
+#   1. import   — a git history (≥ 50k commits) into the server, with a
+#                 changeset↔git bijection proven in the metadata;
+#   2. serve    — the server on an ephemeral port;
 #   3. clone    — a sparse bed that materializes NOTHING, in < 5 s;
-#   4. plot add — every materialized file byte-identical to
+#   4. sparse add — every materialized file byte-identical to
 #                 `git show <sha>:<path>`, with exec bits and symlinks;
-#   5. sow      — a new changeset, queryable via the API in < 1 s;
+#   5. commit      — a new changeset, queryable via the API in < 1 s;
 #   6. export   — back to git: `git fsck` clean, `git push --dry-run` to a
 #                 fresh mirror succeeds, and the exported SHAs roundtrip
 #                 (100% for an unsigned history; ≥ 99% otherwise);
@@ -128,7 +128,7 @@ elif [[ -d /dev/shm ]]; then
 else
     W=$(mktemp -d)
 fi
-ARBORETUM=$W/arboretum
+SERVER_ROOT=$W/server
 GARDEN=$W/garden
 MCP_HOME=$W/mcp-home
 
@@ -186,7 +186,7 @@ step_build() {
 # ------------------------------------------------------------ 1. import
 
 step_import() {
-    log "## 1. import — history into the arboretum"
+    log "## 1. import — history into the server"
     log ""
 
     # Corpus acquisition: a real pinned repo when one is named, else the
@@ -238,17 +238,17 @@ step_import() {
     fi
 
     if ! timed "import" \
-        "$SERVER_BIN" import --from "$CORPUS" --root "$ARBORETUM" \
+        "$SERVER_BIN" import --from "$CORPUS" --root "$SERVER_ROOT" \
         >"$W/import.log" 2>"$W/import.err"; then
         bad "gardenbed-server import failed (stderr: $(tail -2 "$W/import.err"))"
         return 1
     fi
 
     # Bijection: every imported commit has exactly one changeset, and the
-    # seedbed's git_map holds one row per git commit (the ingest is
+    # metadata's git_map holds one row per git commit (the ingest is
     # 1:1 by construction — content-addressed ids make duplicates
     # impossible; the count proves the walk found everything).
-    GB_COMMITS=$(sqlite3 "$ARBORETUM/seedbed.sqlite3" 'SELECT COUNT(*) FROM git_map')
+    GB_COMMITS=$(sqlite3 "$SERVER_ROOT/metadata.sqlite3" 'SELECT COUNT(*) FROM git_map')
     if [[ $GB_COMMITS -eq $GIT_COMMITS ]]; then
         ok "git_map ↔ git bijection: $GB_COMMITS changesets for $GIT_COMMITS commits"
     else
@@ -263,7 +263,7 @@ step_import() {
 step_serve() {
     log "## 2. serve (gardenbed-server, ephemeral port)"
     log ""
-    "$SERVER_BIN" --addr 127.0.0.1:0 --root "$ARBORETUM" \
+    "$SERVER_BIN" --addr 127.0.0.1:0 --root "$SERVER_ROOT" \
         >"$W/server.log" 2>"$W/server.err" &
     SERVER_PID=$!
     local addr=""
@@ -278,7 +278,7 @@ step_serve() {
     done
     if [[ $addr == "listening on "* ]]; then
         SERVER_URL="http://${addr#listening on }"
-        ok "arboretum listening at $SERVER_URL"
+        ok "server listening at $SERVER_URL"
     else
         bad "server never announced a listening address"
         return 1
@@ -316,19 +316,19 @@ step_clone() {
     return 0
 }
 
-# ------------------------------------------------------------ 4. plot add
+# ------------------------------------------------------------ 4. sparse add
 
-step_plot_add() {
-    log "## 4. bed plot add big (fetch + materialize, byte-verified)"
+step_sparse_add() {
+    log "## 4. bed sparse add big (fetch + materialize, byte-verified)"
     log ""
     local out
-    if ! out=$(cd "$GARDEN" && timed "bed plot add big" "$BED_BIN" plot add big 2>&1); then
-        bad "bed plot add failed: $out"
+    if ! out=$(cd "$GARDEN" && timed "bed sparse add big" "$BED_BIN" sparse add big 2>&1); then
+        bad "bed sparse add failed: $out"
         return 1
     fi
-    local files_in_plot
-    files_in_plot=$(printf '%s\n' "$out" | sed -n 's/.*(\([0-9]*\) file(s) in the plot).*/\1/p')
-    ok "plot add: ${files_in_plot:-?} files in the plot"
+    local files_in_sparse
+    files_in_sparse=$(printf '%s\n' "$out" | sed -n 's/.*(\([0-9]*\) file(s) in the selected paths).*/\1/p')
+    ok "sparse add: ${files_in_sparse:-?} files in the selected paths"
 
     # Full byte sweep — ~1k files, under the 2k full-sweep bar: every
     # materialized file must be byte-identical to `git show HEAD:<path>`.
@@ -384,30 +384,30 @@ step_plot_add() {
     [[ $bad_execs -eq 0 ]] && ok "all $execs executable files kept their mode bit"
 
     # And the offline heart agrees.
-    if out=$(cd "$GARDEN" && "$BED_BIN" status 2>&1) && printf '%s' "$out" | grep -q "the plot is clean"; then
-        ok "bed status: the plot is clean"
+    if out=$(cd "$GARDEN" && "$BED_BIN" status 2>&1) && printf '%s' "$out" | grep -q "working copy is clean"; then
+        ok "bed status: working copy is clean"
     else
-        bad "bed status after plot add: $out"
+        bad "bed status after sparse add: $out"
     fi
     log ""
     return 0
 }
 
-# ------------------------------------------------------------ 5. sow
+# ------------------------------------------------------------ 5. commit
 
-step_sow() {
-    log "## 5. bed sow (write path: edit → sow → query < 1 s)"
+step_commit() {
+    log "## 5. bed commit (write path: edit → commit → query < 1 s)"
     log ""
     printf 'demo tend %s\n' "$(date -u +%FT%TZ)" >>"$GARDEN/big/f00000.txt"
     printf 'demo tend %s\n' "$(date -u +%FT%TZ)" >>"$GARDEN/big/d0/g00.md"
-    printf 'a brand new file, sown by the demo\n' >"$GARDEN/big/demo-note.txt"
+    printf 'a brand new file, created by the demo\n' >"$GARDEN/big/demo-note.txt"
 
     local out
-    if ! out=$(cd "$GARDEN" && timed "bed sow" "$BED_BIN" sow -m "v0.1 demo" 2>&1); then
-        bad "bed sow failed: $out"
+    if ! out=$(cd "$GARDEN" && timed "bed commit" "$BED_BIN" commit -m "v0.1 demo" 2>&1); then
+        bad "bed commit failed: $out"
         return 1
     fi
-    ok "sow accepted: $(printf '%s\n' "$out" | head -1)"
+    ok "commit accepted: $(printf '%s\n' "$out" | head -1)"
 
     # §0 step 4: the new changeset is queryable via the API in < 1 s.
     local ms out2
@@ -422,15 +422,15 @@ step_sow() {
         bad "log --limit 1 took ${ms} ms (§0 wants < 1000)"
     fi
     if printf '%s' "$out2" | grep -q "v0.1 demo"; then
-        ok "the sown changeset is the newest history entry"
+        ok "the created changeset is the newest history entry"
     else
-        bad "bed log does not show the sown changeset: $(printf '%s' "$out2" | head -3)"
+        bad "bed log does not show the created changeset: $(printf '%s' "$out2" | head -3)"
     fi
 
-    if out=$(cd "$GARDEN" && "$BED_BIN" status 2>&1) && printf '%s' "$out" | grep -q "the plot is clean"; then
-        ok "bed status after sow: the plot is clean"
+    if out=$(cd "$GARDEN" && "$BED_BIN" status 2>&1) && printf '%s' "$out" | grep -q "working copy is clean"; then
+        ok "bed status after commit: working copy is clean"
     else
-        bad "bed status after sow: $out"
+        bad "bed status after commit: $out"
     fi
     log ""
     return 0
@@ -442,7 +442,7 @@ step_export() {
     log "## 6. export — back to git (fsck + push --dry-run + SHA roundtrip)"
     log ""
     if ! timed "export" \
-        "$SERVER_BIN" export --root "$ARBORETUM" --into "$W/export.git" \
+        "$SERVER_BIN" export --root "$SERVER_ROOT" --into "$W/export.git" \
         --mapping "$W/mapping.tsv" >"$W/export.log" 2>"$W/export.err"; then
         bad "gardenbed-server export failed: $(tail -2 "$W/export.err")"
         return 1
@@ -498,7 +498,7 @@ step_export() {
 mcp_session() { # <requests-file> <responses-file>
     (
         cd "$MCP_HOME" &&
-            "$MCP_BIN" --root "$ARBORETUM" --repo garden \
+            "$MCP_BIN" --root "$SERVER_ROOT" --repo garden \
                 <"$1" >"$2" 2>"$1.stderr"
     )
 }
@@ -621,7 +621,7 @@ step_mcp() {
     # The zero-checkout claim: nothing under the MCP home is (or became) a
     # working copy.
     if [[ $(find "$MCP_HOME" -name .bed | wc -l) -eq 0 ]]; then
-        ok "no .bed anywhere under the MCP session's home — the arboretum answered alone"
+        ok "no .bed anywhere under the MCP session's home — the server answered alone"
     else
         bad "the MCP session left a working copy behind"
     fi
@@ -657,8 +657,8 @@ run_step "build" step_build
 run_step "import" step_import
 run_step "serve" step_serve
 run_step "clone" step_clone
-run_step "plot-add" step_plot_add
-run_step "sow" step_sow
+run_step "sparse-add" step_sparse_add
+run_step "commit" step_commit
 run_step "export" step_export
 run_step "mcp" step_mcp
 

@@ -1,13 +1,13 @@
 //! `fuzz_tree_apply` — random changeset sequences applied through the
-//! compost engine (v0.1.md M8.3 "tree-apply" target).
+//! derived data engine (v0.1.md M8.3 "tree-apply" target).
 //!
 //! The input seeds a deterministic RNG; from it the target builds a short
 //! chain of *canonical* changesets (sorted, deduplicated, op/table-valid —
-//! the seedbed rejects anything else) and drives
+//! the metadata rejects anything else) and drives
 //! `Engine::derive_tree` over each. The contract: applying canonical
 //! changesets never panics — semantic inconsistencies (deleting a missing
 //! path, renaming to an existing path, …) must surface as `Err`, and every
-//! successfully derived tree must re-decode from loam.
+//! successfully derived tree must re-decode from objects.
 
 #![no_main]
 

@@ -1,6 +1,6 @@
 # Durable publication validation
 
-Native sow and Git import validate changeset shape, referenced blob availability,
+Native commit and Git import validate changeset shape, referenced blob availability,
 and tree application before publishing metadata. Every parent must already be
 validated, including parents beyond the first. Tree replay uses the first
 parent's verified root directly; mutable derived cache entries cannot establish
@@ -18,7 +18,7 @@ existing certificate's root. Ordinary `put_changeset`, `ingest_changeset`, and
 `put_validated_changeset` API is reserved for trusted validators that have
 performed replay and blob validation; it is not a public RPC.
 
-On CAS, harvest, or selection of an import frontier, a certified tip needs one
+On CAS, publish, or selection of an import frontier, a certified tip needs one
 indexed certificate lookup to establish history validity. A new changeset only
 checks its parents' certificates and replays its own delta. Certificates survive
 server restarts; the service retains no history-sized validation set. Tree reads
@@ -41,7 +41,7 @@ later be damaged or manually removed from disk.
 
 `crates/server/tests/integrity.rs` seeds 10,000 native changesets, reopens the
 stores three times, and counts backend operations: publishing the certified tip
-loads zero changesets and performs exactly one certificate lookup. New sow reads
+loads zero changesets and performs exactly one certificate lookup. New commit reads
 fewer than 16 changesets/certificates. Removing certificates to simulate an old
 database validates each ancestor once, and another restart again loads zero
 changesets for publication. Additional tests reject forged generic tree caches,

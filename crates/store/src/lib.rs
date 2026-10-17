@@ -2,10 +2,10 @@
 //!
 //! Two traits partition repository state (see `DESIGN.md`):
 //!
-//! - [`ObjectStore`] — **loam**, the content-addressed object store (blobs
+//! - [`ObjectStore`] — **objects**, the content-addressed object store (blobs
 //!   and trees). Immutable once written; every read is verified.
 //!   Backends: [`FsObjectStore`] (filesystem), [`MemoryStore`].
-//! - [`MetadataStore`] — the **seedbed**: changesets, refs with
+//! - [`MetadataStore`] — the **metadata**: changesets, refs with
 //!   compare-and-swap, the git-SHA mapping table, and the derived-data
 //!   cache. Backends: [`SqliteMetadataStore`], [`MemoryStore`].
 //!

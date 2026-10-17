@@ -1,7 +1,7 @@
 //! Verification M2.5 (server smoke test): spawns the built
 //! `gardenbed-server` binary on an ephemeral port with a temp repo root and
 //! drives it through the typed client — object access, the change graph,
-//! refs, graft/harvest, blame ranges, the empty-`repo`
+//! refs, rebase/publish, blame ranges, the empty-`repo`
 //! rejection, and the request counters.
 
 use std::collections::BTreeMap;
@@ -31,7 +31,7 @@ fn add(path: &str, content: &[u8]) -> Change {
     }
 }
 
-/// One change with explicit op, mode, and rename source — the graft
+/// One change with explicit op, mode, and rename source — the rebase
 /// edge-case fixtures need more than `add`'s plain adds.
 fn chg(path: &str, op: Op, content: Option<&[u8]>, mode: Mode, src: Option<&str>) -> Change {
     Change {
@@ -60,8 +60,8 @@ fn cs(
     }
 }
 
-/// Sows `cs` with its inline blobs, returning the assigned id.
-async fn sow(
+/// Commits `cs` with its inline blobs, returning the assigned id.
+async fn commit(
     client: &GardenbedClient,
     repo: &str,
     cs: &Changeset,
@@ -295,17 +295,17 @@ async fn server_smoke_end_to_end() {
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].name, "refs/heads/feature");
 
-    // Harvest fast-forwards "main"; a non-descendant is refused.
-    let harvested = client.harvest(repo, id_child).await.expect("harvest");
-    assert_eq!(harvested, id_child);
+    // Publish fast-forwards "main"; a non-descendant is refused.
+    let published = client.publish(repo, id_child).await.expect("publish");
+    assert_eq!(published, id_child);
     assert_eq!(
         client.get_ref(repo, "main").await.expect("main"),
         Some(id_child)
     );
 
-    // ----------------------------------------------------------- graft
+    // ----------------------------------------------------------- rebase
     // An independent branch retaining the modified file's pre-image;
-    // grafting the child replays its changes as a single-parent changeset.
+    // rebaseing the child replays its changes as a single-parent changeset.
     let c = b"unrelated\n".to_vec();
     let cs_branch = Changeset {
         parents: vec![],
@@ -319,41 +319,41 @@ async fn server_smoke_end_to_end() {
         .create_changeset(repo, &cs_branch, [(blob_id(&c), c.clone())])
         .await
         .expect("branch changeset created");
-    let grafted = client
-        .graft(repo, id_child, id_branch)
+    let rebased = client
+        .rebase(repo, id_child, id_branch)
         .await
-        .expect("graft succeeds (no conflicts)");
-    let got_graft = client
-        .get_changeset(repo, grafted)
+        .expect("rebase succeeds (no conflicts)");
+    let got_rebase = client
+        .get_changeset(repo, rebased)
         .await
-        .expect("graft readable");
-    assert_eq!(got_graft.parents, vec![id_branch], "graft has one parent");
+        .expect("rebase readable");
+    assert_eq!(got_rebase.parents, vec![id_branch], "rebase has one parent");
     assert_eq!(
-        got_graft.changes, cs_child.changes,
+        got_rebase.changes, cs_child.changes,
         "changes replayed verbatim"
     );
-    let graft_tree = client.root_tree(repo, grafted).await.expect("graft tree");
-    let grafted_files = client
-        .get_tree(repo, graft_tree.expect("non-empty"))
+    let rebase_tree = client.root_tree(repo, rebased).await.expect("rebase tree");
+    let rebased_files = client
+        .get_tree(repo, rebase_tree.expect("non-empty"))
         .await
         .expect("tree");
-    let mut graft_names: Vec<&str> = grafted_files
+    let mut rebase_names: Vec<&str> = rebased_files
         .entries
         .iter()
         .map(|e| e.name.as_str())
         .collect();
-    graft_names.sort_unstable();
-    // The graft replays the delta only: the branch's other.txt plus the
+    rebase_names.sort_unstable();
+    // The rebase replays the delta only: the branch's other.txt plus the
     // replayed a.txt modify.
     assert_eq!(
-        graft_names,
+        rebase_names,
         vec!["a.txt", "other.txt"],
         "replayed tree merges"
     );
 
-    // A conflicting graft fails with FAILED_PRECONDITION listing the path:
+    // A conflicting rebase fails with FAILED_PRECONDITION listing the path:
     // this changeset deletes "other.txt", which exists on its own parent
-    // (so it stores fine) but not on the graft target's tree.
+    // (so it stores fine) but not on the rebase target's tree.
     let cs_bad = Changeset {
         parents: vec![id_branch],
         changes: vec![Change {
@@ -373,9 +373,9 @@ async fn server_smoke_end_to_end() {
         .await
         .expect("valid against its own parent");
     let err = client
-        .graft(repo, id_bad, id_root)
+        .rebase(repo, id_bad, id_root)
         .await
-        .expect_err("graft conflicts on the missing path");
+        .expect_err("rebase conflicts on the missing path");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
         err.message().contains("other.txt"),
@@ -401,14 +401,14 @@ async fn server_smoke_end_to_end() {
         )
         .await
         .expect("pre-image branch created");
-    let grafted_pre = client
-        .graft(repo, id_child, id_branch_pre)
+    let rebased_pre = client
+        .rebase(repo, id_child, id_branch_pre)
         .await
-        .expect("graft over an untouched pre-image succeeds");
+        .expect("rebase over an untouched pre-image succeeds");
     let pre_tree = client
-        .root_tree(repo, grafted_pre)
+        .root_tree(repo, rebased_pre)
         .await
-        .expect("graft tree")
+        .expect("rebase tree")
         .expect("non-empty");
     let mut pre_files: Vec<String> = client
         .get_tree(repo, pre_tree)
@@ -446,9 +446,9 @@ async fn server_smoke_end_to_end() {
         .await
         .expect("diverged branch created");
     let err = client
-        .graft(repo, id_child, id_branch_div)
+        .rebase(repo, id_child, id_branch_div)
         .await
-        .expect_err("graft onto a diverged copy conflicts");
+        .expect_err("rebase onto a diverged copy conflicts");
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     assert!(
         err.message().contains("a.txt"),
@@ -476,8 +476,8 @@ async fn server_smoke_end_to_end() {
     // --------------------------------------------------------- counters
     // Exactly the four counted RPCs were exercised, in these amounts:
     // create_changeset ×6 (root, child, branch, bad, pre-image branch,
-    // diverged branch); GetTree ×4 (root, child subtree, graft tree,
-    // pre-image graft tree); GetBlob ×1; PutBlob ×0 so far.
+    // diverged branch); GetTree ×4 (root, child subtree, rebase tree,
+    // pre-image rebase tree); GetBlob ×1; PutBlob ×0 so far.
     let stats: BTreeMap<String, u64> = client.get_stats(repo).await.expect("stats");
     assert_eq!(stats.get("create_changeset"), Some(&6), "stats: {stats:?}");
     assert_eq!(stats.get("get_tree"), Some(&4), "stats: {stats:?}");
@@ -510,8 +510,8 @@ async fn server_smoke_end_to_end() {
 /// Truncated changeset ids resolve through the shared revspec resolver
 /// (ROUGH-EDGE-4.1): hex prefixes of ≥ 8 chars work on every id-taking
 /// surface via `GetRef`'s prefix fallback, with ref-wins precedence and
-/// the three error shapes pinned end to end. The seedbed is real SQLite
-/// here, so the ambiguous case plants a twin-id row beside a genuine
+/// the three error shapes pinned end to end. The metadata is real SQLite
+/// here, so the ambiguous case inserts a twin-id row beside a genuine
 /// changeset (the ids are hash-driven and cannot be chosen).
 #[tokio::test]
 async fn revspec_prefix_resolution_end_to_end() {
@@ -522,7 +522,7 @@ async fn revspec_prefix_resolution_end_to_end() {
     let repo = "garden";
     let client = server.client().await;
 
-    // A two-commit history, `main` harvested onto the child.
+    // A two-commit history, `main` published onto the child.
     let a = b"hello garden\n".to_vec();
     let a2 = b"hello garden v2\n".to_vec();
     let cs_root = cs(
@@ -531,19 +531,19 @@ async fn revspec_prefix_resolution_end_to_end() {
         "root",
         10,
     );
-    let id_root = sow(&client, repo, &cs_root, &[&a, b"world\n"]).await;
+    let id_root = commit(&client, repo, &cs_root, &[&a, b"world\n"]).await;
     let cs_child = cs(
         vec![id_root],
         vec![chg("a.txt", Op::Modify, Some(&a2), Mode::Regular, None)],
         "update a",
         20,
     );
-    let id_child = sow(&client, repo, &cs_child, &[&a2]).await;
-    client.harvest(repo, id_child).await.expect("harvest");
+    let id_child = commit(&client, repo, &cs_child, &[&a2]).await;
+    client.publish(repo, id_child).await.expect("publish");
 
     let hex_root = id_root.to_hex();
 
-    // An 8-hex prefix resolves; so do bed's 16-hex `short()` form and an
+    // An 8-hex prefix resolves; so do working copy's 16-hex `short()` form and an
     // UPPERCASE spelling (canonical spec §1: parsers accept any case).
     let p8 = &hex_root[..8];
     assert_eq!(
@@ -647,12 +647,14 @@ async fn revspec_prefix_resolution_end_to_end() {
 
     // Ambiguity: plant a second changeset row whose id shares the root's
     // first 8 hex chars (hash-prefixed ids cannot be engineered, so the
-    // twin is written beside a real row in the test's own seedbed — the
+    // twin is written beside a real row in the test's own metadata — the
     // same offline surgery the chaos suite practices).
-    let seedbed =
-        rusqlite::Connection::open(dir.path().join("seedbed.sqlite3")).expect("seedbed opens");
-    seedbed.busy_timeout(std::time::Duration::from_secs(5)).ok();
-    let canonical: Vec<u8> = seedbed
+    let metadata =
+        rusqlite::Connection::open(dir.path().join("metadata.sqlite3")).expect("metadata opens");
+    metadata
+        .busy_timeout(std::time::Duration::from_secs(5))
+        .ok();
+    let canonical: Vec<u8> = metadata
         .query_row(
             "SELECT canonical FROM changesets WHERE id = ?1",
             [id_root.as_bytes()],
@@ -661,7 +663,7 @@ async fn revspec_prefix_resolution_end_to_end() {
         .expect("root row present");
     let mut twin = *id_root.as_bytes();
     twin[31] ^= 0x01; // same 8-hex prefix, different id
-    seedbed
+    metadata
         .execute(
             "INSERT INTO changesets(id, canonical) VALUES(?1, ?2)",
             rusqlite::params![&twin[..], &canonical],
@@ -677,14 +679,14 @@ async fn revspec_prefix_resolution_end_to_end() {
     server.shutdown().await;
 }
 
-/// The graft three-way rule's edge cases (FIX-A follow-up): writes are
+/// The rebase three-way rule's edge cases (FIX-A follow-up): writes are
 /// admitted when the new parent's copy is a no-op or exactly the
 /// pre-image — including mode-only changes, renames over a modified
 /// source, delete/re-add interplay, symlink retargets and empty files —
 /// while a genuinely diverged modify still fails and leaves zero partial
 /// state.
 #[tokio::test]
-async fn graft_three_way_edge_cases() {
+async fn rebase_three_way_edge_cases() {
     use tonic::Code;
 
     let dir = tempfile::tempdir().expect("tempdir");
@@ -705,7 +707,7 @@ async fn graft_three_way_edge_cases() {
         "root",
         10,
     );
-    let id_root = sow(
+    let id_root = commit(
         &client,
         repo,
         &cs_root,
@@ -728,23 +730,23 @@ async fn graft_three_way_edge_cases() {
         "flip mode.txt to exec",
         20,
     );
-    let id_mode = sow(&client, repo, &cs_mode, &[]).await;
+    let id_mode = commit(&client, repo, &cs_mode, &[]).await;
     let cs_target_a = cs(
         vec![],
         vec![add("mode.txt", b"mode\n"), add("ta.txt", b"ta\n")],
         "branch with the pre-image mode.txt",
         30,
     );
-    let id_target_a = sow(&client, repo, &cs_target_a, &[b"ta\n"]).await;
-    let grafted_a = client
-        .graft(repo, id_mode, id_target_a)
+    let id_target_a = commit(&client, repo, &cs_target_a, &[b"ta\n"]).await;
+    let rebased_a = client
+        .rebase(repo, id_mode, id_target_a)
         .await
-        .expect("mode-only graft over the pre-image replays");
+        .expect("mode-only rebase over the pre-image replays");
     let tree_a = client
         .get_tree(
             repo,
             client
-                .root_tree(repo, grafted_a)
+                .root_tree(repo, rebased_a)
                 .await
                 .expect("tree")
                 .expect("non-empty"),
@@ -757,10 +759,10 @@ async fn graft_three_way_edge_cases() {
         Some(blob_id(b"mode\n"))
     );
     assert_eq!(tree_entry_mode(&tree_a, "ta.txt"), Mode::Regular);
-    // The grafted changeset is exactly the deterministic replay.
-    assert_eq!(grafted_a, expected_graft_id(&cs_mode, id_target_a));
+    // The rebased changeset is exactly the deterministic replay.
+    assert_eq!(rebased_a, expected_rebase_id(&cs_mode, id_target_a));
     let got_a = client
-        .get_changeset(repo, grafted_a)
+        .get_changeset(repo, rebased_a)
         .await
         .expect("readable");
     assert_eq!(got_a.parents, vec![id_target_a], "one parent: the target");
@@ -779,7 +781,7 @@ async fn graft_three_way_edge_cases() {
         "rename ren.txt",
         40,
     );
-    let id_rename = sow(&client, repo, &cs_rename, &[]).await;
+    let id_rename = commit(&client, repo, &cs_rename, &[]).await;
     let cs_main_mod = cs(
         vec![id_root],
         vec![chg(
@@ -792,9 +794,9 @@ async fn graft_three_way_edge_cases() {
         "modify the future rename source on main",
         50,
     );
-    let id_main_mod = sow(&client, repo, &cs_main_mod, &[b"ren v2\n"]).await;
+    let id_main_mod = commit(&client, repo, &cs_main_mod, &[b"ren v2\n"]).await;
     let error = client
-        .graft(repo, id_rename, id_main_mod)
+        .rebase(repo, id_rename, id_main_mod)
         .await
         .expect_err("rename must preserve concurrent source edits");
     assert_eq!(error.code(), Code::FailedPrecondition);
@@ -809,20 +811,20 @@ async fn graft_three_way_edge_cases() {
         "delete gone.txt",
         50,
     );
-    let id_del = sow(&client, repo, &cs_del, &[]).await;
+    let id_del = commit(&client, repo, &cs_del, &[]).await;
     let cs_readd = cs(
         vec![id_del],
         vec![add("gone.txt", b"gone\n")],
         "re-add gone.txt",
         50,
     );
-    let id_readd = sow(&client, repo, &cs_readd, &[]).await;
-    let grafted_c1 = client
-        .graft(repo, id_readd, id_root)
+    let id_readd = commit(&client, repo, &cs_readd, &[]).await;
+    let rebased_c1 = client
+        .rebase(repo, id_readd, id_root)
         .await
         .expect("re-add over the kept copy is a no-op");
     assert_eq!(
-        client.root_tree(repo, grafted_c1).await.expect("tree"),
+        client.root_tree(repo, rebased_c1).await.expect("tree"),
         client.root_tree(repo, id_root).await.expect("tree"),
         "the replayed re-add changed nothing"
     );
@@ -834,13 +836,13 @@ async fn graft_three_way_edge_cases() {
         "delete gone.txt (again)",
         60,
     );
-    let id_del_again = sow(&client, repo, &cs_del_again, &[]).await;
-    let grafted_c2 = client
-        .graft(repo, id_del_again, id_readd)
+    let id_del_again = commit(&client, repo, &cs_del_again, &[]).await;
+    let rebased_c2 = client
+        .rebase(repo, id_del_again, id_readd)
         .await
         .expect("delete over a re-added identical copy replays");
     assert_eq!(
-        client.root_tree(repo, grafted_c2).await.expect("tree"),
+        client.root_tree(repo, rebased_c2).await.expect("tree"),
         client.root_tree(repo, id_del).await.expect("tree"),
         "the replayed delete lands where the first delete did"
     );
@@ -858,7 +860,7 @@ async fn graft_three_way_edge_cases() {
         "retarget the symlink",
         60,
     );
-    let id_link = sow(&client, repo, &cs_link, &[b"new-target"]).await;
+    let id_link = commit(&client, repo, &cs_link, &[b"new-target"]).await;
     let cs_target_d = cs(
         vec![],
         vec![
@@ -868,16 +870,16 @@ async fn graft_three_way_edge_cases() {
         "branch with the pre-image symlink",
         70,
     );
-    let id_target_d = sow(&client, repo, &cs_target_d, &[b"td\n"]).await;
-    let grafted_d = client
-        .graft(repo, id_link, id_target_d)
+    let id_target_d = commit(&client, repo, &cs_target_d, &[b"td\n"]).await;
+    let rebased_d = client
+        .rebase(repo, id_link, id_target_d)
         .await
         .expect("symlink retarget over the pre-image replays");
     let tree_d = client
         .get_tree(
             repo,
             client
-                .root_tree(repo, grafted_d)
+                .root_tree(repo, rebased_d)
                 .await
                 .expect("tree")
                 .expect("non-empty"),
@@ -897,27 +899,27 @@ async fn graft_three_way_edge_cases() {
         "add an empty file",
         70,
     );
-    let id_empty = sow(&client, repo, &cs_empty, &[b""]).await;
+    let id_empty = commit(&client, repo, &cs_empty, &[b""]).await;
     let cs_target_e = cs(
         vec![],
         vec![add("newempty.txt", b"")],
         "empty file here",
         80,
     );
-    let id_target_e = sow(&client, repo, &cs_target_e, &[b""]).await;
-    let grafted_e = client
-        .graft(repo, id_empty, id_target_e)
+    let id_target_e = commit(&client, repo, &cs_target_e, &[b""]).await;
+    let rebased_e = client
+        .rebase(repo, id_empty, id_target_e)
         .await
         .expect("empty-file creation over an existing empty file");
     assert_eq!(
-        client.root_tree(repo, grafted_e).await.expect("tree"),
+        client.root_tree(repo, rebased_e).await.expect("tree"),
         client.root_tree(repo, id_target_e).await.expect("tree"),
         "the replayed creation changed nothing"
     );
 
     // (f) A genuinely conflicting modify still FAILS_PRECONDITION naming
-    // the path — and a failed graft leaves zero partial state: the refs
-    // are untouched and the would-be grafted changeset does not exist.
+    // the path — and a failed rebase leaves zero partial state: the refs
+    // are untouched and the would-be rebased changeset does not exist.
     let cs_conflict = cs(
         vec![id_root],
         vec![chg(
@@ -930,37 +932,37 @@ async fn graft_three_way_edge_cases() {
         "rewrite conflict.txt",
         90,
     );
-    let id_conflict = sow(&client, repo, &cs_conflict, &[b"new\n"]).await;
+    let id_conflict = commit(&client, repo, &cs_conflict, &[b"new\n"]).await;
     let cs_target_f = cs(
         vec![],
         vec![add("conflict.txt", b"divergent\n")],
         "diverged conflict.txt",
         90,
     );
-    let id_target_f = sow(&client, repo, &cs_target_f, &[b"divergent\n"]).await;
+    let id_target_f = commit(&client, repo, &cs_target_f, &[b"divergent\n"]).await;
 
     let refs_before = drain(client.list_refs(repo).await).await;
-    let graft_err = client
-        .graft(repo, id_conflict, id_target_f)
+    let rebase_err = client
+        .rebase(repo, id_conflict, id_target_f)
         .await
-        .expect_err("conflicting graft refused");
-    assert_eq!(graft_err.code(), Code::FailedPrecondition);
+        .expect_err("conflicting rebase refused");
+    assert_eq!(rebase_err.code(), Code::FailedPrecondition);
     assert!(
-        graft_err.message().contains("conflict.txt"),
-        "conflict names the path: {graft_err}"
+        rebase_err.message().contains("conflict.txt"),
+        "conflict names the path: {rebase_err}"
     );
     // Zero partial state: refs identical, and the replayed changeset
-    // (computable client-side — graft is deterministic) is absent.
+    // (computable client-side — rebase is deterministic) is absent.
     assert_eq!(
         drain(client.list_refs(repo).await).await,
         refs_before,
-        "a failed graft leaves no ref behind"
+        "a failed rebase leaves no ref behind"
     );
-    let would_be = expected_graft_id(&cs_conflict, id_target_f);
+    let would_be = expected_rebase_id(&cs_conflict, id_target_f);
     let missing = client
         .get_changeset(repo, would_be)
         .await
-        .expect_err("no changeset was stored by the failed graft");
+        .expect_err("no changeset was stored by the failed rebase");
     assert_eq!(
         missing.code(),
         Code::NotFound,
@@ -968,10 +970,10 @@ async fn graft_three_way_edge_cases() {
     );
     // Retrying fails identically — nothing half-written the first time.
     let retry = client
-        .graft(repo, id_conflict, id_target_f)
+        .rebase(repo, id_conflict, id_target_f)
         .await
         .expect_err("retry refuses identically");
-    assert_eq!(retry.message(), graft_err.message());
+    assert_eq!(retry.message(), rebase_err.message());
 
     server.shutdown().await;
 }
@@ -994,10 +996,10 @@ fn tree_entry_blob(tree: &gardenbed_model::Tree, name: &str) -> Option<gardenbed
         .and_then(|e| e.blob)
 }
 
-/// The id a graft of `cs` onto `new_parent` will deterministically get:
-/// the replayed changeset is fully derived client-side, so a failed graft
+/// The id a rebase of `cs` onto `new_parent` will deterministically get:
+/// the replayed changeset is fully derived client-side, so a failed rebase
 /// can prove zero partial state by showing its id is absent.
-fn expected_graft_id(cs: &Changeset, new_parent: gardenbed_model::Id) -> gardenbed_model::Id {
+fn expected_rebase_id(cs: &Changeset, new_parent: gardenbed_model::Id) -> gardenbed_model::Id {
     use sha2::{Digest, Sha256};
     let replayed = Changeset {
         parents: vec![new_parent],

@@ -1,9 +1,9 @@
-//! Materializing the plot: writing the want-list plan onto the garden
+//! Materializing selected paths: writing the want-list plan onto the repository
 //! (files, modes, symlinks) and the treestate, exactly once per path.
 //!
-//! Shared by `bed plot add` (sync the added prefixes at the current
-//! changeset) and `bed goto` (sync the whole plot at the new changeset).
-//! A complete preflight rejects overwrites of unsown work and untracked
+//! Shared by `bed sparse add` (sync the added prefixes at the current
+//! changeset) and `bed switch` (sync the whole sparse at the new changeset).
+//! A complete preflight rejects overwrites of uncreated work and untracked
 //! collisions before changing files or treestate. Local edits to paths
 //! whose target still equals the indexed baseline are preserved. Repeated
 //! runs accept already-materialized target entries after interruption.
@@ -21,16 +21,16 @@ use std::collections::BTreeSet;
 
 use gardenbed_model::Mode;
 
-use crate::error::BedError;
-use crate::plot::in_plot;
+use crate::error::ClientError;
 use crate::rpc::PlanFile;
+use crate::sparse::in_sparse;
 use crate::treestate::HINT_UNVERIFIED;
 use crate::treestate::HINT_VERIFIED;
 use crate::treestate::MODE_GITLINK;
 use crate::treestate::Treestate;
 use crate::treestate::TreestateEntry;
 
-/// What one sync run did to the garden.
+/// What one sync run did to the repository.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SyncOutcome {
     /// Files written (new content or mode) or created.
@@ -43,7 +43,7 @@ pub struct SyncOutcome {
 }
 
 impl SyncOutcome {
-    /// A one-line garden-voice summary of the materialization.
+    /// A one-line plain-language summary of the materialization.
     pub fn summarize(&self) -> String {
         let mut parts = Vec::new();
         if self.written > 0 {
@@ -63,38 +63,38 @@ impl SyncOutcome {
     }
 }
 
-/// Brings the working copy under `plot` in line with `plan`, relative to
-/// the garden root. Blobs must already be in the local cache (the plan
+/// Brings the working copy under `sparse` in line with `plan`, relative to
+/// the working-copy root. Blobs must already be in the local cache (the plan
 /// fetch guarantees it); this function never touches the network.
 ///
-/// Only paths inside `plot` are touched. Treestate rows are upserted with
+/// Only paths inside `sparse` are touched. Treestate rows are upserted with
 /// freshly observed size/mtime and the verified hint; rows the plan no
-/// longer covers (inside the plot) are deleted along with their files.
-pub async fn sync_plot(
-    garden_root: &std::path::Path,
-    plot: &[String],
+/// longer covers (inside the sparse selection) are deleted along with their files.
+pub async fn sync_sparse(
+    workspace_root: &std::path::Path,
+    sparse: &[String],
     plan: Vec<PlanFile>,
     fetcher: &crate::rpc::Fetcher,
     treestate: &Treestate,
-) -> Result<SyncOutcome, BedError> {
+) -> Result<SyncOutcome, ClientError> {
     let target: BTreeMap<String, PlanFile> = plan
         .into_iter()
         .map(|file| (file.path.clone(), file))
         .collect();
     let disk = crate::checkout_fs::CheckoutFs::open(
-        garden_root,
+        workspace_root,
         treestate.path().parent().expect("state directory"),
     )?;
     // Only identity-registered staging entries from dead writers are
     // reclaimed. Substituted names remain ordinary local/untracked work.
     disk.cleanup_staging()?;
     // Validate the whole operation before changing any file or index row.
-    let preserve = preflight(garden_root, plot, &target, treestate, &disk)?;
+    let preserve = preflight(workspace_root, sparse, &target, treestate, &disk)?;
     let mut outcome = SyncOutcome::default();
     let mut obsolete = Vec::new();
 
     for path in treestate.all_paths()? {
-        if target.contains_key(&path) || !in_plot(&path, plot) {
+        if target.contains_key(&path) || !in_sparse(&path, sparse) {
             continue;
         }
         // An interrupted file→directory transition may already have the
@@ -154,19 +154,19 @@ pub async fn sync_plot(
     Ok(outcome)
 }
 
-fn blocked(path: &str, reason: &str) -> BedError {
-    BedError::CheckoutBlocked {
+fn blocked(path: &str, reason: &str) -> ClientError {
+    ClientError::CheckoutBlocked {
         path: path.to_owned(),
         reason: reason.to_owned(),
     }
 }
 
 /// Identify the active state directory from the selected treestate, so a
-/// custom --bed-dir is protected by the same rule as the default .bed.
+/// custom --state-dir is protected by the same rule as the default .bed.
 pub(crate) fn state_prefixes(
     root: &std::path::Path,
     treestate: &Treestate,
-) -> Result<BTreeSet<String>, BedError> {
+) -> Result<BTreeSet<String>, ClientError> {
     let state = treestate.path().parent().expect("treestate has a parent");
     let mut prefixes = BTreeSet::new();
     if let Some(name) = state.file_name().and_then(|name| name.to_str()) {
@@ -192,21 +192,21 @@ pub(crate) fn is_state_path(path: &str, prefixes: &BTreeSet<String>) -> bool {
 
 fn preflight(
     root: &std::path::Path,
-    plot: &[String],
+    sparse: &[String],
     target: &BTreeMap<String, PlanFile>,
     treestate: &Treestate,
     disk: &crate::checkout_fs::CheckoutFs,
-) -> Result<BTreeSet<String>, BedError> {
+) -> Result<BTreeSet<String>, ClientError> {
     use crate::checkout_fs::Entry;
     let protected = state_prefixes(root, treestate)?;
     let tracked: BTreeMap<_, _> = treestate
         .all_paths()?
         .into_iter()
         .map(|path| Ok((path.clone(), treestate.lookup(&path)?.expect("listed row"))))
-        .collect::<Result<_, BedError>>()?;
+        .collect::<Result<_, ClientError>>()?;
     let affected: BTreeSet<_> = target
         .keys()
-        .chain(tracked.keys().filter(|path| in_plot(path, plot)))
+        .chain(tracked.keys().filter(|path| in_sparse(path, sparse)))
         .cloned()
         .collect();
     let mut preserve = BTreeSet::new();
@@ -332,7 +332,7 @@ fn materialized_ancestor(
     path: &str,
     target: &BTreeMap<String, PlanFile>,
     disk: &crate::checkout_fs::CheckoutFs,
-) -> Result<bool, BedError> {
+) -> Result<bool, ClientError> {
     for (position, _) in path.match_indices('/') {
         let ancestor = &path[..position];
         if let Some(file) = target.get(ancestor)
@@ -357,8 +357,8 @@ pub fn plan_paths(plan: &[PlanFile]) -> BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bed::Bed;
     use crate::checkout_fs::CheckoutFs;
+    use crate::workspace::WorkingCopy;
     use gardenbed_model::blob_id;
     use std::fs;
 
@@ -393,25 +393,25 @@ mod tests {
     #[test]
     fn preflight_preserves_unchanged_local_edits_and_refuses_actual_overwrites() {
         let dir = tempfile::tempdir().unwrap();
-        let bed = Bed::init(&dir.path().join(".bed"), "s", "r").unwrap();
+        let bed = WorkingCopy::init(&dir.path().join(".bed"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
         track(&ts, "f", b"base");
         fs::write(dir.path().join("f"), b"local").unwrap();
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
-        let plot = vec![".".into()];
+        let sparse = vec![".".into()];
         assert_eq!(
-            preflight(dir.path(), &plot, &plan(&[("f", b"base")]), &ts, &disk).unwrap(),
+            preflight(dir.path(), &sparse, &plan(&[("f", b"base")]), &ts, &disk).unwrap(),
             BTreeSet::from(["f".into()])
         );
-        assert!(preflight(dir.path(), &plot, &plan(&[("f", b"target")]), &ts, &disk).is_err());
-        assert!(preflight(dir.path(), &plot, &plan(&[]), &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &plan(&[("f", b"target")]), &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &plan(&[]), &ts, &disk).is_err());
         fs::remove_file(dir.path().join("f")).unwrap();
-        assert!(preflight(dir.path(), &plot, &plan(&[("f", b"target")]), &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &plan(&[("f", b"target")]), &ts, &disk).is_err());
         fs::write(dir.path().join("untracked"), b"local").unwrap();
         assert!(
             preflight(
                 dir.path(),
-                &plot,
+                &sparse,
                 &plan(&[("untracked", b"target")]),
                 &ts,
                 &disk
@@ -423,41 +423,41 @@ mod tests {
     #[test]
     fn directory_replacements_refuse_untracked_and_modified_descendants() {
         let dir = tempfile::tempdir().unwrap();
-        let bed = Bed::init(&dir.path().join(".bed"), "s", "r").unwrap();
+        let bed = WorkingCopy::init(&dir.path().join(".bed"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
         track(&ts, "d/f", b"base");
         fs::create_dir(dir.path().join("d")).unwrap();
         fs::write(dir.path().join("d/f"), b"base").unwrap();
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
-        let plot = vec![".".into()];
+        let sparse = vec![".".into()];
         let target = plan(&[("d", b"replacement")]);
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
         fs::write(dir.path().join("d/extra"), b"local").unwrap();
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_err());
         fs::remove_file(dir.path().join("d/extra")).unwrap();
         fs::write(dir.path().join("d/f"), b"local").unwrap();
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_err());
     }
 
     #[test]
     fn interrupted_shape_transitions_and_partial_writes_can_resume() {
         let dir = tempfile::tempdir().unwrap();
-        let bed = Bed::init(&dir.path().join(".bed"), "s", "r").unwrap();
+        let bed = WorkingCopy::init(&dir.path().join(".bed"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
-        let plot = vec![".".into()];
+        let sparse = vec![".".into()];
         track(&ts, "d/f", b"base");
         fs::write(dir.path().join("d"), b"replacement").unwrap();
         let target = plan(&[("d", b"replacement")]);
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
         assert!(materialized_ancestor("d/f", &target, &disk).unwrap());
         // A crash after removing the old descendants but before installing
         // the new file retains baseline rows and an empty directory.
         fs::remove_file(dir.path().join("d")).unwrap();
         fs::create_dir(dir.path().join("d")).unwrap();
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
         fs::remove_dir(dir.path().join("d")).unwrap();
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
         fs::write(dir.path().join("d"), b"replacement").unwrap();
         ts.remove("d/f").unwrap();
         track(&ts, "d", b"replacement");
@@ -465,31 +465,40 @@ mod tests {
         fs::create_dir(dir.path().join("d")).unwrap();
         fs::write(dir.path().join("d/new"), b"done").unwrap();
         let target = plan(&[("d/new", b"done"), ("d/remaining", b"next")]);
-        assert!(preflight(dir.path(), &plot, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
     }
 
     #[test]
     fn active_custom_state_and_symlink_ancestors_are_protected() {
         let dir = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let bed = Bed::init(&dir.path().join("custom"), "s", "r").unwrap();
+        let bed = WorkingCopy::init(&dir.path().join("custom"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
-        let plot = vec![".".into()];
+        let sparse = vec![".".into()];
         assert!(
             preflight(
                 dir.path(),
-                &plot,
+                &sparse,
                 &plan(&[("custom/config.toml", b"bad")]),
                 &ts,
                 &disk
             )
             .is_err()
         );
-        assert!(preflight(dir.path(), &plot, &plan(&[("custom", b"bad")]), &ts, &disk).is_err());
+        assert!(
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[("custom", b"bad")]),
+                &ts,
+                &disk
+            )
+            .is_err()
+        );
         fs::write(outside.path().join("f"), b"outside").unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();
-        assert!(preflight(dir.path(), &plot, &plan(&[("d/f", b"bad")]), &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &plan(&[("d/f", b"bad")]), &ts, &disk).is_err());
         // Operations enforce the rule independently of preflight.
         assert!(disk.write("d/f", b"bad", Mode::Regular).is_err());
         assert!(disk.remove("d/f").is_err());

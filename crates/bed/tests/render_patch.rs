@@ -1,4 +1,4 @@
-//! Integration tests for bed's git-shaped patch renderer
+//! Integration tests for working copy's git-shaped patch renderer
 //! ([`gardenbed::render::render_diff`]).
 //!
 //! The unit tests in `render.rs` pin each entry class alone; these pin the

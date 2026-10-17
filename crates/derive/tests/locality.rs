@@ -2,7 +2,7 @@
 //! writes O(k) new tree objects — untouched subtrees are kept by id and
 //! never loaded or re-encoded.
 //!
-//! Measured on the on-disk loam (`FsObjectStore` is one flat CAS holding
+//! Measured on the on-disk objects (`FsObjectStore` is one flat CAS holding
 //! blobs and trees, so new blob writes are made *before* the baseline count
 //! to isolate the tree-object delta). The 5k-file variant runs by default;
 //! the 50k-file variant is `#[ignore]`d (run with `cargo test -- --ignored`).
@@ -93,7 +93,7 @@ fn modify_changeset(
     )
 }
 
-/// Number of files under the loam object directory (the flat CAS: one file
+/// Number of files under the objects object directory (the flat CAS: one file
 /// per object, blobs and trees alike).
 fn count_object_files(root: &Path) -> usize {
     let objects = root.join("objects");
@@ -110,11 +110,11 @@ fn count_object_files(root: &Path) -> usize {
 
 /// The locality scenario: `total_files` spread over `total_dirs`, then a
 /// 100-file change touching `changed_dirs` distinct directories. Asserts the
-/// number of new loam objects is ≤ 2×(changed dirs) + a small constant.
+/// number of new objects is ≤ 2×(changed dirs) + a small constant.
 fn run_locality(total_files: usize, total_dirs: usize, changed_dirs: usize) {
     assert_eq!(total_files % total_dirs, 0, "even spread");
     let dir = tempfile::tempdir().expect("tempdir");
-    let objects = Arc::new(FsObjectStore::open(dir.path()).expect("loam opens"));
+    let objects = Arc::new(FsObjectStore::open(dir.path()).expect("objects opens"));
     let metadata = Arc::new(MemoryStore::new());
     let engine = Engine::new(objects.clone(), metadata.clone());
 
@@ -152,7 +152,7 @@ fn run_locality(total_files: usize, total_dirs: usize, changed_dirs: usize) {
     assert!(
         new_objects <= 2 * changed_dirs + 8,
         "locality violated: a 100-file change across {changed_dirs} dirs wrote \
-         {new_objects} new loam objects (bound {})",
+         {new_objects} new objects objects (bound {})",
         2 * changed_dirs + 8
     );
 }
@@ -168,7 +168,7 @@ fn locality_5k_files_100_dirs() {
 #[test]
 fn locality_5k_files_one_dir() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let objects = Arc::new(FsObjectStore::open(dir.path()).expect("loam opens"));
+    let objects = Arc::new(FsObjectStore::open(dir.path()).expect("objects opens"));
     let metadata = Arc::new(MemoryStore::new());
     let engine = Engine::new(objects.clone(), metadata.clone());
 

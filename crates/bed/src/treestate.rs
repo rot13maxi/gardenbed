@@ -1,4 +1,4 @@
-//! `.bed/treestate` — the sqlite index of the materialized plot
+//! `.bed/index.sqlite3` — the sqlite index of the materialized sparse
 //! (v0.1.md §6).
 //!
 //! One row per materialized file:
@@ -9,7 +9,7 @@
 //! ```
 //!
 //! - `blob_id` — the blob's SHA-256 content address (raw 32 bytes), as
-//!   recorded when the file was materialized or sown.
+//!   recorded when the file was materialized or created.
 //! - `mode` — §4 mode codes (0 regular · 1 exec · 2 symlink · 3 gitlink).
 //! - `size` / `mtime_ns` — the *hints* `bed status` uses to avoid hashing:
 //!   if a file's size and mtime still match the row (and `hint` marks the
@@ -18,7 +18,7 @@
 //!   they are unproven and the file must always be hashed.
 //!
 //! The database is opened in WAL mode so a reader (status) never blocks a
-//! writer (treestate updates during sow/goto in later waves).
+//! writer (treestate updates during commit/switch in later waves).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
 
-use crate::error::BedError;
+use crate::error::ClientError;
 
 /// Hint value meaning "these hints were hash-verified at write time; a
 /// matching size+mtime on the next scan may be trusted without hashing".
@@ -66,7 +66,7 @@ pub struct TreestateEntry {
     pub hint: i64,
 }
 
-/// The treestate database: `.bed/treestate`.
+/// The treestate database: `.bed/index.sqlite3`.
 #[derive(Debug)]
 pub struct Treestate {
     path: PathBuf,
@@ -76,9 +76,9 @@ pub struct Treestate {
 impl Treestate {
     /// Opens (creating if needed) the treestate database at `path`, with
     /// WAL journaling. Parent directories are created as needed.
-    pub fn open(path: &Path) -> Result<Self, BedError> {
+    pub fn open(path: &Path) -> Result<Self, ClientError> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            std::fs::create_dir_all(parent).map_err(|e| BedError::Treestate {
+            std::fs::create_dir_all(parent).map_err(|e| ClientError::Treestate {
                 path: path.to_path_buf(),
                 message: e.to_string(),
             })?;
@@ -120,7 +120,7 @@ impl Treestate {
     }
 
     /// Inserts or replaces the row for `entry.path`.
-    pub fn upsert(&self, entry: &TreestateEntry) -> Result<(), BedError> {
+    pub fn upsert(&self, entry: &TreestateEntry) -> Result<(), ClientError> {
         self.conn
             .execute(
                 "INSERT INTO files (path, blob_id, mode, size, mtime_ns, hint)
@@ -145,7 +145,7 @@ impl Treestate {
     }
 
     /// The row for `path`, if the treestate knows it.
-    pub fn lookup(&self, path: &str) -> Result<Option<TreestateEntry>, BedError> {
+    pub fn lookup(&self, path: &str) -> Result<Option<TreestateEntry>, ClientError> {
         let row = self
             .conn
             .query_row(
@@ -167,10 +167,11 @@ impl Treestate {
         match row {
             None => Ok(None),
             Some((blob, mode, size, mtime_ns, hint)) => {
-                let blob_id = Id::from_bytes(blob.try_into().map_err(|_| BedError::Treestate {
-                    path: self.path.clone(),
-                    message: format!("blob_id for {path:?} is not 32 bytes"),
-                })?);
+                let blob_id =
+                    Id::from_bytes(blob.try_into().map_err(|_| ClientError::Treestate {
+                        path: self.path.clone(),
+                        message: format!("blob_id for {path:?} is not 32 bytes"),
+                    })?);
                 Ok(Some(TreestateEntry {
                     path: path.to_owned(),
                     blob_id,
@@ -184,7 +185,7 @@ impl Treestate {
     }
 
     /// Every known path, sorted.
-    pub fn all_paths(&self) -> Result<Vec<String>, BedError> {
+    pub fn all_paths(&self) -> Result<Vec<String>, ClientError> {
         let mut stmt = self
             .conn
             .prepare("SELECT path FROM files ORDER BY path")
@@ -198,7 +199,7 @@ impl Treestate {
     }
 
     /// Forgets `path` entirely (no-op when unknown).
-    pub fn remove(&self, path: &str) -> Result<(), BedError> {
+    pub fn remove(&self, path: &str) -> Result<(), ClientError> {
         self.conn
             .execute("DELETE FROM files WHERE path = ?1", params![path])
             .map_err(|e| bed_err(&self.path, e))?;
@@ -206,7 +207,7 @@ impl Treestate {
     }
 
     /// Forgets every row (the treestate is always rebuildable).
-    pub fn clear(&self) -> Result<(), BedError> {
+    pub fn clear(&self) -> Result<(), ClientError> {
         self.conn
             .execute("DELETE FROM files", [])
             .map_err(|e| bed_err(&self.path, e))?;
@@ -214,7 +215,7 @@ impl Treestate {
     }
 
     /// How many rows the treestate holds.
-    pub fn count(&self) -> Result<i64, BedError> {
+    pub fn count(&self) -> Result<i64, ClientError> {
         self.conn
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))
             .map_err(|e| bed_err(&self.path, e))
@@ -224,8 +225,8 @@ impl Treestate {
     /// clean: records the observed size/mtime and marks the row verified.
     ///
     /// Never touches `blob_id` — content addresses change only through
-    /// `sow`/`goto` (later waves), never through a scan.
-    pub fn refresh_hint(&self, path: &str, size: i64, mtime_ns: i64) -> Result<(), BedError> {
+    /// `commit`/`switch` (later waves), never through a scan.
+    pub fn refresh_hint(&self, path: &str, size: i64, mtime_ns: i64) -> Result<(), ClientError> {
         self.conn
             .execute(
                 "UPDATE files SET size = ?2, mtime_ns = ?3, hint = ?4 WHERE path = ?1",
@@ -236,9 +237,9 @@ impl Treestate {
     }
 }
 
-/// Maps a rusqlite error to [`BedError::Treestate`], naming the database.
-fn bed_err(path: &Path, e: rusqlite::Error) -> BedError {
-    BedError::Treestate {
+/// Maps a rusqlite error to [`ClientError::Treestate`], naming the database.
+fn bed_err(path: &Path, e: rusqlite::Error) -> ClientError {
+    ClientError::Treestate {
         path: path.to_path_buf(),
         message: e.to_string(),
     }
@@ -318,13 +319,13 @@ mod tests {
                 [],
             )
             .unwrap();
-        assert!(matches!(t.lookup("f"), Err(BedError::Treestate { .. })));
+        assert!(matches!(t.lookup("f"), Err(ClientError::Treestate { .. })));
     }
 
     #[test]
     fn opens_in_wal_mode() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("treestate");
+        let path = dir.path().join("index.sqlite3");
         {
             let t = Treestate::open(&path).unwrap();
             t.upsert(&entry("a", b"a", 0)).unwrap();

@@ -199,7 +199,7 @@ message PutBlobResp {
   bytes id = 1;
 }
 
-// Sows a new changeset. Blobs <= 1 MiB ride along in `inline_blobs`, keyed by
+// Commits a new changeset. Blobs <= 1 MiB ride along in `inline_blobs`, keyed by
 // their 64-hex-character lowercase blob id (SHA-256 of the raw content);
 // larger blobs must be uploaded via PutBlob first and referenced by id in the
 // changeset. The reply is the changeset's id.
@@ -268,7 +268,7 @@ message ListRefsReq {
 // the shared revspec resolver for `<cs-or-ref>` arguments: when no ref
 // matches the name, an all-hex token of 8..=63 chars resolves as a
 // changeset id prefix (case-insensitive; one indexed range seek over the
-// seedbed's 32-byte ids). An existing ref with that exact name wins over
+// metadata's 32-byte ids). An existing ref with that exact name wins over
 // prefix interpretation; a full 64-hex token is never prefix-interpreted
 // (clients parse those as ids directly). Exactly one prefix match answers
 // with its id; several fail with INVALID_ARGUMENT naming the match count
@@ -298,27 +298,27 @@ message CasRefReq {
 // Server-side replay of `cs_id`'s changes onto `new_parent`'s tree
 // (linearized rebase). Semantic conflicts abort the RPC with
 // FAILED_PRECONDITION (conflicting paths in the status message).
-message GraftReq {
+message RebaseReq {
   string repo = 1;
   bytes cs_id = 2;
   bytes new_parent = 3;
 }
 
-// The id of the grafted changeset.
-message GraftResp {
+// The id of the rebased changeset.
+message RebaseResp {
   bytes id = 1;
 }
 
 // Fast-forwards ref "main" to `cs_id`: asserts IsAncestor(current main,
 // cs_id), then CAS-moves "main" (v0.1.md D5). Violating the ancestry
 // precondition fails with FAILED_PRECONDITION.
-message HarvestReq {
+message PublishReq {
   string repo = 1;
   bytes cs_id = 2;
 }
 
-// The changeset "main" now points at (== the harvested cs_id).
-message HarvestResp {
+// The changeset "main" now points at (== the published cs_id).
+message PublishResp {
   bytes id = 1;
 }
 
@@ -361,7 +361,7 @@ service Gardenbed {
   // The first frame must be the header (which names the repo).
   rpc PutBlob(stream PutBlobChunk) returns (PutBlobResp);
 
-  // Sow a changeset (with <= 1 MiB blobs inline); replies with its id.
+  // Commit a changeset (with <= 1 MiB blobs inline); replies with its id.
   rpc CreateChangeset(CreateChangesetReq) returns (CreateChangesetResp);
 
   // Merge base of two changesets; absent when they share none.
@@ -400,10 +400,10 @@ service Gardenbed {
 
   // Replay a changeset's changes onto a new parent (conflicts are
   // FAILED_PRECONDITION errors, not results).
-  rpc Graft(GraftReq) returns (GraftResp);
+  rpc Rebase(RebaseReq) returns (RebaseResp);
 
   // Fast-forward CAS of ref "main" to the given changeset.
-  rpc Harvest(HarvestReq) returns (HarvestResp);
+  rpc Publish(PublishReq) returns (PublishResp);
 
   // Per-repo request counters (debug/test infrastructure).
   rpc GetStats(GetStatsReq) returns (StatsResp);

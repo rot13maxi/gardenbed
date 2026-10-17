@@ -120,7 +120,7 @@ fn check_against_git(
         if *mode == Mode::Gitlink {
             // The entry's blob field is the upstream git sha left-padded to
             // 32 bytes; git's ls-tree shows the raw 20-byte sha. Pointers
-            // are opaque references, not loam objects — compare them from
+            // are opaque references, not objects objects — compare them from
             // the derived tree directly.
             assert_eq!(
                 &blob.as_bytes()[12..],
@@ -145,9 +145,10 @@ fn run_history(seed: u64, eager: bool, on_disk: bool) {
     let metadata: Arc<dyn MetadataStore>;
     let dir = tempfile::tempdir().expect("tempdir");
     if on_disk {
-        objects = Arc::new(FsObjectStore::open(dir.path()).expect("loam opens"));
+        objects = Arc::new(FsObjectStore::open(dir.path()).expect("objects opens"));
         metadata = Arc::new(
-            SqliteMetadataStore::open(&dir.path().join("seedbed.sqlite3")).expect("seedbed opens"),
+            SqliteMetadataStore::open(&dir.path().join("metadata.sqlite3"))
+                .expect("metadata opens"),
         );
     } else {
         let m = Arc::new(MemoryStore::new());
@@ -181,7 +182,7 @@ fn tree_equality_seed42_memory_lazy() {
     run_history(42, false, false);
 }
 
-/// Seed 2026: on-disk loam + seedbed, eager derivation.
+/// Seed 2026: on-disk objects + metadata, eager derivation.
 #[test]
 fn tree_equality_seed2026_disk_eager() {
     run_history(2026, true, true);

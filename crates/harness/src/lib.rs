@@ -2,13 +2,13 @@
 //!
 //! The harness generates deterministic synthetic histories as gardenbed
 //! changesets ([`generate`]) and materializes the *same* history into a real
-//! git repository using git plumbing ([`materialize`]), so later milestones
-//! can compare gardenbed's answers against git as the oracle.
+//! git repository using git plumbing ([`mod@materialize`]), so later milestones
+//! can compare Gardenbed's answers against git as the oracle.
 //!
 //! Layout:
 //!
 //! - [`generator`]: seeded history generator + [`files_at`] replay.
-//! - [`materialize`]: renders changesets into a git repo via plumbing
+//! - [`mod@materialize`]: renders changesets into a git repo via plumbing
 //!   (`hash-object`, `update-index --index-info`, `write-tree`,
 //!   `commit-tree`, `update-ref`).
 //! - [`oracle`]: subprocess-git oracle wrappers (`show`, `ls-tree -r -z`,

@@ -3,14 +3,14 @@ mod common;
 
 use std::{collections::BTreeMap, fs, path::PathBuf};
 
-use common::{Arboretum, REPO, bed};
+use common::{REPO, Server, bed};
 use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_server::Repo;
 
 struct World {
     _root: tempfile::TempDir,
     garden: PathBuf,
-    server: Arboretum,
+    server: Server,
     target: Id,
 }
 
@@ -82,11 +82,11 @@ async fn world_with_external_state(
         &[("a", Op::Modify, b"target"), ("z", Op::Modify, b"target")],
     );
     repo.cas_ref("main", None, local).unwrap();
-    let server = Arboretum::spawn(&store_root).await;
+    let server = Server::spawn(&store_root).await;
     let (code, _, err) = bed(
         &garden,
         &[
-            "--bed-dir",
+            "--state-dir",
             state_name,
             "clone",
             &server.http(),
@@ -104,36 +104,36 @@ async fn world_with_external_state(
 }
 
 #[tokio::test]
-async fn dirty_goto_and_graft_refuse_before_any_file_or_state_moves() {
+async fn dirty_switch_and_rebase_refuse_before_any_file_or_state_moves() {
     let mut w = world(None, ".bed").await;
-    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "{err}");
-    fs::write(w.garden.join("z"), b"unsown").unwrap();
+    fs::write(w.garden.join("z"), b"uncreated").unwrap();
     let config = fs::read(w.garden.join(".bed/config.toml")).unwrap();
     let heads = fs::read(w.garden.join(".bed/heads")).unwrap();
-    for command in ["goto", "graft"] {
+    for command in ["switch", "rebase"] {
         let (code, _, err) = bed(&w.garden, &[command, &w.target.to_hex()]);
         assert_ne!(code, 0, "{command} must refuse");
         assert!(err.contains("local changes"), "{err}");
         assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"base");
-        assert_eq!(fs::read(w.garden.join("z")).unwrap(), b"unsown");
+        assert_eq!(fs::read(w.garden.join("z")).unwrap(), b"uncreated");
         assert_eq!(fs::read(w.garden.join(".bed/config.toml")).unwrap(), config);
         assert_eq!(fs::read(w.garden.join(".bed/heads")).unwrap(), heads);
     }
-    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "an unchanged target preserves edits: {err}");
-    assert_eq!(fs::read(w.garden.join("z")).unwrap(), b"unsown");
+    assert_eq!(fs::read(w.garden.join("z")).unwrap(), b"uncreated");
     w.server.shutdown().await;
 }
 
 #[tokio::test]
-async fn ancestor_symlink_and_untracked_collisions_refuse_before_plot_config_moves() {
+async fn ancestor_symlink_and_untracked_collisions_refuse_before_sparse_config_moves() {
     let mut w = world(Some("d/f"), ".bed").await;
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("f"), b"valuable").unwrap();
     std::os::unix::fs::symlink(outside.path(), w.garden.join("d")).unwrap();
     let config = fs::read(w.garden.join(".bed/config.toml")).unwrap();
-    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_ne!(code, 0);
     assert!(err.contains("ancestor"), "{err}");
     assert!(
@@ -144,7 +144,7 @@ async fn ancestor_symlink_and_untracked_collisions_refuse_before_plot_config_mov
     assert_eq!(fs::read(w.garden.join(".bed/config.toml")).unwrap(), config);
     fs::remove_file(w.garden.join("d")).unwrap();
     fs::write(w.garden.join("a"), b"untracked").unwrap();
-    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_ne!(code, 0);
     assert!(err.contains("untracked"), "{err}");
     assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"untracked");
@@ -156,14 +156,17 @@ async fn ancestor_symlink_and_untracked_collisions_refuse_before_plot_config_mov
 async fn repository_cannot_overwrite_custom_bed_state() {
     let mut w = world(Some("state/config.toml"), "state").await;
     let config = fs::read(w.garden.join("state/config.toml")).unwrap();
-    let (code, _, err) = bed(&w.garden, &["--bed-dir", "state", "plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["--state-dir", "state", "sparse", "add", "."]);
     assert_ne!(code, 0);
     assert!(err.contains("active bed state"), "{err}");
     assert_eq!(
         fs::read(w.garden.join("state/config.toml")).unwrap(),
         config
     );
-    let (code, out, err) = bed(&w.garden, &["--bed-dir", "state", "status", "--full-scan"]);
+    let (code, out, err) = bed(
+        &w.garden,
+        &["--state-dir", "state", "status", "--full-scan"],
+    );
     assert_eq!(code, 0, "{err}");
     assert!(!out.contains("config.toml"), "{out}");
     w.server.shutdown().await;
@@ -185,38 +188,38 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
         eprintln!("cross-device CLI test unavailable: devices are identical");
         return;
     }
-    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"base");
     std::os::unix::fs::symlink("a", w.garden.join("link")).unwrap();
-    let (code, _, err) = bed(&w.garden, &["sow", "-m", "symlink"]);
+    let (code, _, err) = bed(&w.garden, &["commit", "-m", "symlink"]);
     assert_eq!(code, 0, "{err}");
-    let saved = gardenbed::bed::Bed::open(&w.garden.join(".bed"))
+    let saved = gardenbed::workspace::WorkingCopy::open(&w.garden.join(".bed"))
         .unwrap()
         .config()
         .current_cs
         .clone()
         .unwrap();
-    let (code, _, err) = bed(&w.garden, &["goto", &w.target.to_hex()]);
+    let (code, _, err) = bed(&w.garden, &["switch", &w.target.to_hex()]);
     assert_eq!(code, 0, "{err}");
     assert!(!w.garden.join("link").exists());
-    let (code, _, err) = bed(&w.garden, &["goto", &saved]);
+    let (code, _, err) = bed(&w.garden, &["switch", &saved]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(
         fs::read_link(w.garden.join("link")).unwrap(),
         std::path::Path::new("a")
     );
-    fs::write(w.garden.join("a"), b"unsown").unwrap();
+    fs::write(w.garden.join("a"), b"uncreated").unwrap();
     let config = fs::read(state.path().join("config.toml")).unwrap();
-    let (code, _, err) = bed(&w.garden, &["goto", &w.target.to_hex()]);
+    let (code, _, err) = bed(&w.garden, &["switch", &w.target.to_hex()]);
     assert_ne!(code, 0);
     assert!(err.contains("local changes"), "{err}");
-    assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"unsown");
+    assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"uncreated");
     assert_eq!(fs::read(state.path().join("config.toml")).unwrap(), config);
     fs::write(w.garden.join("a"), b"base").unwrap();
 
     // Simulate a partial stage retained by a killed writer. Only the
-    // registered device/inode pair is excluded from status and sow.
+    // registered device/inode pair is excluded from status and commit.
     let stage = ".bed-checkout-recovery";
     fs::write(w.garden.join(stage), b"partial stage bytes").unwrap();
     let meta = fs::symlink_metadata(w.garden.join(stage)).unwrap();
@@ -231,9 +234,9 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
     assert_eq!(code, 0, "{err}");
     assert!(out.contains("normal"));
     assert!(!out.contains(stage), "{out}");
-    let (code, _, err) = bed(&w.garden, &["sow", "-m", "real work"]);
+    let (code, _, err) = bed(&w.garden, &["commit", "-m", "real work"]);
     assert_eq!(code, 0, "{err}");
-    let current = gardenbed::bed::Bed::open(&w.garden.join(".bed"))
+    let current = gardenbed::workspace::WorkingCopy::open(&w.garden.join(".bed"))
         .unwrap()
         .config()
         .current_cs
@@ -248,7 +251,7 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
             .collect::<Vec<_>>(),
         ["normal"]
     );
-    let (code, _, err) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "{err}");
     assert!(!w.garden.join(stage).exists());
     assert!(!state.path().join("checkout-stage-recovery").exists());

@@ -1,7 +1,7 @@
 //! Shared bench world: tmpfs fixtures, a spawned `gardenbed-server`
 //! binary, generated histories ingested in-process, and lib-side beds.
 //!
-//! The same rules as bed's perf tests apply (and for the same reason):
+//! The same rules as working copy's perf tests apply (and for the same reason):
 //! fixtures live on tmpfs when one exists (`/dev/shm`), because the
 //! object store fsyncs every object it publishes — the dominant cost on
 //! ext4, a rounding error on tmpfs — and the benches measure the *design*,
@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{Duration, timeout};
 
-/// The repo name every fixture is ingested under (and the bed's default).
+/// The repo name every fixture is ingested under (and the working copy's default).
 pub const REPO: &str = "garden";
 
 /// Reads a usize env knob, falling back to `default` (and flooring at
@@ -83,17 +83,17 @@ pub fn server_bin() -> PathBuf {
     )
 }
 
-/// One running arboretum: the spawned `gardenbed-server` process, its
+/// One running server: the spawned `gardenbed-server` process, its
 /// bound address, and its repo root. Killed (and the tmpfs removed) when
 /// the bench's world drops.
-pub struct Arboretum {
+pub struct Server {
     pub child: tokio::process::Child,
     /// The `ip:port` the server announced.
     pub addr: String,
     pub root: PathBuf,
 }
 
-impl Arboretum {
+impl Server {
     /// Spawns the server binary over `root` and waits (≤ 30 s) for its
     /// `listening on <addr>` stdout line.
     pub async fn spawn(root: &Path) -> Self {
@@ -119,7 +119,7 @@ impl Arboretum {
             .strip_prefix("listening on ")
             .unwrap_or_else(|| panic!("expected a listening line, got {line:?}"))
             .to_owned();
-        Arboretum {
+        Server {
             child,
             addr,
             root: root.to_path_buf(),
@@ -139,7 +139,7 @@ impl Arboretum {
 }
 
 /// True if a blob id is a submodule pointer: 12 zero bytes followed by the
-/// 20-byte upstream git SHA-1 (canonical spec §3). Never a loam object.
+/// 20-byte upstream git SHA-1 (canonical spec §3). Never a objects object.
 pub fn is_gitlink_pointer(id: &Id, history: &GeneratedHistory) -> bool {
     id.as_bytes()[..12].iter().all(|b| *b == 0)
         && history.blob(id) == Some(id.as_bytes().as_slice())
@@ -155,7 +155,7 @@ pub fn ingest(history: &GeneratedHistory, root: &Path) -> Id {
         for change in &cs.changes {
             let Some(blob) = change.blob else { continue };
             if change.mode == Mode::Gitlink || is_gitlink_pointer(&blob, history) {
-                continue; // opaque upstream pointer, never a loam object
+                continue; // opaque upstream pointer, never a objects object
             }
             let content = history
                 .blob(&blob)
@@ -174,7 +174,7 @@ pub fn ingest(history: &GeneratedHistory, root: &Path) -> Id {
 
 /// A generated history whose head mixes exec, symlink, and gitlink files
 /// in with the regular ones (the first qualifying seed in 1..100 — the
-/// same fixture contract bed's perf tests use).
+/// same fixture contract working copy's perf tests use).
 pub fn seeded_history(opts: &GenOptions) -> GeneratedHistory {
     (1..100u64)
         .map(|s| generate(s, opts))
@@ -186,17 +186,17 @@ pub fn seeded_history(opts: &GenOptions) -> GeneratedHistory {
         .expect("a qualifying seed exists in 1..100")
 }
 
-/// A planted bed beside its garden root: `<dir>` holds the working files,
-/// `<dir>/.bed` the bed state.
+/// A initialized bed beside its working-copy root: `<dir>` holds the working files,
+/// `<dir>/.bed` the working copy state.
 pub struct Garden {
-    /// The working-copy root (what `bed.garden_root()` resolves to).
+    /// The working-copy root (what `bed.workspace_root()` resolves to).
     pub dir: PathBuf,
     /// The bed state directory (`<dir>/.bed`).
     pub bed: PathBuf,
 }
 
 impl Garden {
-    /// Creates the directory and plants a fresh bed over `server_http`
+    /// Creates the directory and creates a fresh working copy over `server_http`
     /// (the lib-side `ops::clone`: one ref read, nothing materialized).
     pub async fn plant(dir: &Path, server_http: &str) -> Self {
         std::fs::create_dir_all(dir).expect("garden dir");
@@ -213,9 +213,9 @@ impl Garden {
 
 /// Ingests `total_files` bulk files (in changesets of `per_cs` adds,
 /// spread over per-changeset directories so each tree apply touches a
-/// handful of nodes) plus a `small/` plot of `small_files` files, and
-/// points `main` at the head. The same fixture shape bed's M5 size-
-/// independence budget uses; the sow benches measure the identical delta
+/// handful of nodes) plus a `small/` sparse of `small_files` files, and
+/// points `main` at the head. The same fixture shape working copy's M5 size-
+/// independence budget uses; the commit benches measure the identical delta
 /// against repos of different total size on top of it.
 pub fn build_sized_repo(root: &Path, total_files: usize, per_cs: usize, small_files: usize) -> Id {
     use gardenbed_model::{Change, Changeset, Identity, Op};

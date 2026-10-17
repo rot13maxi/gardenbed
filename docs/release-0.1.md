@@ -1,5 +1,9 @@
 # v0.1.0 — release notes and verification record
 
+Historical record: command names, package names, and storage paths in this
+document describe the recorded version. See [current terminology](terminology.md)
+and the [CLI reference](cli.md) for the current interface.
+
 This document is the M8 close-out: what shipped, what was verified, and
 what a reviewer should re-run before tagging. The plan of record is
 [docs/v0.1.md](v0.1.md); §10 defines done.

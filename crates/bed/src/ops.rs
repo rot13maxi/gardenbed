@@ -1,11 +1,11 @@
-//! The server-backed commands (M4 read path): `clone`, `plot add`, `goto`,
+//! The server-backed commands (M4 read path): `clone`, `sparse add`, `switch`,
 //! `file`, `log`, `diff`; M6/M7 add `blame`.
 //!
 //! Two invariants shape every function here:
 //!
 //! * **validate, connect, then write** — argument validation and the
 //!   network round-trips happen before any local state changes, so a
-//!   failed command leaves the bed exactly as it stood (v0.1.md §M4.5:
+//!   failed command leaves the working copy exactly as it stood (v0.1.md §M4.5:
 //!   no half-states; offline = clean errors);
 //! * **want-list + cache** — objects are fetched only when missing, into
 //!   `.bed/objects`, with bounded parallelism, so every command is
@@ -24,79 +24,79 @@ use gardenbed_store::ObjectStore as _;
 use tokio_stream::StreamExt as _;
 use tonic::Code;
 
-use crate::bed::Bed;
-use crate::error::BedError;
+use crate::error::ClientError;
 use crate::render::{self, DiffEntry, LogEntry};
 use crate::rpc::{self, Session};
 use crate::sync;
+use crate::workspace::WorkingCopy;
 
-/// The ref every v0.1 bed grows from unless `--ref` says otherwise: the
-/// first name the no-flag `clone` resolution probes, the tip `harvest`
+/// The ref every v0.1 working copy starts at unless `--ref` says otherwise: the
+/// first name the no-flag `clone` resolution probes, the tip `publish`
 /// consults after a lost race. (v0.1 has no remote-head discovery beyond
 /// `ListRefs`; see `docs/v0.1.md` §2.)
 const DEFAULT_REF: &str = "main";
 
 /// The refs a no-flag `clone` probes, in order: `main` first — the v0.1
 /// default, and the deterministic winner when several common names exist —
-/// then the common primary-branch names an arboretum might grow instead.
-/// When none resolve, the arboretum's own ref listing (`ListRefs`)
+/// then the common primary-branch names a server might grow instead.
+/// When none resolve, the server's own ref listing (`ListRefs`)
 /// enriches the error with what actually exists.
 const STARTING_REF_PROBES: [&str; 3] = [DEFAULT_REF, "master", "trunk"];
 
-/// `bed clone <server> [--repo name] [--ref name] [--plot path...]` —
-/// plant a new bed.
+/// `bed clone <server> [--repo name] [--ref name] [--sparse path...]` —
+/// create a working copy.
 ///
-/// Validates everything local (no bed already here, repo name, plot
+/// Validates everything local (no bed already here, repo name, sparse
 /// prefixes), then connects and resolves the starting ref **before any
 /// state is written** — a server that is down, a repo that does not
 /// exist, or a garden with none of the expected refs leaves zero state
-/// behind. On success the full `.bed` layout is planted with `current_cs`
+/// behind. On success the full `.bed` layout is initialized with `current_cs`
 /// = the ref's changeset and the tip recorded in `heads`.
-/// **Materializes nothing** (v0.1.md §2): planting a bed costs one ref
-/// lookup, not a checkout. Plot prefixes handed to `--plot` are recorded
-/// in the config; files come with `bed plot add`.
+/// **Materializes nothing** (v0.1.md §2): creating a working copy costs one ref
+/// lookup, not a checkout. Sparse prefixes handed to `--sparse` are recorded
+/// in the config; files come with `bed sparse add`.
 ///
 /// The starting ref: `--ref` names it exactly (bare names resolve against
 /// `refs/heads/` server-side; full ref names pass through verbatim). A
-/// ref the arboretum does not have is refused, nothing planted. Without
+/// ref the server does not have is refused, nothing initialized. Without
 /// the flag, `main` is tried first — the v0.1 default, and the
 /// deterministic winner when several common names exist — then the other
-/// common names ([`STARTING_REF_PROBES`]), so an arboretum that only
-/// grows `master` clones without a flag. When none resolve, the error
-/// names what was tried and — via the arboretum's ref listing — what does
+/// common names (`STARTING_REF_PROBES`), so a server that only
+/// has a `master` branch clones without a flag. When none resolve, the error
+/// names what was tried and — via the server's ref listing — what does
 /// exist, pointing at `--ref`.
 ///
-/// With `--repo` omitted the bed is named `garden` (v0.1 arboreta are
+/// With `--repo` omitted the working copy is named `garden` (v0.1 servers are
 /// single-repo and offer no name discovery; a documented deviation).
 pub async fn clone_with_ref(
-    bed_dir: &Path,
+    state_dir: &Path,
     server: &str,
     repo: Option<&str>,
     ref_name: Option<&str>,
-    plot: Vec<String>,
-) -> Result<String, BedError> {
+    sparse: Vec<String>,
+) -> Result<String, ClientError> {
     // ---- validation phase: nothing has been written yet ----
     let repo = match repo {
         Some(r) if !r.trim().is_empty() => r.trim().to_owned(),
         Some(_) => {
-            return Err(BedError::ConfigInvalid("repo name is empty".into()));
+            return Err(ClientError::ConfigInvalid("repo name is empty".into()));
         }
-        None => "garden".to_owned(),
+        None => "default".to_owned(),
     };
-    let mut prefixes = Vec::with_capacity(plot.len());
-    for raw in &plot {
-        let prefix = crate::plot::normalize_prefix(raw)?;
+    let mut prefixes = Vec::with_capacity(sparse.len());
+    for raw in &sparse {
+        let prefix = crate::sparse::normalize_prefix(raw)?;
         refuse_bed_state_prefix(raw, &prefix)?;
         prefixes.push(prefix);
     }
-    if bed_dir.join("config.toml").exists() {
-        return Err(BedError::AlreadyABed(bed_dir.to_path_buf()));
+    if state_dir.join("config.toml").exists() {
+        return Err(ClientError::AlreadyAWorkingCopy(state_dir.to_path_buf()));
     }
 
     // ---- connection and resolution: still no local state ----
     let client = GardenbedClient::connect(server)
         .await
-        .map_err(|e| BedError::Connect {
+        .map_err(|e| ClientError::Connect {
             server: server.to_owned(),
             message: e.to_string(),
         })?;
@@ -104,12 +104,12 @@ pub async fn clone_with_ref(
         Some(name) => match client.get_ref(&repo, name).await {
             Ok(Some(id)) => (name.to_owned(), id),
             Ok(None) => {
-                return Err(BedError::MissingRef {
+                return Err(ClientError::MissingRef {
                     name: name.to_owned(),
                 });
             }
             Err(status) => {
-                return Err(BedError::Rpc {
+                return Err(ClientError::Rpc {
                     command: "clone",
                     code: status.code(),
                     message: status.message().to_owned(),
@@ -119,14 +119,14 @@ pub async fn clone_with_ref(
         None => resolve_starting_ref(&client, &repo).await?,
     };
     // The ref must name a real changeset (a ref to nowhere is refused here,
-    // not discovered half-planted).
+    // not discovered half-initialized).
     match client.get_changeset(&repo, main).await {
         Ok(_) => {}
         Err(status) if status.code() == Code::NotFound => {
-            return Err(BedError::MissingCs(main));
+            return Err(ClientError::MissingCs(main));
         }
         Err(status) => {
-            return Err(BedError::Rpc {
+            return Err(ClientError::Rpc {
                 command: "clone",
                 code: status.code(),
                 message: status.message().to_owned(),
@@ -134,17 +134,17 @@ pub async fn clone_with_ref(
         }
     }
 
-    // ---- plant the layout ----
-    let mut bed = Bed::init(bed_dir, server, &repo)?;
-    bed.config_mut().plot = prefixes;
+    // ---- initialize local state ----
+    let mut bed = WorkingCopy::init(state_dir, server, &repo)?;
+    bed.config_mut().sparse = prefixes;
     bed.config_mut().current_cs = Some(main.to_hex());
     bed.save_config()?;
     bed.heads().append(main)?;
 
     Ok(format!(
-        "planted a bed for {repo} at {server}\n\
-         the garden grows from {} ({ref_name})\n\
-         materialized nothing — plant files with `bed plot add <path>`\n",
+        "created working copy for {repo} at {server}\n\
+         current changeset: {} ({ref_name})\n\
+         no files materialized — select paths with `bed sparse add <path>`\n",
         main.short()
     ))
 }
@@ -153,31 +153,31 @@ pub async fn clone_with_ref(
 /// no-flag fallback resolution. Kept as the narrow entry point the
 /// benchmark (`crates/bench`) and pre-`--ref` callers use.
 pub async fn clone(
-    bed_dir: &Path,
+    state_dir: &Path,
     server: &str,
     repo: Option<&str>,
-    plot: Vec<String>,
-) -> Result<String, BedError> {
-    clone_with_ref(bed_dir, server, repo, None, plot).await
+    sparse: Vec<String>,
+) -> Result<String, ClientError> {
+    clone_with_ref(state_dir, server, repo, None, sparse).await
 }
 
-/// Resolves the ref a no-flag `clone` grows from: `main` first ([`DEFAULT_REF`],
+/// Resolves the ref a no-flag `clone` starts at: `main` first ([`DEFAULT_REF`],
 /// the deterministic winner when several common names exist), then the
-/// other common primary-branch names, so an arboretum that only grows
-/// `master` clones without a flag. When nothing resolves, the arboretum's
+/// other common primary-branch names, so a server that only has
+/// `master` clones without a flag. When nothing resolves, the server's
 /// ref listing (best-effort: its failure cannot change the verdict already
 /// earned from the probes) names what does exist, and the error points at
 /// `--ref`.
 async fn resolve_starting_ref(
     client: &GardenbedClient,
     repo: &str,
-) -> Result<(String, Id), BedError> {
+) -> Result<(String, Id), ClientError> {
     for name in STARTING_REF_PROBES {
         match client.get_ref(repo, name).await {
             Ok(Some(id)) => return Ok((name.to_owned(), id)),
             Ok(None) => {}
             Err(status) => {
-                return Err(BedError::Rpc {
+                return Err(ClientError::Rpc {
                     command: "clone",
                     code: status.code(),
                     message: status.message().to_owned(),
@@ -186,7 +186,7 @@ async fn resolve_starting_ref(
         }
     }
     // Best-effort listing: it only ever enriches the error with the
-    // arboretum's own ref names (the full stored spellings `--ref`
+    // server's own ref names (the full stored spellings `--ref`
     // accepts), never masks the all-probes-missed verdict.
     let mut names: Vec<String> = match client.list_refs(repo).await {
         Ok(stream) => {
@@ -203,74 +203,74 @@ async fn resolve_starting_ref(
         Err(_) => Vec::new(),
     };
     names.sort();
-    Err(BedError::NoStartingRef {
+    Err(ClientError::NoStartingRef {
         primary: DEFAULT_REF.to_owned(),
         tried: STARTING_REF_PROBES.join(", "),
         available: if names.is_empty() {
             String::new()
         } else {
-            format!("\n  the arboretum has refs: {}", names.join(", "))
+            format!("\n  the server has refs: {}", names.join(", "))
         },
     })
 }
 
-/// `bed plot add <paths...> [--concurrency N]` — record the prefixes, then
+/// `bed sparse add <paths...> [--concurrency N]` — record the prefixes, then
 /// want-list fetch and materialize them at the current changeset.
 ///
-/// Re-adding an existing plot is idempotent: the cache-first fetch pulls
-/// nothing the bed already has, and faithful files are kept untouched.
+/// Re-adding an existing sparse is idempotent: the cache-first fetch pulls
+/// nothing the working copy already has, and faithful files are kept untouched.
 /// The config only gains the new prefixes once the fetch has succeeded, so
-/// a server that is down leaves the plot list (and everything else)
+/// a server that is down leaves the sparse selection list (and everything else)
 /// unchanged.
 ///
 /// The state-dir rule: a prefix that is `.bed` or lies inside it is
-/// refused outright ([`refuse_bed_state_prefix`]), and repo files that
+/// refused outright (`refuse_bed_state_prefix`), and repo files that
 /// merely shadow that name (they can arrive under a root prefix) are
 /// excluded from materialization with a printed note
-/// ([`exclude_bed_state`]) — no repo file is ever planted inside the
-/// bed's own state directory.
-pub async fn plot_add(
-    bed_dir: &Path,
+/// (`exclude_bed_state`) — no repo file is ever initialized inside the
+/// working copy's own state directory.
+pub async fn sparse_add(
+    state_dir: &Path,
     paths: &[String],
     concurrency: usize,
-) -> Result<String, BedError> {
-    let mut bed = Bed::open(bed_dir)?;
+) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
     let mut added: Vec<String> = Vec::new();
     for raw in paths {
-        let prefix = crate::plot::normalize_prefix(raw)?;
+        let prefix = crate::sparse::normalize_prefix(raw)?;
         refuse_bed_state_prefix(raw, &prefix)?;
-        if !bed.config().plot.contains(&prefix) {
-            bed.config_mut().plot.push(prefix.clone());
+        if !bed.config().sparse.contains(&prefix) {
+            bed.config_mut().sparse.push(prefix.clone());
             added.push(prefix);
         }
     }
 
     // Fetch (cache-first) before saving config or materializing: a failed
-    // fetch leaves neither the plot list nor the treestate half-changed.
+    // fetch leaves neither the sparse selection list nor the treestate half-changed.
     let session = Session::open_with(&bed, concurrency).await?;
-    let cs = session.resolve_current_cs(&bed, "plot add").await?;
-    let root = session.root_tree(cs, "plot add").await?;
-    let prefixes: Vec<String> = bed.config().plot.clone();
-    let (plan_files, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
+    let cs = session.resolve_current_cs(&bed, "sparse add").await?;
+    let root = session.root_tree(cs, "sparse add").await?;
+    let prefixes: Vec<String> = bed.config().sparse.clone();
+    let (plan_files, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
 
     // Which of the newly added prefixes actually matched something at the
-    // current changeset? Computed before the plan moves into sync_plot.
+    // current changeset? Computed before the plan moves into sync_sparse.
     let prefix_matches: Vec<bool> = added
         .iter()
         .map(|p| {
             plan_files
                 .iter()
-                .any(|f| crate::plot::in_plot(&f.path, std::slice::from_ref(p)))
+                .any(|f| crate::sparse::in_sparse(&f.path, std::slice::from_ref(p)))
         })
         .collect();
 
-    // Repo files that name `.bed` must never land in the bed's state
+    // Repo files that name `.bed` must never land in the working copy's state
     // directory: exclude them from materialization and say so.
     let (plan_files, bed_state) = exclude_bed_state(plan_files);
 
     let treestate = bed.treestate()?;
-    let outcome = sync::sync_plot(
-        &bed.garden_root(),
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
         &prefixes,
         plan_files,
         session.fetcher(),
@@ -284,21 +284,21 @@ pub async fn plot_add(
     let mut out = String::new();
     for (prefix, matched) in added.iter().zip(&prefix_matches) {
         if *matched {
-            out.push_str(&format!("plotted {prefix}\n"));
+            out.push_str(&format!("selected {prefix}\n"));
         } else {
             out.push_str(&format!(
-                "plotted {prefix} — note: nothing exists under it at the \
+                "selected {prefix} — note: nothing exists under it at the \
                  current changeset; it fills as history lands (check the \
                  spelling if that surprises you)\n"
             ));
         }
     }
     if added.is_empty() {
-        out.push_str("those prefixes are already in the plot — re-tending them\n");
+        out.push_str("those paths are already selected — refreshing them\n");
     }
     out.push_str(&bed_state_note(&bed_state));
     out.push_str(&format!(
-        "fetched {} tree(s) and {} blob(s) from the arboretum ({} file(s) in the plot)\n",
+        "fetched {} tree(s) and {} blob(s) from the server ({} file(s) in the selected paths)\n",
         stats.trees_fetched,
         stats.blobs_fetched,
         stats.files - bed_state.len()
@@ -308,19 +308,21 @@ pub async fn plot_add(
     Ok(out)
 }
 
-/// The state-dir rule: `.bed` is the bed's own machinery (config,
+/// The state-dir rule: `.bed` is the working copy's own machinery (config,
 /// treestate, object cache, heads), never garden content. A prefix that
 /// is `.bed` or lies inside it would point the materializer straight at
 /// the state directory — a repo that ships `.bed/config.toml`,
-/// `.bed/treestate`, or `.bed/heads` could hijack or corrupt the bed —
+/// `.bed/index.sqlite3`, or `.bed/heads` could hijack or corrupt the working copy —
 /// so such a prefix is refused in the same voice as every other
 /// impossible prefix. Any component matching counts: the name `.bed` is
 /// reserved wherever it appears in a repo path.
-fn refuse_bed_state_prefix(raw: &str, prefix: &str) -> Result<(), BedError> {
+fn refuse_bed_state_prefix(raw: &str, prefix: &str) -> Result<(), ClientError> {
     if prefix.split('/').any(|comp| comp == ".bed") {
-        Err(BedError::PlotPrefix {
+        Err(ClientError::SparsePrefix {
             raw: raw.to_owned(),
-            reason: format!("refusing to plot {prefix} — bed tends its own state there"),
+            reason: format!(
+                "refusing to sparse {prefix} — path is reserved for working-copy state"
+            ),
         })
     } else {
         Ok(())
@@ -328,12 +330,12 @@ fn refuse_bed_state_prefix(raw: &str, prefix: &str) -> Result<(), BedError> {
 }
 
 /// Splits the `.bed`-shaded paths out of a materialization plan: any path
-/// with a `.bed` component would be planted under a `.bed` directory in
-/// the garden — at the root that IS the live state directory, and a repo
-/// shipping `.bed/config.toml`, `.bed/treestate`, or `.bed/heads` would
-/// hijack or corrupt the bed. Such paths are excluded from
-/// materialization rather than refusing the whole command — `bed plot
-/// add .` keeps tending every other file the repo grows — and the caller
+/// with a `.bed` component would be initialized under a `.bed` directory in
+/// the repository — at the root that IS the live state directory, and a repo
+/// shipping `.bed/config.toml`, `.bed/index.sqlite3`, or `.bed/heads` would
+/// hijack or corrupt the working copy. Such paths are excluded from
+/// materialization rather than refusing the whole command — `bed sparse
+/// add .` continues tracking every other file in the repository — and the caller
 /// reports what was skipped ([`bed_state_note`]). Returns the plan that
 /// may be materialized plus the skipped paths, in plan order.
 fn exclude_bed_state(plan: Vec<rpc::PlanFile>) -> (Vec<rpc::PlanFile>, Vec<String>) {
@@ -349,7 +351,7 @@ fn exclude_bed_state(plan: Vec<rpc::PlanFile>) -> (Vec<rpc::PlanFile>, Vec<Strin
     (kept, skipped)
 }
 
-/// The note naming what [`exclude_bed_state`] kept out of the garden.
+/// The note naming what `exclude_bed_state` kept out of the repository.
 /// Empty when nothing was skipped; the list is capped so a repo shipping
 /// a large `.bed/` tree cannot flood one line.
 fn bed_state_note(skipped: &[String]) -> String {
@@ -366,35 +368,35 @@ fn bed_state_note(skipped: &[String]) -> String {
             skipped.len() - LISTED
         )
     };
-    format!("note: skipped {names} — bed tends its own state there\n")
+    format!("note: skipped {names} — path is reserved for working-copy state\n")
 }
 
-/// `bed goto <cs-or-ref>` — move the bed to a changeset and refresh the
-/// plot's working copy to match it (fetch missing, rewrite changed, remove
+/// `bed switch <cs-or-ref>` — move the working copy to a changeset and refresh the
+/// sparse's working copy to match it (fetch missing, rewrite changed, remove
 /// gone). Local edits survive when the target leaves their paths unchanged;
 /// destructive collisions are refused before any materialization.
 ///
 /// The config's `current_cs` moves only after successful materialization.
-/// A fetch failure or preflight refusal leaves the bed where it stood;
-/// an interrupted refresh is repaired by simply running goto again.
-pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
-    let mut bed = Bed::open(bed_dir)?;
+/// A fetch failure or preflight refusal leaves the working copy where it stood;
+/// an interrupted refresh is repaired by simply running switch again.
+pub async fn switch(state_dir: &Path, spec: &str) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;
     let session = Session::open(&bed).await?;
-    let cs = session.resolve(&parsed, "goto").await?;
+    let cs = session.resolve(&parsed, "switch").await?;
 
-    // Fetch everything the plot needs at the new changeset before writing
+    // Fetch everything the sparse selection needs at the new changeset before writing
     // anything locally.
-    let root = session.root_tree(cs, "goto").await?;
-    let prefixes = bed.config().plot.clone();
-    let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
+    let root = session.root_tree(cs, "switch").await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
     // `.bed`-shaded repo paths never reach the state directory; say what
     // was skipped.
     let (plan, bed_state) = exclude_bed_state(plan);
 
     let treestate = bed.treestate()?;
-    let outcome = sync::sync_plot(
-        &bed.garden_root(),
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
         &prefixes,
         plan,
         session.fetcher(),
@@ -406,7 +408,7 @@ pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
 
     let where_from = parsed.as_ref_name().unwrap_or("changeset").to_owned();
     Ok(format!(
-        "the bed now grows from {} ({}) — fetched {} tree(s), {} blob(s)\n{}{}\n",
+        "working copy at {} ({}) — fetched {} tree(s), {} blob(s)\n{}{}\n",
         cs.short(),
         where_from,
         stats.trees_fetched,
@@ -420,16 +422,16 @@ pub async fn goto(bed_dir: &Path, spec: &str) -> Result<String, BedError> {
 /// changeset. Trees along the walk are cached; the blob is fetched
 /// cache-first. Pure read: no treestate, config, or heads writes.
 pub async fn file(
-    bed_dir: &Path,
+    state_dir: &Path,
     path: &str,
     cs: Option<&str>,
     out: &mut dyn Write,
-) -> Result<(), BedError> {
-    validate_path(path).map_err(|e| BedError::Path {
+) -> Result<(), ClientError> {
+    validate_path(path).map_err(|e| ClientError::Path {
         raw: path.to_owned(),
         reason: e.to_string(),
     })?;
-    let bed = Bed::open(bed_dir)?;
+    let bed = WorkingCopy::open(state_dir)?;
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
@@ -438,13 +440,13 @@ pub async fn file(
     let entry = session
         .locate_entry(cs_id, path, "file")
         .await?
-        .ok_or_else(|| BedError::FileNotAFile {
+        .ok_or_else(|| ClientError::FileNotAFile {
             path: path.to_owned(),
             cs: cs_id.short(),
         })?;
     match entry.kind {
         TreeKind::Dir => {
-            return Err(BedError::FileNotAFile {
+            return Err(ClientError::FileNotAFile {
                 path: path.to_owned(),
                 cs: cs_id.short(),
             });
@@ -452,14 +454,14 @@ pub async fn file(
         TreeKind::File => {}
     }
     if entry.mode == Mode::Gitlink {
-        return Err(BedError::FileIsGitlink {
+        return Err(ClientError::FileIsGitlink {
             path: path.to_owned(),
             cs: cs_id.short(),
         });
     }
     // "Present exactly when kind == File" is the tree invariant; a missing
-    // blob id would mean the arboretum handed us a malformed tree.
-    let blob = entry.blob.ok_or(BedError::BlobHashMismatch(cs_id))?;
+    // blob id would mean the server handed us a malformed tree.
+    let blob = entry.blob.ok_or(ClientError::BlobHashMismatch(cs_id))?;
     let content = session.fetcher().blob(blob).await?;
     // Raw bytes, exactly — no trailing newline added. A closed pipe (e.g.
     // `bed file x | head -1`) is a graceful end, not an error.
@@ -478,69 +480,69 @@ pub async fn file(
     Ok(())
 }
 
-/// `bed graft <new-parent>` — replay the current changeset onto a new
-/// parent (the server-side linearized rebase, v0.1.md D5) and move the bed
+/// `bed rebase <new-parent>` — replay the current changeset onto a new
+/// parent (the server-side linearized rebase, v0.1.md D5) and move the working copy
 /// onto the replayed changeset.
 ///
-/// The server returns the grafted changeset's id, or refuses with
+/// The server returns the rebased changeset's id, or refuses with
 /// `FAILED_PRECONDITION` naming the conflicting paths (same path written
 /// on both sides, delete of a missing path, …) — surfaced as
-/// [`BedError::Rpc`], verbatim. On success the bed treats the result like
-/// a `goto`: the plot is re-planned and re-synced at the grafted changeset
-/// (which usually changes nothing — the replay carries this bed's own
-/// changes — but the new parent may differ elsewhere under the plot), the
+/// [`ClientError::Rpc`], verbatim. On success the working copy treats the result like
+/// a `switch`: the sparse selection is re-planned and re-synced at the rebased changeset
+/// (which usually changes nothing — the replay carries this working copy's own
+/// changes — but the new parent may differ elsewhere under the selected paths), the
 /// config moves, and the heads stack is re-pointed from the old changeset
-/// to the grafted one.
-pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError> {
-    let mut bed = Bed::open(bed_dir)?;
+/// to the rebased one.
+pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
     let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
     let session = Session::open(&bed).await?;
-    let current = session.resolve_current_cs(&bed, "graft").await?;
-    let parent = session.resolve(&parsed, "graft").await?;
+    let current = session.resolve_current_cs(&bed, "rebase").await?;
+    let parent = session.resolve(&parsed, "rebase").await?;
 
-    // The replay is the arboretum's decision; conflicts come back as a
+    // The replay is the server's decision; conflicts come back as a
     // FAILED_PRECONDITION whose message lists every conflicting path.
-    let grafted = match session
+    let rebased = match session
         .client
-        .graft(&bed.config().repo, current, parent)
+        .rebase(&bed.config().repo, current, parent)
         .await
     {
         Ok(id) => id,
         Err(status) => {
-            return Err(BedError::Rpc {
-                command: "graft",
+            return Err(ClientError::Rpc {
+                command: "rebase",
                 code: status.code(),
                 message: status.message().to_owned(),
             });
         }
     };
 
-    // Move the bed like `goto` does: plan the plot at the grafted
+    // Move the working copy like `switch` does: plan the sparse selection at the rebased
     // changeset, then fetch + sync. `.bed`-shaded repo paths never reach
     // the state directory; say what was skipped.
-    let root = session.root_tree(grafted, "graft").await?;
-    let prefixes = bed.config().plot.clone();
-    let (plan, stats) = rpc::plan_plot(&session, root, &prefixes).await?;
+    let root = session.root_tree(rebased, "rebase").await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
     let (plan, bed_state) = exclude_bed_state(plan);
     let treestate = bed.treestate()?;
-    let outcome = sync::sync_plot(
-        &bed.garden_root(),
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
         &prefixes,
         plan,
         session.fetcher(),
         &treestate,
     )
     .await?;
-    bed.config_mut().current_cs = Some(grafted.to_hex());
+    bed.config_mut().current_cs = Some(rebased.to_hex());
     bed.save_config()?;
-    bed.heads().repoint(current, grafted)?;
+    bed.heads().repoint(current, rebased)?;
 
     Ok(format!(
-        "grafted {} onto {} as {}\n\
+        "rebased {} onto {} as {}\n\
          fetched {} tree(s), {} blob(s)\n{}{}\n",
         current.short(),
         parent.short(),
-        grafted.short(),
+        rebased.short(),
         stats.trees_fetched,
         stats.blobs_fetched,
         bed_state_note(&bed_state),
@@ -548,32 +550,32 @@ pub async fn graft(bed_dir: &Path, new_parent: &str) -> Result<String, BedError>
     ))
 }
 
-/// `bed harvest` — fast-forward `main` to the bed's current changeset.
+/// `bed publish` — fast-forward `main` to the working copy's current changeset.
 ///
-/// The arboretum enforces the ancestry precondition with a
-/// compare-and-swap: exactly one harvester wins a race, everyone else
-/// receives [`BedError::HarvestNotFastForward`] with the fix spelled out.
-/// Success appends the harvested changeset to the heads stack; the bed
-/// stays where it is — harvesting publishes, it does not move.
-pub async fn harvest(bed_dir: &Path) -> Result<String, BedError> {
-    let bed = Bed::open(bed_dir)?;
+/// The server enforces the ancestry precondition with a
+/// compare-and-swap: exactly one publisher wins a race, everyone else
+/// receives [`ClientError::PublishNotFastForward`] with the fix spelled out.
+/// Success appends the published changeset to the heads stack; the working copy
+/// stays where it is — publishing publishes, it does not move.
+pub async fn publish(state_dir: &Path) -> Result<String, ClientError> {
+    let bed = WorkingCopy::open(state_dir)?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
-    let current = session.resolve_current_cs(&bed, "harvest").await?;
+    let current = session.resolve_current_cs(&bed, "publish").await?;
 
-    match session.client.harvest(&repo, current).await {
+    match session.client.publish(&repo, current).await {
         // The returned tip is `main`'s value after the fast-forward —
-        // the changeset itself for a conforming arboretum.
+        // the changeset itself for a conforming server.
         Ok(_tip) => {
             bed.heads().append(current)?;
             Ok(format!(
-                "harvested {} — `main` now grows from it\n",
+                "published {} — `main` now points to it\n",
                 current.short()
             ))
         }
         Err(status) if status.code() == Code::FailedPrecondition => {
-            // The ref moved under us (a concurrent harvest, or history
-            // landing from elsewhere). Name the new tip when the arboretum
+            // The ref moved under us (a concurrent publish, or history
+            // landing from elsewhere). Name the new tip when the server
             // will say it, so the fix is one command away.
             let tip = session
                 .client
@@ -581,15 +583,15 @@ pub async fn harvest(bed_dir: &Path) -> Result<String, BedError> {
                 .await
                 .ok()
                 .flatten()
-                .map(|id| format!(", which now grows from {}", id.short()))
+                .map(|id| format!(", whose current tip is {}", id.short()))
                 .unwrap_or_default();
-            Err(BedError::HarvestNotFastForward {
+            Err(ClientError::PublishNotFastForward {
                 cs: current.short(),
                 tip,
             })
         }
-        Err(status) => Err(BedError::Rpc {
-            command: "harvest",
+        Err(status) => Err(ClientError::Rpc {
+            command: "publish",
             code: status.code(),
             message: status.message().to_owned(),
         }),
@@ -597,25 +599,25 @@ pub async fn harvest(bed_dir: &Path) -> Result<String, BedError> {
 }
 
 /// Resolves the changeset a read command should answer at: an explicit
-/// `<cs-or-ref>` when given, else the bed's current changeset. A missing
+/// `<cs-or-ref>` when given, else the working copy's current changeset. A missing
 /// current changeset is reported before any connection is attempted (the
-/// bed's own state is the actionable error there).
-fn require_current_cs(bed: &Bed) -> Result<(), BedError> {
+/// working copy's own state is the actionable error there).
+fn require_current_cs(bed: &WorkingCopy) -> Result<(), ClientError> {
     bed.config()
         .current_cs
         .as_ref()
         .map(|_| ())
-        .ok_or(BedError::NoCurrentCs)
+        .ok_or(ClientError::NoCurrentCs)
 }
 
 /// Resolves the changeset a read command should answer at: an explicit
-/// `<cs-or-ref>` when given, else the bed's current changeset.
+/// `<cs-or-ref>` when given, else the working copy's current changeset.
 async fn resolve_target(
     session: &Session,
-    bed: &Bed,
+    bed: &WorkingCopy,
     cs: Option<&str>,
     command: &'static str,
-) -> Result<Id, BedError> {
+) -> Result<Id, ClientError> {
     match cs {
         Some(spec) => {
             let parsed = crate::revspec::CsOrRef::parse(spec)?;
@@ -628,8 +630,12 @@ async fn resolve_target(
 /// `bed log [--limit N] [--cs id-or-ref]` — the history from the server's
 /// date-ordered walk (git's own algorithm), newest first, rendered
 /// git-log-like (see [`crate::render`]). `--limit 0` or omitted: all.
-pub async fn log(bed_dir: &Path, limit: Option<u32>, cs: Option<&str>) -> Result<String, BedError> {
-    let bed = Bed::open(bed_dir)?;
+pub async fn log(
+    state_dir: &Path,
+    limit: Option<u32>,
+    cs: Option<&str>,
+) -> Result<String, ClientError> {
+    let bed = WorkingCopy::open(state_dir)?;
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
@@ -659,8 +665,12 @@ fn log_entry_of(summary: &ChangesetSummary) -> LogEntry {
 /// With no arguments: the current changeset against its first parent (a
 /// root changeset has nothing to diff against — empty output). With one
 /// argument: that changeset against its first parent. With two: `a → b`.
-pub async fn diff(bed_dir: &Path, a: Option<&str>, b: Option<&str>) -> Result<String, BedError> {
-    let bed = Bed::open(bed_dir)?;
+pub async fn diff(
+    state_dir: &Path,
+    a: Option<&str>,
+    b: Option<&str>,
+) -> Result<String, ClientError> {
+    let bed = WorkingCopy::open(state_dir)?;
     if a.is_none() {
         require_current_cs(&bed)?;
     }
@@ -688,7 +698,7 @@ pub async fn diff(bed_dir: &Path, a: Option<&str>, b: Option<&str>) -> Result<St
             }
         }
         (None, Some(_)) => {
-            return Err(BedError::ConfigInvalid(
+            return Err(ClientError::ConfigInvalid(
                 "bed diff takes two changesets, or none for the current one vs its parent".into(),
             ));
         }
@@ -711,8 +721,10 @@ pub async fn diff(bed_dir: &Path, a: Option<&str>, b: Option<&str>) -> Result<St
     // fetch above is cache-first); rendering reads them straight from the
     // local store, no async needed.
     let objects = bed.objects()?;
-    let content_of = |id: Id| -> Result<Vec<u8>, BedError> {
-        objects.get_blob(id)?.ok_or(BedError::BlobHashMismatch(id))
+    let content_of = |id: Id| -> Result<Vec<u8>, ClientError> {
+        objects
+            .get_blob(id)?
+            .ok_or(ClientError::BlobHashMismatch(id))
     };
     render::render_diff(&entries, &content_of)
 }
@@ -726,12 +738,12 @@ async fn build_entries(
     older: Id,
     newer: Id,
     changes: Vec<ChangeMsg>,
-) -> Result<Vec<DiffEntry>, BedError> {
+) -> Result<Vec<DiffEntry>, ClientError> {
     let mut entries = Vec::with_capacity(changes.len());
     let mut wanted: HashSet<Id> = HashSet::new();
 
     for change in &changes {
-        let op = op_from_wire(change.op).map_err(|_| BedError::BlobHashMismatch(newer))?;
+        let op = op_from_wire(change.op).map_err(|_| ClientError::BlobHashMismatch(newer))?;
         let path = change.path.clone();
         let new_side = match op {
             gardenbed_model::Op::Delete => None,
@@ -740,9 +752,9 @@ async fn build_entries(
                     .blob_id
                     .as_deref()
                     .and_then(|b| <[u8; 32]>::try_from(b).ok().map(Id::from_bytes))
-                    .ok_or(BedError::BlobHashMismatch(newer))?;
-                let mode =
-                    mode_from_wire(change.mode).map_err(|_| BedError::BlobHashMismatch(newer))?;
+                    .ok_or(ClientError::BlobHashMismatch(newer))?;
+                let mode = mode_from_wire(change.mode)
+                    .map_err(|_| ClientError::BlobHashMismatch(newer))?;
                 if mode != Mode::Gitlink {
                     wanted.insert(blob);
                 }
@@ -756,7 +768,7 @@ async fn build_entries(
             gardenbed_model::Op::Add => None,
             _ => match session.locate_entry(older, &path, "diff").await? {
                 Some(e) if e.kind == TreeKind::File => {
-                    let blob = e.blob.ok_or(BedError::BlobHashMismatch(older))?;
+                    let blob = e.blob.ok_or(ClientError::BlobHashMismatch(older))?;
                     if e.mode != Mode::Gitlink {
                         wanted.insert(blob);
                     }
@@ -793,12 +805,12 @@ async fn build_entries(
 /// ranges they cover. A path that is missing or a directory at the target
 /// changeset, and submodule pointers, are refused before the blame RPC —
 /// the same rules `bed file` applies.
-pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<String, BedError> {
-    validate_path(path).map_err(|e| BedError::Path {
+pub async fn blame(state_dir: &Path, path: &str, cs: Option<&str>) -> Result<String, ClientError> {
+    validate_path(path).map_err(|e| ClientError::Path {
         raw: path.to_owned(),
         reason: e.to_string(),
     })?;
-    let bed = Bed::open(bed_dir)?;
+    let bed = WorkingCopy::open(state_dir)?;
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
@@ -811,13 +823,13 @@ pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<Strin
     let entry = session
         .locate_entry(cs_id, path, "blame")
         .await?
-        .ok_or_else(|| BedError::FileNotAFile {
+        .ok_or_else(|| ClientError::FileNotAFile {
             path: path.to_owned(),
             cs: cs_id.short(),
         })?;
     match entry.kind {
         TreeKind::Dir => {
-            return Err(BedError::FileNotAFile {
+            return Err(ClientError::FileNotAFile {
                 path: path.to_owned(),
                 cs: cs_id.short(),
             });
@@ -825,14 +837,14 @@ pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<Strin
         TreeKind::File => {}
     }
     if entry.mode == Mode::Gitlink {
-        return Err(BedError::FileIsGitlink {
+        return Err(ClientError::FileIsGitlink {
             path: path.to_owned(),
             cs: cs_id.short(),
         });
     }
 
     let ranges = session.blame(cs_id, path, "blame").await?;
-    let blob = entry.blob.ok_or(BedError::BlobHashMismatch(cs_id))?;
+    let blob = entry.blob.ok_or(ClientError::BlobHashMismatch(cs_id))?;
     let content = session.fetcher().blob(blob).await?;
 
     // Identity lookups per attributed changeset, cached for this run.
@@ -866,11 +878,11 @@ pub async fn blame(bed_dir: &Path, path: &str, cs: Option<&str>) -> Result<Strin
 }
 
 /// The changeset id off a wire blame range (a 32-byte content address).
-fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, BedError> {
+fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, ClientError> {
     <[u8; 32]>::try_from(r.cs_id.as_slice())
         .map(Id::from_bytes)
         .map_err(|_| {
-            BedError::MalformedRpc(format!(
+            ClientError::MalformedRpc(format!(
                 "blame range {}-{} carries a {}-byte changeset address",
                 r.lo,
                 r.hi,

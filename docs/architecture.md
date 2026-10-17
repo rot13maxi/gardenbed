@@ -1,27 +1,27 @@
 # gardenbed architecture — v0.1
 
-The system in layers, with pointers to the design decisions that are
-contractual for v0.1 ([docs/v0.1.md](v0.1.md) §3 D1–D8 and the §8
-milestone gates). Terminology: **arboretum** = server-side repository;
-**bed** = client workspace; **loam** = content-addressed object store;
-**seedbed** = metadata store; **plot** = materialized subtree.
+Gardenbed has a central repository server, a sparse working-copy client,
+and an MCP service. The server stores immutable content-addressed objects
+and SQLite metadata. Derived trees, blame, and ancestry data support queries.
+
+Use the standard terms in [Terminology](terminology.md). Repository storage uses `objects/` and `metadata.sqlite3`.
 
 ```text
-bed ──gRPC── arboretum (single binary)
-               ├─ seedbed: sqlite  (changesets, refs,
+bed ──gRPC── gardenbed-server
+               ├─ metadata: SQLite  (changesets, refs,
                │                    git-SHA map, derived)
-               └─ loam: fs CAS     (blobs, trees; zstd)
+               └─ objects: filesystem CAS     (blobs, trees; zstd)
 gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 ```
 
-- Transport: tonic gRPC over TCP (`--addr host:port`); the bed client
+- Transport: tonic gRPC over TCP (`--addr host:port`); the working copy client
   additionally accepts `unix:///path/to/socket` endpoints. The server
   listens on TCP only in v0.1 (`gardenbed-server --addr`).
 - Every tier answers the same RPCs (v0.1.md §2): all object access is
   **want-list** — a client resolves `RootTree(cs)` and requests exactly
   the trees/blobs it is missing. Every request names a content-addressed
   object, so any interrupted session resumes exactly.
-- No daemon in v0.1: `bed` embeds the client; scarecrow (fs watch, shared
+- No daemon in v0.1: `bed` embeds the client; a local daemon (filesystem watching, shared
   node cache) is v0.2 (v0.1.md §1). The RPC surface is identical either
   way.
 
@@ -39,7 +39,7 @@ from day one, v0.1.md §1).
 | changesets | `GetChangeset`, `PutBlob` (client-stream), `CreateChangeset` | blob bytes move **only** through `PutBlob` (> 1 MiB, header frame first) or `CreateChangeset.inline_blobs` (≤ 1 MiB) |
 | graph + queries | `MergeBase`, `IsAncestor`, `Diff` (stream), `Log` (stream), `Blame` (stream) | blob content never rides on Diff/Log |
 | refs | `ListRefs`, `GetRef`, `CasRef` | `GetRef` doubles as the shared revspec resolver (see §2) |
-| write ops | `Graft`, `Harvest` | server-side replay and fast-forward CAS |
+| write ops | `Rebase`, `Publish` | server-side replay and fast-forward CAS |
 | debug | `GetStats` | per-repo request counters (e.g. the zero-duplicate-fetch proofs) |
 
 Wire conventions mirrored from the canonical encoding: `Op`/`Mode`
@@ -49,7 +49,7 @@ reproduce identical git SHAs.
 
 ## 2. Server (`gardenbed-server`, lib `gardenbed_server::Repo`)
 
-`Repo` wires one repository's stores (`<root>/loam` + `<root>/seedbed.sqlite3`)
+`Repo` wires one repository's stores (`<root>/objects` + `<root>/metadata.sqlite3`)
 and holds the semantics every surface shares — the `bed` binary's gRPC
 service and `gardenbed-mcp` call the same methods, which is why MCP and
 CLI answers agree by construction (v0.1.md §M7.1).
@@ -68,7 +68,7 @@ RPC).** One resolver funnels every id-taking surface:
    too, so exports stay git-valid);
 2. a hex token of 8..=63 chars is a changeset id **prefix**: decoded
    case-insensitively, answered by one indexed range seek over the
-   seedbed's 32-byte ids. Exactly one match resolves; several fail with
+   metadata store's 32-byte ids. Exactly one match resolves; several fail with
    `prefix <p> is ambiguous (N changesets)`; none with
    `no ref or changeset matching <p>`;
 3. fewer than 8 hex chars is rejected with the minimum-length hint —
@@ -81,13 +81,13 @@ RPC).** One resolver funnels every id-taking surface:
 second ref is never forked.
 
 **Write checks (`CreateChangeset`).** Every blob id a changeset
-references must exist in loam or ride in `inline_blobs` (≤ 1 MiB, content
+references must exist in object store or ride in `inline_blobs` (≤ 1 MiB, content
 verified against its claimed id); gitlink entries are opaque pointers —
-never dereferenced, never loam objects. The stored id is
+never dereferenced, never object store objects. The stored id is
 `SHA-256(canonical bytes)`: a re-put of the same id with different bytes
 is an immutability violation, never a silent overwrite.
 
-**Graft (server-side linear replay).** Replays `cs`'s changes onto
+**Rebase (server-side linear replay).** Replays `cs`'s changes onto
 `new_parent`'s tree with hard conflict detection; the replayed changeset
 keeps message/identities/signature and gains `parents = [new_parent]`.
 Semantics (deliberate, tested):
@@ -102,11 +102,11 @@ Semantics (deliberate, tested):
 | `Delete` / rename source that does not exist | conflict |
 
 All conflicting paths are collected and reported together
-(`graft conflicts on: …`); nothing partial is ever stored.
+(`rebase conflicts on: …`); nothing partial is ever stored.
 
-**Harvest** asserts `IsAncestor(current main, cs)` then CAS-moves `main`
+**Publish** asserts `IsAncestor(current main, cs)` then CAS-moves `main`
 (v0.1.md D5) — violating the precondition fails with
-`harvest refused: "main" is not an ancestor of the given changeset`; a
+`publish refused: "main" is not an ancestor of the given changeset`; a
 lost CAS race is a clean conflict result, not an error.
 
 ## 3. Data model
@@ -123,28 +123,28 @@ lost CAS race is a clean conflict result, not an error.
 - **Trees are derived, never stored as truth**: `tree(cs) =
   apply(changes(cs), tree(first parent))` — only directories a change
   touches are re-created (derivation locality, M2.4: commit cost scales
-  with change size, not repo size). Trees are cached in loam and
+  with change size, not repo size). Trees are cached in object store and
   identified by their canonical bytes, so identical trees reached via
   different histories share one object.
-- **Three derived caches** (the seedbed `derived` table, keyed
+- **Three derived caches** (the metadata store `derived` table, keyed
   `(kind, cs)`):
 
 | kind | what it is | what it buys |
 |---|---|---|
-| `tree` | the changeset's derived root tree id (the tree object itself lives in loam) | clone/plot/export resolve trees immediately (D3 eager materialization); recompute is a cache miss, never a wrong answer |
+| `tree` | the changeset's derived root tree id (the tree object itself lives in the object store) | clone/sparse/export resolve trees immediately (D3 eager materialization); recompute is a cache miss, never a wrong answer |
 | `skiplist` | segmented ancestry changelog over mainline (roots and merges are segment heads) | fast `MergeBase`/`IsAncestor` and blame segment skips |
 | `pathsummary` | per-changeset bounded touched-path set + cumulative per-segment Bloom filter | blame skips a whole linear segment with **one** derived read when the summary proves the path untouched (a false positive costs a step, never a wrong answer) |
 
 Everything derived is a **cache**: wipe + rebuild must converge to
 identical state (verified in M6 and re-verified after every chaos kill).
 
-## 4. Loam layout
+## 4. Object storage
 
-Under the arboretum root, the object store lives at `<root>/loam`, and
+Under the server root, the object store lives at `<root>/objects`, and
 `FsObjectStore` shards it two levels deep:
 
 ```text
-<root>/loam/objects/<2 hex>/<62 hex>
+<root>/objects/<2 hex>/<62 hex>
 ```
 
 - **Blobs** are stored under `SHA-256(raw content)` in the §6 envelope:
@@ -159,7 +159,7 @@ Under the arboretum root, the object store lives at `<root>/loam`, and
   tmp-file + fsync + atomic rename, so a crash leaves an object either
   absent or byte-complete (`crates/store/src/fs.rs`).
 
-## 5. Seedbed tables
+## 5. Metadata tables
 
 `crates/store/src/sqlite.rs` — opened WAL, `synchronous=NORMAL`
 (crash-safe against process kill; power-loss durability comes from the
@@ -180,25 +180,25 @@ commit or none of it.
 
 ## 6. The bed client
 
-All local state lives under `--bed-dir` (default `./.bed`):
+All local state lives under `--state-dir` (default `./.bed`):
 
 ```text
 .bed/config.toml    server (http(s)://host:port or unix:///path), repo,
-                    plot prefixes, current changeset
-.bed/treestate      sqlite: files(path PK, blob_id, mode,
+                    sparse prefixes, current changeset
+.bed/index.sqlite3      sqlite: files(path PK, blob_id, mode,
                     size, mtime_ns, hint) — the hint marks rows whose
                     size+mtime were hash-verified at write time
 .bed/objects/       local CAS cache — the same GBLO1 envelope and
-                    2-level sharding as loam
+                    2-level sharding as object store
 .bed/heads          local stack tips
 ```
 
-- **Fetch path**: want-list + cache-first — every command asks loam-shaped
+- **Fetch path**: want-list + cache-first — every command asks content-addressed
   questions of `.bed/objects` before the wire, with bounded parallelism
   (`--concurrency`, default 8) and singleflight on concurrent requests.
   Resumability and idempotence fall out of content addressing, not retry
   logic (v0.1.md §M4 right-thing signal).
-- **Two-phase sow**: scan the plot, read changed files, then upload —
+- **Two-phase commit**: scan the selected paths, read changed files, then upload —
   blobs ≤ 1 MiB ride inline on `CreateChangeset` within a 2 MiB aggregate
   content budget; heavier blobs and overflow stream via `PutBlob` first.
   A SIGKILL between the two leaves orphaned blobs that
@@ -211,7 +211,7 @@ All local state lives under `--bed-dir` (default `./.bed`):
   rename stays on one mount. Linux regular files prefer `O_TMPFILE`; the
   fallback creates a named entry exclusively. A state journal records its
   exact path, device, inode and kind before file bytes are written.
-  Status/sow hold a shared staging lock throughout the scan; destination
+  Status/commit hold a shared staging lock throughout the scan; destination
   writers hold the exclusive lock through publication. Recovery also
   checks the per-stage writer lock and identity before deleting debris.
   Registered temporary entries never become repository content, and
@@ -221,9 +221,9 @@ All local state lives under `--bed-dir` (default `./.bed`):
   work rather than being assumed disposable. Checkout directory traversal
   uses open directory descriptors and refuses symlink ancestors.
 
-## 7. Import pipeline (rootstock)
+## 7. Import pipeline (git)
 
-1. A URL is mirror-cloned to `<root>/rootstock-mirror.git` and refreshed
+1. A URL is mirror-cloned to `<root>/git-mirror.git` and refreshed
    on re-use (local paths import in place).
 2. Object reads go through gitoxide (D6). The commit graph is walked
    topologically (Kahn, compact `u32` arena): parents always ingest
@@ -276,14 +276,14 @@ divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
   kernel-corpus import ran this way (docs/corpora.md); benchmarks and
   budget gates keep fsync **on** so the durability story stays under
   test.
-- **Seedbed**: WAL + `synchronous=NORMAL` — crash-safe against process
+- **Metadata**: WAL + `synchronous=NORMAL` — crash-safe against process
   kill, power-loss durability from the WAL; every mutation transactional.
 - **Evidence**: the M1 torn-write torture (put blob + SIGKILL × 1000 —
   every object reads back byte-exact or absent), and the M8 SIGKILL chaos
   suite (every RPC class × 100 verified cycles: 1,000 kill/restart
-  rounds, every acknowledged answer re-fetched byte-exactly, then loam
+  rounds, every acknowledged answer re-fetched byte-exactly, then object store
   checksum sweep + `integrity_check` + derived rebuild determinism —
-  docs/release-0.1.md). The loam checksum sweep deliberately skips
+  docs/release-0.1.md). The object store checksum sweep deliberately skips
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
   unpublished, unreadable, and reaped by the next rename into that shard.
 
@@ -294,7 +294,7 @@ divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
 | scope (what is Out) | v0.1.md §1 — the Out table is contractual |
 | byte-level object identity | canonical-encoding.md (D1) |
 | RPC surface | `crates/protocol/proto/gardenbed.proto` (D4) |
-| graft/harvest semantics | v0.1.md D5, §M5.3 |
+| rebase/publish semantics | v0.1.md D5, §M5.3 |
 | blame definition | v0.1.md D7 |
 | import mechanics (gitoxide, diff-tree, renames) | v0.1.md D6/D8 |
 | divergences from git | divergences.md (§10.2: zero *silent* divergences) |

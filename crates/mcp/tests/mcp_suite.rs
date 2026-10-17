@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 
 use gardenbed::render::{self as bed_render, LogEntry as BedLogEntry};
 use gardenbed_harness::oracle::{git_blame_first_parent, git_show};
-use gardenbed_mcp::qa::{McpProcess, assert_no_bed_dir, run_canned_qa, run_demo};
+use gardenbed_mcp::qa::{McpProcess, assert_no_state_dir, run_canned_qa, run_demo};
 use gardenbed_mcp::{handle_line, protocol};
 use gardenbed_model::Mode;
 use gardenbed_server::Repo;
@@ -261,7 +261,7 @@ fn m7_4_protocol_conformance_in_process() {
 fn m7_4_protocol_conformance_over_stdio() {
     let fixture = gardenbed_mcp::qa::Fixture::build(4, 6);
     let sandbox = tempfile::tempdir().expect("sandbox tempdir");
-    assert_no_bed_dir(sandbox.path());
+    assert_no_state_dir(sandbox.path());
 
     let mut mcp =
         McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
@@ -311,7 +311,7 @@ fn m7_4_protocol_conformance_over_stdio() {
     );
 
     // The sandbox is still empty — the server never wrote a checkout.
-    assert_no_bed_dir(sandbox.path());
+    assert_no_state_dir(sandbox.path());
 }
 
 // ---------------------------------------------------------------- M7.1 parity
@@ -325,9 +325,9 @@ fn m7_1_parity_with_repo_engine_and_bed() {
     let head_sha = fixture.head_sha();
 
     let sandbox = tempfile::tempdir().expect("sandbox tempdir");
-    assert_no_bed_dir(sandbox.path());
-    assert_no_bed_dir(&fixture.root);
-    assert_no_bed_dir(&fixture.git);
+    assert_no_state_dir(sandbox.path());
+    assert_no_state_dir(&fixture.root);
+    assert_no_state_dir(&fixture.git);
 
     let mut mcp =
         McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
@@ -336,7 +336,7 @@ fn m7_1_parity_with_repo_engine_and_bed() {
     let files = fixture.files_at(head_index);
 
     // ---- log: the id sequence equals Repo::log's, and the text equals
-    // bed's renderer byte for byte — after widening bed's 16-hex id
+    // working copy's renderer byte for byte — after widening working copy's 16-hex id
     // column to the documented full 64-hex MCP form.
     let repo_log = repo.log(head, 0).expect("repo log");
     let answer = mcp
@@ -369,7 +369,7 @@ fn m7_1_parity_with_repo_engine_and_bed() {
     }
     assert_eq!(
         answer.text, want,
-        "MCP log text == bed's rendering (64-hex ids)"
+        "MCP log text == working copy's rendering (64-hex ids)"
     );
 
     // ---- diff: letters == git diff-tree --name-status; paths == Repo::diff.
@@ -500,9 +500,9 @@ fn m7_2_zero_checkout_all_tools_from_root_alone() {
     // The agent's sandbox: an empty directory, asserted checkout-free
     // before the server even starts.
     let sandbox = tempfile::tempdir().expect("sandbox tempdir");
-    assert_no_bed_dir(sandbox.path());
-    assert_no_bed_dir(&fixture.root);
-    assert_no_bed_dir(&fixture.git);
+    assert_no_state_dir(sandbox.path());
+    assert_no_state_dir(&fixture.root);
+    assert_no_state_dir(&fixture.git);
 
     let mut mcp =
         McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
@@ -536,9 +536,9 @@ fn m7_2_zero_checkout_all_tools_from_root_alone() {
     assert!(!file.is_error, "file: {}", file.text);
 
     // And nothing appeared anywhere: no checkout was made to answer.
-    assert_no_bed_dir(sandbox.path());
-    assert_no_bed_dir(&fixture.root);
-    assert_no_bed_dir(&fixture.git);
+    assert_no_state_dir(sandbox.path());
+    assert_no_state_dir(&fixture.root);
+    assert_no_state_dir(&fixture.git);
 
     let _ = mcp.shutdown().expect("server exits");
 }

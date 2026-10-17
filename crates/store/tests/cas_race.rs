@@ -66,7 +66,7 @@ fn race_from_base(store: Arc<dyn MetadataStore>, base: Option<Id>, name: &str) {
 #[test]
 fn cas_race_sqlite_from_existing_base() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = dir.path().join("seedbed.sqlite3");
+    let db = dir.path().join("metadata.sqlite3");
     let store = Arc::new(SqliteMetadataStore::open(&db).expect("open"));
 
     let base = id_of(0xB4E);
@@ -80,7 +80,7 @@ fn cas_race_sqlite_from_existing_base() {
 #[test]
 fn cas_race_sqlite_from_absent_ref() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = dir.path().join("seedbed.sqlite3");
+    let db = dir.path().join("metadata.sqlite3");
     let store = Arc::new(SqliteMetadataStore::open(&db).expect("open"));
     race_from_base(store, None, "feature/stack");
 }

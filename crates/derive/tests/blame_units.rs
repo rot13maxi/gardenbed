@@ -64,7 +64,7 @@ fn chg(
 
 /// A submodule pointer: 12 zero bytes + a pseudo upstream sha (the
 /// canonical encoding: the blob field carries the upstream git sha
-/// left-padded to 32 bytes; loam never stores it as a blob).
+/// left-padded to 32 bytes; objects never stores it as a blob).
 fn gitlink_ptr(tag: u8) -> (Id, Vec<u8>) {
     let mut padded = [0u8; 32];
     padded[12] = tag;
@@ -182,7 +182,7 @@ impl Hist {
     }
 }
 
-/// One store pair (loam + seedbed share one MemoryStore).
+/// One store pair (objects + metadata share one MemoryStore).
 fn stores() -> (Arc<dyn ObjectStore>, Arc<dyn MetadataStore>) {
     let m = Arc::new(MemoryStore::new());
     (m.clone(), m)

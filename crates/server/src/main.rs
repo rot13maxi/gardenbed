@@ -1,4 +1,4 @@
-//! The arboretum: the authoritative gardenbed server binary.
+//! The server: the authoritative gardenbed server binary.
 //!
 //! Two modes:
 //!
@@ -8,19 +8,19 @@
 //!
 //!     * `--addr` — listen address, default `127.0.0.1:9418` (`:0` binds an
 //!       ephemeral port; the bound address is printed to stdout).
-//!     * `--root` — repository directory (required): holds `<root>/loam/`
-//!       and `<root>/seedbed.sqlite3`, created if missing.
+//!     * `--root` — repository directory (required): holds `<root>/objects/`
+//!       and `<root>/metadata.sqlite3`, created if missing.
 //!
 //! * `gardenbed-server import --from <repo> --root DIR [--limit N]
 //!   [--renames on|off] [--ref <pattern>...]` — ingests a git repository
-//!   into the same stores (rootstock). `--from` may be a local path or a
-//!   URL; URLs are cloned/refreshed into a mirror under the gardenbed
+//!   into the same stores (git_bridge). `--from` may be a local path or a
+//!   URL; URLs are cloned/refreshed into a mirror under the Gardenbed
 //!   root first. Prints the import report on success.
 //!
 //! * `gardenbed-server export --root DIR --into GIT-DIR [--ref <pattern>...]
 //!   [--mapping FILE]` — renders the changeset graph into a real git
 //!   repository via one `git fast-import` stream
-//!   ([`gardenbed_rootstock::export_to_path`]). Prints the export report;
+//!   ([`gardenbed_git::export_to_path`]). Prints the export report;
 //!   with `--mapping` also writes a TSV `<changeset id> <tab> <git sha>`
 //!   file (sorted by changeset id) for roundtrip verification. This is
 //!   scaffolding over the library API, not engine code.
@@ -38,10 +38,7 @@ use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "gardenbed-server",
-    about = "The gardenbed arboretum (authoritative server)"
-)]
+#[command(name = "gardenbed-server", about = "Gardenbed repository server")]
 struct Args {
     /// Listen address (`host:port`; `:0` picks an ephemeral port).
     #[arg(long, default_value = "127.0.0.1:9418")]
@@ -61,15 +58,15 @@ enum Command {
         /// Listen address (`host:port`; `:0` picks an ephemeral port).
         #[arg(long, default_value = "127.0.0.1:9418")]
         addr: String,
-        /// Repository directory; holds `<root>/loam` and
-        /// `<root>/seedbed.sqlite3`.
+        /// Repository directory; holds `<root>/objects` and
+        /// `<root>/metadata.sqlite3`.
         #[arg(long)]
         root: Option<PathBuf>,
     },
-    /// Import a git repository's history into the gardenbed stores.
+    /// Import Git history into a repository.
     Import {
         /// Git repository: a local path (bare or working tree) or a URL.
-        /// URLs are cloned (mirror) into `<root>/rootstock-mirror.git`
+        /// URLs are cloned (mirror) into `<root>/git-mirror.git`
         /// and refreshed on re-use.
         #[arg(long)]
         from: String,
@@ -89,12 +86,10 @@ enum Command {
         #[arg(long = "ref")]
         refs: Vec<String>,
     },
-    /// Export the changeset graph into a real git repository (one
-    /// `git fast-import` stream). The changeset→git mapping rides in the
-    /// report; `--mapping FILE` writes it as TSV for verification.
+    /// Export repository history to Git.
     Export {
-        /// Gardenbed repository directory (holds `loam/` and
-        /// `seedbed.sqlite3`).
+        /// Gardenbed repository directory (holds `objects/` and
+        /// `metadata.sqlite3`).
         #[arg(long)]
         root: PathBuf,
         /// Destination git repository: created as a bare sha1 repository
@@ -102,7 +97,7 @@ enum Command {
         #[arg(long)]
         into: PathBuf,
         /// Only export refs matching this glob (e.g. `refs/heads/*`);
-        /// repeatable, empty means every ref in the seedbed.
+        /// repeatable, empty means every ref in the metadata.
         #[arg(long = "ref")]
         refs: Vec<String>,
         /// Write one `<64-hex changeset id>\t<git sha>` line per exported
@@ -160,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// One-shot git export from the stores under `root` into the git
-/// repository at `into` (rootstock's `git fast-import` writer). Prints the
+/// repository at `into` (git_bridge's `git fast-import` writer). Prints the
 /// report; optionally writes the changeset→git-SHA mapping as TSV.
 fn run_export(
     root: &Path,
@@ -170,10 +165,11 @@ fn run_export(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
 
-    let objects = Arc::new(FsObjectStore::open(&root.join("loam"))?);
-    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3"))?);
-    let opts = gardenbed_rootstock::ExportOptions { refs };
-    let report = gardenbed_rootstock::export_to_path(into, objects, metadata, &opts)?;
+    Repo::validate_layout(root)?;
+    let objects = Arc::new(FsObjectStore::open(root)?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?);
+    let opts = gardenbed_git::ExportOptions { refs };
+    let report = gardenbed_git::export_to_path(into, objects, metadata, &opts)?;
     if let Some(path) = mapping {
         use std::io::Write as _;
         // Sorted by changeset id so the file is deterministic and diffable.
@@ -203,22 +199,23 @@ fn run_import(
     limit: Option<usize>,
     refs: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use gardenbed_rootstock as rootstock;
+    use gardenbed_git as git_bridge;
     use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
 
-    let objects = Arc::new(FsObjectStore::open(&root.join("loam"))?);
-    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3"))?);
+    Repo::validate_layout(root)?;
+    let objects = Arc::new(FsObjectStore::open(root)?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?);
     let engine = gardenbed_derive::Engine::new(objects.clone(), metadata.clone());
-    let opts = rootstock::ImportOptions {
+    let opts = git_bridge::ImportOptions {
         detect_renames,
         limit,
         refs,
     };
     let report = if from.contains("://") {
-        let mirror = root.join("rootstock-mirror.git");
-        rootstock::import_from_url(from, &mirror, objects, metadata, engine, &opts)?
+        let mirror = root.join("git-mirror.git");
+        git_bridge::import_from_url(from, &mirror, objects, metadata, engine, &opts)?
     } else {
-        rootstock::import_from_path(Path::new(from), objects, metadata, engine, &opts)?
+        git_bridge::import_from_path(Path::new(from), objects, metadata, engine, &opts)?
     };
     // Machine- and human-readable one-line report on stdout.
     println!("{report}");

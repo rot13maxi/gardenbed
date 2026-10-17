@@ -1,5 +1,5 @@
 //! Errors bed reports to its human. Every message is written to be
-//! actionable in the garden vocabulary of the docs: say what failed, name
+//! actionable in the source-control terminology of the docs: say what failed, name
 //! the file involved, and point at the command that fixes it.
 
 use std::path::PathBuf;
@@ -9,9 +9,9 @@ use gardenbed_store::StoreError;
 
 /// Everything `bed` can fail with in its local (offline) half.
 #[derive(Debug, thiserror::Error)]
-pub enum BedError {
+pub enum ClientError {
     /// A checkout would overwrite local work or cross an unsafe path.
-    #[error("cannot materialize {path:?}: {reason}; preserve or sow local work before retrying")]
+    #[error("cannot materialize {path:?}: {reason}; preserve or commit local work before retrying")]
     CheckoutBlocked {
         /// Repository-relative path.
         path: String,
@@ -19,20 +19,20 @@ pub enum BedError {
         reason: String,
     },
 
-    /// The directory does not look like a bed: no `config.toml`.
-    #[error("not a bed: {0} has no config.toml — plant one with `bed clone <server>`")]
-    NotABed(PathBuf),
+    /// The directory does not look like a working copy: no `config.toml`.
+    #[error("not a working copy: {0} has no config.toml — create one with `bed clone <server>`")]
+    NotAWorkingCopy(PathBuf),
 
-    /// The given bed directory looks like a garden root: a `.bed` lives
-    /// inside it. `--bed-dir` names the `.bed` directory itself.
+    /// The given bed directory looks like a working-copy root: a `.bed` lives
+    /// inside it. `--state-dir` names the `.bed` directory itself.
     #[error(
-        "no bed at {0} — but {0}/.bed exists: --bed-dir names the .bed \
-         directory itself, so pass --bed-dir {0}/.bed"
+        "no working copy at {0} — but {0}/.bed exists: --state-dir names the .bed \
+         directory itself, so pass --state-dir {0}/.bed"
     )]
-    BedDirIsGardenRoot(PathBuf),
+    StateDirIsWorkspace(PathBuf),
 
     /// The config file exists but could not be read.
-    #[error("cannot read the bed config at {path}: {source}")]
+    #[error("cannot read the working copy config at {path}: {source}")]
     ConfigRead {
         /// Config file path.
         path: PathBuf,
@@ -40,8 +40,8 @@ pub enum BedError {
         source: std::io::Error,
     },
 
-    /// The config file is not valid TOML for the bed schema.
-    #[error("cannot parse the bed config at {path}:\n  {message}")]
+    /// The config file is not valid TOML for the working copy schema.
+    #[error("cannot parse the working copy config at {path}:\n  {message}")]
     ConfigParse {
         /// Config file path.
         path: PathBuf,
@@ -50,11 +50,11 @@ pub enum BedError {
     },
 
     /// The config parsed but its values are unusable.
-    #[error("invalid bed config: {0}")]
+    #[error("invalid working copy config: {0}")]
     ConfigInvalid(String),
 
     /// The config file could not be written.
-    #[error("cannot write the bed config at {path}: {message}")]
+    #[error("cannot write the working copy config at {path}: {message}")]
     ConfigWrite {
         /// Config file path.
         path: PathBuf,
@@ -62,9 +62,9 @@ pub enum BedError {
         message: String,
     },
 
-    /// A plot prefix does not name a place inside the garden.
-    #[error("invalid plot prefix {raw:?}: {reason}")]
-    PlotPrefix {
+    /// A sparse prefix does not name a place inside the repository.
+    #[error("invalid sparse prefix {raw:?}: {reason}")]
+    SparsePrefix {
         /// The prefix as typed.
         raw: String,
         /// Why it was rejected.
@@ -99,7 +99,7 @@ pub enum BedError {
     },
 
     /// The treestate database could not be opened or updated.
-    #[error("treestate at {path} is unusable: {message}")]
+    #[error("working copy index at {path} is unusable: {message}")]
     Treestate {
         /// Database path.
         path: PathBuf,
@@ -111,16 +111,16 @@ pub enum BedError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    /// An error surfaced by the local loam cache (`FsObjectStore`).
+    /// An error surfaced by the local objects cache (`FsObjectStore`).
     #[error(transparent)]
     Store(#[from] StoreError),
 
-    // ------------------------------------------------- arboretum (M4 read path)
-    /// The arboretum could not be reached. Validation and connection both
-    /// happen before any local state is written, so nothing is half-planted.
+    // ------------------------------------------------- server (M4 read path)
+    /// The server could not be reached. Validation and connection both
+    /// happen before any local state is written, so local state is unchanged.
     #[error(
-        "cannot reach the arboretum at {server}: {message}\n  \
-         is it running? plant the arboretum with `gardenbed-server --addr <ip:port> --root <dir>`"
+        "cannot reach the server at {server}: {message}\n  \
+         is it running? start the server with `gardenbed-server --addr <ip:port> --root <dir>`"
     )]
     Connect {
         /// The endpoint bed tried.
@@ -129,11 +129,11 @@ pub enum BedError {
         message: String,
     },
 
-    /// An RPC reached the arboretum and was refused. The command is named so
-    /// the human knows which step of the tending failed.
-    #[error("bed {command}: the arboretum refused ({code:?}): {message}")]
+    /// An RPC reached the server and was refused. The command is named so
+    /// the human knows which step of the operation failed.
+    #[error("bed {command}: the server refused ({code:?}): {message}")]
     Rpc {
-        /// The command that issued the RPC (`file`, `goto`, …).
+        /// The command that issued the RPC (`file`, `switch`, …).
         command: &'static str,
         /// gRPC status code, e.g. `NotFound`.
         code: tonic::Code,
@@ -141,29 +141,29 @@ pub enum BedError {
         message: String,
     },
 
-    /// The command needs a current changeset and the bed has none.
+    /// The command needs a current changeset and the working copy has none.
     #[error(
-        "this bed has no current changeset — plant one with `bed clone` or \
-         move with `bed goto`"
+        "this working copy has no current changeset — create one with `bed clone` or \
+         move with `bed switch`"
     )]
     NoCurrentCs,
 
-    /// The bed is already planted at this directory.
+    /// The bed is already initialized at this directory.
     #[error(
-        "there is already a bed at {0} — tend it where it grows, or choose \
-         another --bed-dir"
+        "there is already a working copy at {0} — use it or choose \
+         another --state-dir"
     )]
-    AlreadyABed(PathBuf),
+    AlreadyAWorkingCopy(PathBuf),
 
-    /// The named ref does not exist on the arboretum.
-    #[error("the arboretum has no ref {name:?}")]
+    /// The named ref does not exist on the server.
+    #[error("the server has no ref {name:?}")]
     MissingRef {
         /// The ref name as requested.
         name: String,
     },
 
     /// `clone` without `--ref` resolved none of the standard starting
-    /// refs. Names what was probed and — when the arboretum's ref listing
+    /// refs. Names what was probed and — when the server's ref listing
     /// answered — what actually exists, so the fix is one flag away.
     #[error("no ref {primary} (tried {tried}); pass --ref{available}")]
     NoStartingRef {
@@ -172,14 +172,14 @@ pub enum BedError {
         /// Every ref name the fallback probed, comma-separated in order.
         tried: String,
         /// Pre-rendered suffix: empty, or a newline naming the refs the
-        /// arboretum does have (its full stored names, exactly what
+        /// server does have (its full stored names, exactly what
         /// `--ref` accepts).
         available: String,
     },
 
-    /// The changeset id is not on the arboretum (never sown there, or the
-    /// arboretum is a different garden).
-    #[error("changeset {0} is not on the arboretum")]
+    /// The changeset id is not on the server (never created there, or the
+    /// server is a different garden).
+    #[error("changeset {0} is not on the server")]
     MissingCs(Id),
 
     /// The file the command wanted does not exist (or is a directory) at
@@ -205,14 +205,14 @@ pub enum BedError {
         cs: String,
     },
 
-    /// The arboretum streamed blob bytes that do not hash to the address
+    /// The server streamed blob bytes that do not hash to the address
     /// they were asked for. A cache or tier is lying; refuse the bytes.
-    #[error("the arboretum sent blob {0} with content that does not match its address")]
+    #[error("the server sent blob {0} with content that does not match its address")]
     BlobHashMismatch(Id),
 
-    /// The arboretum streamed a malformed item (e.g. a blame range whose
-    /// changeset address is not 32 bytes). Refuse the answer, not the bed.
-    #[error("the arboretum sent a malformed response: {0}")]
+    /// The server streamed a malformed item (e.g. a blame range whose
+    /// changeset address is not 32 bytes). Refuse the answer, not the working copy.
+    #[error("the server sent a malformed response: {0}")]
     MalformedRpc(String),
 
     // ------------------------------------------------- write path (M5)
@@ -221,7 +221,7 @@ pub enum BedError {
     /// cannot carry (which would make the changeset unexportable).
     #[error(
         "bad author {raw:?}: {reason}\n  \
-         sow with --author \"Name <email>\""
+         commit with --author \"Name <email>\""
     )]
     Author {
         /// The value as given.
@@ -230,29 +230,29 @@ pub enum BedError {
         reason: String,
     },
 
-    /// `sow` was called with an empty (or whitespace-only) message.
-    #[error("the message is empty — sow with -m <message>")]
+    /// `commit` was called with an empty (or whitespace-only) message.
+    #[error("the message is empty — commit with -m <message>")]
     EmptyMessage,
 
-    /// The scan found nothing to sow: the plot is clean.
-    #[error("the plot is clean — nothing modified, deleted, or untracked to sow")]
-    NothingToSow,
+    /// The scan found nothing to commit: working copy is clean.
+    #[error("working copy is clean — nothing modified, deleted, or untracked to commit")]
+    NothingToCommit,
 
-    /// A working file changed between the scan and the read that sows it.
-    /// Harmless and rare; sowing again simply re-scans.
-    #[error("{0:?} keeps changing while sowing — rerun `bed sow`")]
+    /// A working file changed between the scan and the read that commits it.
+    /// Harmless and rare; committing again simply re-scans.
+    #[error("{0:?} keeps changing while committing — rerun `bed commit`")]
     FileChanged(String),
 
-    /// `harvest` was refused because `main` is no longer where this bed's
+    /// `publish` was refused because `main` is no longer where this working copy's
     /// changeset grew from — a fast-forward CAS lost to a moved ref.
     #[error(
-        "`main` moved while harvesting — {cs} is not its tip anymore{tip}\n  \
-         graft this changeset onto the new main (`bed graft main`) and harvest again"
+        "cannot publish {cs}: it does not fast-forward `main`{tip}\n  \
+         rebase this changeset onto the new main (`bed rebase main`) and publish again"
     )]
-    HarvestNotFastForward {
-        /// The changeset that was being harvested (short form).
+    PublishNotFastForward {
+        /// The changeset that was being published (short form).
         cs: String,
-        /// `main`'s current tip (short form), when the arboretum said.
+        /// `main`'s current tip (short form), when the server said.
         tip: String,
     },
 }

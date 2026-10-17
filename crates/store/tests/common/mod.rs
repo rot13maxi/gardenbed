@@ -1,4 +1,4 @@
-//! Shared helpers for the gardenbed-store verification suite.
+//! Shared helpers for the Gardenbed-store verification suite.
 #![allow(dead_code)]
 
 use gardenbed_model::Id;

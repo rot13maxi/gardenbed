@@ -173,7 +173,7 @@ fn verify_everything(
     all_objs: &[(u64, usize, Id)],
     all_css: &[(u64, usize, Id)],
 ) -> usize {
-    let store = FsObjectStore::open(&root.join("loam")).expect("reopen loam");
+    let store = FsObjectStore::open(root).expect("reopen objects");
     let mut absent = 0;
     for (iter, idx, id) in all_objs {
         let expected = torture_blob_content(*iter, *idx);
@@ -198,10 +198,11 @@ fn verify_everything(
         }
     }
 
-    let seedbed = SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("reopen seedbed");
+    let metadata =
+        SqliteMetadataStore::open(&root.join("metadata.sqlite3")).expect("reopen metadata");
     for (iter, idx, id) in all_css {
         let expected = torture_changeset(*iter, *idx);
-        let got = seedbed
+        let got = metadata
             .get_changeset(*id)
             .expect("get_changeset after kill");
         let (decoded, canonical) = got.expect("committed changeset must survive");
@@ -222,8 +223,8 @@ fn torn_write_torture_sigkill_mid_put() {
 
     let root = tempfile::tempdir().expect("tempdir");
     // Pre-create both stores so the first child finds them initialized.
-    FsObjectStore::open(&root.path().join("loam")).expect("open loam");
-    SqliteMetadataStore::open(&root.path().join("seedbed.sqlite3")).expect("open seedbed");
+    FsObjectStore::open(root.path()).expect("open objects");
+    SqliteMetadataStore::open(&root.path().join("metadata.sqlite3")).expect("open metadata");
 
     let mut all_objs: Vec<(u64, usize, Id)> = Vec::new();
     let mut all_css: Vec<(u64, usize, Id)> = Vec::new();
@@ -248,7 +249,7 @@ fn torn_write_torture_sigkill_mid_put() {
     }
 
     // After the loop: sqlite integrity + full survival sweep.
-    let conn = rusqlite::Connection::open(root.path().join("seedbed.sqlite3"))
+    let conn = rusqlite::Connection::open(root.path().join("metadata.sqlite3"))
         .expect("open db for integrity check");
     let verdict: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
@@ -292,9 +293,9 @@ fn torture_child_entry() {
 
     let root = std::env::var("GARDENBED_TORTURE_ROOT").expect("child root");
     let root = Path::new(&root);
-    let store = FsObjectStore::open(&root.join("loam")).expect("child opens loam");
-    let seedbed =
-        SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).expect("child opens seedbed");
+    let store = FsObjectStore::open(root).expect("child opens objects");
+    let metadata =
+        SqliteMetadataStore::open(&root.join("metadata.sqlite3")).expect("child opens metadata");
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -306,7 +307,7 @@ fn torture_child_entry() {
 
         if i % common::CHANGESET_EVERY == 0 {
             let cs = torture_changeset(iter, i / common::CHANGESET_EVERY);
-            let cs_id = seedbed.put_changeset(&cs).expect("child put_changeset");
+            let cs_id = metadata.put_changeset(&cs).expect("child put_changeset");
             writeln!(out, "CS {} {}", i / common::CHANGESET_EVERY, cs_id.to_hex())
                 .expect("write CS");
             out.flush().expect("flush CS");

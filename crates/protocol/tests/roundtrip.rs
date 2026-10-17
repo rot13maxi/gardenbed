@@ -77,7 +77,7 @@ fn kitchen_sink_cs() -> model::Changeset {
                 mode: model::Mode::Regular,
             },
         ],
-        message: "rearrange the garden".into(),
+        message: "rearrange the repository".into(),
         author: ident("ada"),
         committer: ident("grace"),
         signature: None,
@@ -183,7 +183,7 @@ fn modes_roundtrip() {
             },
             // Exec bit.
             model::Change {
-                path: "scripts/sow.sh".into(),
+                path: "scripts/commit.sh".into(),
                 op: model::Op::Modify,
                 blob: Some(model::blob_id(b"#!/bin/sh")),
                 src_path: None,
@@ -278,7 +278,7 @@ fn empty_root_changeset_roundtrip() {
     let cs = model::Changeset {
         parents: vec![],
         changes: vec![],
-        message: "the garden is empty".into(),
+        message: "the working copy is empty".into(),
         author: ident("ada"),
         committer: ident("ada"),
         signature: None,
@@ -311,7 +311,7 @@ fn kitchen_sink_tree() -> model::Tree {
                 tree: Some(model::blob_id(b"subtree")),
             },
             model::TreeEntry {
-                name: "sow.sh".into(),
+                name: "commit.sh".into(),
                 kind: model::TreeKind::File,
                 mode: model::Mode::Exec,
                 blob: Some(model::blob_id(b"#!/bin/sh")),

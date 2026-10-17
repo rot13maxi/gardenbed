@@ -2,20 +2,20 @@
 //! in the `gardenbed` library so other surfaces (the MCP server) reuse it
 //! unchanged.
 //!
-//! Every v0.1 command is wired: the read path (`clone`, `plot add`,
-//! `goto`, `file`, `log`, `diff`, `blame`) and the write path (`sow`,
-//! `graft`, `harvest`) run against the arboretum; `status` and `plot
+//! Every v0.1 command is wired: the read path (`clone`, `sparse add`,
+//! `switch`, `file`, `log`, `diff`, `blame`) and the write path (`commit`,
+//! `rebase`, `publish`) run against the server; `status` and `sparse
 //! list/remove` are fully offline.
 
 use clap::Parser as _;
 
-use gardenbed::bed::Bed;
 use gardenbed::cli::Cli;
 use gardenbed::cli::Command;
-use gardenbed::cli::PlotCommand;
-use gardenbed::error::BedError;
-use gardenbed::plot;
+use gardenbed::cli::SparseCommand;
+use gardenbed::error::ClientError;
 use gardenbed::revspec::CsOrRef;
+use gardenbed::sparse;
+use gardenbed::workspace::WorkingCopy;
 
 fn main() {
     // A closed pipe is a graceful end, not a crash: `bed log | head` must
@@ -64,50 +64,54 @@ fn restore_default_sigpipe() -> std::io::Result<()> {
     Ok(())
 }
 
-async fn run(cli: &Cli) -> Result<i32, BedError> {
+async fn run(cli: &Cli) -> Result<i32, ClientError> {
     match &cli.command {
         Command::Clone {
             server,
             repo,
             ref_name,
-            plot,
+            sparse,
         } => {
             let out = gardenbed::ops::clone_with_ref(
-                &cli.bed_dir,
+                &cli.state_dir,
                 server,
                 repo.as_deref(),
                 ref_name.as_deref(),
-                plot.clone(),
+                sparse.clone(),
             )
             .await?;
             print!("{out}");
             Ok(0)
         }
 
-        Command::Plot { command } => run_plot(cli, command).await,
+        Command::Sparse { command } => run_sparse(cli, command).await,
 
         Command::Status { full_scan } => {
-            let bed = Bed::open(&cli.bed_dir)?;
-            let plot = bed.config().plot.clone();
-            if plot.is_empty() {
-                println!("the plot is empty — plant a prefix with `bed plot add <path>`");
+            let bed = WorkingCopy::open(&cli.state_dir)?;
+            let sparse = bed.config().sparse.clone();
+            if sparse.is_empty() {
+                println!("no sparse paths selected — add paths with `bed sparse add <path>`");
                 return Ok(0);
             }
             let treestate = bed.treestate()?;
-            let report =
-                gardenbed::status::scan_status(&bed.garden_root(), &plot, &treestate, *full_scan)?;
+            let report = gardenbed::status::scan_status(
+                &bed.workspace_root(),
+                &sparse,
+                &treestate,
+                *full_scan,
+            )?;
             let rendered = report.render();
             if rendered.is_empty() {
-                println!("the plot is clean — nothing modified, deleted, or untracked.");
+                println!("working copy is clean — nothing modified, deleted, or untracked.");
             } else {
                 print!("{rendered}");
             }
             Ok(0)
         }
 
-        Command::Goto { cs_or_ref } => {
+        Command::Switch { cs_or_ref } => {
             CsOrRef::parse(cs_or_ref)?;
-            let out = gardenbed::ops::goto(&cli.bed_dir, cs_or_ref).await?;
+            let out = gardenbed::ops::switch(&cli.state_dir, cs_or_ref).await?;
             print!("{out}");
             Ok(0)
         }
@@ -118,7 +122,7 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
                 CsOrRef::parse(cs)?;
             }
             let mut out = std::io::stdout().lock();
-            gardenbed::ops::file(&cli.bed_dir, path, cs.as_deref(), &mut out).await?;
+            gardenbed::ops::file(&cli.state_dir, path, cs.as_deref(), &mut out).await?;
             Ok(0)
         }
 
@@ -126,7 +130,7 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
             if let Some(cs) = cs {
                 CsOrRef::parse(cs)?;
             }
-            let out = gardenbed::ops::log(&cli.bed_dir, *limit, cs.as_deref()).await?;
+            let out = gardenbed::ops::log(&cli.state_dir, *limit, cs.as_deref()).await?;
             // render_log already terminates every entry with a newline.
             if !out.is_empty() {
                 print!("{out}");
@@ -138,33 +142,34 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
             for arg in [a, b].into_iter().flatten() {
                 CsOrRef::parse(arg)?;
             }
-            let out = gardenbed::ops::diff(&cli.bed_dir, a.as_deref(), b.as_deref()).await?;
+            let out = gardenbed::ops::diff(&cli.state_dir, a.as_deref(), b.as_deref()).await?;
             if !out.is_empty() {
                 print!("{out}");
             }
             Ok(0)
         }
 
-        Command::Sow { message, author } => {
+        Command::Commit { message, author } => {
             if message.trim().is_empty() {
-                return Err(BedError::EmptyMessage);
+                return Err(ClientError::EmptyMessage);
             }
-            let outcome = gardenbed::sow::sow(&cli.bed_dir, message, author.as_deref()).await?;
-            print!("{}", gardenbed::sow::render_outcome(&outcome));
+            let outcome =
+                gardenbed::commit::commit(&cli.state_dir, message, author.as_deref()).await?;
+            print!("{}", gardenbed::commit::render_outcome(&outcome));
             Ok(0)
         }
 
-        Command::Graft { new_parent } => {
-            let _bed = Bed::open(&cli.bed_dir)?;
+        Command::Rebase { new_parent } => {
+            let _bed = WorkingCopy::open(&cli.state_dir)?;
             CsOrRef::parse(new_parent)?;
-            let out = gardenbed::ops::graft(&cli.bed_dir, new_parent).await?;
+            let out = gardenbed::ops::rebase(&cli.state_dir, new_parent).await?;
             print!("{out}");
             Ok(0)
         }
 
-        Command::Harvest => {
-            let _bed = Bed::open(&cli.bed_dir)?;
-            let out = gardenbed::ops::harvest(&cli.bed_dir).await?;
+        Command::Publish => {
+            let _bed = WorkingCopy::open(&cli.state_dir)?;
+            let out = gardenbed::ops::publish(&cli.state_dir).await?;
             print!("{out}");
             Ok(0)
         }
@@ -174,7 +179,7 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
             if let Some(cs) = cs {
                 CsOrRef::parse(cs)?;
             }
-            let out = gardenbed::ops::blame(&cli.bed_dir, path, cs.as_deref()).await?;
+            let out = gardenbed::ops::blame(&cli.state_dir, path, cs.as_deref()).await?;
             // render_blame already terminates every line with a newline.
             if !out.is_empty() {
                 print!("{out}");
@@ -184,57 +189,57 @@ async fn run(cli: &Cli) -> Result<i32, BedError> {
     }
 }
 
-/// `bed plot` — `list` and `remove` are fully local; `add` records the
-/// prefixes and then fetches + materializes them from the arboretum.
-async fn run_plot(cli: &Cli, command: &PlotCommand) -> Result<i32, BedError> {
+/// `bed sparse` — `list` and `remove` are fully local; `add` records the
+/// prefixes and then fetches + materializes them from the server.
+async fn run_sparse(cli: &Cli, command: &SparseCommand) -> Result<i32, ClientError> {
     match command {
-        PlotCommand::List => {
-            let bed = Bed::open(&cli.bed_dir)?;
-            let plot = &bed.config().plot;
-            if plot.is_empty() {
-                println!("the plot is empty — plant a prefix with `bed plot add <path>`");
+        SparseCommand::List => {
+            let bed = WorkingCopy::open(&cli.state_dir)?;
+            let sparse = &bed.config().sparse;
+            if sparse.is_empty() {
+                println!("no sparse paths selected — add paths with `bed sparse add <path>`");
             } else {
-                for prefix in plot {
+                for prefix in sparse {
                     println!("{prefix}");
                 }
             }
             Ok(0)
         }
 
-        PlotCommand::Add { paths, concurrency } => {
+        SparseCommand::Add { paths, concurrency } => {
             // Normalize everything first: a bad prefix is rejected before
             // any connection is attempted.
             for raw in paths {
-                plot::normalize_prefix(raw)?;
+                sparse::normalize_prefix(raw)?;
             }
-            let out = gardenbed::ops::plot_add(&cli.bed_dir, paths, *concurrency).await?;
+            let out = gardenbed::ops::sparse_add(&cli.state_dir, paths, *concurrency).await?;
             print!("{out}");
             Ok(0)
         }
 
-        PlotCommand::Remove { paths } => {
-            let mut bed = Bed::open(&cli.bed_dir)?;
+        SparseCommand::Remove { paths } => {
+            let mut bed = WorkingCopy::open(&cli.state_dir)?;
             let mut removed: Vec<String> = Vec::new();
             let mut missing: Vec<String> = Vec::new();
             for raw in paths {
-                let prefix = plot::normalize_prefix(raw)?;
-                match bed.config().plot.iter().position(|p| *p == prefix) {
+                let prefix = sparse::normalize_prefix(raw)?;
+                match bed.config().sparse.iter().position(|p| *p == prefix) {
                     Some(i) => {
-                        bed.config_mut().plot.remove(i);
+                        bed.config_mut().sparse.remove(i);
                         removed.push(prefix);
                     }
                     None => missing.push(prefix),
                 }
             }
             for prefix in &missing {
-                println!("not plotted: {prefix}");
+                println!("not selected: {prefix}");
             }
             if removed.is_empty() {
                 return Ok(0);
             }
             bed.save_config()?;
             for prefix in &removed {
-                println!("unplotted {prefix}");
+                println!("unselected {prefix}");
             }
             Ok(0)
         }
@@ -242,8 +247,8 @@ async fn run_plot(cli: &Cli, command: &PlotCommand) -> Result<i32, BedError> {
 }
 
 /// Validates a path argument against the repo's flat-path rules (spec §3.1).
-fn validate_path_arg(raw: &str) -> Result<(), BedError> {
-    gardenbed_model::codec::validate_path(raw).map_err(|e| BedError::Path {
+fn validate_path_arg(raw: &str) -> Result<(), ClientError> {
+    gardenbed_model::codec::validate_path(raw).map_err(|e| ClientError::Path {
         raw: raw.to_owned(),
         reason: e.to_string(),
     })

@@ -1,10 +1,10 @@
-//! `fuzz_difftree_parse` — rootstock's `git diff-tree -z --name-status`
+//! `fuzz_difftree_parse` — git_bridge's `git diff-tree -z --name-status`
 //! batch parser fed random bytes (v0.1.md M8.3 "import parser" target).
 //!
 //! The input's first byte picks how many *expected* commit ids to allow
 //! (0–7, built deterministically from 20-byte chunks of the input so the
 //! fuzzer can reach the "id token" branch of the parser); the remainder is
-//! fed to [`gardenbed_rootstock::difftree::parse_batch`] verbatim. The
+//! fed to [`gardenbed_git::difftree::parse_batch`] verbatim. The
 //! contract: any byte string parses to `Ok` (with only requested ids in the
 //! map) or a descriptive `Err` — never a panic, never an accepted
 //! unrequested id.
@@ -12,8 +12,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use gardenbed_rootstock::difftree::parse_batch;
-use gardenbed_rootstock::oid::GitOid;
+use gardenbed_git::difftree::parse_batch;
+use gardenbed_git::oid::GitOid;
 
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() {

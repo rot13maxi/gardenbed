@@ -5,6 +5,24 @@ All notable changes to gardenbed are documented here. The format follows
 tags, and the verification record for a release lives in
 [docs/release-0.1.md](docs/release-0.1.md).
 
+## Unreleased
+
+### Changed
+
+- Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
+  `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
+  are not aliases. `--state-dir` replaces `--bed-dir`; `clone --sparse`
+  replaces `--plot`.
+- Use server, repository, working copy, changeset, object store, metadata
+  database, and derived data throughout current help, messages, and docs.
+- Rename the Git bridge to `gardenbed-git` (`crates/git`) and the planned
+  daemon package to `gardenbed-daemon` (`crates/daemon`). RPCs use `Rebase`
+  and `Publish`.
+- Repository storage is `objects/` and `metadata.sqlite3`; working-copy
+  state uses `index.sqlite3` and a `sparse` configuration field. This is a
+  breaking pre-release interface and layout change; existing repositories
+  and working copies need to be recreated using the current version.
+
 ## [0.1.0] - 2026-10-16
 
 First tagged release. Everything below landed between the workspace

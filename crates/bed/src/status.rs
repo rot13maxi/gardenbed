@@ -1,7 +1,7 @@
 //! `bed status` — the offline working-copy scanner (v0.1.md §6, M4
 //! verification 1 and 5).
 //!
-//! The engine compares the working files under the plot prefixes against
+//! The engine compares the working files under the selected paths prefixes against
 //! the treestate, entirely offline: no server, no network.
 //!
 //! Like git's index racy-refresh, the scan is *guided by hints*: a tracked
@@ -17,15 +17,15 @@
 //! - different hash → **modified** (same-size different-content is caught
 //!   exactly here);
 //! - tracked but missing on disk → **deleted**;
-//! - present in the plot but unknown to the treestate → **untracked**.
+//! - present in the selected paths but unknown to the treestate → **untracked**.
 //!
-//! [`scan_paths`] is the pure core: `(root, plot, treestate) → a per-path
+//! [`scan_paths`] is the pure core: `(root, sparse, treestate) → a per-path
 //! classification carrying blob ids, modes and hint metadata` — the shape
-//! `sow` consumes. [`scan_status`] wraps it, collapsing the classification
+//! `commit` consumes. [`scan_status`] wraps it, collapsing the classification
 //! into the three-bucket report the CLI prints. Their only side effect is
 //! the deliberate one: refreshing hint metadata on files that hash clean —
 //! never their blob ids (content addresses change only through
-//! `sow`/`goto`).
+//! `commit`/`switch`).
 
 use std::collections::HashSet;
 use std::fs;
@@ -37,9 +37,9 @@ use std::time::UNIX_EPOCH;
 use gardenbed_model::Id;
 use gardenbed_model::blob_id;
 
-use crate::error::BedError;
-use crate::plot::dir_may_hold_plotted;
-use crate::plot::in_plot;
+use crate::error::ClientError;
+use crate::sparse::dir_may_hold_selected;
+use crate::sparse::in_sparse;
 use crate::treestate::HINT_UNVERIFIED;
 use crate::treestate::MODE_GITLINK;
 use crate::treestate::MODE_SYMLINK;
@@ -54,7 +54,7 @@ pub enum ScanDelta {
     /// Tracked, on disk, but content or mode differs from the row. Carries
     /// the file's *current* blob id (recomputed from the working bytes —
     /// identical to the row's for a mode-only change), mode, and the
-    /// stat metadata `sow` needs to refresh the row.
+    /// stat metadata `commit` needs to refresh the row.
     Modified {
         /// SHA-256 of the working bytes.
         blob_id: Id,
@@ -68,7 +68,7 @@ pub enum ScanDelta {
     /// Tracked as a file but gone from disk — or replaced by a directory,
     /// which is the same outcome: the path no longer holds a file.
     Deleted,
-    /// In the plot but unknown to the treestate. Carries the same metadata
+    /// In the sparse selection but unknown to the treestate. Carries the same metadata
     /// as [`ScanDelta::Modified`] (the path has no row yet).
     Untracked {
         /// SHA-256 of the working bytes.
@@ -91,14 +91,14 @@ pub struct ScanItem {
     pub delta: ScanDelta,
 }
 
-/// What `bed status` found under the plot.
+/// What `bed status` found under the selected paths.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StatusReport {
     /// Tracked files whose content or mode differs from the treestate.
     pub modified: Vec<String>,
     /// Tracked files missing from the working copy.
     pub deleted: Vec<String>,
-    /// Files inside the plot that the treestate has never seen.
+    /// Files inside the sparse selection that the treestate has never seen.
     pub untracked: Vec<String>,
 }
 
@@ -109,7 +109,7 @@ impl StatusReport {
     }
 
     /// git-status-like rendering: one section per non-empty category,
-    /// paths sorted, entries indented. Empty when the plot is clean (the
+    /// paths sorted, entries indented. Empty when working copy is clean (the
     /// CLI prints its own "clean" line).
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -132,7 +132,7 @@ impl StatusReport {
     }
 }
 
-/// Compares the working files under `plot` against `treestate`, relative to
+/// Compares the working files under `sparse` against `treestate`, relative to
 /// the working-copy root `root`, classifying every path the scan touches.
 /// See the module docs for the semantics; [`scan_status`] renders the same
 /// walk as a `StatusReport`.
@@ -145,10 +145,10 @@ impl StatusReport {
 /// globally — callers that print sort their own buckets.
 pub fn scan_paths(
     root: &Path,
-    plot: &[String],
+    sparse: &[String],
     treestate: &Treestate,
     full_scan: bool,
-) -> Result<Vec<ScanItem>, BedError> {
+) -> Result<Vec<ScanItem>, ClientError> {
     let mut items: Vec<ScanItem> = Vec::new();
     let state_prefixes = crate::sync::state_prefixes(root, treestate)?;
     let disk = crate::checkout_fs::CheckoutFs::open(
@@ -160,12 +160,12 @@ pub fn scan_paths(
     let tracked_paths = treestate.all_paths()?;
     let tracked: HashSet<String> = tracked_paths.iter().cloned().collect();
 
-    // Pass 1 — deleted: tracked, inside the plot, and gone from disk (or
+    // Pass 1 — deleted: tracked, inside the sparse selection, and gone from disk (or
     // replaced by something that is not a file or symlink, e.g. a directory
     // landed on the path). Gitlink rows are skipped: submodule pointers are
     // never materialized as files, so their absence is their normal state.
     for path in &tracked_paths {
-        if !in_plot(path, plot) || crate::sync::is_state_path(path, &state_prefixes) {
+        if !in_sparse(path, sparse) || crate::sync::is_state_path(path, &state_prefixes) {
             continue;
         }
         let entry = match treestate.lookup(path)? {
@@ -226,7 +226,7 @@ pub fn scan_paths(
         }
     }
 
-    // Pass 2 — walk the garden within the plot: untracked files and
+    // Pass 2 — walk the repository within the selected paths: untracked files and
     // suspects needing a hash.
     let mut stack: Vec<String> = vec![String::new()];
     while let Some(dir) = stack.pop() {
@@ -256,10 +256,10 @@ pub fn scan_paths(
                 continue;
             }
             if entry.file_type()?.is_dir() {
-                if dir_may_hold_plotted(&rel, plot) {
+                if dir_may_hold_selected(&rel, sparse) {
                     stack.push(rel);
                 }
-            } else if in_plot(&rel, plot) {
+            } else if in_sparse(&rel, sparse) {
                 if !tracked.contains(&rel) {
                     items.push(ScanItem {
                         path: rel.clone(),
@@ -281,12 +281,12 @@ pub fn scan_paths(
 /// correctness path: every tracked file is hashed regardless of hints.
 pub fn scan_status(
     root: &Path,
-    plot: &[String],
+    sparse: &[String],
     treestate: &Treestate,
     full_scan: bool,
-) -> Result<StatusReport, BedError> {
+) -> Result<StatusReport, ClientError> {
     let mut report = StatusReport::default();
-    for item in scan_paths(root, plot, treestate, full_scan)? {
+    for item in scan_paths(root, sparse, treestate, full_scan)? {
         match item.delta {
             ScanDelta::Clean => {}
             ScanDelta::Modified { .. } => report.modified.push(item.path),
@@ -303,13 +303,13 @@ pub fn scan_status(
 
 /// Classifies a path the treestate has never seen: stat it and hash its
 /// bytes (for a symlink, the link-target bytes).
-fn classify_untracked(root: &Path, rel: &str) -> Result<ScanDelta, BedError> {
+fn classify_untracked(root: &Path, rel: &str) -> Result<ScanDelta, ClientError> {
     let observed = observe(root, rel)?.ok_or_else(|| {
         // The walk listed the entry moments ago; it cannot have vanished
         // through a race bed cares about. Classify it deleted-of-nothing:
         // there is no row to delete, so the path is simply absent.
-        BedError::ConfigInvalid(format!(
-            "{rel:?} appeared and vanished while scanning — the garden is \
+        ClientError::ConfigInvalid(format!(
+            "{rel:?} appeared and vanished while scanning — the working copy is \
              being changed concurrently"
         ))
     })?;
@@ -332,7 +332,7 @@ fn classify_tracked(
     rel: &str,
     full_scan: bool,
     treestate: &Treestate,
-) -> Result<ScanDelta, BedError> {
+) -> Result<ScanDelta, ClientError> {
     let entry = match treestate.lookup(rel)? {
         Some(entry) => entry,
         // The tracked set was loaded a moment ago; a row vanishing mid-scan
@@ -402,7 +402,7 @@ struct Observed {
 /// Reads and hashes the working entry at `root/rel`. A symlink's content is
 /// its link-target bytes. `Ok(None)` when the entry vanished (or was
 /// replaced by a directory) between the walk and this read.
-fn observe(root: &Path, rel: &str) -> Result<Option<Observed>, BedError> {
+fn observe(root: &Path, rel: &str) -> Result<Option<Observed>, ClientError> {
     let meta = match fs::symlink_metadata(root.join(rel)) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -470,18 +470,21 @@ mod tests {
 
     struct Garden {
         dir: tempfile::TempDir,
-        bed: crate::bed::Bed,
+        bed: crate::workspace::WorkingCopy,
     }
 
     impl Garden {
-        /// A bed with `src/` plotted and the treestate seeded to match the
+        /// A bed with `src/` selected and the treestate seeded to match the
         /// files on disk (as a completed materialization would leave it).
         fn planted(files: &[(&str, &[u8])]) -> Self {
             let dir = tempfile::tempdir().unwrap();
-            let mut bed =
-                crate::bed::Bed::init(&dir.path().join(".bed"), "http://127.0.0.1:1", "garden")
-                    .unwrap();
-            bed.config_mut().plot.push("src".to_owned());
+            let mut bed = crate::workspace::WorkingCopy::init(
+                &dir.path().join(".bed"),
+                "http://127.0.0.1:1",
+                "garden",
+            )
+            .unwrap();
+            bed.config_mut().sparse.push("src".to_owned());
             bed.save_config().unwrap();
 
             let ts = bed.treestate().unwrap();
@@ -506,10 +509,10 @@ mod tests {
         }
 
         fn scan(&self, full: bool) -> StatusReport {
-            let plot = self.bed.config().plot.clone();
+            let sparse = self.bed.config().sparse.clone();
             scan_status(
-                &self.bed.garden_root(),
-                &plot,
+                &self.bed.workspace_root(),
+                &sparse,
                 &self.bed.treestate().unwrap(),
                 full,
             )
@@ -605,24 +608,24 @@ mod tests {
     }
 
     #[test]
-    fn files_outside_the_plot_are_invisible() {
+    fn files_outside_the_sparse_are_invisible() {
         let g = Garden::planted(&[("src/a.rs", b"hello")]);
-        // Untracked-looking file outside the plot: ignored entirely.
+        // Untracked-looking file outside the sparse selection: ignored entirely.
         fs::create_dir_all(g.dir.path().join("elsewhere")).unwrap();
         fs::write(g.dir.path().join("elsewhere/x.rs"), "?").unwrap();
-        // Modified-looking file outside the plot: ignored entirely.
+        // Modified-looking file outside the sparse selection: ignored entirely.
         fs::write(g.dir.path().join("elsewhere/z.rs"), "?").unwrap();
         let report = g.scan(false);
         assert!(report.is_clean());
     }
 
     #[test]
-    fn empty_plot_scans_nothing() {
+    fn empty_sparse_scans_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let bed = crate::bed::Bed::init(&dir.path().join(".bed"), "s", "r").unwrap();
+        let bed = crate::workspace::WorkingCopy::init(&dir.path().join(".bed"), "s", "r").unwrap();
         fs::write(dir.path().join("stray.rs"), "?").unwrap();
         let report =
-            scan_status(&bed.garden_root(), &[], &bed.treestate().unwrap(), false).unwrap();
+            scan_status(&bed.workspace_root(), &[], &bed.treestate().unwrap(), false).unwrap();
         assert!(report.is_clean());
     }
 
@@ -641,7 +644,7 @@ mod tests {
     }
 
     #[test]
-    fn the_bed_directory_is_never_garden_content() {
+    fn the_state_directory_is_never_garden_content() {
         let g = Garden::planted(&[("src/a.rs", b"hello")]);
         // `.bed` at the root is machinery, not files to report.
         fs::write(g.dir.path().join(".bed/loose.txt"), "?").unwrap();
@@ -662,7 +665,7 @@ mod tests {
         assert_eq!(StatusReport::default().render(), "");
     }
 
-    /// The sow-facing core reports the same walk with metadata attached.
+    /// The commit-facing core reports the same walk with metadata attached.
     #[test]
     fn scan_paths_carries_blob_ids_modes_and_stat_metadata() {
         let g = Garden::planted(&[("src/a.rs", b"hello"), ("src/gone.txt", b"bye")]);
@@ -671,8 +674,8 @@ mod tests {
         fs::write(g.dir.path().join("src/new.txt"), b"fresh").unwrap();
 
         let items = scan_paths(
-            &g.bed.garden_root(),
-            &g.bed.config().plot,
+            &g.bed.workspace_root(),
+            &g.bed.config().sparse,
             &g.bed.treestate().unwrap(),
             false,
         )
@@ -701,13 +704,13 @@ mod tests {
                 mtime_ns: mtime_ns(&meta),
             })
         );
-        // Everything tracked and untouched is Clean — the planted fixture
+        // Everything tracked and untouched is Clean — the initialized fixture
         // has no other files.
         assert_eq!(by_path.len(), 3);
     }
 
     /// A mode-only change reports the SAME blob id (content re-hashed
-    /// unchanged) with the new mode — the shape sow turns into a `Modify`
+    /// unchanged) with the new mode — the shape commit turns into a `Modify`
     /// that reuses the old blob.
     #[test]
     fn mode_only_change_keeps_the_blob_id() {
@@ -720,8 +723,8 @@ mod tests {
             perms.set_mode(perms.mode() | 0o111);
             fs::set_permissions(&path, perms).unwrap();
             let items = scan_paths(
-                &g.bed.garden_root(),
-                &g.bed.config().plot,
+                &g.bed.workspace_root(),
+                &g.bed.config().sparse,
                 &g.bed.treestate().unwrap(),
                 false,
             )
@@ -760,9 +763,9 @@ mod tests {
     }
 
     #[test]
-    fn custom_state_directory_is_excluded_from_status_and_sow_scan() {
+    fn custom_state_directory_is_excluded_from_status_and_commit_scan() {
         let dir = tempfile::tempdir().unwrap();
-        let bed = crate::bed::Bed::init(&dir.path().join("state"), "s", "r").unwrap();
+        let bed = crate::workspace::WorkingCopy::init(&dir.path().join("state"), "s", "r").unwrap();
         let ts = bed.treestate().unwrap();
         fs::write(dir.path().join("normal"), b"garden").unwrap();
         let report = scan_status(dir.path(), &[".".into()], &ts, true).unwrap();

@@ -1,8 +1,8 @@
-//! Shared helpers for bed's integration tests: run the real `bed`
+//! Shared helpers for working copy's integration tests: run the real `bed`
 //! binary, spawn the real `gardenbed-server` binary on an ephemeral
 //! port, ingest a generated history into its repo (in-process, through
 //! the server library — fixture setup must not pollute the request
-//! counters the tests assert on), and compute the exact want-list a plot
+//! counters the tests assert on), and compute the exact want-list a sparse
 //! should fetch.
 //!
 //! The server binary is not a bin target of this package, so
@@ -24,7 +24,7 @@ use gardenbed_server::Repo;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::{Duration, timeout};
 
-/// The repo name every fixture is ingested under (and the bed's default).
+/// The repo name every fixture is ingested under (and the working copy's default).
 pub const REPO: &str = "garden";
 
 /// Runs the real `bed` binary in `dir`, returning (exit code, stdout,
@@ -103,16 +103,16 @@ pub fn server_bin() -> PathBuf {
     )
 }
 
-/// One running arboretum: the spawned `gardenbed-server` process, its
+/// One running server: the spawned `gardenbed-server` process, its
 /// bound address, and a client for stats polling.
-pub struct Arboretum {
+pub struct Server {
     pub child: tokio::process::Child,
     /// The `ip:port` the server announced.
     pub addr: String,
     pub root: PathBuf,
 }
 
-impl Arboretum {
+impl Server {
     /// Spawns the server binary over `root` and waits (≤ 30 s) for its
     /// `listening on <addr>` stdout line.
     pub async fn spawn(root: &Path) -> Self {
@@ -141,7 +141,7 @@ impl Arboretum {
             .strip_prefix("listening on ")
             .unwrap_or_else(|| panic!("expected a listening line, got {line:?}"))
             .to_owned();
-        Arboretum {
+        Server {
             child,
             addr,
             root: root.to_path_buf(),
@@ -157,7 +157,7 @@ impl Arboretum {
     pub async fn client(&self) -> GardenbedClient {
         GardenbedClient::connect(&self.http())
             .await
-            .expect("client connects to the arboretum")
+            .expect("client connects to the server")
     }
 
     /// A snapshot of the server's counted RPCs: `(get_tree, get_blob)`.
@@ -178,7 +178,7 @@ impl Arboretum {
 
 /// True if a blob id is a submodule pointer: 12 zero bytes followed by the
 /// 20-byte upstream git SHA-1 (canonical spec §3 — the pointer's "content"
-/// is the padded pointer itself). Such ids are never loam objects.
+/// is the padded pointer itself). Such ids are never objects objects.
 pub fn is_gitlink_pointer(
     id: &Id,
     history: &gardenbed_harness::generator::GeneratedHistory,
@@ -199,7 +199,7 @@ pub fn ingest(history: &gardenbed_harness::generator::GeneratedHistory, root: &P
         for change in &cs.changes {
             let Some(blob) = change.blob else { continue };
             if change.mode == Mode::Gitlink || is_gitlink_pointer(&blob, history) {
-                continue; // opaque upstream pointer, never a loam object
+                continue; // opaque upstream pointer, never a objects object
             }
             let content = history
                 .blob(&blob)
@@ -219,7 +219,7 @@ pub fn ingest(history: &gardenbed_harness::generator::GeneratedHistory, root: &P
 /// should fetch at `head` under `prefixes`:
 /// `(distinct tree ids, distinct non-gitlink blob ids)`. Computed by
 /// walking the server's derived trees in-process (uncounted), mirroring
-/// `plan_plot`'s traversal exactly.
+/// `plan_sparse`'s traversal exactly.
 pub fn want_list(root: &Path, head: Id, prefixes: &[&str]) -> (HashSet<Id>, HashSet<Id>) {
     let repo = Repo::open(root).expect("repo opens");
     let mut trees: HashSet<Id> = HashSet::new();
@@ -288,10 +288,10 @@ pub fn want_list(root: &Path, head: Id, prefixes: &[&str]) -> (HashSet<Id>, Hash
     (trees, blobs)
 }
 
-/// How many of `ids` the bed's local object cache already holds.
-pub fn cached_count(bed_dir: &Path, ids: &HashSet<Id>) -> usize {
+/// How many of `ids` the working copy's local object cache already holds.
+pub fn cached_count(state_dir: &Path, ids: &HashSet<Id>) -> usize {
     // The store root is `.bed` (FsObjectStore appends `objects/` itself).
-    let store = gardenbed_store::FsObjectStore::open(bed_dir).expect("bed object cache opens");
+    let store = gardenbed_store::FsObjectStore::open(state_dir).expect("bed object cache opens");
     use gardenbed_store::ObjectStore as _;
     ids.iter().filter(|id| store.has(**id).unwrap()).count()
 }

@@ -141,12 +141,12 @@ pub fn git_diff_two(repo: &Path, a: &str, b: &str) -> Vec<(char, String)> {
     entries
 }
 
-/// Maps a git status letter onto the gardenbed op classification.
+/// Maps a git status letter onto the Gardenbed op classification.
 ///
 /// git's `T` (typechange: the same path flips mode class, e.g. regular ↔
 /// symlink, as when a rename lands on an existing path of another type) is
 /// a gardenbed `Modify`: the path exists on both sides with a different
-/// blob and/or mode. gardenbed's diff has no separate type-change class.
+/// blob and/or mode. Gardenbed's diff has no separate type-change class.
 pub fn git_status_op(status: char) -> Op {
     match status {
         'A' => Op::Add,

@@ -1,31 +1,28 @@
 # gardenbed-mcp — the MCP surface
 
-`gardenbed-mcp` lets an agent ask a garden questions — `log`, `diff`,
-`blame`, `file` — over the Model Context Protocol with **no working copy
-anywhere**: not on the machine the agent runs on, not in the server. This
-is the zero-checkout contract (v0.1.md §M7.2). The server opens the
-arboretum's data directory in process and answers from loam + seedbed
-alone; it never reads or creates a `.bed` directory, and it writes nothing
-at all.
+`gardenbed-mcp` exposes repository `log`, `diff`, `blame`, and `file`
+queries over the Model Context Protocol. It opens the repository's object
+store and metadata database directly; no working copy or `.bed` directory
+is needed. Tool calls do not create changesets or update refs.
 
 ## 1. Quickstart
 
 ```sh
 cargo build -p gardenbed-mcp
-# Serve the arboretum rooted at /srv/garden over stdio:
+# Query repository storage over stdio:
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  | gardenbed-mcp --root /srv/garden
+  | gardenbed-mcp --root /srv/repository
 ```
 
 Options:
 
 | Flag | Meaning |
 |---|---|
-| `--root <DIR>` (required) | The arboretum's data dir: its `loam/` object store and `seedbed.sqlite3` metadata database — the same directory `gardenbed-server --root` serves. |
-| `--repo <NAME>` | Accepted for forward compatibility; v0.1 arboreta are single-repo and the name is validated but otherwise unused (the API carries a repo field from day one, v0.1.md §1). |
+| `--root <DIR>` (required) | The server's data dir: its `objects/` object store and `metadata.sqlite3` metadata database — the same directory `gardenbed-server --root` serves. |
+| `--repo <NAME>` | Accepted for forward compatibility; v0.1 servers are single-repo and the name is validated but otherwise unused (the API carries a repo field from day one, v0.1.md §1). |
 
 The server speaks newline-delimited JSON-RPC 2.0 on stdin/stdout. EOF on
-stdin ends it cleanly (exit 0); an arboretum that will not open exits 1
+stdin ends it cleanly (exit 0); a server that will not open exits 1
 with the reason on stderr. Diagnostics go to **stderr only** — stdout
 carries the protocol and nothing else.
 
@@ -38,7 +35,7 @@ Any MCP client that launches stdio servers can attach. The generic shape:
   "mcpServers": {
     "gardenbed": {
       "command": "gardenbed-mcp",
-      "args": ["--root", "/srv/garden"]
+      "args": ["--root", "/srv/repository"]
     }
   }
 }
@@ -74,7 +71,7 @@ explanation the agent can read and act on".
 All ids and refs are strings. The optional `cs` argument of `log`,
 `blame`, and `file` accepts a 64-hex changeset id (uppercase tolerated —
 parsers accept any case per the canonical-encoding spec §1) or a ref
-name, resolved through the arboretum's ref table; it defaults to the
+name, resolved through the server's ref table; it defaults to the
 `main` ref. Every resolution verifies existence. Display ids are always
 lowercase hex.
 
@@ -104,7 +101,7 @@ What changed between changesets `a` and `b` (a → b), as git
 ```
 
 Letters: `A` added, `M` modified, `D` deleted, `T` type change (regular ↔
-symlink ↔ gitlink). Rename detection is off, matching gardenbed's
+symlink ↔ gitlink). Rename detection is off, matching Gardenbed's
 changeset tree diffs and `git diff-tree --no-renames`. An empty diff
 answers `no changes between <a> and <b>`. **Both sides are required** —
 omitting either is an `isError` result saying `diff needs two changesets`,
@@ -132,7 +129,7 @@ instead of blamed (git errors on it — documented divergence, see
 One file's content at a changeset as a single text block — what
 `git show <cs>:<path>` prints. Symlinks render their target bytes;
 **submodule pointers** are described (`upstream commit <sha>`) instead of
-read (the pointer is not a loam object); an empty file answers empty
+read (the pointer is not a object store object); an empty file answers empty
 text. Content that is not valid UTF-8 is rendered **lossily**, with a
 warning on stderr (v0.1: the tool returns text blocks only — a documented
 divergence).
@@ -177,7 +174,7 @@ cargo run -p gardenbed-mcp --example qa_agent
 | `log` shows the full 64-hex id (bed shows the 16-hex short form) | agents must be able to copy an id straight into the next tool call |
 | `diff` is name-status only (no patch hunks) | v0.1 tool surface; `bed diff` renders the full patch |
 | `blame` answers coalesced ranges, not per-line annotations with authors | the author attribution is one follow-up `log` call away; ranges keep answers compact |
-| submodule pointers are described, not read (`file`) or blamed (`blame`) | the pointer is not a loam object; git errors on `git blame` for one |
+| submodule pointers are described, not read (`file`) or blamed (`blame`) | the pointer is not a object store object; git errors on `git blame` for one |
 | non-UTF-8 file content renders lossily (with a stderr warning) | tools return text blocks in v0.1 |
 | `file` on a gitlink names the upstream commit, `git show` prints the raw pointer bytes | the commit is what an agent wants |
 

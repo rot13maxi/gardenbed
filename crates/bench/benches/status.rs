@@ -1,10 +1,10 @@
-//! Warm `bed status` over a 10k-file plot (the M4 offline heart,
+//! Warm `bed status` over a 10k-file sparse (the M4 offline heart,
 //! v0.1.md §M4.4): the hint-guided scan hashes only suspects — on a clean
-//! plot, nothing at all.
+//! sparse, nothing at all.
 //!
-//! Two measurements on the same planted fixture (10k regular files on
+//! Two measurements on the same initialized fixture (10k regular files on
 //! disk, treestate rows whose size/mtime/hint match — exactly the state
-//! after a real plot add):
+//! after a real sparse add):
 //!
 //! * **hint_scan** — the default `bed status`: stat-only walk, nothing
 //!   hashed (the warm path; the 500 ms budget rides on this).
@@ -12,7 +12,7 @@
 //!   correctness path after a hint loss, and the contrast that shows what
 //!   the hint path buys.
 //!
-//! No arboretum is involved: status is the offline heart. The scan may
+//! No server is involved: status is the offline heart. The scan may
 //! refresh hint metadata in the treestate (a sqlite write on tmpfs); the
 //! first pass refreshes, later passes find everything verified.
 
@@ -24,28 +24,29 @@ use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use gardenbed::bed::Bed;
 use gardenbed::treestate::{HINT_VERIFIED, MODE_REGULAR, TreestateEntry};
+use gardenbed::workspace::WorkingCopy;
 use gardenbed_model::blob_id;
 
-/// The planted fixture: a bed with a 10k-file plot, all rows warm.
+/// The initialized fixture: a working copy with a 10k-file sparse, all rows warm.
 struct World {
     _dir: tempfile::TempDir,
-    garden_root: std::path::PathBuf,
+    workspace_root: std::path::PathBuf,
     treestate: gardenbed::treestate::Treestate,
     files: usize,
 }
 
 fn setup() -> World {
     let dir = world::temp_root();
-    let garden_root = dir.path().to_path_buf();
-    let bed_dir = garden_root.join(".bed");
-    let mut planted = Bed::init(&bed_dir, "http://127.0.0.1:1", world::REPO).expect("bed inits");
-    planted.config_mut().plot.push(".".to_owned());
+    let workspace_root = dir.path().to_path_buf();
+    let state_dir = workspace_root.join(".bed");
+    let mut planted =
+        WorkingCopy::init(&state_dir, "http://127.0.0.1:1", world::REPO).expect("bed inits");
+    planted.config_mut().sparse.push(".".to_owned());
     planted.save_config().expect("config saved");
     let treestate = planted.treestate().expect("treestate opens");
 
-    let garden = garden_root.clone();
+    let garden = workspace_root.clone();
     let n = world::env_usize("GARDENBED_BENCH_STATUS_FILES", 10_000, 100);
     let mut content = Vec::with_capacity(64);
     for i in 0..n {
@@ -73,7 +74,7 @@ fn setup() -> World {
 
     World {
         _dir: dir,
-        garden_root,
+        workspace_root,
         treestate,
         files: n,
     }
@@ -89,14 +90,19 @@ fn bench_status(c: &mut Criterion) {
 
     group.bench_function("hint_scan", |b| {
         b.iter(|| {
-            gardenbed::status::scan_status(&w.garden_root, &[".".to_owned()], &w.treestate, false)
-                .expect("hint scan works")
+            gardenbed::status::scan_status(
+                &w.workspace_root,
+                &[".".to_owned()],
+                &w.treestate,
+                false,
+            )
+            .expect("hint scan works")
         })
     });
 
     group.bench_function("full_scan", |b| {
         b.iter(|| {
-            gardenbed::status::scan_status(&w.garden_root, &[".".to_owned()], &w.treestate, true)
+            gardenbed::status::scan_status(&w.workspace_root, &[".".to_owned()], &w.treestate, true)
                 .expect("full scan works")
         })
     });

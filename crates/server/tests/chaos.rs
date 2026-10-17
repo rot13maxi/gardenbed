@@ -7,11 +7,11 @@
 //!    must match exactly; refs touched by an interrupted write must sit at
 //!    one of the two legal values (old or new) — a torn ref is impossible
 //!    by construction (one-row CAS in one immediate transaction).
-//! 2. **Loam checksum sweep.** Every object file under `<root>/loam/` is
+//! 2. **Loam checksum sweep.** Every object file under `<root>/objects/` is
 //!    walked and verified against its content address: blob envelopes are
 //!    zstd-decoded and SHA-256-checked (`GBLO1` envelope, canonical
 //!    encoding §6); trees are decoded from canonical bytes and hashed.
-//! 3. **`PRAGMA integrity_check` ok** on the seedbed after WAL recovery.
+//! 3. **`PRAGMA integrity_check` ok** on the metadata after WAL recovery.
 //! 4. **Derived-data rebuild determinism.** All derived kinds (`tree`,
 //!    `skiplist`, `pathsummary`) are wiped, recomputed from the changeset
 //!    log through a fresh in-process engine, and the answers (root trees of
@@ -19,7 +19,7 @@
 //!    to the pre-chaos baseline.
 //!
 //! Classes: GetTree, GetBlob, CreateChangeset, PutBlob, Log, Diff, Blame,
-//! CasRef, Graft, Harvest. Default 10 kill/restart cycles per class (100
+//! CasRef, Rebase, Publish. Default 10 kill/restart cycles per class (100
 //! total); `GARDENBED_CHAOS_ITERS` raises it (the M8 gate runs 100/class
 //! once per release). The default run stays within a few minutes.
 //!
@@ -50,12 +50,12 @@ const BLAME_PATH: &str = "log/changes.txt";
 const BIG_BLOB_LEN: usize = 4 << 20;
 /// PutBlob body size (multi-chunk, killed mid-stream).
 const PUT_BLOB_LEN: usize = 8 << 20;
-/// Harvest-chain depth (≥ default iterations; cycles wrap).
+/// Publish-chain depth (≥ default iterations; cycles wrap).
 const HCHAIN_LEN: usize = 12;
 
 // ---------------------------------------------------------------- server
 
-/// One running arboretum process (fresh ephemeral port per spawn).
+/// One running server process (fresh ephemeral port per spawn).
 struct ServerProc {
     child: tokio::process::Child,
     addr: String,
@@ -97,7 +97,7 @@ impl ServerProc {
     async fn client(&self) -> GardenbedClient {
         GardenbedClient::connect(&self.http())
             .await
-            .expect("client connects to the arboretum")
+            .expect("client connects to the server")
     }
 
     /// SIGKILL (the chaos primitive) and reap.
@@ -132,7 +132,7 @@ struct Fixture {
     root: PathBuf,
     /// `main` before the chaos loop (also every mutator's fixed parent).
     main: Id,
-    /// An older changeset on the mainline (the diff/graft anchor).
+    /// An older changeset on the mainline (the diff/rebase anchor).
     cs40: Id,
     tree: Option<Id>,
     /// The root tree of `main` as served before any chaos (the GetTree
@@ -144,7 +144,7 @@ struct Fixture {
     blame: Vec<BlameRange>,
     big_blob: Id,
     big_content: Vec<u8>,
-    graftable: Vec<(Id, Changeset)>,
+    rebaseable: Vec<(Id, Changeset)>,
     hchain: Vec<Id>,
     /// Root-tree answers per sampled changeset (rebuild determinism).
     /// `Id` hashes by content; no ordering is needed.
@@ -157,7 +157,7 @@ fn build_fixture(root: &Path) -> Fixture {
 
     // A merge-dense generated history (the M-fixture shape), then three
     // deterministic extensions appended on its first-parent chain:
-    // 60 walk changesets (blame oracle), one 4 MiB blob, graft/harvest
+    // 60 walk changesets (blame oracle), one 4 MiB blob, rebase/publish
     // material. Identity times increase so log ordering is stable.
     let history = generate(
         7,
@@ -176,7 +176,7 @@ fn build_fixture(root: &Path) -> Fixture {
         for change in &cs.changes {
             let Some(blob) = change.blob else { continue };
             if change.mode == Mode::Gitlink || is_gitlink_pointer(&blob, &blobs) {
-                continue; // opaque upstream pointer, never a loam object
+                continue; // opaque upstream pointer, never a objects object
             }
             let content = history
                 .blob(&blob)
@@ -206,7 +206,7 @@ fn build_fixture(root: &Path) -> Fixture {
     // file each.
     let mut story = String::new();
     for i in 0..60u64 {
-        story.push_str(&format!("chaos walk line {i}: the plot thickens\n"));
+        story.push_str(&format!("chaos walk line {i}: the sparse thickens\n"));
         let mut changes = Vec::new();
         let mut inline = BTreeMap::new();
         let blob = blob_id(story.as_bytes());
@@ -268,16 +268,16 @@ fn build_fixture(root: &Path) -> Fixture {
         .expect("big-blob cs ingests");
     let main = parent;
 
-    // Three additive changesets graftable onto any parent (new paths only).
-    let mut graftable = Vec::new();
+    // Three additive changesets rebaseable onto any parent (new paths only).
+    let mut rebaseable = Vec::new();
     for n in 0..3u64 {
         let mut changes = Vec::new();
         let mut inline = BTreeMap::new();
         for k in 0..30u64 {
-            let content = format!("graft payload {n}/{k}\n");
+            let content = format!("rebase payload {n}/{k}\n");
             let blob = blob_id(content.as_bytes());
             changes.push(Change {
-                path: format!("graft/{n}/f{k:02}.txt"),
+                path: format!("rebase/{n}/f{k:02}.txt"),
                 op: Op::Add,
                 blob: Some(blob),
                 src_path: None,
@@ -288,34 +288,34 @@ fn build_fixture(root: &Path) -> Fixture {
         let cs = Changeset {
             parents: vec![main],
             changes,
-            message: format!("graftable {n}"),
+            message: format!("rebaseable {n}"),
             author: ident(70 + n),
             committer: ident(70 + n),
             signature: None,
         };
         let id = repo
             .create_changeset(&cs, &inline)
-            .expect("graftable ingests");
-        graftable.push((id, cs));
+            .expect("rebaseable ingests");
+        rebaseable.push((id, cs));
     }
 
-    // The harvest chain: hchain[0] is a child of main, each next a child of
-    // the previous — harvesting them in order is always a fast-forward.
+    // The publish chain: hchain[0] is a child of main, each next a child of
+    // the previous — publishing them in order is always a fast-forward.
     let mut hchain = Vec::new();
     let mut hp = main;
     for k in 0..HCHAIN_LEN {
-        let content = format!("harvest step {k}\n");
+        let content = format!("publish step {k}\n");
         let blob = blob_id(content.as_bytes());
         let cs = Changeset {
             parents: vec![hp],
             changes: vec![Change {
-                path: format!("harvest/step-{k:02}.txt"),
+                path: format!("publish/step-{k:02}.txt"),
                 op: Op::Add,
                 blob: Some(blob),
                 src_path: None,
                 mode: Mode::Regular,
             }],
-            message: format!("harvestable {k}"),
+            message: format!("publishable {k}"),
             author: ident(80 + k as u64),
             committer: ident(80 + k as u64),
             signature: None,
@@ -361,7 +361,7 @@ fn build_fixture(root: &Path) -> Fixture {
         blame,
         big_blob: blob,
         big_content,
-        graftable,
+        rebaseable,
         hchain,
         sample_trees,
     }
@@ -379,10 +379,10 @@ enum Outcome {
     Created(Id, Changeset),
     /// CasRef answered: `(ref value before, new value, outcome)`.
     Cas(Option<Id>, Id, Option<CasOutcome>),
-    /// Graft acknowledged: `(grafted id, new parent, changes)`.
-    Grafted(Id, Id, Vec<Change>),
-    /// Harvest acknowledged or rejected: the target (and main before).
-    Harvested(Id, Option<Id>),
+    /// Rebase acknowledged: `(rebased id, new parent, changes)`.
+    Rebaseed(Id, Id, Vec<Change>),
+    /// Publish acknowledged or rejected: the target (and main before).
+    Published(Id, Option<Id>),
     /// The call failed cleanly (transport error) — nothing acknowledged.
     Failed(&'static str),
 }
@@ -398,8 +398,8 @@ enum Class {
     Diff,
     Blame,
     CasRef,
-    Graft,
-    Harvest,
+    Rebase,
+    Publish,
 }
 
 const CLASSES: [Class; 10] = [
@@ -411,8 +411,8 @@ const CLASSES: [Class; 10] = [
     Class::Diff,
     Class::Blame,
     Class::CasRef,
-    Class::Graft,
-    Class::Harvest,
+    Class::Rebase,
+    Class::Publish,
 ];
 
 impl Class {
@@ -426,8 +426,8 @@ impl Class {
             Class::Diff => "Diff",
             Class::Blame => "Blame",
             Class::CasRef => "CasRef",
-            Class::Graft => "Graft",
-            Class::Harvest => "Harvest",
+            Class::Rebase => "Rebase",
+            Class::Publish => "Publish",
         }
     }
 }
@@ -443,8 +443,8 @@ struct CallCtx {
     log_ids: Vec<Id>,
     diff: Vec<Change>,
     blame: Vec<BlameRange>,
-    graftable: (Id, Changeset),
-    harvest_target: Id,
+    rebaseable: (Id, Changeset),
+    publish_target: Id,
 }
 
 /// Starts one call of `class` (iteration `i`) against the ctx's client.
@@ -608,27 +608,27 @@ async fn drive(ctx: CallCtx, class: Class, i: usize) -> Outcome {
                 Err(_) => Outcome::Cas(before, new, None),
             }
         }
-        Class::Graft => {
-            let (gid, cs) = &ctx.graftable;
-            match client.graft(REPO, *gid, ctx.cs40).await {
-                Ok(id) => Outcome::Grafted(id, ctx.cs40, cs.changes.clone()),
-                Err(_) => Outcome::Failed("Graft"),
+        Class::Rebase => {
+            let (gid, cs) = &ctx.rebaseable;
+            match client.rebase(REPO, *gid, ctx.cs40).await {
+                Ok(id) => Outcome::Rebaseed(id, ctx.cs40, cs.changes.clone()),
+                Err(_) => Outcome::Failed("Rebase"),
             }
         }
-        Class::Harvest => {
+        Class::Publish => {
             let before = match client.get_ref(REPO, "main").await {
                 Ok(value) => value,
-                Err(_) => return Outcome::Failed("Harvest (pre-read)"),
+                Err(_) => return Outcome::Failed("Publish (pre-read)"),
             };
-            let target = ctx.harvest_target;
-            match client.harvest(REPO, target).await {
+            let target = ctx.publish_target;
+            match client.publish(REPO, target).await {
                 Ok(id) => {
-                    assert_eq!(id, target, "Harvest echoes the harvested changeset");
-                    Outcome::Harvested(target, before)
+                    assert_eq!(id, target, "Publish echoes the published changeset");
+                    Outcome::Published(target, before)
                 }
-                // A rejected harvest (target behind main once the chain
+                // A rejected publish (target behind main once the chain
                 // wraps) is a clean refusal, not an error outcome.
-                Err(_) => Outcome::Harvested(target, before),
+                Err(_) => Outcome::Published(target, before),
             }
         }
     }
@@ -803,24 +803,24 @@ async fn verify(client: &GardenbedClient, fx: &Fixture, outcome: &Outcome) {
                 ),
             }
         }
-        Outcome::Grafted(id, parent, changes) => {
+        Outcome::Rebaseed(id, parent, changes) => {
             let got = client
                 .get_changeset(REPO, *id)
                 .await
-                .expect("acknowledged graft reads back");
-            assert_eq!(got.parents, vec![*parent], "graft parents must read back");
-            assert_eq!(got.changes, *changes, "graft changes must read back");
+                .expect("acknowledged rebase reads back");
+            assert_eq!(got.parents, vec![*parent], "rebase parents must read back");
+            assert_eq!(got.changes, *changes, "rebase changes must read back");
         }
-        Outcome::Harvested(target, before) => {
+        Outcome::Published(target, before) => {
             let now = client.get_ref(REPO, "main").await.expect("main reads");
             if now.is_some_and(|id| id == *target) {
                 // Acknowledged or committed-before-the-kill: both fine.
             } else {
-                // Not (visibly) harvested: main must be untouched or exactly
+                // Not (visibly) published: main must be untouched or exactly
                 // the target — never a third value.
                 assert_eq!(
                     now, *before,
-                    "main moved to a third value across a Harvest kill"
+                    "main moved to a third value across a Publish kill"
                 );
             }
         }
@@ -835,12 +835,12 @@ async fn verify(client: &GardenbedClient, fx: &Fixture, outcome: &Outcome) {
 
 // ---------------------------------------------------- offline verification
 
-/// Walks every object under `<root>/loam/objects` and verifies it against
+/// Walks every object under `<root>/objects` and verifies it against
 /// its content address: blob envelopes are zstd-decoded and SHA-256
 /// checked; trees are decoded from canonical bytes and hashed. Returns the
 /// number of objects verified.
-fn sweep_loam(root: &Path) -> u64 {
-    let objects = root.join("loam").join("objects");
+fn sweep_objects(root: &Path) -> u64 {
+    let objects = root.join("objects");
     let mut verified = 0u64;
     let mut stack = vec![objects];
     while let Some(dir) = stack.pop() {
@@ -901,20 +901,21 @@ fn sweep_loam(root: &Path) -> u64 {
     verified
 }
 
-/// `PRAGMA integrity_check` on the seedbed (after WAL recovery).
+/// `PRAGMA integrity_check` on the metadata (after WAL recovery).
 fn integrity_check(root: &Path) {
-    let conn = rusqlite::Connection::open(root.join("seedbed.sqlite3")).expect("seedbed opens");
+    let conn = rusqlite::Connection::open(root.join("metadata.sqlite3")).expect("metadata opens");
     let verdict: String = conn
         .query_row("PRAGMA integrity_check", [], |r| r.get(0))
         .expect("integrity_check runs");
-    assert_eq!(verdict, "ok", "seedbed failed its integrity check");
+    assert_eq!(verdict, "ok", "metadata failed its integrity check");
 }
 
 /// Wipes every derived-data kind and recomputes the sampled answers from
 /// the changeset log through a fresh in-process engine; they must be
 /// identical to the pre-chaos baseline.
 fn rebuild_derived_deterministically(fx: &Fixture) {
-    let conn = rusqlite::Connection::open(fx.root.join("seedbed.sqlite3")).expect("seedbed opens");
+    let conn =
+        rusqlite::Connection::open(fx.root.join("metadata.sqlite3")).expect("metadata opens");
     let wiped = conn
         .execute("DELETE FROM derived", [])
         .expect("derived wiped");
@@ -970,7 +971,7 @@ async fn rpc_classes_survive_sigkill_mid_call() {
         tempfile::tempdir()
     }
     .expect("chaos tempdir");
-    let root = dir.path().join("arboretum");
+    let root = dir.path().join("server");
 
     let t0 = std::time::Instant::now();
     let fx = build_fixture(&root);
@@ -998,8 +999,8 @@ async fn rpc_classes_survive_sigkill_mid_call() {
                 log_ids: fx.log_ids.clone(),
                 diff: fx.diff.clone(),
                 blame: fx.blame.clone(),
-                graftable: fx.graftable[i % fx.graftable.len()].clone(),
-                harvest_target: fx.hchain[i % fx.hchain.len()],
+                rebaseable: fx.rebaseable[i % fx.rebaseable.len()].clone(),
+                publish_target: fx.hchain[i % fx.hchain.len()],
             };
             let task = tokio::spawn(drive(ctx, class, i));
             sleep(kill_delay(i)).await;
@@ -1016,9 +1017,9 @@ async fn rpc_classes_survive_sigkill_mid_call() {
             verify(&client, &fx, &outcome).await;
             restarted.kill().await;
 
-            // 3. offline: loam checksum sweep, seedbed integrity, derived
+            // 3. offline: objects checksum sweep, metadata integrity, derived
             //    rebuild determinism.
-            verified_objects = sweep_loam(&root);
+            verified_objects = sweep_objects(&root);
             integrity_check(&root);
             rebuild_derived_deterministically(&fx);
             let entry = tally.entry(class.label()).or_insert((0, 0));
@@ -1042,8 +1043,8 @@ async fn rpc_classes_survive_sigkill_mid_call() {
     }
 
     println!(
-        "chaos: {cycles} kill/restart cycles, {verified_objects} loam objects verified, \
-         seedbed ok, derived rebuild deterministic"
+        "chaos: {cycles} kill/restart cycles, {verified_objects} objects objects verified, \
+         metadata ok, derived rebuild deterministic"
     );
     assert_eq!(cycles, CLASSES.len() * iters);
 }

@@ -1,9 +1,9 @@
 //! Resumability of the want-list fetch (v0.1.md §M4.3): an interrupted
-//! `bed plot add` resumes with **zero duplicates** across the wire.
+//! `bed sparse add` resumes with **zero duplicates** across the wire.
 //!
 //! The proof is exact, not observational. The server counts every
 //! `GetTree`/`GetBlob` it receives (bumped at handler start, so a snapshot
-//! after the client dies is final); the bed's cache contents are read from
+//! after the client dies is final); the working copy's cache contents are read from
 //! `.bed/objects` directly. Because each distinct want id is requested at
 //! most once per run (tree singleflight + blob dedup), and a rerun
 //! requests exactly the ids that never made it into the cache:
@@ -29,31 +29,31 @@ use gardenbed_harness::generator::{GenOptions, GeneratedHistory, files_at, gener
 use gardenbed_model::Id;
 use tempfile::TempDir;
 
-use common::{Arboretum, bed, bed_async};
+use common::{Server, bed, bed_async};
 
-/// One arboretum carrying a large generated history, plus two gardens:
+/// One server carrying a large generated history, plus two gardens:
 /// one for each resumability cycle.
 struct World {
-    /// Temp root holding the arboretum and the gardens.
+    /// Temp root holding the server and the repositorys.
     _dir: TempDir,
     /// Garden for cycle A (kill mid-fetch).
     garden1: PathBuf,
     /// Garden for cycle B (kill after the fetch phase, during refresh).
     garden2: PathBuf,
-    server: Arboretum,
+    server: Server,
     history: GeneratedHistory,
     /// The head changeset id (what `main` names).
     head: Id,
 }
 
 impl World {
-    fn bed_dir(&self, garden: &std::path::Path) -> PathBuf {
+    fn state_dir(&self, garden: &std::path::Path) -> PathBuf {
         garden.join(".bed")
     }
 }
 
 /// Boots a 40-commit history (a few hundred files at the tip) into a
-/// fresh arboretum. The seed search is bounded and falls back to seed 1:
+/// fresh server. The seed search is bounded and falls back to seed 1:
 /// the counter proof only needs a sizeable tree, not every file mode
 /// (fidelity across modes is proven by `read_path.rs`).
 async fn setup() -> World {
@@ -76,13 +76,13 @@ async fn setup() -> World {
         .expect("generate never fails");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let arboretum = dir.path().join("arboretum");
+    let server = dir.path().join("server");
     let garden1 = dir.path().join("garden-one");
     let garden2 = dir.path().join("garden-two");
     fs::create_dir_all(&garden1).expect("garden one");
     fs::create_dir_all(&garden2).expect("garden two");
-    let head = common::ingest(&history, &arboretum);
-    let server = Arboretum::spawn(&arboretum).await;
+    let head = common::ingest(&history, &server);
+    let server = Server::spawn(&server).await;
     World {
         _dir: dir,
         garden1,
@@ -172,11 +172,11 @@ async fn kill(mut child: tokio::process::Child) {
     child.wait().await.expect("reap the killed bed");
 }
 
-/// The bed's cache should be exactly `expected` after a full run.
+/// The working copy's cache should be exactly `expected` after a full run.
 fn assert_clean(world: &World, garden: &std::path::Path) {
     let (code, out, stderr) = bed(garden, &["status", "--full-scan"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
     assert_eq!(files_under(garden), expected_paths(world), "working copy");
 }
 
@@ -193,7 +193,7 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
     assert_eq!(code, 0, "clone: {stderr}");
 
     // ---- cycle A: SIGKILL a quarter of the way through the blob fetch ----
-    let child = bed_async(&world.garden1, &["plot", "add", "."]);
+    let child = bed_async(&world.garden1, &["sparse", "add", "."]);
     let quarter = want_blobs / 4;
     await_counters(
         &world,
@@ -208,7 +208,7 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
     // short grace just lets the server's streams tear down before we read.
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let bed1 = world.bed_dir(&world.garden1);
+    let bed1 = world.state_dir(&world.garden1);
     let cached_trees = common::cached_count(&bed1, &{
         let (trees, _) = common::want_list(&world.server.root, world.head, &["."]);
         trees
@@ -232,7 +232,7 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
     );
 
     // ---- resume: the rerun fetches exactly the uncached remainder ----
-    let (code, out, stderr) = bed(&world.garden1, &["plot", "add", "."]);
+    let (code, out, stderr) = bed(&world.garden1, &["sparse", "add", "."]);
     assert_eq!(code, 0, "rerun: {stderr}\n{out}");
     let (t2, b2) = world.server.counted(&client).await;
     let run2 = (t2 - t1) + (b2 - b1);
@@ -264,10 +264,10 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
     let (t2, b2) = world.server.counted(&client).await;
     assert_eq!((t2, b2), (t0, b0), "clone itself fetches no objects");
 
-    // ---- cycle B: let the fetch phase finish, then stop the bed during
+    // ---- cycle B: let the fetch phase finish, then stop the working copy during
     // ---- the refresh (or, if it beats us to it, join it — the state to
     // ---- prove is the same: everything fetched, everything cached). ----
-    let mut child = bed_async(&world.garden2, &["plot", "add", "."]);
+    let mut child = bed_async(&world.garden2, &["sparse", "add", "."]);
     await_counters(
         &world,
         &client,
@@ -277,7 +277,7 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
     )
     .await;
     // A short grace for the last fetch's cache write; fetching strictly
-    // precedes planting, so a still-running bed is now mid-materialization.
+    // precedes creating, so a still-running bed is now mid-materialization.
     tokio::time::sleep(Duration::from_millis(150)).await;
     let killed_mid_refresh = matches!(child.try_wait(), Ok(None));
     if killed_mid_refresh {
@@ -295,7 +295,7 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
         "total GetTree+GetBlob must equal the distinct want-list exactly"
     );
     // ...and every one of them sits in the local cache.
-    let bed2 = world.bed_dir(&world.garden2);
+    let bed2 = world.state_dir(&world.garden2);
     let cached_total = (common::cached_count(&bed2, &{
         let (trees, _) = common::want_list(&world.server.root, world.head, &["."]);
         trees
@@ -308,9 +308,9 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
         "everything fetched is in the cache"
     );
 
-    // The rerun therefore fetches nothing and repairs the half-planted
+    // The rerun therefore fetches nothing and repairs the half-initialized
     // garden to a clean, faithful state.
-    let (code, out, stderr) = bed(&world.garden2, &["plot", "add", "."]);
+    let (code, out, stderr) = bed(&world.garden2, &["sparse", "add", "."]);
     assert_eq!(code, 0, "rerun: {stderr}\n{out}");
     assert!(
         out.contains("fetched 0 tree(s) and 0 blob(s)"),

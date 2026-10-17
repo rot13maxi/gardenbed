@@ -1,11 +1,11 @@
-//! gardenbed-server — the arboretum: the authoritative gardenbed server
+//! gardenbed-server — the server: the authoritative gardenbed server
 //! (lib part; the binary is `src/main.rs`).
 //!
-//! [`Repo`] wires one repository's stores (loam + seedbed) and the compost
+//! [`Repo`] wires one repository's stores (objects + metadata) and the derived data
 //! [`Engine`] into the Task-B service layer: changeset creation with blob
 //! validation and eager derivation, object access, the ancestry queries,
-//! refs with compare-and-swap, server-side graft (linearized rebase), and
-//! the harvest fast-forward. [`GardenbedService`] adapts [`Repo`] to the
+//! refs with compare-and-swap, server-side rebase (linearized rebase), and
+//! the publish fast-forward. [`GardenbedService`] adapts [`Repo`] to the
 //! generated tonic `Gardenbed` trait (v0.1.md §5).
 //!
 //! Error philosophy: a conforming client never sees an error for a *result*
@@ -65,12 +65,12 @@ pub enum ServerError {
         /// How many stored changesets share the prefix.
         matches: usize,
     },
-    /// Graft hit semantic conflicts; the paths are listed in the message.
-    #[error("graft conflicts on: {}", .0.join(", "))]
-    GraftConflict(Vec<String>),
-    /// Harvest refused: ref "main" is not an ancestor of the target (or the
-    /// CAS was lost to a concurrent harvest after the check passed).
-    #[error("harvest refused: \"main\" is not an ancestor of the given changeset")]
+    /// Rebase hit semantic conflicts; the paths are listed in the message.
+    #[error("rebase conflicts on: {}", .0.join(", "))]
+    RebaseConflict(Vec<String>),
+    /// Publish refused: ref "main" is not an ancestor of the target (or the
+    /// CAS was lost to a concurrent publish after the check passed).
+    #[error("publish refused: \"main\" is not an ancestor of the given changeset")]
     NotFastForward,
 }
 
@@ -110,7 +110,7 @@ impl Stats {
     }
 }
 
-/// The repository service: stores + compost engine + counters.
+/// The repository service: stores + derived data engine + counters.
 ///
 /// Cheap to share: every method takes `&self`, both stores live behind
 /// `Arc`, and all counters are atomics. One `Repo` per process in v0.1
@@ -130,12 +130,23 @@ impl std::fmt::Debug for Repo {
 
 impl Repo {
     /// Opens (creating if needed) the repository rooted at `root`:
-    /// `<root>/loam/` holds the content-addressed object store and
-    /// `<root>/seedbed.sqlite3` the metadata database. Idempotent.
+    /// `<root>/objects/` holds the content-addressed object store and
+    /// `<root>/metadata.sqlite3` the metadata database. Idempotent.
     pub fn open(root: &Path) -> Result<Self, ServerError> {
-        let objects = Arc::new(FsObjectStore::open(&root.join("loam"))?);
-        let metadata = Arc::new(SqliteMetadataStore::open(&root.join("seedbed.sqlite3"))?);
+        Self::validate_layout(root)?;
+        let objects = Arc::new(FsObjectStore::open(root)?);
+        let metadata = Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?);
         Ok(Self::new(objects, metadata))
+    }
+
+    /// Refuse obsolete layouts instead of silently opening an empty repository.
+    pub fn validate_layout(root: &Path) -> Result<(), ServerError> {
+        if root.join("seedbed.sqlite3").exists() && !root.join("metadata.sqlite3").exists() {
+            return Err(ServerError::Invalid(
+                "repository uses an obsolete storage layout; export it with the previous version and import into a new directory".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// A repo over explicit stores (tests, embedded tiers).
@@ -151,16 +162,16 @@ impl Repo {
 
     // -------------------------------------------------------- write path
 
-    /// Sows a changeset: validates parents and blob references, stores any
+    /// Commits a changeset: validates parents and blob references, stores any
     /// inline blobs, validates tree application and computes derived data
     /// before storing the changeset. Returns the changeset's id.
     ///
-    /// Blob resolution per change: a blob already in loam passes as-is;
+    /// Blob resolution per change: a blob already in objects passes as-is;
     /// otherwise it must ride in `inline_blobs` (keyed by its 64-hex id),
     /// weigh ≤ [`MAX_INLINE_BLOB_LEN`], and hash to its id. Gitlink changes
     /// are exempt: their blob field is an opaque upstream pointer (the
     /// zero-padded git SHA-1), not a content address, and is never stored
-    /// in loam.
+    /// in objects.
     pub fn create_changeset(
         &self,
         cs: &Changeset,
@@ -173,13 +184,13 @@ impl Repo {
             self.validate_history(*p)?;
         }
 
-        // Resolve blob references: loam hit, inline hit (verified, ≤ 1 MiB),
+        // Resolve blob references: objects hit, inline hit (verified, ≤ 1 MiB),
         // or gitlink pointer.
         let mut resolved: HashMap<Id, bool> = HashMap::new(); // id → stored now
         for c in &cs.changes {
             let Some(blob) = c.blob else { continue }; // DELETE carries none
             if c.mode == Mode::Gitlink {
-                continue; // opaque pointer, never a loam object
+                continue; // opaque pointer, never a objects object
             }
             if resolved.contains_key(&blob) {
                 continue; // already resolved (or rejected) once
@@ -191,7 +202,7 @@ impl Repo {
             let key = blob.to_hex();
             let Some(content) = inline_blobs.get(&key) else {
                 return Err(ServerError::Invalid(format!(
-                    "blob {key} is referenced but neither in loam nor inline"
+                    "blob {key} is referenced but neither in objects nor inline"
                 )));
             };
             if content.len() > MAX_INLINE_BLOB_LEN {
@@ -255,7 +266,7 @@ impl Repo {
     }
 
     /// A blob's raw content; `None` when absent (gitlink pointers are never
-    /// loam objects, so they read as absent here too).
+    /// objects objects, so they read as absent here too).
     pub fn get_blob(&self, id: Id) -> Result<Option<Vec<u8>>, ServerError> {
         Ok(self.objects.get_blob(id)?)
     }
@@ -344,7 +355,7 @@ impl Repo {
 
     /// First-parent lineage blame of `path` at changeset `cs_id` (v0.1.md
     /// D7): coalesced `(lo, hi, changeset)` ranges, 1-based inclusive,
-    /// ascending, with rename following. Delegates to the compost
+    /// ascending, with rename following. Delegates to the derived data
     /// [`Engine`] — the very implementation the M6 differential suite
     /// anchors to `git blame --first-parent`, so the gRPC surface and
     /// `bed blame` are semantically identical by construction.
@@ -376,7 +387,7 @@ impl Repo {
     /// lookup every id-taking surface funnels through (remote `bed`
     /// clients through the `GetRef` RPC, the MCP tools through [`Repo`]
     /// directly), so one fix here teaches `GetChangeset`, `Diff`,
-    /// `Blame`, `file`, `goto` and friends truncated ids at once.
+    /// `Blame`, `file`, `switch` and friends truncated ids at once.
     /// Resolution order (precedence is deliberate and documented on the
     /// `GetRef` RPC):
     ///
@@ -386,7 +397,7 @@ impl Repo {
     ///    names; native writes land there too);
     /// 2. a hex token of 8..=63 chars is a **changeset id prefix**:
     ///    decoded case-insensitively to bytes and ranged over the
-    ///    seedbed's 32-byte ids with one indexed seek
+    ///    metadata's 32-byte ids with one indexed seek
     ///    (`id >= prefix‖0x00… AND id < prefix+1‖0x00…`). Exactly one
     ///    match resolves; several fail with
     ///    [`ServerError::AmbiguousPrefix`] (`invalid_argument`, naming
@@ -451,9 +462,9 @@ impl Repo {
         Ok(self.metadata.cas_ref(&target, expected, new)?)
     }
 
-    // ------------------------------------------------- graft and harvest
+    // ------------------------------------------------- rebase and publish
 
-    /// Server-side graft (linearized rebase): replays `cs_id`'s changes onto
+    /// Server-side rebase (linearized rebase): replays `cs_id`'s changes onto
     /// `new_parent`'s tree with **hard** conflict detection, then stores a
     /// new changeset `parents = [new_parent]` carrying the same changes,
     /// message, identities and signature, and eagerly materializes it.
@@ -462,7 +473,7 @@ impl Repo {
     /// removals require an unchanged pre-image. Directory replacements also
     /// compare all descendants, preventing loss of concurrent subtree edits.
     /// Conflicts are checked against immutable trees before any application.
-    pub fn graft(&self, cs_id: Id, new_parent: Id) -> Result<Id, ServerError> {
+    pub fn rebase(&self, cs_id: Id, new_parent: Id) -> Result<Id, ServerError> {
         let cs = self.get_changeset(cs_id)?;
         // The new parent must exist and its tree must be derivable (a
         // missing parent is `ChangesetNotFound`, mapped by `root_tree`).
@@ -511,11 +522,11 @@ impl Repo {
             }
         }
         if !conflicts.is_empty() {
-            return Err(ServerError::GraftConflict(conflicts));
+            return Err(ServerError::RebaseConflict(conflicts));
         }
 
         // The replayed changeset: same changes and metadata, one parent.
-        let grafted = Changeset {
+        let rebased = Changeset {
             parents: vec![new_parent],
             changes: cs.changes.clone(),
             message: cs.message.clone(),
@@ -524,9 +535,9 @@ impl Repo {
             signature: cs.signature.clone(),
         };
         // validate_changeset(…, true) re-checks shape/sortedness; blob ids
-        // are already loam objects (they shipped with the original), so the
+        // are already objects objects (they shipped with the original), so the
         // inline map is empty.
-        self.create_changeset(&grafted, &BTreeMap::new())
+        self.create_changeset(&rebased, &BTreeMap::new())
     }
 
     /// Fast-forwards ref `main` to `cs_id` (v0.1.md D5): asserts that the
@@ -534,12 +545,12 @@ impl Repo {
     /// compare-and-swaps `main` to it. Returns `cs_id`.
     ///
     /// With no `main` yet, the ancestry precondition holds trivially and the
-    /// CAS creates the ref from nothing. A CAS lost to a concurrent harvest
+    /// CAS creates the ref from nothing. A CAS lost to a concurrent publish
     /// (between the check and the swap) surfaces as
     /// [`ServerError::NotFastForward`]; the caller retries against the new
     /// value.
-    pub fn harvest(&self, cs_id: Id) -> Result<Id, ServerError> {
-        // The harvested changeset must exist (a clear 404 beats a CAS that
+    pub fn publish(&self, cs_id: Id) -> Result<Id, ServerError> {
+        // The published changeset must exist (a clear 404 beats a CAS that
         // would silently create a ref to nowhere).
         self.get_changeset(cs_id)?;
         let current = self.get_ref("main")?;
@@ -575,7 +586,7 @@ impl Repo {
     }
 }
 
-/// The canonical seedbed name for a client-facing ref: bare branch names
+/// The canonical metadata name for a client-facing ref: bare branch names
 /// (`main`, `feature`) live under `refs/heads/` — the spelling git itself
 /// requires and the one an import already stores. Full names pass through
 /// untouched.
@@ -772,7 +783,7 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
-            ServerError::GraftConflict(_) | ServerError::NotFastForward => {
+            ServerError::RebaseConflict(_) | ServerError::NotFastForward => {
                 Status::failed_precondition(e.to_string())
             }
         }
@@ -1119,29 +1130,29 @@ impl Gardenbed for GardenbedService {
         }))
     }
 
-    async fn graft(
+    async fn rebase(
         &self,
-        request: Request<pb::GraftReq>,
-    ) -> Result<Response<pb::GraftResp>, Status> {
+        request: Request<pb::RebaseReq>,
+    ) -> Result<Response<pb::RebaseResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Graft")?;
+        self.repo_field(&req.repo, "Rebase")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let new_parent = Self::id(&req.new_parent, "new_parent")?;
-        let id = self.repo.graft(cs_id, new_parent)?;
-        Ok(Response::new(pb::GraftResp {
+        let id = self.repo.rebase(cs_id, new_parent)?;
+        Ok(Response::new(pb::RebaseResp {
             id: id_to_bytes(id),
         }))
     }
 
-    async fn harvest(
+    async fn publish(
         &self,
-        request: Request<pb::HarvestReq>,
-    ) -> Result<Response<pb::HarvestResp>, Status> {
+        request: Request<pb::PublishReq>,
+    ) -> Result<Response<pb::PublishResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Harvest")?;
+        self.repo_field(&req.repo, "Publish")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let id = self.repo.harvest(cs_id)?;
-        Ok(Response::new(pb::HarvestResp {
+        let id = self.repo.publish(cs_id)?;
+        Ok(Response::new(pb::PublishResp {
             id: id_to_bytes(id),
         }))
     }
@@ -1443,7 +1454,7 @@ mod ref_normalization_tests {
     #[test]
     fn bare_names_resolve_and_move_imported_refs() {
         let (_dir, repo) = repo();
-        // The import path stores full names (rootstock does exactly this),
+        // The import path stores full names (git_bridge does exactly this),
         // and every ref target is a published changeset.
         let r1 = fixture_changeset(&repo, vec![], "root");
         repo.cas_ref("refs/heads/main", None, r1)

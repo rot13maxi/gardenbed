@@ -3,7 +3,7 @@
 //!
 //! Each input is lossily decoded to a `String` and run through
 //! [`gardenbed_mcp::handle_line`] against a fixed, empty in-memory
-//! arboretum. The contract: every line produces a protocol answer (or
+//! server. The contract: every line produces a protocol answer (or
 //! `None` for a notification), never a panic — malformed JSON, wrong
 //! shapes, hostile ids, and enormous limits must all land in JSON-RPC
 //! errors or `isError` tool results.
@@ -17,7 +17,7 @@ use gardenbed_mcp::handle_line;
 use gardenbed_server::Repo;
 use gardenbed_store::{MemoryStore, MetadataStore, ObjectStore};
 
-/// One shared empty arboretum over memory stores (the tools answer with
+/// One shared empty server over memory stores (the tools answer with
 /// `isError` results on it; nothing panics).
 fn repo() -> &'static Repo {
     static REPO: OnceLock<Repo> = OnceLock::new();

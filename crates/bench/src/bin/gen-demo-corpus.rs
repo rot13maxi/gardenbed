@@ -3,7 +3,7 @@
 //! it via `$GARDENBED_DEMO_CORPUS`.
 //!
 //! The output is a *real* git repository (a single `git fast-import` stream,
-//! the same writer rootstock export uses), deterministic byte-for-byte for a
+//! the same writer git_bridge export uses), deterministic byte-for-byte for a
 //! given commit count, with the shapes the demo asserts on:
 //!
 //! * ≥ 50,000 commits (default) on `refs/heads/main`, timestamps strictly
@@ -150,7 +150,10 @@ fn generate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
         let is_merge = i > 1 && i % merge == 0;
         // The story gains one line per commit; the sliding window keeps the
         // file bounded so blame over it has a small, well-defined answer.
-        story.push(format!("line {i}: {} tended the garden", AUTHORS[author].0));
+        story.push(format!(
+            "line {i}: {} tended the repository",
+            AUTHORS[author].0
+        ));
 
         main_mark = if is_merge {
             // Fold a one-commit side branch back into main: `reset side` to
@@ -193,7 +196,7 @@ fn generate(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 None,
                 author,
                 secs,
-                "commit 1: plant the garden\n",
+                "commit 1: plant the repository\n",
             )?;
             stream.initial_tree()?;
             stream.end_commit()?;
@@ -332,7 +335,7 @@ impl<W: Write> Stream<W> {
 
     /// A file command for one touched file: `M <mode> inline <path>` + data
     /// or `D <path>`. (Renames are expressed as delete + modify, exactly
-    /// like rootstock export does.)
+    /// like git_bridge export does.)
     fn file_commands(
         &mut self,
         touched: &[(String, String, Vec<u8>)],

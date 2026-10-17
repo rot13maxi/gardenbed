@@ -1,11 +1,11 @@
-//! gardenbed-mcp — the MCP surface (M7): let agents ask the garden
+//! gardenbed-mcp — the MCP surface (M7): let agents ask the repository
 //! questions with **no working copy anywhere**.
 //!
 //! The binary `gardenbed-mcp` serves newline-delimited JSON-RPC 2.0 on
 //! stdin/stdout (hand-rolled with `serde_json`, no MCP SDK) with four
 //! tools: `log`, `diff`, `blame`, `file` (v0.1.md §1). It opens the
-//! arboretum's [`gardenbed_server::Repo`] **in process** over
-//! `--root` (the arboretum's data dir: `loam/` + `seedbed.sqlite3`), so
+//! server's [`gardenbed_server::Repo`] **in process** over
+//! `--root` (the server's data dir: `objects/` + `metadata.sqlite3`), so
 //! every answer comes from the same service layer the CLI's server
 //! serves gRPC from — parity with `bed` by construction, and the
 //! zero-checkout contract (v0.1.md §M7.2) falls out: nothing here touches

@@ -1,4 +1,4 @@
-//! M1 verification: seedbed surface beyond CAS — changeset storage with
+//! M1 verification: metadata surface beyond CAS — changeset storage with
 //! canonical bytes, the git-SHA ⇄ changeset bijection, ref listing, and the
 //! derived-data cache — against both metadata backends.
 

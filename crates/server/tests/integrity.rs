@@ -32,7 +32,7 @@ fn changeset(parents: Vec<gardenbed_model::Id>, changes: Vec<Change>, message: &
     }
 }
 
-fn sow(repo: &Repo, cs: &Changeset) -> gardenbed_model::Id {
+fn commit(repo: &Repo, cs: &Changeset) -> gardenbed_model::Id {
     repo.create_changeset(cs, &BTreeMap::new()).unwrap()
 }
 
@@ -40,8 +40,8 @@ fn sow(repo: &Repo, cs: &Changeset) -> gardenbed_model::Id {
 fn invalid_changesets_never_become_visible_or_publishable() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store.clone());
-    let root = sow(&repo, &changeset(vec![], vec![], "root"));
-    repo.harvest(root).unwrap();
+    let root = commit(&repo, &changeset(vec![], vec![], "root"));
+    repo.publish(root).unwrap();
     let invalid = changeset(
         vec![root],
         vec![change("absent", Op::Delete, None, Mode::Regular, None)],
@@ -51,7 +51,7 @@ fn invalid_changesets_never_become_visible_or_publishable() {
     for _ in 0..2 {
         assert!(repo.create_changeset(&invalid, &BTreeMap::new()).is_err());
         assert!(store.get_changeset(invalid_id).unwrap().is_none());
-        assert!(repo.harvest(invalid_id).is_err());
+        assert!(repo.publish(invalid_id).is_err());
         assert!(repo.cas_ref("invalid-branch", None, invalid_id).is_err());
         assert_eq!(repo.get_ref("main").unwrap(), Some(root));
         assert_eq!(repo.get_ref("invalid-branch").unwrap(), None);
@@ -62,8 +62,8 @@ fn invalid_changesets_never_become_visible_or_publishable() {
 fn legacy_invalid_history_cannot_be_published_even_as_a_nonfirst_parent() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store.clone());
-    let root = sow(&repo, &changeset(vec![], vec![], "root"));
-    repo.harvest(root).unwrap();
+    let root = commit(&repo, &changeset(vec![], vec![], "root"));
+    repo.publish(root).unwrap();
     // Simulate metadata retained by a server predating validation-before-put.
     let bad = store
         .put_changeset(&changeset(
@@ -77,7 +77,7 @@ fn legacy_invalid_history_cannot_be_published_even_as_a_nonfirst_parent() {
     // Its own first-parent tree is valid, so checking only the head misses it.
     assert!(repo.root_tree(merge_id).is_ok());
     for id in [bad, merge_id] {
-        assert!(repo.harvest(id).is_err());
+        assert!(repo.publish(id).is_err());
         assert!(repo.cas_ref("invalid-branch", None, id).is_err());
     }
     assert!(repo.create_changeset(&merge, &BTreeMap::new()).is_err());
@@ -86,13 +86,13 @@ fn legacy_invalid_history_cannot_be_published_even_as_a_nonfirst_parent() {
 }
 
 #[test]
-fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
+fn rebase_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store);
     for content in [b"old".as_slice(), b"new", b"concurrent", b"destination"] {
         repo.put_blob(content).unwrap();
     }
-    let base = sow(
+    let base = commit(
         &repo,
         &changeset(
             vec![],
@@ -103,7 +103,7 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             "base",
         ),
     );
-    let delete = sow(
+    let delete = commit(
         &repo,
         &changeset(
             vec![base],
@@ -111,7 +111,7 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             "delete",
         ),
     );
-    let modify = sow(
+    let modify = commit(
         &repo,
         &changeset(
             vec![base],
@@ -119,7 +119,7 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             "modify",
         ),
     );
-    let rename = sow(
+    let rename = commit(
         &repo,
         &changeset(
             vec![base],
@@ -133,7 +133,7 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             "rename",
         ),
     );
-    let edit = sow(
+    let edit = commit(
         &repo,
         &changeset(
             vec![base],
@@ -147,7 +147,7 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             "concurrent content",
         ),
     );
-    let mode = sow(
+    let mode = commit(
         &repo,
         &changeset(
             vec![base],
@@ -155,7 +155,7 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             "concurrent mode",
         ),
     );
-    let dest_edit = sow(
+    let dest_edit = commit(
         &repo,
         &changeset(
             vec![base],
@@ -183,23 +183,23 @@ fn graft_preserves_concurrent_edits_modes_deletions_and_rename_destinations() {
             &repo.get_changeset(source).unwrap().message,
         );
         assert!(matches!(
-            repo.graft(source, target),
-            Err(ServerError::GraftConflict(_))
+            repo.rebase(source, target),
+            Err(ServerError::RebaseConflict(_))
         ));
         assert!(repo.get_changeset(replay.id().unwrap()).is_err());
     }
     // An untouched source and an unchanged, distinct destination can be renamed.
-    assert!(repo.graft(rename, base).is_ok());
-    assert!(repo.graft(delete, base).is_ok());
+    assert!(repo.rebase(rename, base).is_ok());
+    assert!(repo.rebase(delete, base).is_ok());
 }
 
 #[test]
-fn graft_directory_replacement_checks_all_swallowed_paths() {
+fn rebase_directory_replacement_checks_all_swallowed_paths() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store);
     repo.put_blob(b"old").unwrap();
     repo.put_blob(b"new").unwrap();
-    let base = sow(
+    let base = commit(
         &repo,
         &changeset(
             vec![],
@@ -207,7 +207,7 @@ fn graft_directory_replacement_checks_all_swallowed_paths() {
             "base",
         ),
     );
-    let replacement = sow(
+    let replacement = commit(
         &repo,
         &changeset(
             vec![base],
@@ -219,7 +219,7 @@ fn graft_directory_replacement_checks_all_swallowed_paths() {
         ),
     );
     // Explicit deletion is swallowed by the earlier write during tree apply.
-    assert!(repo.graft(replacement, base).is_ok());
+    assert!(repo.rebase(replacement, base).is_ok());
     for changes in [
         vec![change(
             "dir/f",
@@ -231,13 +231,13 @@ fn graft_directory_replacement_checks_all_swallowed_paths() {
         vec![change("dir/g", Op::Add, Some(b"new"), Mode::Regular, None)],
         vec![change("dir/f", Op::Delete, None, Mode::Regular, None)],
     ] {
-        let target = sow(
+        let target = commit(
             &repo,
             &changeset(vec![base], changes, "concurrent subtree change"),
         );
         assert!(matches!(
-            repo.graft(replacement, target),
-            Err(ServerError::GraftConflict(_))
+            repo.rebase(replacement, target),
+            Err(ServerError::RebaseConflict(_))
         ));
     }
 }
@@ -354,12 +354,12 @@ fn restart_publication_uses_durable_frontier_after_native_writes_and_legacy_migr
     use std::sync::atomic::Ordering::Relaxed;
     const COMMITS: usize = 10_000;
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("seedbed.sqlite3");
+    let db = dir.path().join("metadata.sqlite3");
     let head = {
         let repo = Repo::open(dir.path()).unwrap();
         let mut head = None;
         for index in 0..COMMITS {
-            head = Some(sow(
+            head = Some(commit(
                 &repo,
                 &changeset(head.into_iter().collect(), vec![], &format!("seed {index}")),
             ));
@@ -371,7 +371,7 @@ fn restart_publication_uses_durable_frontier_after_native_writes_and_legacy_migr
             SqliteMetadataStore::open(&db).unwrap(),
         )));
         let repo = Repo::new(
-            Arc::new(FsObjectStore::open(&dir.path().join("loam")).unwrap()),
+            Arc::new(FsObjectStore::open(dir.path()).unwrap()),
             metadata.clone(),
         );
         (repo, metadata)
@@ -386,13 +386,13 @@ fn restart_publication_uses_durable_frontier_after_native_writes_and_legacy_migr
             "restart must not load certified ancestors"
         );
         assert_eq!(metadata.certificate_reads.load(Relaxed), 1);
-        sow(
+        commit(
             &repo,
             &changeset(vec![head], vec![], &format!("child {index}")),
         );
         assert!(
             metadata.reads.load(Relaxed) < 16,
-            "new sow must not scan old history"
+            "new commit must not scan old history"
         );
         assert!(metadata.certificate_reads.load(Relaxed) < 16);
     }
@@ -418,7 +418,7 @@ fn restart_publication_uses_durable_frontier_after_native_writes_and_legacy_migr
 fn mutable_tree_cache_cannot_certify_invalid_legacy_changesets_or_override_certified_roots() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store.clone());
-    let root = sow(&repo, &changeset(vec![], vec![], "root"));
+    let root = commit(&repo, &changeset(vec![], vec![], "root"));
     let invalid = changeset(
         vec![root],
         vec![change("absent", Op::Delete, None, Mode::Regular, None)],
@@ -435,7 +435,7 @@ fn mutable_tree_cache_cannot_certify_invalid_legacy_changesets_or_override_certi
     assert_eq!(repo.get_ref("forged-cache").unwrap(), None);
 
     repo.put_blob(b"content").unwrap();
-    let with_file = sow(
+    let with_file = commit(
         &repo,
         &changeset(
             vec![root],
@@ -462,7 +462,7 @@ fn mutable_tree_cache_cannot_certify_invalid_legacy_changesets_or_override_certi
 fn legacy_certification_rejects_a_changeset_under_the_wrong_content_address() {
     use gardenbed_store::SqliteMetadataStore;
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("seedbed.sqlite3");
+    let db = dir.path().join("metadata.sqlite3");
     let store = SqliteMetadataStore::open(&db).unwrap();
     let valid = changeset(vec![], vec![], "valid bytes under wrong ID");
     let real = store.put_changeset(&valid).unwrap();
@@ -488,7 +488,7 @@ fn eager_rebuild_restores_certificate_backed_derived_tree_rows() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store.clone());
     repo.put_blob(b"content").unwrap();
-    let root = sow(
+    let root = commit(
         &repo,
         &changeset(
             vec![],
@@ -502,7 +502,7 @@ fn eager_rebuild_restores_certificate_backed_derived_tree_rows() {
             "root",
         ),
     );
-    let child = sow(&repo, &changeset(vec![root], vec![], "child"));
+    let child = commit(&repo, &changeset(vec![root], vec![], "child"));
     let kinds = ["tree", "skiplist", "pathsummary"];
     let before: Vec<_> = [root, child]
         .into_iter()
@@ -518,4 +518,18 @@ fn eager_rebuild_restores_certificate_backed_derived_tree_rows() {
     for (id, kind, bytes) in before {
         assert_eq!(store.derived_get(kind, id).unwrap(), Some(bytes));
     }
+}
+
+#[test]
+fn obsolete_layout_is_rejected_without_creating_an_empty_repository() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("seedbed.sqlite3"), b"old metadata").unwrap();
+    let error = Repo::open(dir.path()).unwrap_err();
+    assert!(error.to_string().contains("obsolete storage layout"));
+    assert!(!dir.path().join("metadata.sqlite3").exists());
+    assert!(!dir.path().join("objects").exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("seedbed.sqlite3")).unwrap(),
+        b"old metadata"
+    );
 }

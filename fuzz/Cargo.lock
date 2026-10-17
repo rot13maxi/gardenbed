@@ -674,12 +674,25 @@ name = "gardenbed-fuzz"
 version = "0.0.0"
 dependencies = [
  "gardenbed-derive",
+ "gardenbed-git",
  "gardenbed-mcp",
  "gardenbed-model",
- "gardenbed-rootstock",
  "gardenbed-server",
  "gardenbed-store",
  "libfuzzer-sys",
+]
+
+[[package]]
+name = "gardenbed-git"
+version = "0.1.0"
+dependencies = [
+ "gardenbed-derive",
+ "gardenbed-model",
+ "gardenbed-store",
+ "gix",
+ "log",
+ "sha2",
+ "thiserror",
 ]
 
 [[package]]
@@ -726,28 +739,15 @@ dependencies = [
 ]
 
 [[package]]
-name = "gardenbed-rootstock"
-version = "0.1.0"
-dependencies = [
- "gardenbed-derive",
- "gardenbed-model",
- "gardenbed-store",
- "gix",
- "log",
- "sha2",
- "thiserror",
-]
-
-[[package]]
 name = "gardenbed-server"
 version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
  "gardenbed-derive",
+ "gardenbed-git",
  "gardenbed-model",
  "gardenbed-protocol",
- "gardenbed-rootstock",
  "gardenbed-store",
  "log",
  "prost",

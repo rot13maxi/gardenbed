@@ -1,6 +1,6 @@
-//! `gardenbed-mcp` — the binary. Parses `--root` (the arboretum's data
+//! `gardenbed-mcp` — the binary. Parses `--root` (the server's data
 //! dir) and the accepted `--repo` name (single-repo in v0.1), opens the
-//! arboretum's [`gardenbed_server::Repo`] in process, and serves the MCP
+//! server's [`gardenbed_server::Repo`] in process, and serves the MCP
 //! stdio protocol: one JSON-RPC message per stdin line, one response per
 //! request, stdout for nothing but the protocol.
 //!
@@ -13,21 +13,21 @@ use clap::Parser;
 
 use gardenbed_server::Repo;
 
-/// Command line for the gardenbed MCP server.
+/// Command line for the Gardenbed MCP server.
 #[derive(Parser, Debug)]
 #[command(
     name = "gardenbed-mcp",
     version,
-    about = "answer repo questions (log, diff, blame, file) over MCP — no working copy needed"
+    about = "Query repository history over MCP without a working copy"
 )]
 struct Args {
-    /// The arboretum's data directory (its `loam/` object store and
-    /// `seedbed.sqlite3` metadata database).
+    /// The server's data directory (its `objects/` object store and
+    /// `metadata.sqlite3` metadata database).
     #[arg(long, value_name = "DIR")]
     root: std::path::PathBuf,
 
     /// Repo name; accepted and validated for forward compatibility
-    /// (v0.1 arboreta are single-repo; the API carries a repo field
+    /// (v0.1 servers are single-repo; the API carries a repo field
     /// from day one, docs/v0.1.md §1).
     #[arg(long, value_name = "NAME")]
     repo: Option<String>,
@@ -41,21 +41,21 @@ fn main() {
             eprintln!("gardenbed-mcp: --repo must not be empty");
             std::process::exit(1);
         }
-        None => "garden".to_owned(),
+        None => "default".to_owned(),
     };
     let repo = match Repo::open(&args.root) {
         Ok(repo) => repo,
         Err(e) => {
             eprintln!(
-                "gardenbed-mcp: cannot open the arboretum at {}: {e}",
+                "gardenbed-mcp: cannot open repository at {}: {e}",
                 args.root.display()
             );
             std::process::exit(1);
         }
     };
     eprintln!(
-        "gardenbed-mcp: serving repo {repo_name:?} from {} (root's loam/ + \
-         seedbed.sqlite3); MCP protocol on stdin/stdout, diagnostics here",
+        "gardenbed-mcp: serving repo {repo_name:?} from {} (root's objects/ + \
+         metadata.sqlite3); MCP protocol on stdin/stdout, diagnostics here",
         args.root.display()
     );
 

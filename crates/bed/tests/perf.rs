@@ -6,14 +6,14 @@
 //! cargo test -p gardenbed --release -- --ignored --nocapture
 //! ```
 //!
-//! * a ~1k-file `bed plot add` finishes in under 5 s (fetch + plant,
+//! * a ~1k-file `bed sparse add` finishes in under 5 s (fetch + plant,
 //!   end to end);
-//! * a warm `bed status` over a 10k-file plot answers in under 500 ms
+//! * a warm `bed status` over a 10k-file sparse answers in under 500 ms
 //!   (hint-guided: nothing is hashed);
-//! * a cold `bed file` (fresh process, warm cache, live arboretum) has a
+//! * a cold `bed file` (fresh process, warm cache, live server) has a
 //!   p95 under 50 ms across 20 runs;
-//! * **M5**: sowing the same 100-file change is size-independent — the
-//!   p50 sow on a 1M-file arboretum is at most twice the p50 sow on a
+//! * **M5**: committing the same 100-file change is size-independent — the
+//!   p50 commit on a 1M-file server is at most twice the p50 commit on a
 //!   10k-file one (the write path costs the change, not the repository).
 //!
 //! Each test asserts its budget and prints its numbers.
@@ -34,13 +34,13 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use gardenbed::bed::Bed;
 use gardenbed::treestate::{HINT_VERIFIED, MODE_REGULAR, TreestateEntry};
+use gardenbed::workspace::WorkingCopy;
 use gardenbed_harness::generator::{GenOptions, files_at, generate};
 use gardenbed_model::blob_id;
 use tempfile::TempDir;
 
-use common::{Arboretum, bed};
+use common::{Server, bed};
 
 /// Fails `what` if the measured `elapsed` exceeds `budget`.
 fn assert_budget(what: &str, elapsed: Duration, budget: Duration) {
@@ -80,11 +80,11 @@ fn assert_release() {
     );
 }
 
-/// One arboretum with an ingested history and a garden beside it.
+/// One server with an ingested history and a garden beside it.
 struct World {
     _dir: TempDir,
     garden: PathBuf,
-    server: Arboretum,
+    server: Server,
     head_files: std::collections::BTreeMap<String, (gardenbed_model::Id, gardenbed_model::Mode)>,
 }
 
@@ -103,8 +103,8 @@ async fn setup(opts: GenOptions) -> World {
     let dir = temp_root();
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let head = common::ingest(&seed, &dir.path().join("arboretum"));
-    let server = Arboretum::spawn(&dir.path().join("arboretum")).await;
+    let head = common::ingest(&seed, &dir.path().join("server"));
+    let server = Server::spawn(&dir.path().join("server")).await;
     assert_eq!(head, seed.head);
     World {
         _dir: dir,
@@ -114,11 +114,11 @@ async fn setup(opts: GenOptions) -> World {
     }
 }
 
-/// M4 perf 1: a plot add that fetches and plants ~1k files, end to end
+/// M4 perf 1: a sparse add that fetches and plants ~1k files, end to end
 /// (process spawn → exit), under 5 s.
 #[tokio::test]
 #[ignore = "performance budget; run in release: cargo test -p gardenbed --release -- --ignored"]
-async fn plot_add_of_1k_files_under_5s() {
+async fn sparse_add_of_1k_files_under_5s() {
     assert_release();
     let mut w = setup(GenOptions {
         commits: 20,
@@ -132,21 +132,21 @@ async fn plot_add_of_1k_files_under_5s() {
     let files = w.head_files.len();
     assert!(files >= 500, "fixture should be sizeable: {files}");
     let start = Instant::now();
-    let (code, out, stderr) = bed(&w.garden, &["plot", "add", "."]);
+    let (code, out, stderr) = bed(&w.garden, &["sparse", "add", "."]);
     assert_budget(
-        &format!("plot add of {files} files"),
+        &format!("sparse add of {files} files"),
         start.elapsed(),
         Duration::from_secs(5),
     );
-    assert_eq!(code, 0, "plot add: {stderr}\n{out}");
+    assert_eq!(code, 0, "sparse add: {stderr}\n{out}");
 
     let (code, out, _) = bed(&w.garden, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
     w.server.shutdown().await;
 }
 
-/// M4 perf 2: a warm `bed status` over a 10k-file plot (planted lib-side,
+/// M4 perf 2: a warm `bed status` over a 10k-file sparse (initialized lib-side,
 /// no server involved) answers in under 500 ms — the hint path, nothing
 /// hashed. Three runs, each within budget.
 #[test]
@@ -154,14 +154,15 @@ async fn plot_add_of_1k_files_under_5s() {
 fn warm_status_10k_under_500ms() {
     assert_release();
     let dir = temp_root();
-    let bed_dir = dir.path().join(".bed");
-    let mut planted = Bed::init(&bed_dir, "http://127.0.0.1:1", "garden").expect("bed inits");
-    planted.config_mut().plot.push(".".to_owned());
+    let state_dir = dir.path().join(".bed");
+    let mut planted =
+        WorkingCopy::init(&state_dir, "http://127.0.0.1:1", "garden").expect("bed inits");
+    planted.config_mut().sparse.push(".".to_owned());
     planted.save_config().expect("config saved");
     let treestate = planted.treestate().expect("treestate opens");
 
-    // 10k regular files planted with rows whose size/mtime/hint match —
-    // exactly the "warm" state after a real plot add.
+    // 10k regular files initialized with rows whose size/mtime/hint match —
+    // exactly the "warm" state after a real sparse add.
     let garden = dir.path();
     const N: usize = 10_000;
     let mut content = Vec::with_capacity(64);
@@ -186,7 +187,7 @@ fn warm_status_10k_under_500ms() {
     // The fixture must read clean before it is worth timing.
     let (code, out, stderr) = bed(garden, &["status"]);
     assert_eq!(code, 0, "status: {stderr}");
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
     // One untimed warm-up (page cache), then the measured runs.
     let mut samples = Vec::new();
@@ -195,7 +196,7 @@ fn warm_status_10k_under_500ms() {
         let (code, out, _) = bed(garden, &["status"]);
         let elapsed = start.elapsed();
         assert_eq!(code, 0);
-        assert!(out.contains("the plot is clean"), "out: {out}");
+        assert!(out.contains("working copy is clean"), "out: {out}");
         samples.push(elapsed);
     }
     for (i, s) in samples.iter().enumerate() {
@@ -210,7 +211,7 @@ fn warm_status_10k_under_500ms() {
 }
 
 /// M4 perf 3: a cold `bed file` — fresh process every time, warm local
-/// cache, live arboretum — stays under 50 ms at p95 over 20 runs.
+/// cache, live server — stays under 50 ms at p95 over 20 runs.
 #[tokio::test]
 #[ignore = "performance budget; run in release: cargo test -p gardenbed --release -- --ignored"]
 async fn cold_file_p95_under_50ms() {
@@ -223,10 +224,10 @@ async fn cold_file_p95_under_50ms() {
     .await;
     let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "clone: {stderr}");
-    let (code, _, stderr) = bed(&w.garden, &["plot", "add", "."]);
-    assert_eq!(code, 0, "plot add: {stderr}");
+    let (code, _, stderr) = bed(&w.garden, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse add: {stderr}");
 
-    // Any plain file of the plot.
+    // Any plain file of the sparse selection.
     let path = w
         .head_files
         .iter()
@@ -256,7 +257,7 @@ async fn cold_file_p95_under_50ms() {
 /// changeset, spread over per-changeset directories so each tree apply
 /// touches a handful of nodes — real repositories grow breadth-wise, and
 /// the fixture must not smuggle an O(repo) shape into the *fixture* build)
-/// plus a 100-file `small/` plot directory, and points `main` at the head.
+/// plus a 100-file `small/` sparse directory, and points `main` at the head.
 /// Runs through the server library in-process, so no request counters move.
 ///
 /// The 2^20-changes-per-changeset codec bound caps `per_cs`; 10k keeps
@@ -329,21 +330,21 @@ fn build_sized_repo(root: &Path, total_files: usize, per_cs: usize) -> gardenbed
     head
 }
 
-/// M5 perf: sow latency is independent of repository size. Two synthetic
-/// arboreta (10k and 1M files) are ingested in-process and served; on
-/// each, seven fresh beds sow the identical 100-file change (the `small/`
-/// plot only — nothing else is ever materialized). The p50 of the 1M sows
-/// must stay within 2× the p50 of the 10k sows.
+/// M5 perf: commit latency is independent of repository size. Two synthetic
+/// servers (10k and 1M files) are ingested in-process and served; on
+/// each, seven fresh beds commit the identical 100-file change (the `small/`
+/// sparse only — nothing else is ever materialized). The p50 of the 1M commits
+/// must stay within 2× the p50 of the 10k commits.
 #[tokio::test]
 #[ignore = "size-independence budget; run in release: cargo test -p gardenbed --release -- --ignored"]
-async fn sow_p50_is_size_independent_10k_vs_1m() {
+async fn commit_p50_is_size_independent_10k_vs_1m() {
     assert_release();
     const REPS: usize = 7;
     const SMALL_FILES: usize = 100;
 
     let dir = temp_root();
-    let small_repo = dir.path().join("arboretum-10k");
-    let big_repo = dir.path().join("arboretum-1m");
+    let small_repo = dir.path().join("server-10k");
+    let big_repo = dir.path().join("server-1m");
 
     // Fixture ingest (uncounted, in-process). 1M files arrive as ~100
     // changesets of 10k adds each.
@@ -352,48 +353,48 @@ async fn sow_p50_is_size_independent_10k_vs_1m() {
     build_sized_repo(&big_repo, 1_000_000, 10_000);
     println!("fixtures ingested in {:.1?} (10k + 1M files)", t0.elapsed());
 
-    let mut small_server = Arboretum::spawn(&small_repo).await;
-    let mut big_server = Arboretum::spawn(&big_repo).await;
+    let mut small_server = Server::spawn(&small_repo).await;
+    let mut big_server = Server::spawn(&big_repo).await;
 
-    // One fresh bed per rep: clone, plot the small/ subtree, rewrite its
-    // 100 files, sow. Only the sow is timed.
-    let sow_once = |server_http: &str, garden: &Path, rep: usize| -> Duration {
+    // One fresh bed per rep: clone, sparse the small/ subtree, rewrite its
+    // 100 files, commit. Only the commit is timed.
+    let commit_once = |server_http: &str, garden: &Path, rep: usize| -> Duration {
         fs::create_dir_all(garden).expect("garden dir");
         let (code, _, stderr) = bed(garden, &["clone", server_http]);
         assert_eq!(code, 0, "clone: {stderr}");
-        let (code, _, stderr) = bed(garden, &["plot", "add", "small"]);
-        assert_eq!(code, 0, "plot add: {stderr}");
+        let (code, _, stderr) = bed(garden, &["sparse", "add", "small"]);
+        assert_eq!(code, 0, "sparse add: {stderr}");
         for k in 0..SMALL_FILES {
             fs::write(
                 garden.join(format!("small/f{k:02}.txt")),
-                format!("small file {k} — sown by rep {rep}\n"),
+                format!("small file {k} — created by rep {rep}\n"),
             )
             .expect("working file");
         }
         let start = Instant::now();
-        let (code, out, stderr) = bed(garden, &["sow", "-m", &format!("rep {rep}")]);
+        let (code, out, stderr) = bed(garden, &["commit", "-m", &format!("rep {rep}")]);
         let elapsed = start.elapsed();
-        assert_eq!(code, 0, "sow: {stderr}\n{out}");
+        assert_eq!(code, 0, "commit: {stderr}\n{out}");
         elapsed
     };
 
     // One untimed warm-up per size (page cache, code paths), then the
     // measured reps.
-    let _ = sow_once(
+    let _ = commit_once(
         &small_server.http(),
         &dir.path().join("garden-warm-10k"),
         100,
     );
-    let _ = sow_once(&big_server.http(), &dir.path().join("garden-warm-1m"), 100);
+    let _ = commit_once(&big_server.http(), &dir.path().join("garden-warm-1m"), 100);
     let mut small_samples = Vec::new();
     let mut big_samples = Vec::new();
     for rep in 0..REPS {
-        small_samples.push(sow_once(
+        small_samples.push(commit_once(
             &small_server.http(),
             &dir.path().join(format!("garden-10k-{rep}")),
             rep,
         ));
-        big_samples.push(sow_once(
+        big_samples.push(commit_once(
             &big_server.http(),
             &dir.path().join(format!("garden-1m-{rep}")),
             rep,
@@ -406,12 +407,12 @@ async fn sow_p50_is_size_independent_10k_vs_1m() {
     big_samples.sort();
     let p50_small = small_samples[REPS / 2];
     let p50_big = big_samples[REPS / 2];
-    println!("p50 sow over 10k files: {p50_small:.1?}");
-    println!("p50 sow over 1M files:  {p50_big:.1?}");
+    println!("p50 commit over 10k files: {p50_small:.1?}");
+    println!("p50 commit over 1M files:  {p50_big:.1?}");
     let ratio = p50_big.as_secs_f64() / p50_small.as_secs_f64();
     println!("ratio: {ratio:.2} (budget 2.00)");
     assert!(
         p50_big <= p50_small * 2,
-        "sow is not size-independent: 1M p50 {p50_big:.1?} vs 10k p50 {p50_small:.1?}"
+        "commit is not size-independent: 1M p50 {p50_big:.1?} vs 10k p50 {p50_small:.1?}"
     );
 }

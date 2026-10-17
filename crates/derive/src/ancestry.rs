@@ -1,5 +1,5 @@
 //! Ancestry queries: naive graph walks plus the segmented-ancestry skip
-//! list ("compost" derived data, kind `"skiplist"`).
+//! list ("derived data" derived data, kind `"skiplist"`).
 //!
 //! ## Segmented ancestry
 //!
@@ -25,7 +25,7 @@
 //! `is_ancestor` walks from `b` downward: at each node it either answers
 //! from the segment samples, prunes by height, or jumps to the segment
 //! head / expands a merge's parents. `merge_base` answers comparable pairs
-//! (one side an ancestor of the other — the dominant harvest/graft case)
+//! (one side an ancestor of the other — the dominant publish/rebase case)
 //! through that check and otherwise uses the naive common-ancestor
 //! intersection, which is the semantic definition. General criss-cross
 //! merge-base acceleration is the segmented changelog's M6 work.
@@ -411,7 +411,7 @@ fn ancestors_naive(metadata: &dyn MetadataStore, start: Id) -> Result<HashSet<Id
 ///
 /// `git merge-base` returns "the best common ancestor"; when several are
 /// equally best (criss-cross merges) git's choice is implementation-defined,
-/// so this deterministic rule is gardenbed's documented answer. On v0.1
+/// so this deterministic rule is Gardenbed's documented answer. On v0.1
 /// histories (redundant merges over a linear mainline) the maximal common
 /// ancestor is unique and both agree exactly.
 fn merge_base_naive_impl(
@@ -644,7 +644,7 @@ impl Engine {
     pub fn on_changeset_created(&self, cs_id: Id) -> Result<(), StoreError> {
         let tree = self.derive_tree(cs_id)?;
         // A durable certificate can answer derive_tree without consulting
-        // compost. Explicit eager rebuilds must still restore its tree row.
+        // derived data. Explicit eager rebuilds must still restore its tree row.
         self.cache_tree(cs_id, tree)?;
         self.skiplist_entry(cs_id)?;
         self.pathsummary_entry(cs_id)?;

@@ -98,7 +98,7 @@ fn memory_certificate_contract() {
 #[test]
 fn sqlite_certificate_contract_and_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("seedbed.sqlite3");
+    let path = dir.path().join("metadata.sqlite3");
     let root = cs(vec![], "root").id().unwrap();
     {
         let store = SqliteMetadataStore::open(&path).unwrap();
@@ -111,7 +111,7 @@ fn sqlite_certificate_contract_and_restart() {
 #[test]
 fn sqlite_certificate_failure_rolls_back_the_entire_ingest() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("seedbed.sqlite3");
+    let path = dir.path().join("metadata.sqlite3");
     let store = SqliteMetadataStore::open(&path).unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection.execute_batch("CREATE TRIGGER abort_validation BEFORE INSERT ON validated_changesets_v1 BEGIN SELECT RAISE(ABORT, 'injected certificate failure'); END;").unwrap();

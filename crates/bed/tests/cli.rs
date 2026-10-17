@@ -1,10 +1,10 @@
 //! End-to-end tests of the `bed` binary: the CLI voice, exit codes, and
-//! the offline behaviors M4 promises (`status`/`plot` work with no server;
+//! the offline behaviors M4 promises (`status`/`sparse` work with no server;
 //! server-backed commands fail cleanly, never half-states).
 //!
-//! The arboretum is unreachable on purpose in the offline tests. The
+//! The server is unreachable on purpose in the offline tests. The
 //! serve-backed regressions at the bottom (clone ref resolution, the
-//! FailedPrecondition voice, the plot-add note) spawn a real arboretum
+//! FailedPrecondition voice, the sparse selection-add note) spawn a real server
 //! over a hand-built repo, exactly like `read_path.rs`/`write_path.rs`.
 
 mod common;
@@ -14,10 +14,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
 
-use gardenbed::bed::Bed;
 use gardenbed::status::mtime_ns;
 use gardenbed::treestate::HINT_VERIFIED;
 use gardenbed::treestate::TreestateEntry;
+use gardenbed::workspace::WorkingCopy;
 use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_server::Repo;
 use tempfile::TempDir;
@@ -43,21 +43,21 @@ fn bed_in(dir: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// A tempdir with a freshly planted bed (as `bed clone` would leave it,
+/// A tempdir with a freshly initialized bed (as `bed clone` would leave it,
 /// minus the server round-trip).
 fn planted_bed() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
-    Bed::init(&dir.path().join(".bed"), "http://127.0.0.1:1", "garden").unwrap();
+    WorkingCopy::init(&dir.path().join(".bed"), "http://127.0.0.1:1", "garden").unwrap();
     dir
 }
 
-/// Records `prefixes` in the bed's config, as `bed plot add` would once
-/// its fetch phase succeeded (the tests here run offline, so the plot
+/// Records `prefixes` in the working copy's config, as `bed sparse add` would once
+/// its fetch phase succeeded (the tests here run offline, so the sparse selection
 /// list is set through the library).
-fn plot(dir: &TempDir, prefixes: &[&str]) {
-    let mut bed = Bed::open(&dir.path().join(".bed")).unwrap();
+fn sparse(dir: &TempDir, prefixes: &[&str]) {
+    let mut bed = WorkingCopy::open(&dir.path().join(".bed")).unwrap();
     bed.config_mut().current_cs = Some("0".repeat(64));
-    bed.config_mut().plot = prefixes.iter().map(|s| s.to_string()).collect();
+    bed.config_mut().sparse = prefixes.iter().map(|s| s.to_string()).collect();
     bed.save_config().unwrap();
 }
 
@@ -69,7 +69,7 @@ fn materialize(dir: &TempDir, name: &str, content: &[u8]) {
     fs::write(&path, content).unwrap();
     let meta = fs::metadata(&path).unwrap();
 
-    let bed = gardenbed::bed::Bed::open(&dir.path().join(".bed")).unwrap();
+    let bed = gardenbed::workspace::WorkingCopy::open(&dir.path().join(".bed")).unwrap();
     let ts = bed.treestate().unwrap();
     ts.upsert(&TreestateEntry {
         path: format!("src/{name}"),
@@ -88,75 +88,75 @@ fn status_without_a_bed_fails_clearly() {
     let (code, stdout, stderr) = bed(&dir, &["status"]);
     assert_eq!(code, 1);
     assert!(stdout.is_empty());
-    assert!(stderr.contains("not a bed"), "stderr: {stderr}");
+    assert!(stderr.contains("not a working copy"), "stderr: {stderr}");
 }
 
 #[test]
-fn plot_list_and_remove_roundtrip_offline() {
+fn sparse_list_and_remove_roundtrip_offline() {
     let dir = planted_bed();
-    plot(&dir, &["src", "docs"]);
+    sparse(&dir, &["src", "docs"]);
 
-    let (code, out, _) = bed(&dir, &["plot", "list"]);
+    let (code, out, _) = bed(&dir, &["sparse", "list"]);
     assert_eq!(code, 0);
     assert_eq!(out, "src\ndocs\n", "out: {out}");
 
-    let (code, out, _) = bed(&dir, &["plot", "remove", "src", "tests"]);
+    let (code, out, _) = bed(&dir, &["sparse", "remove", "src", "tests"]);
     assert_eq!(code, 0);
-    assert!(out.contains("unplotted src"), "out: {out}");
-    assert!(out.contains("not plotted: tests"), "out: {out}");
+    assert!(out.contains("unselected src"), "out: {out}");
+    assert!(out.contains("not selected: tests"), "out: {out}");
 
-    let (code, out, _) = bed(&dir, &["plot", "list"]);
+    let (code, out, _) = bed(&dir, &["sparse", "list"]);
     assert_eq!(code, 0);
     assert_eq!(out, "docs\n", "out: {out}");
 }
 
 #[test]
-fn plot_add_needs_the_arboretum_and_writes_nothing_on_failure() {
+fn sparse_add_needs_the_server_and_writes_nothing_on_failure() {
     let dir = planted_bed();
     let config_before = fs::read_to_string(dir.path().join(".bed/config.toml")).unwrap();
 
-    // The arboretum is unreachable: `plot add` fails cleanly and the plot
+    // The server is unreachable: `sparse add` fails cleanly and the sparse selection
     // list stays as it was (validate + connect before any local write).
-    let (code, stdout, stderr) = bed(&dir, &["plot", "add", "src"]);
+    let (code, stdout, stderr) = bed(&dir, &["sparse", "add", "src"]);
     assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains("cannot reach the arboretum"),
+        stderr.contains("cannot reach the server"),
         "stderr: {stderr}"
     );
 
     let config_after = fs::read_to_string(dir.path().join(".bed/config.toml")).unwrap();
     assert_eq!(config_before, config_after, "config must be untouched");
 
-    let (code, out, _) = bed(&dir, &["plot", "list"]);
+    let (code, out, _) = bed(&dir, &["sparse", "list"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is empty"), "out: {out}");
+    assert!(out.contains("no sparse paths selected"), "out: {out}");
 
     // A prefix that fails normalization is rejected even earlier.
-    let (code, _, stderr) = bed(&dir, &["plot", "add", "../escape"]);
+    let (code, _, stderr) = bed(&dir, &["sparse", "add", "../escape"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("invalid plot prefix"), "stderr: {stderr}");
+    assert!(stderr.contains("invalid sparse prefix"), "stderr: {stderr}");
 }
 
 #[test]
 fn status_is_clean_right_after_planting() {
     let dir = planted_bed();
-    plot(&dir, &["src"]);
+    sparse(&dir, &["src"]);
     materialize(&dir, "a.rs", b"hello");
 
     let (code, out, _) = bed(&dir, &["status"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 
     let (code, out, _) = bed(&dir, &["status", "--full-scan"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 }
 
 #[test]
 fn status_reports_modified_deleted_and_untracked() {
     let dir = planted_bed();
-    plot(&dir, &["src"]);
+    sparse(&dir, &["src"]);
     materialize(&dir, "a.rs", b"hello");
     materialize(&dir, "b.rs", b"byebye");
 
@@ -187,23 +187,23 @@ fn status_reports_modified_deleted_and_untracked() {
 #[test]
 fn status_touch_without_content_change_is_not_modified() {
     let dir = planted_bed();
-    plot(&dir, &["src"]);
+    sparse(&dir, &["src"]);
     materialize(&dir, "a.rs", b"hello");
 
     // Rewrite identical bytes: mtime moves, size and content don't.
     fs::write(dir.path().join("src/a.rs"), b"hello").unwrap();
     let (_, out, _) = bed(&dir, &["status"]);
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
 }
 
 #[test]
-fn read_path_commands_fail_cleanly_without_an_arboretum() {
+fn read_path_commands_fail_cleanly_without_an_server() {
     let dir = planted_bed();
-    plot(&dir, &["src"]);
-    // The bed "has" a current changeset id that no arboretum knows; the
+    sparse(&dir, &["src"]);
+    // The bed "has" a current changeset id that no server knows; the
     // connection itself is the first thing to fail.
     let cases: &[&[&str]] = &[
-        &["goto", "main"],
+        &["switch", "main"],
         &["file", "src/a.rs", "--cs", "main"],
         &["log", "--limit", "3"],
         &["diff"],
@@ -216,7 +216,7 @@ fn read_path_commands_fail_cleanly_without_an_arboretum() {
             "args {args:?}: stdout {stdout:?} stderr {stderr:?}"
         );
         assert!(
-            stderr.contains("cannot reach the arboretum"),
+            stderr.contains("cannot reach the server"),
             "args {args:?}: stderr {stderr:?}"
         );
         assert!(stdout.is_empty(), "args {args:?}: stdout {stdout:?}");
@@ -230,45 +230,45 @@ fn read_path_commands_fail_cleanly_without_an_arboretum() {
 }
 
 #[test]
-fn clone_fails_cleanly_without_an_arboretum_and_leaves_no_bed() {
+fn clone_fails_cleanly_without_an_server_and_leaves_no_bed() {
     let dir = tempfile::tempdir().unwrap();
     let (code, stdout, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1"]);
     assert_eq!(code, 1, "stdout: {stdout} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains("cannot reach the arboretum"),
+        stderr.contains("cannot reach the server"),
         "stderr: {stderr}"
     );
     assert!(!dir.path().join(".bed").exists(), "no bed may be planted");
 }
 
 #[test]
-fn write_path_and_blame_fail_cleanly_without_an_arboretum() {
-    // -- sow never contacts the arboretum for a clean plot: the local
-    //    NothingToSow error comes first (exit 1, no stub code involved).
+fn write_path_and_blame_fail_cleanly_without_an_server() {
+    // -- commit never contacts the server for a clean sparse: the local
+    //    NothingToCommit error comes first (exit 1, no stub code involved).
     let dir = planted_bed();
-    let (code, stdout, stderr) = bed(&dir, &["sow", "-m", "tend the rows"]);
+    let (code, stdout, stderr) = bed(&dir, &["commit", "-m", "tend the rows"]);
     assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
-    assert!(stderr.contains("the plot is clean"), "stderr: {stderr}");
+    assert!(stderr.contains("working copy is clean"), "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
 
-    // -- with something to sow, the (deliberately unreachable) arboretum
+    // -- with something to commit, the (deliberately unreachable) server
     //    connection is what fails — nothing was uploaded, no half-state.
     let dir = planted_bed();
-    plot(&dir, &["src"]);
+    sparse(&dir, &["src"]);
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/new.txt"), b"fresh\n").unwrap();
-    let (code, stdout, stderr) = bed(&dir, &["sow", "-m", "tend the rows"]);
+    let (code, stdout, stderr) = bed(&dir, &["commit", "-m", "tend the rows"]);
     assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
     assert!(
-        stderr.contains("cannot reach the arboretum"),
+        stderr.contains("cannot reach the server"),
         "stderr: {stderr}"
     );
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
 
-    // -- graft and harvest are wired too: the connection fails before any
+    // -- rebase and publish are wired too: the connection fails before any
     //    local state is touched.
-    for args in [&["graft", "main"][..], &["harvest"][..]] {
+    for args in [&["rebase", "main"][..], &["publish"][..]] {
         let dir = planted_bed();
         let (code, stdout, stderr) = bed(&dir, args);
         assert_eq!(
@@ -276,13 +276,13 @@ fn write_path_and_blame_fail_cleanly_without_an_arboretum() {
             "args {args:?}: stdout {stdout:?} stderr {stderr:?}"
         );
         assert!(
-            stderr.contains("cannot reach the arboretum"),
+            stderr.contains("cannot reach the server"),
             "args {args:?}: stderr {stderr:?}"
         );
         assert!(stdout.is_empty(), "args {args:?}: stdout {stdout:?}");
     }
 
-    // -- blame is wired as well (M7): this bed has no current changeset,
+    // -- blame is wired as well (M7): this working copy has no current changeset,
     //    which is diagnosed locally, before any connection attempt — the
     //    same validate-then-connect ordering every read command follows.
     let dir = planted_bed();
@@ -296,13 +296,13 @@ fn write_path_and_blame_fail_cleanly_without_an_arboretum() {
 fn commands_still_validate_arguments_locally() {
     let dir = planted_bed();
 
-    // A bad plot prefix on clone is rejected before any connection.
-    let (code, _, stderr) = bed(&dir, &["clone", "http://s", "--plot", "../escape"]);
+    // A bad sparse prefix on clone is rejected before any connection.
+    let (code, _, stderr) = bed(&dir, &["clone", "http://s", "--sparse", "../escape"]);
     assert_eq!(code, 1, "stderr: {stderr}");
-    assert!(stderr.contains("invalid plot prefix"), "stderr: {stderr}");
+    assert!(stderr.contains("invalid sparse prefix"), "stderr: {stderr}");
 
-    // A bad revspec on goto likewise.
-    let (code, _, stderr) = bed(&dir, &["goto", ""]);
+    // A bad revspec on switch likewise.
+    let (code, _, stderr) = bed(&dir, &["switch", ""]);
     assert_eq!(code, 1);
     assert!(
         stderr.contains("invalid changeset id or ref"),
@@ -316,8 +316,8 @@ fn commands_still_validate_arguments_locally() {
         assert!(stderr.contains("invalid path"), "args {args:?}: {stderr}");
     }
 
-    // An empty message on sow.
-    let (code, _, stderr) = bed(&dir, &["sow", "-m", "   "]);
+    // An empty message on commit.
+    let (code, _, stderr) = bed(&dir, &["commit", "-m", "   "]);
     assert_eq!(code, 1);
     assert!(stderr.contains("message is empty"), "stderr: {stderr}");
 }
@@ -327,45 +327,54 @@ fn clone_refuses_to_overwrite_an_existing_bed_before_connecting() {
     let dir = planted_bed();
     let (code, _, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1"]);
     assert_eq!(code, 1);
-    assert!(stderr.contains("already a bed"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("already a working copy"),
+        "stderr: {stderr}"
+    );
 }
 
 #[test]
-fn status_and_plot_need_a_bed_too() {
+fn status_and_sparse_need_a_bed_too() {
     let dir = tempfile::tempdir().unwrap();
-    for args in [&["plot", "list"][..], &["goto", "main"][..]] {
+    for args in [&["sparse", "list"][..], &["switch", "main"][..]] {
         let (code, _, stderr) = bed(&dir, args);
         assert_eq!(code, 1, "args {args:?}");
-        assert!(stderr.contains("not a bed"), "args {args:?}: {stderr}");
+        assert!(
+            stderr.contains("not a working copy"),
+            "args {args:?}: {stderr}"
+        );
     }
 }
 
 #[test]
-fn custom_bed_dir_override_is_honored() {
+fn custom_state_dir_override_is_honored() {
     let dir = tempfile::tempdir().unwrap();
-    let bed_dir = dir.path().join("state").join("mybed");
-    Bed::init(&bed_dir, "http://127.0.0.1:1", "garden").unwrap();
+    let state_dir = dir.path().join("state").join("mybed");
+    WorkingCopy::init(&state_dir, "http://127.0.0.1:1", "garden").unwrap();
 
     // No ./.bed in cwd — the override must carry the day.
-    let (code, out, stderr) = bed(&dir, &["--bed-dir", bed_dir.to_str().unwrap(), "status"]);
+    let (code, out, stderr) = bed(
+        &dir,
+        &["--state-dir", state_dir.to_str().unwrap(), "status"],
+    );
     assert_eq!(code, 0, "{stderr}");
-    assert!(out.contains("the plot is empty"), "out: {out}");
+    assert!(out.contains("no sparse paths selected"), "out: {out}");
 }
 
-// ---------------------------------------------------- FIX-F: empty sow message
+// ---------------------------------------------------- FIX-F: empty commit message
 // An empty `-m ""` is its own EmptyMessage error with the fix spelled out —
 // not the generic config-invalid voice — and it leaves zero state behind.
 
 #[test]
-fn sow_with_an_empty_message_is_a_clean_empty_message_error() {
+fn commit_with_an_empty_message_is_a_clean_empty_message_error() {
     let dir = planted_bed();
     let config_before = fs::read_to_string(dir.path().join(".bed/config.toml")).unwrap();
 
-    let (code, stdout, stderr) = bed(&dir, &["sow", "-m", ""]);
+    let (code, stdout, stderr) = bed(&dir, &["commit", "-m", ""]);
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert_eq!(
-        stderr, "bed: the message is empty — sow with -m <message>\n",
+        stderr, "bed: the message is empty — commit with -m <message>\n",
         "the EmptyMessage voice, not the config-invalid one"
     );
 
@@ -381,8 +390,8 @@ fn sow_with_an_empty_message_is_a_clean_empty_message_error() {
 }
 
 // =======================================================================
-// Serve-backed regressions (QA hardening). A real arboretum runs over a
-// hand-built repo, so each test controls exactly which refs the arboretum
+// Serve-backed regressions (QA hardening). A real server runs over a
+// hand-built repo, so each test controls exactly which refs the server
 // offers and which changeset each points at — the fixture shape follows
 // write_path.rs.
 
@@ -404,7 +413,7 @@ fn seed_add(path: &str, content: &[u8]) -> (Change, Vec<u8>) {
 /// Seeds a two-changeset repo at `root` and returns `(cs1, cs2)`: cs1
 /// adds docs/readme.md and src/lib.rs, cs2 (its child) modifies
 /// docs/readme.md. Refs are pointed afterwards, so each test chooses
-/// exactly which refs the arboretum offers.
+/// exactly which refs the server offers.
 fn seed_repo(root: &Path) -> (Id, Id) {
     let repo = Repo::open(root).expect("repo opens");
     let ident = |secs: u64| Identity {
@@ -418,7 +427,7 @@ fn seed_repo(root: &Path) -> (Id, Id) {
     let cs1 = Changeset {
         parents: Vec::new(),
         changes: vec![c1.clone(), c2.clone()],
-        message: "seed the garden".into(),
+        message: "seed the repository".into(),
         author: ident(1_700_000_000),
         committer: ident(1_700_000_000),
         signature: None,
@@ -449,7 +458,7 @@ fn seed_repo(root: &Path) -> (Id, Id) {
     (id1, id2)
 }
 
-/// The bed's current changeset, read from its config (the source of truth
+/// The working copy's current changeset, read from its config (the source of truth
 /// the CLI itself writes).
 fn current_cs(garden: &Path) -> Id {
     let text = fs::read_to_string(garden.join(".bed/config.toml")).expect("config.toml");
@@ -463,12 +472,12 @@ fn current_cs(garden: &Path) -> Id {
     panic!("config.toml has no current_cs:\n{text}");
 }
 
-/// One running arboretum over a freshly seeded repo whose refs the test
+/// One running server over a freshly seeded repo whose refs the test
 /// chose, plus an empty garden ready for `bed clone`.
 struct CloneWorld {
     _dir: TempDir,
     garden: PathBuf,
-    server: common::Arboretum,
+    server: common::Server,
     /// The root changeset.
     cs1: Id,
     /// cs1's child (modifies docs/readme.md).
@@ -478,7 +487,7 @@ struct CloneWorld {
 /// Spawns the world; `index` 0 points the ref at cs1, 1 at cs2.
 async fn clone_world(refs: &[(&str, usize)]) -> CloneWorld {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arb_root = dir.path().join("arboretum");
+    let arb_root = dir.path().join("server");
     let (cs1, cs2) = seed_repo(&arb_root);
     {
         let repo = Repo::open(&arb_root).expect("repo opens");
@@ -490,7 +499,7 @@ async fn clone_world(refs: &[(&str, usize)]) -> CloneWorld {
     }
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let server = common::Arboretum::spawn(&arb_root).await;
+    let server = common::Server::spawn(&arb_root).await;
     CloneWorld {
         _dir: dir,
         garden,
@@ -504,15 +513,15 @@ async fn clone_world(refs: &[(&str, usize)]) -> CloneWorld {
 // `bed clone` no longer hardcodes `main`: `--ref` names the starting ref
 // exactly; without it, main → master → trunk resolve in order (main wins
 // deterministically when several exist), and the all-miss error says what
-// was tried, what the arboretum has, and the flag that fixes it.
+// was tried, what the server has, and the flag that fixes it.
 
 #[tokio::test]
 async fn clone_without_a_ref_falls_back_to_the_sole_ref() {
-    // The arboretum grows only `master`: no flag must still plant a bed.
+    // The server grows only `master`: no flag must still plant a working copy.
     let w = clone_world(&[("master", 0)]).await;
     let (code, out, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("the garden grows from "), "out: {out}");
+    assert!(out.contains("current changeset: "), "out: {out}");
     assert!(out.contains("(master)"), "out: {out}");
     assert_eq!(current_cs(&w.garden), w.cs1, "planted from master's tip");
 }
@@ -548,7 +557,7 @@ async fn clone_ref_flag_errors_cleanly_on_an_unknown_ref() {
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains("the arboretum has no ref \"nope\""),
+        stderr.contains("the server has no ref \"nope\""),
         "stderr: {stderr}"
     );
     assert!(
@@ -560,7 +569,7 @@ async fn clone_ref_flag_errors_cleanly_on_an_unknown_ref() {
 #[tokio::test]
 async fn clone_without_a_ref_errors_actionably_when_no_common_ref_exists() {
     // `develop` only: every probe misses, and the error says what was
-    // tried, what exists (the arboretum's own full ref spelling), and the
+    // tried, what exists (the server's own full ref spelling), and the
     // flag that fixes it.
     let w = clone_world(&[("develop", 0)]).await;
     let (code, stdout, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
@@ -571,7 +580,7 @@ async fn clone_without_a_ref_errors_actionably_when_no_common_ref_exists() {
         "stderr: {stderr}"
     );
     assert!(
-        stderr.contains("the arboretum has refs: refs/heads/develop"),
+        stderr.contains("the server has refs: refs/heads/develop"),
         "stderr: {stderr}"
     );
     assert!(
@@ -588,81 +597,81 @@ async fn clone_without_a_ref_errors_actionably_when_no_common_ref_exists() {
         "stderr: {stderr}"
     );
     assert!(
-        !stderr.contains("the arboretum has refs"),
+        !stderr.contains("the server has refs"),
         "nothing to list: {stderr}"
     );
 }
 
-// --------------------------------------------- FIX-E: plot add names its empties
-// `bed plot add <prefix>` prints a note when the newly added prefix matches
-// nothing at the current changeset: planting ahead of history is allowed,
+// --------------------------------------------- FIX-E: sparse add names its empties
+// `bed sparse add <prefix>` prints a note when the newly added prefix matches
+// nothing at the current changeset: creating ahead of history is allowed,
 // but silent emptiness reads like success-by-accident.
 
 #[tokio::test]
-async fn plot_add_notes_when_the_prefix_matches_nothing() {
+async fn sparse_add_notes_when_the_prefix_matches_nothing() {
     let w = clone_world(&[("main", 0)]).await;
     let (code, _, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
     // A prefix that matches at the current changeset: no note.
-    let (code, out, stderr) = bed_in(&w.garden, &["plot", "add", "docs"]);
+    let (code, out, stderr) = bed_in(&w.garden, &["sparse", "add", "docs"]);
     assert_eq!(code, 0, "stderr: {stderr}\n{out}");
-    assert!(out.contains("plotted docs\n"), "out: {out}");
+    assert!(out.contains("selected docs\n"), "out: {out}");
     assert!(!out.contains("note:"), "out: {out}");
 
     // A prefix that names nothing: still exit 0 and recorded — but told.
-    let (code, out, stderr) = bed_in(&w.garden, &["plot", "add", "nowhere"]);
+    let (code, out, stderr) = bed_in(&w.garden, &["sparse", "add", "nowhere"]);
     assert_eq!(code, 0, "stderr: {stderr}\n{out}");
-    assert!(out.contains("plotted nowhere"), "out: {out}");
+    assert!(out.contains("selected nowhere"), "out: {out}");
     assert!(out.contains("nothing exists under it"), "out: {out}");
 
-    // Both prefixes are recorded in the plot.
-    let (code, out, _) = bed_in(&w.garden, &["plot", "list"]);
+    // Both prefixes are recorded in the selected paths.
+    let (code, out, _) = bed_in(&w.garden, &["sparse", "list"]);
     assert_eq!(code, 0);
     assert_eq!(out, "docs\nnowhere\n", "out: {out}");
 }
 
 // ---------------------------------------- FIX-B: short gRPC code in Rpc errors
-// `bed <cmd>: the arboretum refused (FailedPrecondition): ...` renders the
-// tonic Code VARIANT name, not the long description. A conflicting graft is
-// the cleanest way to drive a FailedPrecondition through the CLI (harvest's
+// `bed <cmd>: the server refused (FailedPrecondition): ...` renders the
+// tonic Code VARIANT name, not the long description. A conflicting rebase is
+// the cleanest way to drive a FailedPrecondition through the CLI (publish's
 // one is translated into a dedicated error before it renders).
 
 #[tokio::test]
 async fn rpc_errors_render_the_short_grpc_code_variant() {
     let w = clone_world(&[("main", 1)]).await;
 
-    // Two beds, both starting at main (cs2), both tending docs/readme.md.
+    // Two beds, both starting at main (cs2), both operation docs/readme.md.
     let garden_a = w.garden.clone();
     let garden_b = w._dir.path().join("garden-b");
     fs::create_dir_all(&garden_b).expect("second garden dir");
 
-    // Bed A sows its version of the file.
+    // WorkingCopy A commits its version of the file.
     let (code, _, stderr) = bed_in(&garden_a, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    let (code, _, stderr) = bed_in(&garden_a, &["plot", "add", "docs"]);
+    let (code, _, stderr) = bed_in(&garden_a, &["sparse", "add", "docs"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     fs::write(garden_a.join("docs/readme.md"), b"bed a's version\n").expect("write");
-    let (code, _, stderr) = bed_in(&garden_a, &["sow", "-m", "bed a tends"]);
+    let (code, _, stderr) = bed_in(&garden_a, &["commit", "-m", "bed a tends"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     let a_cs = current_cs(&garden_a);
 
-    // Bed B sows a diverging version of the same path and harvests:
+    // WorkingCopy B commits a diverging version of the same path and publishs:
     // main moves onto B's changeset.
     let (code, _, stderr) = bed_in(&garden_b, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    let (code, _, stderr) = bed_in(&garden_b, &["plot", "add", "docs"]);
+    let (code, _, stderr) = bed_in(&garden_b, &["sparse", "add", "docs"]);
     assert_eq!(code, 0, "stderr: {stderr}");
     fs::write(garden_b.join("docs/readme.md"), b"bed b's version\n").expect("write");
-    let (code, _, stderr) = bed_in(&garden_b, &["sow", "-m", "bed b tends"]);
+    let (code, _, stderr) = bed_in(&garden_b, &["commit", "-m", "bed b tends"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    let (code, _, stderr) = bed_in(&garden_b, &["harvest"]);
+    let (code, _, stderr) = bed_in(&garden_b, &["publish"]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    // Bed A grafts onto the new main: the same path was written on both
-    // sides, so the arboretum refuses with FAILED_PRECONDITION — reported
+    // WorkingCopy A rebases onto the new main: the same path was written on both
+    // sides, so the server refuses with FAILED_PRECONDITION — reported
     // as the short variant name, never the long description.
-    let (code, stdout, stderr) = bed_in(&garden_a, &["graft", "main"]);
+    let (code, stdout, stderr) = bed_in(&garden_a, &["rebase", "main"]);
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
@@ -678,22 +687,22 @@ async fn rpc_errors_render_the_short_grpc_code_variant() {
         stderr.contains("docs/readme.md"),
         "the refusal names the conflict: {stderr}"
     );
-    // And the refusal moved nothing: the bed stays on its own changeset.
+    // And the refusal moved nothing: the working copy stays on its own changeset.
     assert_eq!(
         current_cs(&garden_a),
         a_cs,
-        "a failed graft leaves the bed where it stood"
+        "a failed rebase leaves the working copy where it stood"
     );
 }
 
 // --------------------------------------------- ISSUE-1: `.bed` is never garden content
-// A repo that ships its own `.bed/` (a planted file, a nested tree) must
-// never have it materialized into the live bed's state directory: `plot
+// A repo that ships its own `.bed/` (a initialized file, a nested tree) must
+// never have it materialized into the live working copy's state directory: `sparse
 // add .bed` is refused outright, and a root prefix excludes every
 // `.bed`-shaded path from materialization with a printed note.
 
 /// Seeds a one-changeset repo whose tree grows normal files *and* ships a
-/// `.bed/` of its own — `.bed/planted.txt` and the nested `.bed/sub/x` —
+/// `.bed/` of its own — `.bed/initialized.txt` and the nested `.bed/sub/x` —
 /// the hijack shape Issue 1 describes. Returns the changeset id.
 fn seed_bed_shaded_repo(root: &Path) -> Id {
     let repo = Repo::open(root).expect("repo opens");
@@ -703,7 +712,7 @@ fn seed_bed_shaded_repo(root: &Path) -> Id {
         time_secs: secs,
         tz_min: 0,
     };
-    // Canonical sortedness: ".bed/planted.txt" < ".bed/sub/x" <
+    // Canonical sortedness: ".bed/initialized.txt" < ".bed/sub/x" <
     // "docs/readme.md" < "src/lib.rs".
     let (c_planted, b_planted) = seed_add(".bed/planted.txt", b"planted by the repo itself\n");
     let (c_nested, b_nested) = seed_add(".bed/sub/x", b"nested\n");
@@ -718,7 +727,7 @@ fn seed_bed_shaded_repo(root: &Path) -> Id {
     let cs1 = Changeset {
         parents: Vec::new(),
         changes: vec![c_planted, c_nested, c_readme, c_lib],
-        message: "seed the garden, shipping a .bed of its own".into(),
+        message: "seed the repository, shipping a .bed of its own".into(),
         author: ident(1_700_000_000),
         committer: ident(1_700_000_000),
         signature: None,
@@ -730,11 +739,11 @@ fn seed_bed_shaded_repo(root: &Path) -> Id {
     repo.create_changeset(&cs1, &inline).expect("cs1 ingests")
 }
 
-/// [`clone_world`] over the bed-shaded repo: one ref (`main` → the
-/// changeset that ships `.bed/planted.txt` and `.bed/sub/x`), one garden.
+/// [`clone_world`] over the working copy-shaded repo: one ref (`main` → the
+/// changeset that ships `.bed/initialized.txt` and `.bed/sub/x`), one garden.
 async fn bed_shaded_world() -> CloneWorld {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arb_root = dir.path().join("arboretum");
+    let arb_root = dir.path().join("server");
     let cs1 = seed_bed_shaded_repo(&arb_root);
     {
         let repo = Repo::open(&arb_root).expect("repo opens");
@@ -743,7 +752,7 @@ async fn bed_shaded_world() -> CloneWorld {
     }
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let server = common::Arboretum::spawn(&arb_root).await;
+    let server = common::Server::spawn(&arb_root).await;
     CloneWorld {
         _dir: dir,
         garden,
@@ -802,7 +811,7 @@ fn bed_state(garden: &Path) -> BedState {
     }
     bed_files.sort();
     worktree.sort();
-    let bed = Bed::open(&garden.join(".bed")).unwrap();
+    let bed = WorkingCopy::open(&garden.join(".bed")).unwrap();
     BedState {
         config: fs::read_to_string(garden.join(".bed/config.toml")).unwrap(),
         heads: fs::read_to_string(garden.join(".bed/heads")).unwrap(),
@@ -813,33 +822,35 @@ fn bed_state(garden: &Path) -> BedState {
 }
 
 #[tokio::test]
-async fn plot_add_refuses_the_bed_state_prefix_and_changes_nothing() {
+async fn sparse_add_refuses_the_bed_state_prefix_and_changes_nothing() {
     let w = bed_shaded_world().await;
     let (code, _, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    // `.bed` itself is refused — it is the bed's own state directory, and
-    // plotting it would let repo files land inside the live state.
+    // `.bed` itself is refused — it is the working copy's own state directory, and
+    // selecting it would let repo files land inside the live state.
     let before = bed_state(&w.garden);
-    let (code, stdout, stderr) = bed_in(&w.garden, &["plot", "add", ".bed"]);
+    let (code, stdout, stderr) = bed_in(&w.garden, &["sparse", "add", ".bed"]);
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains(r#"invalid plot prefix ".bed""#),
+        stderr.contains(r#"invalid sparse prefix ".bed""#),
         "stderr: {stderr}"
     );
     assert!(
-        stderr.contains("refusing to plot .bed — bed tends its own state there"),
+        stderr.contains("refusing to sparse .bed — path is reserved for working-copy state"),
         "stderr: {stderr}"
     );
 
     // Anything inside `.bed` is refused for the same reason, naming the
     // prefix as typed.
-    let (code, stdout, stderr) = bed_in(&w.garden, &["plot", "add", ".bed/planted.txt"]);
+    let (code, stdout, stderr) = bed_in(&w.garden, &["sparse", "add", ".bed/planted.txt"]);
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains("refusing to plot .bed/planted.txt — bed tends its own state there"),
+        stderr.contains(
+            "refusing to sparse .bed/planted.txt — path is reserved for working-copy state"
+        ),
         "stderr: {stderr}"
     );
 
@@ -847,33 +858,32 @@ async fn plot_add_refuses_the_bed_state_prefix_and_changes_nothing() {
     assert_eq!(
         before,
         bed_state(&w.garden),
-        "a refused plot add must change nothing"
+        "a refused sparse add must change nothing"
     );
-    let (code, out, _) = bed_in(&w.garden, &["plot", "list"]);
+    let (code, out, _) = bed_in(&w.garden, &["sparse", "list"]);
     assert_eq!(code, 0);
-    assert!(out.contains("the plot is empty"), "out: {out}");
+    assert!(out.contains("no sparse paths selected"), "out: {out}");
 }
 
 #[tokio::test]
-async fn plot_add_root_materializes_everything_but_the_bed_state() {
+async fn sparse_add_root_materializes_everything_but_the_bed_state() {
     let w = bed_shaded_world().await;
     let (code, _, stderr) = bed_in(&w.garden, &["clone", &w.server.http()]);
     assert_eq!(code, 0, "stderr: {stderr}");
 
-    // `plot add .` materializes the repo — except the shipped `.bed/`
+    // `sparse add .` materializes the repo — except the shipped `.bed/`
     // content, which is excluded with a printed note.
-    let (code, out, stderr) = bed_in(&w.garden, &["plot", "add", "."]);
+    let (code, out, stderr) = bed_in(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "stderr: {stderr}\n{out}");
-    assert!(out.contains("plotted .\n"), "out: {out}");
+    assert!(out.contains("selected .\n"), "out: {out}");
     assert!(
         out.contains(
-            "note: skipped .bed/planted.txt, .bed/sub/x — bed tends its \
-             own state there"
+            "note: skipped .bed/planted.txt, .bed/sub/x — path is reserved for working-copy state"
         ),
         "out: {out}"
     );
     assert!(
-        out.contains("(2 file(s) in the plot)"),
+        out.contains("(2 file(s) in the selected paths)"),
         "only the materializable files count: {out}"
     );
 
@@ -881,14 +891,14 @@ async fn plot_add_root_materializes_everything_but_the_bed_state() {
     assert!(w.garden.join("docs/readme.md").is_file());
     assert!(w.garden.join("src/lib.rs").is_file());
     // …but none of the repo's `.bed/` content reached the live state dir:
-    // no planted file, and no `.bed/sub` directory was created either.
+    // no initialized file, and no `.bed/sub` directory was created either.
     assert!(
         !w.garden.join(".bed/planted.txt").exists(),
-        "the repo's .bed/planted.txt must not appear in the bed"
+        "the repo's .bed/planted.txt must not appear in the working copy"
     );
     assert!(
         !w.garden.join(".bed/sub").exists(),
-        "the repo's nested .bed/sub must not appear in the bed"
+        "the repo's nested .bed/sub must not appear in the working copy"
     );
 
     // The bed is unharmed and reports clean: config parses, the current
@@ -896,24 +906,24 @@ async fn plot_add_root_materializes_everything_but_the_bed_state() {
     // paths (they were never materialized, so nothing to report).
     let (code, out, stderr) = bed_in(&w.garden, &["status"]);
     assert_eq!(code, 0, "stderr: {stderr}");
-    assert!(out.contains("the plot is clean"), "out: {out}");
+    assert!(out.contains("working copy is clean"), "out: {out}");
     assert_eq!(current_cs(&w.garden), w.cs1);
 }
 
 #[test]
-fn clone_refuses_to_plot_the_bed_state_dir_before_connecting() {
+fn clone_refuses_to_sparse_the_bed_state_dir_before_connecting() {
     let dir = planted_bed();
     // Validation precedes connection *and* the already-a-bed check: the
     // state-dir refusal is what fires, nothing else is touched.
-    let (code, stdout, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1", "--plot", ".bed"]);
+    let (code, stdout, stderr) = bed(&dir, &["clone", "http://127.0.0.1:1", "--sparse", ".bed"]);
     assert_eq!(code, 1, "stdout: {stdout:?} stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
     assert!(
-        stderr.contains("refusing to plot .bed — bed tends its own state there"),
+        stderr.contains("refusing to sparse .bed — path is reserved for working-copy state"),
         "stderr: {stderr}"
     );
     assert!(
-        !stderr.contains("already a bed") && !stderr.contains("cannot reach the arboretum"),
+        !stderr.contains("already a working copy") && !stderr.contains("cannot reach the server"),
         "no later failure may mask the refusal: {stderr}"
     );
 }

@@ -1,9 +1,9 @@
 //! The clap-derived CLI surface for `bed` — every v0.1 subcommand from
 //! docs/v0.1.md §1, with complete argument parsing.
 //!
-//! All commands are wired: the read path (`clone`, `plot add`, `goto`,
-//! `file`, `log`, `diff`, `blame`), the write path (`sow`, `graft`,
-//! `harvest`), and the fully offline ones (`status`, `plot list/remove`).
+//! All commands are wired: the read path (`clone`, `sparse add`, `switch`,
+//! `file`, `log`, `diff`, `blame`), the write path (`commit`, `rebase`,
+//! `publish`), and the fully offline ones (`status`, `sparse list/remove`).
 
 use std::path::PathBuf;
 
@@ -12,19 +12,19 @@ use clap::Subcommand;
 
 use crate::rpc::DEFAULT_CONCURRENCY;
 
-/// bed — tend your gardenbed: a sparse, server-backed working copy.
+/// bed — source control with sparse, server-backed working copies.
 #[derive(Parser, Debug)]
 #[command(
     name = "bed",
     version,
-    about = "tend your gardenbed — a sparse, server-backed working copy",
+    about = "Source control with sparse, server-backed working copies",
     after_help = after_help()
 )]
 pub struct Cli {
-    /// Where this bed's local state lives (config, treestate, object
+    /// Where this working copy's local state lives (config, index, object
     /// cache, heads).
     #[arg(long, global = true, value_name = "DIR", default_value = "./.bed")]
-    pub bed_dir: PathBuf,
+    pub state_dir: PathBuf,
 
     #[command(subcommand)]
     pub command: Command,
@@ -33,37 +33,35 @@ pub struct Cli {
 /// Every v0.1 subcommand (docs/v0.1.md §1 scope).
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Plant a new bed: fetch an arboretum's roots, materializing nothing.
+    /// Create a working copy connected to a server; materialize no files.
     Clone {
-        /// The arboretum to plant from: `http(s)://host:port` or
+        /// Repository server endpoint: `http(s)://host:port` or
         /// `unix:///path/to/socket`.
         server: String,
-        /// Repo to tend; the server's choice when omitted.
+        /// Repository name (default: default).
         #[arg(long)]
         repo: Option<String>,
-        /// The ref to plant from. Default: `main`, falling back to the
-        /// arboretum's other common names (`master`, `trunk`) when it does
-        /// not grow it — pass this flag to name it exactly.
+        /// Starting ref. Defaults to `main`, then `master` or `trunk`.
         #[arg(long = "ref", value_name = "REF")]
         ref_name: Option<String>,
-        /// Plot prefixes to plant immediately (repeat or list several).
+        /// Sparse paths to record; fetch files afterward with `bed sparse add`.
         #[arg(long, value_name = "PATH", num_args = 1..)]
-        plot: Vec<String>,
+        sparse: Vec<String>,
     },
 
-    /// Tend the plot: which path prefixes this bed materializes.
-    Plot {
+    /// Select which repository paths to materialize in the working copy.
+    Sparse {
         #[command(subcommand)]
-        command: PlotCommand,
+        command: SparseCommand,
     },
 
-    /// Move the bed to a changeset id or ref.
-    Goto {
+    /// Switch the working copy to a changeset or ref.
+    Switch {
         /// A 64-hex changeset id, or a ref name.
         cs_or_ref: String,
     },
 
-    /// Compare the working files under the plot against the treestate.
+    /// Show local changes under the selected sparse paths.
     ///
     /// Works fully offline: mtime/size hints guide the scan; only suspects
     /// are hashed.
@@ -82,8 +80,7 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// History from a changeset or ref, newest first — every parent
-    /// lineage, date-ordered, exactly like `git log`'s default walk.
+    /// Show changeset history, newest first.
     Log {
         /// Show at most N changesets (default: all). Like `git log`, 0
         /// means "no limit", not "show none".
@@ -104,27 +101,27 @@ pub enum Command {
         b: Option<String>,
     },
 
-    /// Sow the plot's changes as a new changeset.
-    Sow {
+    /// Record local changes as a changeset on the server.
+    Commit {
         /// The changeset's message.
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: String,
         /// Author as one `Name <email>` identity (default: the
-        /// GARDENBED_AUTHOR environment variable, else the bed's own).
+        /// GARDENBED_AUTHOR environment variable, else the working copy's own).
         #[arg(long, value_name = "NAME <EMAIL>")]
         author: Option<String>,
     },
 
-    /// Replay the current changeset onto a new parent (server-side rebase).
-    Graft {
+    /// Rebase the current changeset onto another changeset or ref.
+    Rebase {
         /// The new parent: changeset id or ref.
         new_parent: String,
     },
 
-    /// Fast-forward `main` to the current changeset.
-    Harvest,
+    /// Publish the current changeset by fast-forwarding `main`.
+    Publish,
 
-    /// First-parent lineage blame of a path (docs/v0.1.md D7).
+    /// Show first-parent line attribution, following renames.
     Blame {
         /// The file's repo-relative path.
         path: String,
@@ -134,35 +131,35 @@ pub enum Command {
     },
 }
 
-/// Subcommands of `bed plot`.
+/// Subcommands of `bed sparse`.
 #[derive(Subcommand, Debug)]
-pub enum PlotCommand {
-    /// Add path prefixes to the plot (directory or exact file) and
+pub enum SparseCommand {
+    /// Select repository paths (directories or files) and
     /// materialize them at the current changeset.
     Add {
-        /// Repo-relative prefixes; `.` plants the whole garden.
+        /// Repository-relative paths; `.` selects the whole repository.
         #[arg(required = true, num_args = 1.., value_name = "PATH")]
         paths: Vec<String>,
-        /// Bound on concurrent object fetches from the arboretum.
+        /// Bound on concurrent object fetches from the server.
         #[arg(long, value_name = "N", default_value_t = DEFAULT_CONCURRENCY)]
         concurrency: usize,
     },
-    /// Remove path prefixes from the plot.
+    /// Stop selecting paths; keep existing working files.
     Remove {
-        /// The prefixes to unplant.
+        /// The path prefixes to stop selecting (working files are kept).
         #[arg(required = true, num_args = 1.., value_name = "PATH")]
         paths: Vec<String>,
     },
-    /// List the plot's path prefixes.
+    /// List selected sparse path prefixes.
     List,
 }
 
 /// The layout tour printed under `bed --help`.
 fn after_help() -> &'static str {
-    "local state (under --bed-dir, default ./.bed):\n  \
-     config.toml   server, repo, plot, current changeset\n  \
-     treestate     sqlite index of the materialized plot\n  \
-     objects/      local content-addressed cache (loam)\n  \
+    "local state (under --state-dir, default ./.bed):\n  \
+     config.toml   server, repository, sparse paths, current changeset\n  \
+     index.sqlite3 SQLite index of tracked files\n  \
+     objects/      local content-addressed object cache\n  \
      heads         local stack tips\n"
 }
 
@@ -176,24 +173,35 @@ mod tests {
     }
 
     #[test]
+    fn retired_command_names_and_flags_are_rejected() {
+        for command in ["sow", "graft", "harvest", "plot", "goto"] {
+            assert!(Cli::try_parse_from(["bed", command]).is_err(), "{command}");
+        }
+        assert!(Cli::try_parse_from(["bed", "--bed-dir", "x", "status"]).is_err());
+        assert!(
+            Cli::try_parse_from(["bed", "clone", "http://host:7400", "--plot", "src"]).is_err()
+        );
+    }
+
+    #[test]
     fn cli_shape_is_valid() {
         Cli::command().debug_assert();
     }
 
     #[test]
-    fn clone_parses_server_repo_and_plots() {
+    fn clone_parses_server_repo_and_sparses() {
         let cli = parsed(&["clone", "http://host:7400"]);
         match cli.command {
             Command::Clone {
                 server,
                 repo,
                 ref_name,
-                plot,
+                sparse,
             } => {
                 assert_eq!(server, "http://host:7400");
                 assert_eq!(repo, None);
                 assert_eq!(ref_name, None);
-                assert!(plot.is_empty());
+                assert!(sparse.is_empty());
             }
             other => panic!("expected Clone, got {other:?}"),
         }
@@ -203,25 +211,28 @@ mod tests {
             "unix:///tmp/a.sock",
             "--repo",
             "x",
-            "--plot",
+            "--sparse",
             "src",
             "docs",
         ]);
         match cli.command {
             Command::Clone {
-                server, repo, plot, ..
+                server,
+                repo,
+                sparse,
+                ..
             } => {
                 assert_eq!(server, "unix:///tmp/a.sock");
                 assert_eq!(repo.as_deref(), Some("x"));
-                assert_eq!(plot, vec!["src", "docs"]);
+                assert_eq!(sparse, vec!["src", "docs"]);
             }
             other => panic!("expected Clone, got {other:?}"),
         }
 
-        // Repeated --plot flags accumulate too.
-        let cli = parsed(&["clone", "s", "--plot", "a", "--plot", "b"]);
+        // Repeated --sparse flags accumulate too.
+        let cli = parsed(&["clone", "s", "--sparse", "a", "--sparse", "b"]);
         match cli.command {
-            Command::Clone { plot, .. } => assert_eq!(plot, vec!["a", "b"]),
+            Command::Clone { sparse, .. } => assert_eq!(sparse, vec!["a", "b"]),
             other => panic!("expected Clone, got {other:?}"),
         }
 
@@ -234,47 +245,47 @@ mod tests {
     }
 
     #[test]
-    fn plot_subcommands_parse() {
-        match parsed(&["plot", "add", "src", "docs"]).command {
-            Command::Plot {
-                command: PlotCommand::Add { paths, .. },
+    fn sparse_subcommands_parse() {
+        match parsed(&["sparse", "add", "src", "docs"]).command {
+            Command::Sparse {
+                command: SparseCommand::Add { paths, .. },
             } => {
                 assert_eq!(paths, vec!["src", "docs"])
             }
-            other => panic!("expected plot add, got {other:?}"),
+            other => panic!("expected sparse add, got {other:?}"),
         }
-        match parsed(&["plot", "add", "--concurrency", "3", "src"]).command {
-            Command::Plot {
-                command: PlotCommand::Add { paths, concurrency },
+        match parsed(&["sparse", "add", "--concurrency", "3", "src"]).command {
+            Command::Sparse {
+                command: SparseCommand::Add { paths, concurrency },
             } => {
                 assert_eq!(paths, vec!["src"]);
                 assert_eq!(concurrency, 3);
             }
-            other => panic!("expected plot add, got {other:?}"),
+            other => panic!("expected sparse add, got {other:?}"),
         }
-        match parsed(&["plot", "remove", "src"]).command {
-            Command::Plot {
-                command: PlotCommand::Remove { paths },
+        match parsed(&["sparse", "remove", "src"]).command {
+            Command::Sparse {
+                command: SparseCommand::Remove { paths },
             } => {
                 assert_eq!(paths, vec!["src"])
             }
-            other => panic!("expected plot remove, got {other:?}"),
+            other => panic!("expected sparse remove, got {other:?}"),
         }
-        match parsed(&["plot", "list"]).command {
-            Command::Plot {
-                command: PlotCommand::List,
+        match parsed(&["sparse", "list"]).command {
+            Command::Sparse {
+                command: SparseCommand::List,
             } => {}
-            other => panic!("expected plot list, got {other:?}"),
+            other => panic!("expected sparse list, got {other:?}"),
         }
-        // `plot add` with no paths is a usage error.
-        assert!(Cli::try_parse_from(["bed", "plot", "add"]).is_err());
+        // `sparse add` with no paths is a usage error.
+        assert!(Cli::try_parse_from(["bed", "sparse", "add"]).is_err());
     }
 
     #[test]
-    fn goto_status_file_log_parse() {
-        match parsed(&["goto", "main"]).command {
-            Command::Goto { cs_or_ref } => assert_eq!(cs_or_ref, "main"),
-            other => panic!("expected Goto, got {other:?}"),
+    fn switch_status_file_log_parse() {
+        match parsed(&["switch", "main"]).command {
+            Command::Switch { cs_or_ref } => assert_eq!(cs_or_ref, "main"),
+            other => panic!("expected Switch, got {other:?}"),
         }
         match parsed(&["status", "--full-scan"]).command {
             Command::Status { full_scan } => assert!(full_scan),
@@ -301,7 +312,7 @@ mod tests {
     }
 
     #[test]
-    fn diff_sow_graft_harvest_blame_parse() {
+    fn diff_commit_rebase_publish_blame_parse() {
         match parsed(&["diff"]).command {
             Command::Diff { a, b } => {
                 assert!(a.is_none() && b.is_none());
@@ -316,7 +327,7 @@ mod tests {
             other => panic!("expected Diff, got {other:?}"),
         }
         match parsed(&[
-            "sow",
+            "commit",
             "-m",
             "tend the rows",
             "--author",
@@ -324,24 +335,24 @@ mod tests {
         ])
         .command
         {
-            Command::Sow { message, author } => {
+            Command::Commit { message, author } => {
                 assert_eq!(message, "tend the rows");
                 assert_eq!(author.as_deref(), Some("G. Gardener <g@bed.dev>"));
             }
-            other => panic!("expected Sow, got {other:?}"),
+            other => panic!("expected Commit, got {other:?}"),
         }
         // The author is optional (env var / bed default fill in).
-        match parsed(&["sow", "-m", "tend the rows"]).command {
-            Command::Sow { author, .. } => assert!(author.is_none()),
-            other => panic!("expected Sow, got {other:?}"),
+        match parsed(&["commit", "-m", "tend the rows"]).command {
+            Command::Commit { author, .. } => assert!(author.is_none()),
+            other => panic!("expected Commit, got {other:?}"),
         }
-        match parsed(&["graft", "main"]).command {
-            Command::Graft { new_parent } => assert_eq!(new_parent, "main"),
-            other => panic!("expected Graft, got {other:?}"),
+        match parsed(&["rebase", "main"]).command {
+            Command::Rebase { new_parent } => assert_eq!(new_parent, "main"),
+            other => panic!("expected Rebase, got {other:?}"),
         }
-        match parsed(&["harvest"]).command {
-            Command::Harvest => {}
-            other => panic!("expected Harvest, got {other:?}"),
+        match parsed(&["publish"]).command {
+            Command::Publish => {}
+            other => panic!("expected Publish, got {other:?}"),
         }
         match parsed(&["blame", "src/lib.rs"]).command {
             Command::Blame { path, cs } => {
@@ -358,19 +369,19 @@ mod tests {
             other => panic!("expected Blame, got {other:?}"),
         }
         // `-m` is required.
-        assert!(Cli::try_parse_from(["bed", "sow"]).is_err());
+        assert!(Cli::try_parse_from(["bed", "commit"]).is_err());
         // `--author` takes exactly one value.
-        assert!(Cli::try_parse_from(["bed", "sow", "-m", "x", "--author"]).is_err());
+        assert!(Cli::try_parse_from(["bed", "commit", "-m", "x", "--author"]).is_err());
     }
 
     #[test]
-    fn bed_dir_is_a_global_override() {
-        let cli = parsed(&["--bed-dir", "/tmp/other-bed", "status"]);
-        assert_eq!(cli.bed_dir, PathBuf::from("/tmp/other-bed"));
+    fn state_dir_is_a_global_override() {
+        let cli = parsed(&["--state-dir", "/tmp/other-bed", "status"]);
+        assert_eq!(cli.state_dir, PathBuf::from("/tmp/other-bed"));
         // ...and works after the subcommand too.
-        let cli = parsed(&["status", "--bed-dir", "/tmp/other-bed"]);
-        assert_eq!(cli.bed_dir, PathBuf::from("/tmp/other-bed"));
+        let cli = parsed(&["status", "--state-dir", "/tmp/other-bed"]);
+        assert_eq!(cli.state_dir, PathBuf::from("/tmp/other-bed"));
         let cli = parsed(&["status"]);
-        assert_eq!(cli.bed_dir, PathBuf::from("./.bed"));
+        assert_eq!(cli.state_dir, PathBuf::from("./.bed"));
     }
 }

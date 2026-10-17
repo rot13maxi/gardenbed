@@ -5,7 +5,7 @@
 //!   (a fresh session per command holds no tree cache), the blob is read
 //!   from `.bed/objects`, the bytes are written out.
 //! * **cold** — the blob removed from the cache in the untimed setup: one
-//!   `GetBlob` round-trip plus the cache write ride on top. bed's M4 perf
+//!   `GetBlob` round-trip plus the cache write ride on top. working copy's M4 perf
 //!   budget (p95 < 50 ms over real processes) covers this same path with
 //!   process-spawn costs included.
 
@@ -17,13 +17,13 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use gardenbed_harness::GenOptions;
 use gardenbed_model::Mode;
 
-use world::Arboretum;
+use world::Server;
 
 struct World {
     _dir: tempfile::TempDir,
     garden: world::Garden,
-    server: Arboretum,
-    /// A plain regular file of the plot (and its blob id for the cold setup).
+    server: Server,
+    /// A plain regular file of the sparse selection (and its blob id for the cold setup).
     path: String,
     blob: gardenbed_model::Id,
     content_len: usize,
@@ -36,14 +36,14 @@ async fn setup() -> World {
         max_files: 40,
         ..GenOptions::default()
     });
-    world::ingest(&history, &dir.path().join("arboretum"));
-    let server = Arboretum::spawn(&dir.path().join("arboretum")).await;
+    world::ingest(&history, &dir.path().join("server"));
+    let server = Server::spawn(&dir.path().join("server")).await;
     let garden = world::Garden::plant(&dir.path().join("garden"), &server.http()).await;
 
-    // Materialize the plot, then pick one regular file.
-    gardenbed::ops::plot_add(&garden.bed, &[".".to_owned()], 8)
+    // Materialize the sparse selection, then pick one regular file.
+    gardenbed::ops::sparse_add(&garden.bed, &[".".to_owned()], 8)
         .await
-        .expect("plot add materializes the fixture");
+        .expect("sparse add materializes the fixture");
     let head_files = gardenbed_harness::generator::files_at(&history, history.changesets.len() - 1);
     let (path, (blob, _)) = head_files
         .iter()
@@ -70,11 +70,11 @@ async fn setup() -> World {
     }
 }
 
-/// The object file for `id` in the bed's cache (documented CAS layout:
+/// The object file for `id` in the working copy's cache (documented CAS layout:
 /// `objects/<2 hex>/<62 hex>`).
-fn cache_path(bed_dir: &std::path::Path, id: gardenbed_model::Id) -> std::path::PathBuf {
+fn cache_path(state_dir: &std::path::Path, id: gardenbed_model::Id) -> std::path::PathBuf {
     let hex = id.to_hex();
-    bed_dir.join("objects").join(&hex[..2]).join(&hex[2..])
+    state_dir.join("objects").join(&hex[..2]).join(&hex[2..])
 }
 
 fn bench_file_read(c: &mut Criterion) {

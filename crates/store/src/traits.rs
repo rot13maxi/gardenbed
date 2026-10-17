@@ -2,16 +2,16 @@
 //!
 //! Two traits partition the repository state (see `DESIGN.md`):
 //!
-//! - [`ObjectStore`] — **loam**, the content-addressed object store: blobs
+//! - [`ObjectStore`] — **objects**, the content-addressed object store: blobs
 //!   and trees, immutable once written.
-//! - [`MetadataStore`] — the **seedbed**: changesets, refs (compare-and-swap),
-//!   the git-SHA mapping table, and the derived-data cache (compost).
+//! - [`MetadataStore`] — the **metadata**: changesets, refs (compare-and-swap),
+//!   the git-SHA mapping table, and the derived-data cache.
 
 use crate::StoreError;
 use gardenbed_model::Changeset;
 use gardenbed_model::Id;
 
-/// Content-addressed object store (loam). Immutable once written.
+/// Content-addressed object store (objects). Immutable once written.
 ///
 /// Blobs are addressed by `SHA-256(raw content)`; trees by `SHA-256(canonical
 /// tree bytes)`. Writes are atomic and durable: a reader observes either the
@@ -62,7 +62,7 @@ pub enum RefCas {
 }
 
 /// Changesets, refs, the git-SHA mapping, and derived-data caches — the
-/// "seedbed".
+/// "metadata".
 pub trait MetadataStore: Send + Sync {
     /// Encodes `cs` into its canonical bytes, stores them together with a
     /// decoded row, and returns the changeset's Id. Re-putting an identical
@@ -130,7 +130,7 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
-    /// Store bytes in the derived-data cache ("compost"). `kind` is a short
+    /// Store bytes in the derived-data cache ("derived data"). `kind` is a short
     /// tag naming the derived-data type, e.g. `"skiplist"`. Overwrites any
     /// previous value for the same `(kind, cs)` key.
     fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError>;

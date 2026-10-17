@@ -41,8 +41,8 @@ const RPCS: &[(&str, bool, bool)] = &[
     ("ListRefs", false, true),
     ("GetRef", false, false),
     ("CasRef", false, false),
-    ("Graft", false, false),
-    ("Harvest", false, false),
+    ("Rebase", false, false),
+    ("Publish", false, false),
     ("GetStats", false, false),
 ];
 
@@ -202,8 +202,8 @@ fn rpc_input_output_types_match_the_spec() {
         ("ListRefs", "ListRefsReq", "RefEntry"),
         ("GetRef", "GetRefReq", "GetRefResp"),
         ("CasRef", "CasRefReq", "CasResp"),
-        ("Graft", "GraftReq", "GraftResp"),
-        ("Harvest", "HarvestReq", "HarvestResp"),
+        ("Rebase", "RebaseReq", "RebaseResp"),
+        ("Publish", "PublishReq", "PublishResp"),
         ("GetStats", "GetStatsReq", "StatsResp"),
     ];
     for m in service().method.iter() {

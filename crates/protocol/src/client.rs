@@ -53,7 +53,7 @@ pub enum CasOutcome {
     },
 }
 
-/// A thin typed client for the gardenbed gRPC API (v0.1.md §5).
+/// A thin typed client for the Gardenbed gRPC API (v0.1.md §5).
 ///
 /// Cheap to clone and share: every method takes `&self` and clones the
 /// underlying channel handle.
@@ -196,7 +196,7 @@ impl GardenbedClient {
 
     // ------------------------------------------------------ change graph
 
-    /// Sows a changeset (with ≤ 1 MiB blobs inline); returns its id.
+    /// Commits a changeset (with ≤ 1 MiB blobs inline); returns its id.
     ///
     /// `inline_blobs` pairs each referenced blob id with the raw content;
     /// every pairing is checked locally (`blob_id(content) == id`) before
@@ -373,34 +373,34 @@ impl GardenbedClient {
     }
 
     /// Replay a changeset's changes onto a new parent (linearized rebase);
-    /// returns the id of the grafted changeset. Semantic conflicts abort
+    /// returns the id of the rebased changeset. Semantic conflicts abort
     /// with `FAILED_PRECONDITION` (conflicting paths in the status message).
-    pub async fn graft(
+    pub async fn rebase(
         &self,
         repo: &str,
         cs_id: model::Id,
         new_parent: model::Id,
     ) -> Result<model::Id, Status> {
-        let req = pb::GraftReq {
+        let req = pb::RebaseReq {
             repo: repo.to_owned(),
             cs_id: id_to_bytes(cs_id),
             new_parent: id_to_bytes(new_parent),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.graft(req).await?.into_inner();
-        wire_id(&resp.id, "GraftResp.id")
+        let resp = inner.rebase(req).await?.into_inner();
+        wire_id(&resp.id, "RebaseResp.id")
     }
 
     /// Fast-forwards ref "main" to `cs_id`; returns the changeset "main"
     /// now points at (v0.1.md D5).
-    pub async fn harvest(&self, repo: &str, cs_id: model::Id) -> Result<model::Id, Status> {
-        let req = pb::HarvestReq {
+    pub async fn publish(&self, repo: &str, cs_id: model::Id) -> Result<model::Id, Status> {
+        let req = pb::PublishReq {
             repo: repo.to_owned(),
             cs_id: id_to_bytes(cs_id),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.harvest(req).await?.into_inner();
-        wire_id(&resp.id, "HarvestResp.id")
+        let resp = inner.publish(req).await?.into_inner();
+        wire_id(&resp.id, "PublishResp.id")
     }
 
     /// Per-repo request counters (debug/test infrastructure).

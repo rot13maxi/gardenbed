@@ -6,7 +6,7 @@
 //! ls-tree-style lines, deletions as mode-0 lines) plus `read-tree --empty`
 //! once up front, and each changeset becomes
 //! `write-tree` → `commit-tree -p …` with `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
-//! taken verbatim from the changeset's [`Identity`] in git's raw
+//! taken verbatim from the changeset's [`gardenbed_model::Identity`] in git's raw
 //! `"<secs> +hhmm"` date form. A final `update-ref` points `refs/heads/main`
 //! at the last commit.
 //!

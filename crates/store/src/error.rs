@@ -2,7 +2,7 @@
 
 use gardenbed_model::Id;
 
-/// Errors surfaced by the storage layer (`loam` and `seedbed`).
+/// Errors surfaced by the storage layer (`objects` and `metadata`).
 ///
 /// Library code never panics on bad input; every failure mode is one of
 /// these variants.

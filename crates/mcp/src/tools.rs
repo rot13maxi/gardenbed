@@ -1,5 +1,5 @@
 //! The four MCP tools (v0.1.md §1): `log`, `diff`, `blame`, `file` — each
-//! answering through the arboretum's own service layer
+//! answering through the server's own service layer
 //! ([`gardenbed_server::Repo`]), which is the very layer the CLI's server
 //! serves gRPC from. **Parity by construction**: an MCP answer and a
 //! `bed`-over-gRPC answer come from the same function calls on the same
@@ -10,7 +10,7 @@
 //! or a changeset id prefix (8+ hex chars) — resolved through
 //! `Repo::get_ref`, defaulting to the `main` ref.
 //! There is deliberately no working copy anywhere in this path: the whole
-//! toolset answers from the arboretum's loam + seedbed alone (the
+//! toolset answers from the server's objects + metadata alone (the
 //! zero-checkout contract, v0.1.md §M7.2).
 //!
 //! Errors are *results*: bad input (unparsable ids, invalid paths, missing
@@ -30,7 +30,7 @@ pub const SERVER_NAME: &str = "gardenbed-mcp";
 pub const SERVER_VERSION: &str = "0.1.0";
 
 /// The ref every v0.1 tool defaults to when `cs` is omitted (the
-/// arboretum's authoritative tip; `bed clone` grows from the same ref).
+/// server's authoritative tip; `bed clone` starts at the same ref).
 pub const DEFAULT_REF: &str = "main";
 
 /// The outcome of one tool call, as it lands in the `tools/call` result.
@@ -89,7 +89,7 @@ pub fn descriptors() -> serde_json::Value {
             },
             {
                 "name": "diff",
-                "description": "What changed between two changesets (a → b), as git --name-status lines: `<letter> <path>`, letters A (added), M (modified), D (deleted), T (type change); rename detection is off, like gardenbed's changeset tree diffs. Both sides are required — a headless tool has no working copy to default from.",
+                "description": "What changed between two changesets (a → b), as git --name-status lines: `<letter> <path>`, letters A (added), M (modified), D (deleted), T (type change); rename detection is off, like Gardenbed's changeset tree diffs. Both sides are required — a headless tool has no working copy to default from.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -169,7 +169,7 @@ pub fn call_tool(repo: &Repo, name: &str, args: &serde_json::Value) -> ToolOutco
         "blame" => tool_blame(repo, args),
         "file" => tool_file(repo, args),
         other => ToolOutcome::error(format!(
-            "unknown tool {other:?} — the garden answers log, diff, blame and file"
+            "unknown tool {other:?} — the repository answers log, diff, blame and file"
         )),
     }
 }
@@ -194,7 +194,7 @@ fn resolve_cs(repo: &Repo, cs: Option<&str>) -> Result<Id, String> {
         None => repo
             .get_ref(DEFAULT_REF)
             .map_err(err_text)?
-            .ok_or_else(|| format!("ref {DEFAULT_REF:?} does not exist on this arboretum")),
+            .ok_or_else(|| format!("ref {DEFAULT_REF:?} does not exist on this server")),
         Some(spec) => {
             let spec = spec.trim();
             if spec.is_empty() {
@@ -206,7 +206,7 @@ fn resolve_cs(repo: &Repo, cs: Option<&str>) -> Result<Id, String> {
             }
             repo.get_ref(spec)
                 .map_err(err_text)?
-                .ok_or_else(|| format!("ref {spec:?} does not exist on this arboretum"))
+                .ok_or_else(|| format!("ref {spec:?} does not exist on this server"))
         }
     }
 }
@@ -317,7 +317,7 @@ pub fn tool_log(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
     ToolOutcome::text(out)
 }
 
-/// One log entry in bed's git-log-like shape (the date rendering and
+/// One log entry in working copy's git-log-like shape (the date rendering and
 /// message indentation byte-match `gardenbed_bed::render::render_log_entry`
 /// for the same author/message; that format is pinned by the M7 parity
 /// tests — replicated here so the MCP server does not link the CLI crate).
@@ -396,7 +396,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// a changeset-level rename answer keeps the shape for future callers).
 /// Letters: `A` add, `M` modify, `D` delete, `T` type change (regular ↔
 /// symlink ↔ gitlink), classified from the old side's mode exactly like
-/// git's diff-tree and bed's renderer. **Both sides are required**: a
+/// git's diff-tree and working copy's renderer. **Both sides are required**: a
 /// headless tool has no working copy or current changeset to default
 /// from; omitting either is an error the agent can act on.
 pub fn tool_diff(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
@@ -523,7 +523,7 @@ pub fn tool_blame(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
 /// `file`: `{cs?, path}` — the file's content at a changeset as one text
 /// block. Symlinks render their target bytes (what `git show` prints);
 /// submodule pointers are described instead of read (their pointer is not
-/// a loam object); content that is not UTF-8 renders lossily with a
+/// a objects object); content that is not UTF-8 renders lossily with a
 /// stderr note (v0.1, documented in docs/mcp.md).
 pub fn tool_file(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
     let path = match validated_path(args) {
@@ -560,14 +560,14 @@ pub fn tool_file(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
     }
     let Some(blob) = entry.blob else {
         return ToolOutcome::error(format!(
-            "the tree entry at {path:?} carries no blob (arboretum bug)"
+            "the tree entry at {path:?} carries no blob (server bug)"
         ));
     };
     let content = match repo.get_blob(blob) {
         Ok(Some(content)) => content,
         Ok(None) => {
             return ToolOutcome::error(format!(
-                "blob {} is referenced but missing from loam",
+                "blob {} is referenced but missing from objects",
                 blob.to_hex()
             ));
         }
@@ -604,7 +604,7 @@ mod prefix_tests {
     }
 
     /// A two-commit fixture repo: root (a.txt, dir/b.txt) and a child that
-    /// rewrites a.txt, harvested onto `main`.
+    /// rewrites a.txt, published onto `main`.
     fn repo_fixture() -> (tempfile::TempDir, Repo, Id, Id) {
         let dir = tempfile::tempdir().expect("tempdir");
         let repo = Repo::open(dir.path()).expect("repo opens");
@@ -636,7 +636,7 @@ mod prefix_tests {
         };
         let root_id = repo
             .create_changeset(&root, &inline(&[a, world]))
-            .expect("root sows");
+            .expect("root commits");
         let child = Changeset {
             parents: vec![root_id],
             changes: vec![chg("a.txt", Op::Modify, a2, Mode::Regular)],
@@ -647,8 +647,8 @@ mod prefix_tests {
         };
         let child_id = repo
             .create_changeset(&child, &inline(&[a2]))
-            .expect("child sows");
-        repo.harvest(child_id).expect("main harvested");
+            .expect("child commits");
+        repo.publish(child_id).expect("main published");
         (dir, repo, root_id, child_id)
     }
 
@@ -674,7 +674,7 @@ mod prefix_tests {
     fn tools_answer_at_an_id_prefix() {
         let (_dir, repo, root, child) = repo_fixture();
         let p_root = &root.to_hex()[..8];
-        let p_child = &child.to_hex()[..16]; // bed's short() form
+        let p_child = &child.to_hex()[..16]; // working copy's short() form
 
         // `file` at an 8-hex prefix.
         assert_eq!(
@@ -724,7 +724,7 @@ mod prefix_tests {
             &repo,
             "log",
             &json!({ "cs": "no-such-ref" }),
-            "ref \"no-such-ref\" does not exist on this arboretum",
+            "ref \"no-such-ref\" does not exist on this server",
         );
         // A full 64-hex id passes through and is verified by the call.
         err_tool(

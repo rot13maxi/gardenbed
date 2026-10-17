@@ -1,8 +1,8 @@
-//! gardenbed-derive — the compost engine: derived data over the stores.
+//! gardenbed-derive — the derived data engine: derived data over the stores.
 //!
 //! [`Engine`] turns the changeset log into answers. Trees are *derived*:
 //! `tree(cs) = apply(changes(cs), tree(first parent))` — only directories a
-//! change touches are re-created, and every computed tree is cached in loam
+//! change touches are re-created, and every computed tree is cached in objects
 //! (D3: materialized eagerly on write, recomputable lazily anywhere else).
 //! On top of trees sit the recursive tree diff and the segmented-ancestry
 //! skip list backing `merge_base` / `is_ancestor`.
@@ -47,7 +47,7 @@ pub const DERIVED_SKIPLIST: &str = "skiplist";
 /// segment-skip data: bounded touched-path set + segment bloom).
 pub const DERIVED_PATHSUMMARY: &str = "pathsummary";
 
-/// The compost engine over one repository's stores.
+/// The derived data engine over one repository's stores.
 ///
 /// Cheap to share: both stores are behind `Arc` and every method takes
 /// `&self`. Holds trait objects so the server (and any other tier) can keep
@@ -150,7 +150,7 @@ impl std::fmt::Debug for Engine {
 }
 
 impl Engine {
-    /// An engine over `objects` (loam) and `metadata` (seedbed).
+    /// An engine over `objects` (objects) and `metadata` (metadata).
     pub fn new(objects: Arc<dyn ObjectStore>, metadata: Arc<dyn MetadataStore>) -> Self {
         Engine {
             objects,
@@ -168,12 +168,12 @@ impl Engine {
         }
     }
 
-    /// The object store (loam).
+    /// The object store (objects).
     pub fn objects(&self) -> &Arc<dyn ObjectStore> {
         &self.objects
     }
 
-    /// The metadata store (seedbed).
+    /// The metadata store (metadata).
     pub fn metadata(&self) -> &Arc<dyn MetadataStore> {
         &self.metadata
     }
@@ -522,7 +522,7 @@ impl Engine {
     }
 
     /// Best-effort tree cache write. Called after the tree object itself is
-    /// in loam, so the cache entry never names a missing object.
+    /// in objects, so the cache entry never names a missing object.
     fn cache_tree(&self, cs: Id, tree: Option<Id>) -> Result<(), StoreError> {
         self.metadata
             .derived_put(DERIVED_TREE, cs, &cache_payload(tree))

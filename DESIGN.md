@@ -1,4 +1,8 @@
-# gardenbed — design notes
+# Gardenbed — historical design notes
+
+These are historical design notes. Component and command names below have
+been superseded by the [current terminology](docs/terminology.md) and
+[command reference](docs/cli.md).
 
 Name locked (Oct 2026): project **gardenbed**, CLI **bed**, daemon
 **scarecrow**, sparse checkout paths **plot**.
@@ -48,7 +52,7 @@ Ref:  (repo, name) → cs_id, compare-and-swap
   traits (fs/sqlite first, s3/postgres later). Single-binary self-host mode
   is a first-class target.
 
-## Naming system
+## Original naming system (superseded)
 
 Extends git's existing botanical vocabulary:
 

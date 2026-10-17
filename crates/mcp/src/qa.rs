@@ -22,7 +22,7 @@
 //! Ground truth comes from subprocess git: `git blame --first-parent`
 //! (mapped through `Materialized.mapping`), `git diff-tree -r
 //! --name-status`, `git show`, and `git log`. The fixture ingests the
-//! generated history through the arboretum's own `Repo` (the M4/M5
+//! generated history through the server's own `Repo` (the M4/M5
 //! pattern), so the MCP server serves exactly the history git rendered.
 //!
 //! The agent's current directory is an empty sandbox asserted to contain
@@ -45,13 +45,13 @@ use crate::tools::render_log_entry;
 
 // ------------------------------------------------------------------ fixture
 
-/// One test world: an arboretum root with an ingested synthetic history,
+/// One test world: a server root with an ingested synthetic history,
 /// the *same* history materialized into a real git repository (the
 /// oracle), and the id ⇄ sha mapping between them.
 pub struct Fixture {
     /// Holds root and git; kept alive for the fixture's lifetime.
     _dir: TempDir,
-    /// The arboretum's data dir (`loam/` + `seedbed.sqlite3`) — what
+    /// The server's data dir (`objects/` + `metadata.sqlite3`) — what
     /// `gardenbed-mcp --root` serves.
     pub root: PathBuf,
     /// The git oracle repository.
@@ -67,7 +67,7 @@ pub struct Fixture {
 
 impl Fixture {
     /// Generates `commits` changesets, ingests them into a fresh temp
-    /// arboretum root, and materializes the same history into a git
+    /// server root, and materializes the same history into a git
     /// oracle repo. Panics on failure (fixture construction).
     pub fn build(seed: u64, commits: u32) -> Fixture {
         let opts = GenOptions {
@@ -78,7 +78,7 @@ impl Fixture {
         };
         let history = generate(seed, &opts);
         let dir = tempfile::tempdir().expect("fixture tempdir");
-        let root = dir.path().join("arboretum");
+        let root = dir.path().join("server");
         let git = dir.path().join("git-oracle");
         ingest(&history, &root);
         let materialized = materialize(&history, &git).expect("git oracle materializes");
@@ -167,7 +167,7 @@ pub fn qualifying_fixture(commits: u32) -> Fixture {
         let history = generate(seed, &opts);
         if qualifies(&history) {
             let dir = tempfile::tempdir().expect("fixture tempdir");
-            let root = dir.path().join("arboretum");
+            let root = dir.path().join("server");
             let git = dir.path().join("git-oracle");
             ingest(&history, &root);
             let materialized = materialize(&history, &git).expect("git oracle materializes");
@@ -198,7 +198,7 @@ fn qualifies(history: &GeneratedHistory) -> bool {
 
 /// True if `id` is a submodule pointer: 12 zero bytes followed by the
 /// 20-byte upstream git SHA-1 (canonical spec §3) — such ids are never
-/// loam objects and must not ride inline on ingestion.
+/// objects objects and must not ride inline on ingestion.
 fn is_gitlink_pointer(id: &Id, history: &GeneratedHistory) -> bool {
     id.as_bytes()[..12].iter().all(|b| *b == 0)
         && history.blob(id) == Some(id.as_bytes().as_slice())
@@ -207,7 +207,7 @@ fn is_gitlink_pointer(id: &Id, history: &GeneratedHistory) -> bool {
 /// Ingests a generated history into the repo rooted at `root` (the same
 /// layout `gardenbed-mcp --root` serves): every changeset with its blobs
 /// inline, then `main` fast-forwarded to the head. Runs through the
-/// server library, exactly like the bed test fixtures (the M4/M5
+/// server library, exactly like the working copy test fixtures (the M4/M5
 /// pattern). Returns the head changeset id.
 pub fn ingest(history: &GeneratedHistory, root: &Path) -> Id {
     use gardenbed_server::Repo;
@@ -217,7 +217,7 @@ pub fn ingest(history: &GeneratedHistory, root: &Path) -> Id {
         for change in &cs.changes {
             let Some(blob) = change.blob else { continue };
             if change.mode == Mode::Gitlink || is_gitlink_pointer(&blob, history) {
-                continue; // opaque upstream pointer, never a loam object
+                continue; // opaque upstream pointer, never a objects object
             }
             let content = history
                 .blob(&blob)
@@ -880,7 +880,7 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
 
     // The zero-checkout sandbox: the agent's cwd holds nothing at all.
     let sandbox = tempfile::tempdir().expect("sandbox tempdir");
-    assert_no_bed_dir(sandbox.path());
+    assert_no_state_dir(sandbox.path());
 
     let mcp = McpProcess::spawn(bin, &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
     let mut r = Runner {
@@ -1346,7 +1346,7 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
             "file",
             json!({ "path": path, "cs": "no-such-ref" }),
             "Show a file at a ref that does not exist.",
-            "ref \"no-such-ref\" does not exist on this arboretum",
+            "ref \"no-such-ref\" does not exist on this server",
         );
         b.ask_error(
             "blame",
@@ -1415,7 +1415,7 @@ fn run_questions(bin: &Path, limit: usize) -> QaReport {
 // --------------------------------------------------------- workspace helpers
 
 /// Locates a built workspace binary. Order: the env override (`MCP_BIN`
-/// for `gardenbed-mcp`, following the bed tests' `BED_SERVER_BIN`
+/// for `gardenbed-mcp`, following the working copy tests' `BED_SERVER_BIN`
 /// pattern), then the workspace `target/{debug,release}` directory.
 /// Panics with actionable advice when absent.
 pub fn probe_workspace_bin(name: &str, env_override: &str) -> PathBuf {
@@ -1451,7 +1451,7 @@ pub fn probe_workspace_bin(name: &str, env_override: &str) -> PathBuf {
 
 /// Asserts the zero-checkout contract for one directory tree: no `.bed`
 /// directory anywhere beneath it.
-pub fn assert_no_bed_dir(dir: &Path) {
+pub fn assert_no_state_dir(dir: &Path) {
     fn walk(dir: &Path) {
         let entries =
             std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));

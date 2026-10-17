@@ -1,5 +1,5 @@
-//! Parsing `<cs-or-ref>` arguments (`goto`, `file --cs`, `log --cs`,
-//! `diff`, `graft`).
+//! Parsing `<cs-or-ref>` arguments (`switch`, `file --cs`, `log --cs`,
+//! `diff`, `rebase`).
 //!
 //! The rule is deliberately simple: a token that is exactly 64 hex
 //! characters is a changeset id (normalized to lowercase); anything else is
@@ -10,7 +10,7 @@
 use gardenbed_model::Id;
 use std::str::FromStr;
 
-use crate::error::BedError;
+use crate::error::ClientError;
 
 /// A changeset id (full 64-hex) or a ref name, as typed on the command line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,7 +29,7 @@ impl CsOrRef {
     ///   a typo'd id should not silently become a ref lookup.
     /// * anything else → [`CsOrRef::Ref`], after rejecting empty names,
     ///   leading dashes, and whitespace/control characters.
-    pub fn parse(raw: &str) -> Result<Self, BedError> {
+    pub fn parse(raw: &str) -> Result<Self, ClientError> {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Err(revspec_err(raw, "it is empty"));
@@ -64,14 +64,14 @@ impl CsOrRef {
     }
 }
 
-fn revspec_err(raw: &str, reason: &str) -> BedError {
-    BedError::Revspec {
+fn revspec_err(raw: &str, reason: &str) -> ClientError {
+    ClientError::Revspec {
         raw: raw.to_owned(),
         reason: reason.to_owned(),
     }
 }
 
-fn validate_ref_name(raw: &str, name: &str) -> Result<(), BedError> {
+fn validate_ref_name(raw: &str, name: &str) -> Result<(), ClientError> {
     if name.starts_with('-') {
         return Err(revspec_err(raw, "a ref name cannot start with '-'"));
     }
@@ -118,24 +118,27 @@ mod tests {
         let bad: String = "z".repeat(64);
         assert!(matches!(
             CsOrRef::parse(&bad),
-            Err(BedError::Revspec { .. })
+            Err(ClientError::Revspec { .. })
         ));
     }
 
     #[test]
     fn rejects_empty_and_unusable_ref_names() {
-        assert!(matches!(CsOrRef::parse(""), Err(BedError::Revspec { .. })));
+        assert!(matches!(
+            CsOrRef::parse(""),
+            Err(ClientError::Revspec { .. })
+        ));
         assert!(matches!(
             CsOrRef::parse("  "),
-            Err(BedError::Revspec { .. })
+            Err(ClientError::Revspec { .. })
         ));
         assert!(matches!(
             CsOrRef::parse("-main"),
-            Err(BedError::Revspec { .. })
+            Err(ClientError::Revspec { .. })
         ));
         assert!(matches!(
             CsOrRef::parse("two words"),
-            Err(BedError::Revspec { .. })
+            Err(ClientError::Revspec { .. })
         ));
     }
 

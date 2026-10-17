@@ -1,4 +1,4 @@
-//! M1 verification: throughput baseline for loam. `#[ignore]`d so normal CI
+//! M1 verification: throughput baseline for objects. `#[ignore]`d so normal CI
 //! stays fast; run with:
 //!
 //! ```sh
@@ -43,7 +43,7 @@ fn ops_per_sec(ops: u64, elapsed: std::time::Duration) -> f64 {
 
 #[test]
 #[ignore = "throughput baseline; run explicitly with --ignored"]
-fn throughput_baseline_fs_loam() {
+fn throughput_baseline_fs_objects() {
     let n = blob_count();
     let root = tempfile::tempdir().expect("tempdir");
     let store = FsObjectStore::open(root.path()).expect("open");
@@ -65,7 +65,7 @@ fn throughput_baseline_fs_loam() {
     }
     let get_time = t_get.elapsed();
 
-    println!("fs-loam baseline: {n} blobs, content 256 B..8 KiB (75% compressible, 25% random)");
+    println!("fs-objects baseline: {n} blobs, content 256 B..8 KiB (75% compressible, 25% random)");
     println!(
         "  put: {n} ops in {put_time:?}  ->  {:.0} puts/sec",
         ops_per_sec(n, put_time)

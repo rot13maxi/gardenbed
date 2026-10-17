@@ -1,7 +1,7 @@
-//! `.bed/heads` — the bed's local stack tips (v0.1.md §6).
+//! `.bed/heads` — the working copy's local stack tips (v0.1.md §6).
 //!
 //! A plain text file, one lowercase-hex changeset id per line, bottom of
-//! the trellis first. `sow`/`graft` (later waves) push and re-point tips
+//! the trellis first. `commit`/`rebase` (later waves) push and re-point tips
 //! here; for now the file exists so the local layout is complete and the
 //! append/read contract is in place.
 
@@ -14,7 +14,7 @@ use std::str::FromStr;
 
 use gardenbed_model::Id;
 
-use crate::error::BedError;
+use crate::error::ClientError;
 
 /// A handle on `.bed/heads`. Cheap; the file is touched lazily.
 #[derive(Clone, Debug)]
@@ -35,13 +35,13 @@ impl Heads {
 
     /// Every recorded tip, in file order (bottom of the stack first).
     ///
-    /// A missing file reads as "no tips yet" — a bed that has never sown.
+    /// A missing file reads as "no tips yet" — a working copy that has never created.
     /// Blank lines are skipped; anything else must be a 64-hex id.
-    pub fn read(&self) -> Result<Vec<Id>, BedError> {
+    pub fn read(&self) -> Result<Vec<Id>, ClientError> {
         let raw = match fs::read_to_string(&self.path) {
             Ok(raw) => raw,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(BedError::Io(e)),
+            Err(e) => return Err(ClientError::Io(e)),
         };
         let mut tips = Vec::new();
         for (i, line) in raw.lines().enumerate() {
@@ -49,7 +49,7 @@ impl Heads {
             if line.is_empty() {
                 continue;
             }
-            let id = Id::from_str(line).map_err(|e| BedError::HeadsParse {
+            let id = Id::from_str(line).map_err(|e| ClientError::HeadsParse {
                 line: i + 1,
                 reason: format!("{line:?} is not a changeset id: {e}"),
             })?;
@@ -61,7 +61,7 @@ impl Heads {
     /// Appends one tip as a newline-terminated hex line, creating the file
     /// (and its parents) on first use. Appends are history — an id already
     /// present is written again rather than deduplicated.
-    pub fn append(&self, id: Id) -> Result<(), BedError> {
+    pub fn append(&self, id: Id) -> Result<(), ClientError> {
         if let Some(parent) = self.path.parent().filter(|p| !p.as_os_str().is_empty()) {
             fs::create_dir_all(parent)?;
         }
@@ -75,13 +75,13 @@ impl Heads {
 
     /// Re-points the stack: the LAST occurrence of `old` becomes `new`.
     ///
-    /// `graft` replaces a sown changeset with its replayed copy; the tip
+    /// `rebase` replaces a created changeset with its replayed copy; the tip
     /// that named the old changeset must name the new one instead of
     /// growing a stale second tip. When `old` is not on the stack (e.g. the
-    /// bed moved with `goto` after sowing, so heads never recorded it),
-    /// this degrades to [`Heads::append`] — the grafted changeset simply
+    /// bed moved with `switch` after committing, so heads never recorded it),
+    /// this degrades to [`Heads::append`] — the rebased changeset simply
     /// becomes a tip.
-    pub fn repoint(&self, old: Id, new: Id) -> Result<(), BedError> {
+    pub fn repoint(&self, old: Id, new: Id) -> Result<(), ClientError> {
         let mut tips = self.read()?;
         match tips.iter_mut().rposition(|t| *t == old) {
             Some(i) => {
@@ -138,7 +138,7 @@ mod tests {
         let path = dir.path().join("heads");
         fs::write(&path, format!("{}\n\nnot-an-id\n", id(1).to_hex())).unwrap();
         match Heads::open(path).read() {
-            Err(BedError::HeadsParse { line, .. }) => assert_eq!(line, 3),
+            Err(ClientError::HeadsParse { line, .. }) => assert_eq!(line, 3),
             other => panic!("expected HeadsParse, got {other:?}"),
         }
     }
@@ -171,7 +171,7 @@ mod tests {
         heads.append(id(1)).unwrap();
         heads.append(id(2)).unwrap();
 
-        // `old` (7) never made it onto the stack — the grafted changeset
+        // `old` (7) never made it onto the stack — the rebased changeset
         // becomes a new tip instead.
         heads.repoint(id(7), id(8)).unwrap();
         assert_eq!(heads.read().unwrap(), vec![id(1), id(2), id(8)]);
