@@ -12,6 +12,7 @@ gix = "0.89.0"
 log = "0.4"
 sha2 = "0.10"
 thiserror = "2"
+tempfile = "3"
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }

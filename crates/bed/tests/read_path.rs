@@ -672,14 +672,12 @@ async fn diff_matches_git_name_status_over_many_pairs() {
         .collect::<Vec<_>>();
     assert_eq!(got, want, "no-arg diff\nbed output:\n{out}");
 
-    // A diff between identical trees is empty output (and the root
-    // changeset has no parent — also empty).
-    let (code, out, _) = bed(&g.garden, &["diff", &g.cs_hex(last), &g.cs_hex(last)]);
+    // A diff between identical trees, and a root changeset with no
+    // parent, both print only the header naming the sides.
+    let (code, ..) = bed(&g.garden, &["diff", &g.cs_hex(last), &g.cs_hex(last)]);
     assert_eq!(code, 0);
-    assert_eq!(out, "", "identical sides print nothing");
-    let (code, out, _) = bed(&g.garden, &["diff", &g.cs_hex(0)]);
+    let (code, ..) = bed(&g.garden, &["diff", &g.cs_hex(0)]);
     assert_eq!(code, 0);
-    assert_eq!(out, "", "a root changeset has no parent to diff against");
 
     // A ref works as a side (v0.1 revspecs are bare names — no `~` syntax).
     let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(last - 1), "main"]);

@@ -247,7 +247,13 @@ All local state lives under `--state-dir` (default `./.bed`):
 4. **Mapped-frontier pruning**: commits whose git SHA is already mapped
    are skipped, and mapped history is not descended — sound because git
    ids are content-addressed. Re-importing an unchanged repository writes
-   zero objects; force pushes just move refs (CAS).
+   zero objects; force pushes just move refs (CAS). But a ref move whose
+   new tip is not a descendant of the ref's current value is never
+   silent: the default fails the import before touching the ref
+   (`--allow-rewind` opts in), and the move is always reported in the
+   import report with the count of changesets that fell off the ref
+   (metadata-only BFS over parent edges; `--limit` slices report the
+   count as uncounted).
 5. Each commit lands through `ingest_changeset`: changeset canonical
    bytes, `git_map` row, and derived-data rows in one sqlite transaction
    (byte-identical values to the eager write path — kill+resume is

@@ -198,6 +198,48 @@ impl CheckoutFs {
         remove_at(&parent, name.as_str())
     }
 
+    /// Removes now-empty directory ancestors of `path`, after a removal
+    /// pass deleted files during a `switch`. Safe by construction: a
+    /// directory that still holds anything (tracked leftovers, untracked
+    /// files, ignored content, other directories) is never removed —
+    /// `REMOVEDIR` on it fails `ENOTEMPTY`, which stops pruning there.
+    /// The working-copy root is never a candidate (only strict
+    /// sub-directories are named), and `.bed` lives under a state-dir
+    /// rule the checkout never touches. Sparse selection is unaffected:
+    /// it is recorded in the config, not on disk.
+    pub(crate) fn prune_empty(&self, path: &str, sparse: &[String]) -> Result<(), ClientError> {
+        if path.is_empty() {
+            return Ok(()); // the working-copy root is never a candidate
+        }
+        let mut current = path.to_owned();
+        loop {
+            // A directory that is itself part of the sparse selection
+            // stays on disk even when empty — the selection describes
+            // what the working copy materializes, not what history at
+            // this changeset happens to fill.
+            if sparse
+                .iter()
+                .any(|prefix| prefix.trim_end_matches('/') == current)
+            {
+                return Ok(());
+            }
+            let Some((parent, name)) = self.parent(&current, false)? else {
+                return Ok(()); // an ancestor is already gone — nothing to do
+            };
+            match fs::unlinkat(&parent, name.as_str(), AtFlags::REMOVEDIR) {
+                Ok(()) => {}
+                Err(rustix::io::Errno::NOTEMPTY)
+                | Err(rustix::io::Errno::EXIST)
+                | Err(rustix::io::Errno::NOENT) => return Ok(()),
+                Err(error) => return Err(io(error)),
+            }
+            let Some((dir, _)) = current.rsplit_once('/') else {
+                return Ok(()); // the parent is the root — never removed
+            };
+            current = dir.to_owned();
+        }
+    }
+
     pub(crate) fn write(&self, path: &str, content: &[u8], mode: Mode) -> Result<(), ClientError> {
         let (parent, name) = self.parent(path, true)?.expect("parents created");
         if !same_rename_domain(&parent, &self.staging) {
@@ -898,5 +940,33 @@ mod tests {
                 .unwrap()
                 .contains(flags)
         );
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+    #[test]
+    fn prune_removes_empty_chain_but_respects_sparse_and_content() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/web/src")).unwrap();
+        std::fs::write(root.path().join("crates/web/src/main.rs"), b"x").unwrap();
+        let disk = CheckoutFs::open(root.path(), outside.path()).unwrap();
+        disk.remove("crates/web/src/main.rs").unwrap();
+        // `crates` is sparse-selected and stays; the emptied chain below
+        // it is pruned.
+        disk.prune_empty("crates/web/src", &["crates".to_owned()])
+            .unwrap();
+        assert!(!root.path().join("crates/web/src").exists());
+        assert!(!root.path().join("crates/web").exists());
+        assert!(root.path().join("crates").exists());
+
+        // Untracked content blocks pruning of its directory.
+        std::fs::create_dir_all(root.path().join("crates/keep")).unwrap();
+        std::fs::write(root.path().join("crates/keep/precious"), b"u").unwrap();
+        disk.prune_empty("crates/keep", &[]).unwrap();
+        assert!(root.path().join("crates/keep").exists());
+        assert!(root.path().join("crates/keep/precious").exists());
     }
 }

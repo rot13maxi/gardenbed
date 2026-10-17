@@ -30,6 +30,23 @@ tags, and the verification record for a release lives in
   end-to-end suite (`e2e/`) that drives a real browser through every
   page against the seeded repository.
 
+### Fixed
+
+- `bed switch` now prunes directories its removals left empty (dogfood:
+  switching off a changeset that introduced `crates/web` left the empty
+  `crates/web/{src,static,tests}` behind, so a workspace glob `crates/*`
+  matched a member with no `Cargo.toml` and `cargo check` failed). A
+  directory is pruned only when it contains nothing at all — untracked
+  or ignored content, other directories, or a sparse-selected prefix
+  keep it on disk; the working-copy root and the state directory are
+  never candidates; the sparse selection itself stays recorded in the
+  config regardless of disk state.
+- `bed sparse list` marks selected prefixes that match nothing at the
+  current changeset (suffix ` (empty at this changeset)`), computed
+  offline from the treestate's materialized rows — a dead selection no
+  longer reads like live coverage. Recording empty selections ahead of
+  history is unchanged by design.
+
 ### Changed
 
 - **`bed` honors `.gitignore` for untracked-file discovery**: `bed
@@ -62,6 +79,30 @@ tags, and the verification record for a release lives in
   state uses `index.sqlite3` and a `sparse` configuration field. This is a
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
+- No-argument `bed diff` is context-aware and always self-describing: a
+  dirty working copy diffs local bytes against the current changeset
+  (untracked files excluded, git parity; deleted files render as removal
+  to `/dev/null`), while a clean one keeps the current-changeset-vs-
+  first-parent diff. Both modes print a one-line header naming what is
+  being diffed (`diff of working copy against <cs>` /
+  `diff of <cs> against its first parent`); explicit `bed diff A [B]`
+  still means changesets, now with the same header line.
+
+### Fixed
+
+- **`gardenbed-server import` no longer silently rewinds refs** when an
+  incremental import moves a ref to a tip that is not a descendant of
+  the ref's current value (e.g. re-importing a git repository whose
+  `main` is behind the store's published `main` — the dogfood incident:
+  published work fell off `main` with exit 0 and no output). Such an
+  import now fails non-zero before any ref is touched when the move
+  would lose changesets, naming the ref, both tips, and the count;
+  `--allow-rewind` opts in (force-push parity) and the move is reported
+  in the import report (`refs_rewound`) plus a loud stderr warning.
+  Fell-off changesets are counted exactly via a metadata-only BFS.
+  Forward moves are unchanged (silent). Tests:
+  `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
+  `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
 
 ## [0.1.0] - 2026-10-16
 
