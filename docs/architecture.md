@@ -7,10 +7,10 @@ and SQLite metadata. Derived trees, blame, and ancestry data support queries.
 Use the standard terms in [Terminology](terminology.md). Repository storage uses `objects/` and `metadata.sqlite3`.
 
 ```text
-bed ──gRPC── gardenbed-server
-               ├─ metadata: SQLite  (changesets, refs,
-               │                    git-SHA map, derived)
-               └─ objects: filesystem CAS     (blobs, trees; zstd)
+bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
+                        (optional)                    ├─ metadata: SQLite
+                                                      └─ objects: filesystem CAS
+bed ──gRPC──────────────────────────────────────────┘   (direct, no daemon)
 gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 ```
 
@@ -21,9 +21,10 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
   **want-list** — a client resolves `RootTree(cs)` and requests exactly
   the trees/blobs it is missing. Every request names a content-addressed
   object, so any interrupted session resumes exactly.
-- No daemon in v0.1: `bed` embeds the client; a local daemon (filesystem watching, shared
-  node cache) is v0.2 (v0.1.md §1). The RPC surface is identical either
-  way.
+- The local daemon (v0.2, below and [docs/daemon.md](daemon.md)) is an
+  optional caching tier between `bed` and the server: present or absent,
+  outputs and on-disk state are identical, and the RPC surface is the
+  same either way.
 
 ## 1. Wire protocol
 
@@ -321,6 +322,45 @@ keyed by `(changeset, path)`. Attribution is anchored per-line to
 `git blame --first-parent` on all corpora — the only documented
 divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
 §5).
+
+## 8.5. The local daemon (v0.2 M16)
+
+`gardenbed-daemon` (lib `gardenbed_daemon`) is an optional per-machine
+tier between `bed` and the server — a **caching gRPC proxy** plus
+**filesystem watchers**, serving both on one unix socket
+(`$XDG_RUNTIME_DIR/gardenbed/daemon.sock`, 0700 directory; the
+`GARDENBED_DAEMON` env var overrides, and an empty value disables).
+Full lifecycle, socket/cache rules, and the sidecar contract:
+[docs/daemon.md](daemon.md).
+
+```text
+bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
+       (optional)      caching proxy
+```
+
+- **Never an owner of checkout or status logic** (D18): all `.bed`
+  writes stay in `bed`; the daemon never opens a working-copy index.
+- **Forwards every RPC verbatim** — the `repo` field rides untouched,
+  so one daemon serves every repository on its upstream. `GetTree`/
+  `GetBlob` are answered **cache-first** from a shared object store at
+  `$XDG_CACHE_HOME/gardenbed` (same envelope and sharding as
+  `.bed/objects`, write-through after each upstream fetch) —
+  cross-working-copy dedup falls out of content addressing.
+- **Write RPCs are peer-uid-gated**: `SO_PEERCRED` is checked before
+  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`; any uid other
+  than the daemon's owner is refused.
+- **Sidecar**: `Ping`, and `Register(state_dir) → generation counter` —
+  a recursive watch on the working-copy root (excluding `.bed` and
+  checkout staging), every debounced event bumps the generation.
+  `bed status` reuses its cached report while the generation is
+  unchanged; any doubt runs the full scan. A stale "clean" is
+  forbidden.
+- **Endpoint resolution is daemon-first with embedded fallback** (D19):
+  `bed` probes the socket and falls back to `config.server` when the
+  daemon is absent or dead; fetch RPCs retry exactly once against the
+  embedded endpoint on daemon death (writes never blindly retried). The
+  daemon is invisible at both ends: identical outputs and on-disk state
+  whether present or absent.
 
 ## 9. Merge (M9/M10, v0.2.md D9-D11)
 
