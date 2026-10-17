@@ -35,10 +35,12 @@ pub struct Cli {
 pub enum Command {
     /// Create a working copy connected to a server; materialize no files.
     Clone {
-        /// Repository server endpoint: `http(s)://host:port` or
-        /// `unix:///path/to/socket`.
+        /// Repository server endpoint: `http(s)://host:port[/repo]` or
+        /// `unix:///path/to/socket`. An http(s) URL's path names the
+        /// repository; no path selects `default`.
         server: String,
-        /// Repository name (default: default).
+        /// Repository name (default: from the URL path, else `default`;
+        /// the flag wins on conflict).
         #[arg(long)]
         repo: Option<String>,
         /// Starting ref. Defaults to `main`, then `master` or `trunk`.

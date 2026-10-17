@@ -83,7 +83,7 @@ fn add(path: &str, content: &[u8], mode: Mode) -> (Change, Vec<u8>) {
 /// an empty garden directory ready for `bed clone`.
 async fn setup() -> World {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().join("server");
+    let root = dir.path().join("server").join(REPO);
     let repo = Repo::open(&root).expect("repo opens");
 
     let (c1, b1) = add("docs/readme.md", b"# hello\n", Mode::Regular);
@@ -150,7 +150,7 @@ async fn setup() -> World {
 
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let server = Server::spawn(&root).await;
+    let server = Server::spawn(root.parent().unwrap()).await;
     World {
         _dir: dir,
         _root: root,
@@ -164,7 +164,10 @@ async fn setup() -> World {
 
 /// Clones a working copy into `garden` and sparses everything, via the real CLI.
 fn plant(w: &World) {
-    let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(
+        &w.garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
     let (code, out, stderr) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "sparse add: {stderr}\n{out}");
@@ -636,7 +639,7 @@ async fn publish_fast_forwards_and_losers_get_the_recipe() {
     // A second bed parks itself at the base tip BEFORE anything moves.
     let other = w._dir.path().join("garden-2");
     fs::create_dir_all(&other).unwrap();
-    let (code, _, stderr) = bed(&other, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(&other, &["clone", &format!("{}/garden", w.server.http())]);
     assert_eq!(code, 0, "{stderr}");
     let (code, _, stderr) = bed(&other, &["sparse", "add", "."]);
     assert_eq!(code, 0, "{stderr}");
@@ -689,7 +692,7 @@ async fn sixteen_concurrent_publishs_exactly_one_wins() {
     for i in 0..N {
         let dir = w._dir.path().join(format!("bed-{i:02}"));
         fs::create_dir_all(dir.join("row")).unwrap();
-        let (code, _, stderr) = bed(&dir, &["clone", &w.server.http()]);
+        let (code, _, stderr) = bed(&dir, &["clone", &format!("{}/garden", w.server.http())]);
         assert_eq!(code, 0, "clone {i}: {stderr}");
         let (code, _, stderr) = bed(&dir, &["sparse", "add", "."]);
         assert_eq!(code, 0, "sparse add {i}: {stderr}");
@@ -770,7 +773,7 @@ async fn chaos_killed_publishs_leave_a_consistent_ref() {
     for i in 0..N {
         let dir = w._dir.path().join(format!("chaos-{i:02}"));
         fs::create_dir_all(dir.join("row")).unwrap();
-        let (code, _, stderr) = bed(&dir, &["clone", &w.server.http()]);
+        let (code, _, stderr) = bed(&dir, &["clone", &format!("{}/garden", w.server.http())]);
         assert_eq!(code, 0, "clone {i}: {stderr}");
         let (code, _, stderr) = bed(&dir, &["sparse", "add", "."]);
         assert_eq!(code, 0, "sparse add {i}: {stderr}");

@@ -87,14 +87,14 @@ async fn setup() -> Garden {
 
 async fn setup_with(history: GeneratedHistory) -> Garden {
     let dir = tempfile::tempdir().expect("tempdir");
-    let server_root = dir.path().join("server");
+    let server_root = dir.path().join("server").join(common::REPO);
     let git_repo = dir.path().join("git-oracle");
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir created");
     let head = common::ingest(&history, &server_root);
     let materialized = materialize(&history, &git_repo).expect("git oracle materializes");
     assert_eq!(materialized.mapping.last().map(|(id, _)| *id), Some(head));
-    let server = Server::spawn(&server_root).await;
+    let server = Server::spawn(server_root.parent().unwrap()).await;
     Garden {
         _dir: dir,
         garden,
@@ -168,10 +168,13 @@ fn files_under(root: &Path) -> Vec<String> {
 #[tokio::test]
 async fn clone_plants_layout_and_materializes_nothing() {
     let mut g = setup().await;
-    let (code, out, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, out, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     assert!(
-        out.contains("created working copy for default"),
+        out.contains("created working copy for garden"),
         "out: {out}"
     );
     assert!(out.contains("no files materialized"), "out: {out}");
@@ -212,13 +215,17 @@ async fn clone_plants_layout_and_materializes_nothing() {
 
 #[tokio::test]
 async fn clone_with_a_refless_server_leaves_zero_state() {
-    // A server over a fresh root: no repo, no refs.
+    // A server over a fresh multi-repo root with one refless repository:
+    // the repository exists, none of its refs do.
     let dir = tempfile::tempdir().unwrap();
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).unwrap();
+    let repo = gardenbed_server::Repo::open(&dir.path().join("server").join(common::REPO))
+        .expect("empty repository opens");
+    drop(repo);
     let mut server = Server::spawn(&dir.path().join("server")).await;
 
-    let (code, _, stderr) = bed(&garden, &["clone", &server.http()]);
+    let (code, _, stderr) = bed(&garden, &["clone", &format!("{}/garden", server.http())]);
     assert_eq!(code, 1);
     // The no-flag resolution names what it probed and what exists (here:
     // nothing), pointing at --ref.
@@ -229,11 +236,12 @@ async fn clone_with_a_refless_server_leaves_zero_state() {
     assert!(!stderr.contains("the server has refs"), "stderr: {stderr}");
     assert!(!garden.join(".bed").exists(), "no bed may be planted");
 
-    // An unknown repo is the same story.
+    // An unknown repository is a repository error, not a ref error: the
+    // server names it and lists what it serves.
     let (code, _, stderr) = bed(&garden, &["clone", &server.http(), "--repo", "orchard"]);
     assert_eq!(code, 1);
     assert!(
-        stderr.contains("no ref main (tried main, master, trunk); pass --ref\n"),
+        stderr.contains("repository orchard not found (this server serves: garden)"),
         "stderr: {stderr}"
     );
     assert!(!garden.join(".bed").exists(), "no bed may be planted");
@@ -328,7 +336,10 @@ fn assert_fidelity(g: &Garden, index: usize) {
 #[tokio::test]
 async fn sparse_add_dot_materializes_everything_faithfully() {
     let mut g = setup().await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let (code, out, stderr) = bed(&g.garden, &["sparse", "add", "."]);
@@ -357,7 +368,10 @@ async fn sparse_add_dot_materializes_everything_faithfully() {
 #[tokio::test]
 async fn sparse_sparse_materializes_only_its_prefix() {
     let mut g = setup().await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let prefix = some_prefix(&g.history, g.head_index());
@@ -396,7 +410,10 @@ async fn sparse_sparse_materializes_only_its_prefix() {
 #[tokio::test]
 async fn file_serves_bytes_symlinks_and_refuses_gitlinks() {
     let mut g = setup().await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let files = files_at(&g.history, g.head_index());
@@ -507,7 +524,10 @@ async fn log_matches_git_on_two_histories() {
     };
     for seed in [11u64, 12] {
         let mut g = setup_with(generate(seed, &opts)).await;
-        let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+        let (code, _, stderr) = bed(
+            &g.garden,
+            &["clone", &format!("{}/garden", g.server.http())],
+        );
         assert_eq!(code, 0, "seed {seed}: {stderr}");
 
         // Whole history, newest first, in git's order.
@@ -623,7 +643,10 @@ async fn diff_matches_git_name_status_over_many_pairs() {
         ..GenOptions::default()
     };
     let mut g = setup_with(generate(21, &opts)).await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     let last = g.head_index();
 
@@ -696,7 +719,10 @@ async fn diff_matches_git_name_status_over_many_pairs() {
 #[tokio::test]
 async fn switch_moves_the_bed_and_status_stays_clean() {
     let mut g = setup().await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     let prefix = some_prefix(&g.history, g.head_index());
     let (code, out, stderr) = bed(&g.garden, &["sparse", "add", &prefix]);
@@ -763,7 +789,10 @@ async fn switch_moves_the_bed_and_status_stays_clean() {
 #[tokio::test]
 async fn reruns_fetch_nothing_and_leave_the_sparse_faithful() {
     let mut g = setup().await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     let client = g.server.client().await;
     let (t0, b0) = g.server.counted(&client).await;
@@ -805,7 +834,10 @@ async fn reruns_fetch_nothing_and_leave_the_sparse_faithful() {
 #[tokio::test]
 async fn server_down_fails_cleanly_never_half_states() {
     let mut g = setup().await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     let prefix = some_prefix(&g.history, g.head_index());
     let (code, _, stderr) = bed(&g.garden, &["sparse", "add", &prefix]);

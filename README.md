@@ -43,10 +43,10 @@ In one terminal, import the repository and start the server:
 
 ```sh
 ./target/release/gardenbed-server import \
-  --from /path/to/git-repo --root /tmp/gardenbed-repo
+  --from /path/to/git-repo --root /tmp/gardenbed --repo myrepo
 
 ./target/release/gardenbed-server \
-  --root /tmp/gardenbed-repo --addr 127.0.0.1:9418
+  --root /tmp/gardenbed --addr 127.0.0.1:9418
 ```
 
 In another terminal, create a working copy and fetch a directory:
@@ -55,7 +55,7 @@ In another terminal, create a working copy and fetch a directory:
 BIN="$PWD/target/release"
 mkdir -p /tmp/gardenbed-work && cd /tmp/gardenbed-work
 
-"$BIN/bed" clone http://127.0.0.1:9418
+"$BIN/bed" clone http://127.0.0.1:9418/myrepo
 "$BIN/bed" sparse add src
 "$BIN/bed" status
 ```
@@ -76,7 +76,7 @@ Export published history back to Git:
 
 ```sh
 "$BIN/gardenbed-server" export \
-  --root /tmp/gardenbed-repo --into /tmp/gardenbed-export.git
+  --root /tmp/gardenbed --repo myrepo --into /tmp/gardenbed-export.git
 
 git -C /tmp/gardenbed-export.git fsck --strict
 ```
@@ -109,16 +109,17 @@ tools: `log`, `diff`, `file`, and `blame`. It uses stdio and requires no
 working copy:
 
 ```sh
-"$BIN/gardenbed-mcp" --root /tmp/gardenbed-repo
+"$BIN/gardenbed-mcp" --root /tmp/gardenbed --repo myrepo
 ```
 
 See [MCP configuration and tool schemas](docs/mcp.md).
 
 ## Current scope
 
-Gardenbed is an early implementation at version 0.1. It supports a
-single repository per server, filesystem object storage, SQLite metadata,
-sparse working copies, server-side replay, and Git import/export.
+Gardenbed is an early implementation at version 0.1. It serves any
+number of repositories per server, with filesystem object storage, SQLite
+metadata, sparse working copies, server-side replay, and Git
+import/export.
 
 Writes require a connection to the server. There is no authentication,
 server-side merge resolution, garbage collection, or offline commit queue
