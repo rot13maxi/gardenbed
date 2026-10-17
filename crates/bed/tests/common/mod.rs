@@ -337,7 +337,7 @@ pub fn ingest(history: &gardenbed_harness::generator::GeneratedHistory, root: &P
 /// walking the server's derived trees in-process (uncounted), mirroring
 /// `plan_sparse`'s traversal exactly.
 pub fn want_list(root: &Path, head: Id, prefixes: &[&str]) -> (HashSet<Id>, HashSet<Id>) {
-    let repo = Repo::open(root).expect("repo opens");
+    let repo = Repo::open(&root.join(REPO)).expect("repo opens");
     let mut trees: HashSet<Id> = HashSet::new();
     let mut blobs: HashSet<Id> = HashSet::new();
     let top = repo

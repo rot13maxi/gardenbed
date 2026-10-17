@@ -116,6 +116,17 @@ pub enum ClientError {
     Store(#[from] StoreError),
 
     // ------------------------------------------------- server (M4 read path)
+    /// The server URL is malformed in a way the command refuses to guess
+    /// around (e.g. a multi-segment http path, which cannot name a
+    /// repository).
+    #[error("bad server URL {server:?}: {reason}")]
+    BadServerUrl {
+        /// The URL as given.
+        server: String,
+        /// Why it is refused.
+        reason: String,
+    },
+
     /// The server could not be reached. Validation and connection both
     /// happen before any local state is written, so local state is unchanged.
     #[error(

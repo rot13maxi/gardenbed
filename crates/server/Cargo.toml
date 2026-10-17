@@ -44,6 +44,9 @@ tonic = { version = "0.14.6", default-features = false, features = [
     "codegen",
     "channel",
 ] }
+# The root advisory lock (repos::ROOT_LOCK): flock via rustix, the same
+# primitive the working-copy staging journal uses.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }

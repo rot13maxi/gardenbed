@@ -9,6 +9,30 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- **Multi-repository serving** (v0.2.md §5, M11): one server process
+  serves any number of repositories from a root directory
+  (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); the
+  directory tree is the registry. Repositories open lazily on first
+  request (singleflighted), `--max-repos` (default 256) caps open handles
+  with LRU eviction of idle ones, and per-repository request counters
+  stay per-repository. Unknown repository names fail `not_found` listing
+  the served names; illegal and reserved names fail `invalid_argument`.
+- `gardenbed-server import --repo` and `export --repo` target a named
+  repository; per-repository git mirrors live at
+  `<root>/<repo>/git-mirror.git`.
+- `gardenbed-server move --from NAME --into NEW-NAME` renames a
+  repository under the root; history is byte-identical after the move.
+  The move is an **offline operation**: it refuses (non-zero exit,
+  nothing changed) while a server is serving the root, and it checkpoints
+  the repository's WAL and carries `metadata.sqlite3-wal`/`-shm` with the
+  database, so committed rows are never stranded at the old path.
+- `bed clone http://host:port/<repo>` (M12): an http(s) URL's path names
+  the repository; `--repo` wins on conflict. URL-clone and `--repo`-flag
+  clone produce identical working-copy configs.
+- `gardenbed-mcp --repo` is load-bearing: the named repository is the
+  only one the session answers from; an unknown name exits 1 listing
+  what the root serves.
+
 - **Web GUI**: `gardenbed-web` (`crates/web`) — a read-only web interface
   over a repository: history timeline, ref cards, changeset detail with a
   grouped change list, tree browsing with breadcrumbs, file view with
@@ -69,6 +93,28 @@ tags, and the verification record for a release lives in
   refused naming the ref, both tips, and the fell-off count unless
   `--force` is passed), and naming `main` in the `ref` field is rejected
   (main publishes stay the plain, review-gated form).
+
+### Changed
+
+- `gardenbed-server --root` takes the server root (one subdirectory per
+  repository) rather than a single repository directory. A root laid out
+  the v0.1 way (stores at the top level) keeps serving unchanged as the
+  repository named `default`, so existing roots need no migration; use
+  `gardenbed-server move --from default --into NAME` to adopt the
+  per-directory layout. A serving server holds a **shared** advisory
+  lock on `<root>/gardenbed.lock` for its lifetime (many servers may
+  serve many roots, but file-relocating operations are fenced — see
+  `move`), and repository resolution rechecks the directory under the
+  open gate so a concurrent move cannot recreate an empty repository at
+  a vacated name.
+- Per-repository request counters are cumulative per name for the
+  server's lifetime: LRU eviction closes idle repositories, and a reopen
+  keeps counting where the evicted epoch left off (`get_stats` no longer
+  resets after churn).
+- `bed clone` refuses an http(s) URL whose path has more than one
+  segment (`http://host:port/a/b` — it cannot name a repository) instead
+  of silently cloning `default`.
+
 
 ### Fixed
 

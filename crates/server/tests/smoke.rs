@@ -150,6 +150,9 @@ where
 #[tokio::test]
 async fn server_smoke_end_to_end() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it.
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
 
@@ -521,6 +524,9 @@ async fn revspec_prefix_resolution_end_to_end() {
     use tonic::Code;
 
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it.
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
     let client = server.client().await;
@@ -655,8 +661,8 @@ async fn revspec_prefix_resolution_end_to_end() {
     // first 8 hex chars (hash-prefixed ids cannot be engineered, so the
     // twin is written beside a real row in the test's own metadata — the
     // same offline surgery the chaos suite practices).
-    let metadata =
-        rusqlite::Connection::open(dir.path().join("metadata.sqlite3")).expect("metadata opens");
+    let metadata = rusqlite::Connection::open(dir.path().join("garden").join("metadata.sqlite3"))
+        .expect("metadata opens");
     metadata
         .busy_timeout(std::time::Duration::from_secs(5))
         .ok();
@@ -696,6 +702,9 @@ async fn rebase_three_way_edge_cases() {
     use tonic::Code;
 
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it.
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
     let client = server.client().await;
@@ -1027,6 +1036,10 @@ fn expected_rebase_id(cs: &Changeset, new_parent: gardenbed_model::Id) -> garden
 #[tokio::test]
 async fn publish_ref_lane_cas_rewind_and_wire_compat() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it
+    // (the directory tree is the registry — D12).
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
     let client = server.client().await;

@@ -66,8 +66,8 @@ const STARTING_REF_PROBES: [&str; 3] = [DEFAULT_REF, "master", "trunk"];
 /// names what was tried and — via the server's ref listing — what does
 /// exist, pointing at `--ref`.
 ///
-/// With `--repo` omitted the working copy is named `garden` (v0.1 servers are
-/// single-repo and offer no name discovery; a documented deviation).
+/// With `--repo` omitted and no URL path, the repository is `default` (the
+/// name a v0.1 root serves as; v0.2.md §5).
 pub async fn clone_with_ref(
     state_dir: &Path,
     server: &str,
@@ -76,12 +76,18 @@ pub async fn clone_with_ref(
     sparse: Vec<String>,
 ) -> Result<String, ClientError> {
     // ---- validation phase: nothing has been written yet ----
-    let repo = match repo {
-        Some(r) if !r.trim().is_empty() => r.trim().to_owned(),
-        Some(_) => {
+    // The clone URL addresses the repository (v0.2.md §5): an http(s) URL's
+    // path names it (`http://host:port/<repo>`; no path ⇒ `default`).
+    // `--repo` wins on conflict. The endpoint itself is the scheme +
+    // authority; the path never reaches the connection.
+    let (endpoint, url_repo) = split_repo_url(server)?;
+    let repo = match (repo, url_repo) {
+        (Some(r), _) if !r.trim().is_empty() => r.trim().to_owned(),
+        (Some(_), _) => {
             return Err(ClientError::ConfigInvalid("repo name is empty".into()));
         }
-        None => "default".to_owned(),
+        (None, Some(r)) => r,
+        (None, None) => "default".to_owned(),
     };
     let mut prefixes = Vec::with_capacity(sparse.len());
     for raw in &sparse {
@@ -94,7 +100,7 @@ pub async fn clone_with_ref(
     }
 
     // ---- connection and resolution: still no local state ----
-    let client = GardenbedClient::connect(server)
+    let client = GardenbedClient::connect(&endpoint)
         .await
         .map_err(|e| ClientError::Connect {
             server: server.to_owned(),
@@ -135,7 +141,7 @@ pub async fn clone_with_ref(
     }
 
     // ---- initialize local state ----
-    let mut bed = WorkingCopy::init(state_dir, server, &repo)?;
+    let mut bed = WorkingCopy::init(state_dir, &endpoint, &repo)?;
     bed.config_mut().sparse = prefixes;
     bed.config_mut().current_cs = Some(main.to_hex());
     bed.save_config()?;
@@ -147,6 +153,48 @@ pub async fn clone_with_ref(
          no files materialized — select paths with `bed sparse add <path>`\n",
         main.short()
     ))
+}
+
+/// Splits an http(s) clone URL into its endpoint and repository name:
+/// `http://host:port/<repo>` → `("http://host:port", Some("<repo>"))`.
+/// A trailing slash, query, or fragment is ignored; an empty or `/` path
+/// selects `None` (the `default` repository). `unix://` and every other
+/// scheme pass through untouched — only http(s) addresses repositories in
+/// the URL (the daemon socket is a machine-local transport, not an
+/// address).
+///
+/// A path of more than one segment (`http://host:port/a/b`) is refused:
+/// it cannot name a repository (repository names are single path-free
+/// segments), and silently treating it as `default` would send the server
+/// a name the user never typed.
+fn split_repo_url(server: &str) -> Result<(String, Option<String>), ClientError> {
+    let Ok(uri) = http::Uri::try_from(server) else {
+        return Ok((server.to_owned(), None)); // not a URL: pass through
+    };
+    match uri.scheme_str() {
+        Some("http" | "https") => {}
+        _ => return Ok((server.to_owned(), None)),
+    }
+    let path = uri.path().trim_matches('/');
+    let endpoint = || {
+        format!(
+            "{}://{}",
+            uri.scheme_str().unwrap_or("http"),
+            uri.authority().map(|a| a.as_str()).unwrap_or("")
+        )
+    };
+    if path.is_empty() {
+        return Ok((endpoint(), None));
+    }
+    if path.contains('/') {
+        return Err(ClientError::BadServerUrl {
+            server: server.to_owned(),
+            reason: "the URL path has more than one segment; a clone URL names at most \
+                     one repository (http://host:port/<repo>)"
+                .into(),
+        });
+    }
+    Ok((endpoint(), Some(path.to_owned())))
 }
 
 /// [`clone_with_ref`] without `--ref`: the starting ref is left to the
