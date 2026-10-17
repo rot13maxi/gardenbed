@@ -38,6 +38,14 @@ test.afterAll(() => {
 test("empty repo overview renders refs and stats, no full-page error", async ({ page }) => {
   const errors: string[] = [];
   page.on("pageerror", (e) => errors.push(String(e)));
+  // Console must stay quiet too, and the doomed /api/log call must not
+  // fire at all: with zero refs the overview skips the log fetch.
+  const consoleErrors: string[] = [];
+  page.on("console", (m) => {
+    if (m.type() === "error") consoleErrors.push(m.text());
+  });
+  const apiCalls: string[] = [];
+  page.on("request", (r) => apiCalls.push(r.url()));
 
   await page.goto(URL + "/");
   await expect(page.locator("#stat-chips .chip").first()).toBeVisible();
@@ -47,10 +55,14 @@ test("empty repo overview renders refs and stats, no full-page error", async ({ 
   await expect(page.locator("#recent-list .empty-state")).toContainText(/no history yet/i);
   await expect(page.locator(".empty-state", { hasText: /could not load/i })).toHaveCount(0);
 
+  expect(errors).toEqual([]);
+  expect(consoleErrors).toEqual([]);
+  expect(apiCalls.filter((u) => u.includes("/api/log"))).toEqual([]);
+  expect(apiCalls.filter((u) => u.includes("/api/refs")).length).toBeGreaterThan(0);
+
   // Refs chip reports zero; tip chip shows the em-dash placeholder.
   await expect(page.locator("#stat-chips")).toContainText("refs");
   await expect(page.locator("#stat-chips")).toContainText("0");
-  expect(errors).toEqual([]);
 });
 
 test("empty repo hides the all-zero gRPC requests chip", async ({ page }) => {

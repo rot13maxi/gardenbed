@@ -63,9 +63,11 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
 
     let mut tip: Option<Id> = None;
 
-    macro_rules! commit {
-        ($n:expr, $author:expr, $message:expr, [$($edit:expr),* $(,)?]) => {{
-            let parents: Vec<Id> = tip.into_iter().collect();
+    /// One changeset on an explicit parent list (the merge + side-branch
+    /// commits use this directly; `commit!` below is the linear chain).
+    macro_rules! commit_at {
+        ($n:expr, $author:expr, $parents:expr, $message:expr, [$($edit:expr),* $(,)?]) => {{
+            let parents: Vec<Id> = $parents;
             let (name, email) = $author;
             let identity = Identity {
                 name: name.to_owned(),
@@ -115,6 +117,13 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
             let id = repo.create_changeset(&cs, &inline)?;
             tip = Some(id);
         }};
+    }
+
+    /// Linear-chain commit: one parent — the running tip.
+    macro_rules! commit {
+        ($n:expr, $author:expr, $message:expr, [$($edit:expr),* $(,)?]) => {
+            commit_at!($n, $author, tip.into_iter().collect::<Vec<Id>>(), $message, [$($edit),*])
+        };
     }
 
     commit!(
@@ -174,6 +183,8 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
             mode: Mode::Regular,
         }]
     );
+    // Branch point for the side line that gets merged after c8.
+    let c3 = tip;
 
     commit!(
         4,
@@ -232,8 +243,48 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
         ]
     );
 
-    commit!(
+    // Side branch off c3: Ken adds watering data while mainline moved on
+    // to the sow script, README, rename, prune, and the spacing tune.
+    // The merge below gives the seeded history a two-parent changeset so
+    // the commit graph renders its merge nodes and second-parent lane
+    // against real data.
+    let mainline = tip;
+    commit_at!(
         9,
+        KEN,
+        vec![c3.expect("commit 3 ran")],
+        "Add watering schedule data\n\nPer-crop intervals plus the next-watering math the grid will\nneed; no code changes, data only.\n",
+        [Edit::Write {
+            op: Op::Add,
+            path: "data/watering.json",
+            content: WATERING_JSON,
+            mode: Mode::Regular,
+        }]
+    );
+    let side = tip;
+
+    // Merge: the mainline tip stays c8 (the side commit did not move
+    // it); the merged tree gains exactly the side branch's file
+    // (disjoint from everything mainline touched).
+    let mainline_c8 = mainline;
+    commit_at!(
+        10,
+        ROSA,
+        vec![
+            mainline_c8.expect("commit 8 ran"),
+            side.expect("side commit ran"),
+        ],
+        "Merge watering schedule into the planner\n\nKen's watering data lands alongside the sow script; the grid\nkeeps its newer palette. \n",
+        [Edit::Write {
+            op: Op::Add,
+            path: "data/watering.json",
+            content: WATERING_JSON,
+            mode: Mode::Regular,
+        }]
+    );
+
+    commit!(
+        11,
         KEN,
         "Add rotation notes for 2027",
         [Edit::Write {
@@ -245,7 +296,7 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
     );
 
     commit!(
-        10,
+        12,
         ROSA,
         "Document the sow script",
         [Edit::Write {
@@ -256,7 +307,7 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
         }]
     );
 
-    let tip = tip.expect("seed always creates ten changesets");
+    let tip = tip.expect("seed always creates twelve changesets");
     repo.cas_ref(DEMO_REF, None, tip)?;
     Ok(Some(tip))
 }
@@ -610,4 +661,15 @@ const ROTATION: &str = "\
 - north bed: legumes after this year's tomatoes
 - middle bed: brassicas; lettuce moves south
 - south bed: alliums, then a green manure year
+";
+
+const WATERING_JSON: &str = "\
+{
+  \"intervals_days\": {
+    \"carrot\": 2,
+    \"lettuce\": 1,
+    \"tomato\": 3
+  },
+  \"note\": \"deep water, less often, once seedlings establish\"
+}
 ";

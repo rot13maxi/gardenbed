@@ -1,22 +1,14 @@
-import { execFileSync, execSync } from "node:child_process";
-import { rmSync } from "node:fs";
-import { E2E_ROOT } from "./playwright.config";
+import { execSync } from "node:child_process";
 
+/**
+ * Builds the gardenbed-web binary the e2e webServer will run. Seeding and
+ * serving both live in serve-e2e.sh (the webServer command): Playwright
+ * launches the webServer before globalSetup, so setup-time seeding would
+ * mutate the root out from under the already-running server.
+ */
 export default async function globalSetup() {
-  // Build the web binary (debug) from the workspace root.
   execSync("cargo build -p gardenbed-web", {
     cwd: `${__dirname}/..`,
     stdio: "inherit",
   });
-  const bin = `${__dirname}/../target/debug/gardenbed-web`;
-
-  // Fresh deterministic seed every run.
-  rmSync(E2E_ROOT, { recursive: true, force: true });
-  const out = execFileSync(bin, ["seed", "--root", E2E_ROOT], {
-    encoding: "utf8",
-  });
-  process.stdout.write(out);
-  if (!/^seeded tip [0-9a-f]{64}$/m.test(out)) {
-    throw new Error(`seed did not print a tip id: ${JSON.stringify(out)}`);
-  }
 }

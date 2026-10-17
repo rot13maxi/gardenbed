@@ -565,6 +565,17 @@ function pickHost(addr) {
   return (typeof location !== "undefined" && location.hostname) || "localhost";
 }
 
+/** POSIX single-quote: '…' with embedded ' escaped as '"'"'. */
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\"'\"'") + "'";
+}
+
+/** Bare when the value is a plain host/token char class, else shell-quoted. */
+function shellArg(s) {
+  const v = String(s);
+  return /^[A-Za-z0-9._-]+$/.test(v) ? v : shellQuote(v);
+}
+
 /** The markdown prompt an operator can paste into any agent. */
 function buildAgentPrompt(info, refs) {
   info = info || {};
@@ -573,6 +584,13 @@ function buildAgentPrompt(info, refs) {
   const mainRef = refs.find((r) => r.name === "refs/heads/main") || refs[0];
   const host = pickHost(info.addr);
   const root = info.root || "(unknown)";
+  // Shell lines are pasted verbatim: quote paths unconditionally, hosts when
+  // they wander outside the plain [A-Za-z0-9._-] alphabet (spaces, $(…), …).
+  const rootMcp = shellQuote(info.root || "(the repo root from your operator)");
+  const rootQ = shellQuote(root);
+  const hostQ = shellArg(host);
+  const bareHost = hostQ === host;
+  const cloneUrl = "http://" + host + ":9418";
   const origin = (typeof location !== "undefined" && location.origin) || "(this web UI)";
   L.push(
     "# Working with this gardenbed repository", "",
@@ -589,12 +607,12 @@ function buildAgentPrompt(info, refs) {
       "; repo root on the server machine: " + root, "",
     "## Option A — MCP (queries only, no checkout)", "",
     "If your agent host supports MCP servers, register:", "",
-    "    gardenbed-mcp --root " + (info.root || "(the repo root from your operator)"), "",
+    "    gardenbed-mcp --root " + rootMcp, "",
     "Gives you log / diff / file / blame tools with zero checkout.", "",
     "## Option B — bed CLI (full read/write)", "",
     "Ask your operator for the gRPC endpoint (or start it on the repo machine:",
-    "`gardenbed-server --root " + root + " --addr " + host + ":9418`). Then:", "",
-    "    bed clone http://" + host + ":9418        # creates .bed, fetches nothing",
+    "`gardenbed-server --root " + rootQ + " --addr " + hostQ + ":9418`). Then:", "",
+    "    bed clone " + (bareHost ? cloneUrl : shellQuote(cloneUrl)) + "        # creates .bed, fetches nothing",
     "    bed sparse add crates                   # materialize only what you need",
     "    bed status",
     "    GARDENBED_AUTHOR=\"Name <email>\" bed commit -m \"...\"",
@@ -1588,18 +1606,21 @@ function viewOverview(root) {
   setNav("overview");
   clear(root).appendChild(skeleton(8));
   const rev = currentRev();
-  // Refs/stats are independent of history: on an unseeded repo the log
-  // fetch 404s ("no ref or changeset matching main") and must not discard
-  // the rest of the overview. A non-404 log error still fails the page.
-  const logP = api("/api/log?" + qs({ cs: rev, limit: 500 })).catch((err) => {
-    if (err && err.status === 404) return { entries: [] };
-    throw err;
-  });
-  Promise.all([
-    api("/api/refs"),
-    api("/api/stats"),
-    logP,
-  ]).then(([refs, stats, log]) => {
+  // Refs arrive first: an unseeded repo (zero refs) never asks for history
+  // at all — the log endpoint would 404 ("no ref or changeset matching
+  // main") and the browser would log a failed-resource error. A repo WITH
+  // refs keeps the eager fetch, still with a 404 safety net for a stale
+  // selected rev; other log errors still fail the page.
+  api("/api/refs").then((refs) => {
+    const haveRefs = (refs.refs || []).length > 0;
+    const logP = haveRefs
+      ? api("/api/log?" + qs({ cs: rev, limit: 500 })).catch((err) => {
+          if (err && err.status === 404) return { resolved: "", entries: [] };
+          throw err;
+        })
+      : Promise.resolve({ resolved: "", entries: [] });
+    return Promise.all([Promise.resolve(refs), api("/api/stats"), logP]);
+  }).then(([refs, stats, log]) => {
     clear(root);
     const counters = (stats && stats.counters) || {};
     const totalReq = Object.keys(counters).reduce((a, k) => a + (Number(counters[k]) || 0), 0);
@@ -2225,7 +2246,7 @@ function route() {
 }
 
 /* Test/maintainer handle: intentional, stable, undocumented surface. */
-const __gb = { pollTick, diffLines, buildHunks, fuzzyScore };
+const __gb = { pollTick, diffLines, buildHunks, fuzzyScore, buildAgentPrompt, shellQuote, shellArg };
 if (typeof window !== "undefined") window.__gb = __gb;
 
 function boot() {

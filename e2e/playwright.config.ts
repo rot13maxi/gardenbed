@@ -2,7 +2,6 @@ import { defineConfig } from "@playwright/test";
 
 export const E2E_ROOT = "/tmp/gardenbed-web-e2e-root";
 export const BASE_URL = "http://127.0.0.1:18430";
-const BIN = `${__dirname}/../target/debug/gardenbed-web`;
 
 export default defineConfig({
   testDir: "./tests",
@@ -18,7 +17,7 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   webServer: {
-    command: `${BIN} --root ${E2E_ROOT} --addr 127.0.0.1:18430`,
+    command: `sh ${__dirname}/serve-e2e.sh`,
     url: `${BASE_URL}/api/refs`,
     reuseExistingServer: false,
     timeout: 30_000,
