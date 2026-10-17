@@ -826,3 +826,47 @@ fn pathsummary_rebuild_bytes_identical_and_poison_resistant() {
     );
     assert_eq!(rep, engine_a.pathsummary_entry(victim).expect("A entry"));
 }
+
+/// A rename source colliding with another change's destination path must
+/// appear exactly once in the path summary (the summary's `paths` list is
+/// the deduplicated dst ∪ src set, ascending by bytes). Regression for the
+/// O(n²) containment scan, which this shape exercised on every insert.
+#[test]
+fn pathsummary_dedups_rename_src_against_dest() {
+    let mut h = Hist::new();
+    // Root: a.txt and b.txt.
+    let c0 = h.commit_with(Vec::new(), "root", |h| {
+        vec![h.add("a.txt", b"aaa\n"), h.add("b.txt", b"bbb\n")]
+    });
+    // Rename a.txt→b.txt's neighbor plus modify b.txt: `b.txt` is both a
+    // rename destination and a plain change path; `a.txt` is a source.
+    // Also rename b.txt→c.txt so `b.txt` is simultaneously a source for
+    // one change and a destination-free path for another.
+    let c1 = h.commit_with(vec![c0], "collide", |h| {
+        vec![
+            h.rename("a.txt", "c.txt", b"aaa\n"),
+            h.modify("a.txt", b"aaa2\n"),
+        ]
+    });
+    let h: GeneratedHistory = {
+        // Reuse the ingest path: build a GeneratedHistory from the Hist.
+        let mut cs = h.cs.clone();
+        let blobs = h.blobs.clone();
+        let head = c1;
+
+        GeneratedHistory {
+            changesets: cs,
+            blob_contents: {
+                let mut v = blobs;
+                v.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                v
+            },
+            head,
+        }
+    };
+    let (ids, engine, _meta) = setup(&h, true);
+    let e1 = engine.pathsummary_entry(ids[1]).unwrap();
+    // a.txt (src + modified dest), c.txt (rename dest): each exactly once.
+    assert_eq!(e1.paths, vec!["a.txt".to_string(), "c.txt".to_string()]);
+    assert!(!e1.truncated, "two paths cannot overflow the cap");
+}

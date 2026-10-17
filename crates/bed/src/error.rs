@@ -255,4 +255,30 @@ pub enum ClientError {
         /// `main`'s current tip (short form), when the server said.
         tip: String,
     },
+
+    /// A mutating ref/head command was refused because commits are still
+    /// queued offline — syncing first keeps the server's view coherent.
+    #[error(
+        "cannot {command} with {pending} pending commit(s) not yet on the server — \
+         run `bed sync` first"
+    )]
+    PendingCommits {
+        /// The refused command's name.
+        command: &'static str,
+        /// How many commits wait for `bed sync`.
+        pending: usize,
+    },
+
+    /// The requested changeset is queued offline: the object is local, but
+    /// its parents may only exist on the server. Sync uploads it first.
+    #[error(
+        "changeset {cs} is pending — {pending} commit(s) not yet on the server; \
+         run `bed sync` to upload it, or log a synced changeset"
+    )]
+    PendingCs {
+        /// The pending changeset (short form).
+        cs: String,
+        /// How many commits wait for `bed sync`.
+        pending: usize,
+    },
 }

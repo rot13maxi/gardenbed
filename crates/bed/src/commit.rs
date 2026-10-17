@@ -36,13 +36,14 @@ use std::str::FromStr;
 
 use gardenbed_model::codec::validate_changeset;
 use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
+use gardenbed_store::ObjectStore as _;
 
 use crate::error::ClientError;
+use crate::queue::PendingFile;
 use crate::rpc::Session;
 use crate::status::{ScanDelta, mtime_ns, scan_paths};
 use crate::treestate::{HINT_VERIFIED, TreestateEntry};
 use crate::workspace::WorkingCopy;
-use gardenbed_store::ObjectStore as _;
 
 /// Blobs at or under this many bytes ride on `CreateChangeset` inline;
 /// heavier ones are uploaded with `PutBlob` first. Mirrors the server's
@@ -82,6 +83,12 @@ pub struct CommitOutcome {
     /// Blobs sent through `PutBlob` (the heavy ones), including any the
     /// crash-recovery retry re-sent.
     pub blobs_uploaded: usize,
+    /// `true`: the server was unreachable at connect time and the commit
+    /// went to the offline queue instead (`bed sync` uploads it later).
+    pub queued: bool,
+    /// When queued: how many commits (this one included) now wait for
+    /// `bed sync`.
+    pub pending: usize,
 }
 
 /// A working file the scan wants written into the changeset (an untracked
@@ -105,6 +112,15 @@ struct WriteEntry {
 /// bed (config, heads, treestate) onto it. After a successful commit, `bed
 /// status` is clean.
 ///
+/// When the server is unreachable *at connect time* — and only then; a
+/// server that answers, even to refuse, is online and its error is
+/// surfaced — the same three phases run offline: prepare (the changeset
+/// is built and content-addressed locally, every changed blob staged
+/// into `.bed/objects`), queue (one sqlite transaction records the
+/// pending row and its treestate patch), and the exact online state
+/// move. Chained offline commits parent onto the previous pending tip;
+/// `bed sync` re-uploads later.
+///
 /// The author comes from the `--author` argument, else the
 /// `GARDENBED_AUTHOR` environment variable, else the working copy's default
 /// identity. Author and committer are the same person at the same instant
@@ -120,11 +136,17 @@ pub async fn commit(
     let (name, email) = resolve_author(author)?;
 
     let mut bed = WorkingCopy::open(state_dir)?;
+    // Open-time recovery (v0.2 §6): a previous run that died between its
+    // queue insert and its state move is completed before anything new
+    // happens. Cheap when the queue is empty.
+    crate::queue::recover(&mut bed)?;
     let sparse = bed.config().sparse.clone();
     let treestate = bed.treestate()?;
     let root = bed.workspace_root();
 
-    // ---- scan + read: the whole delta is known before any network I/O.
+    // ---- prepare: scan → changes → changeset construction. The whole
+    // delta is known, and the changeset content-addressed, before any
+    // network I/O — this is exactly what an offline commit queues.
     let items = scan_paths(&root, &sparse, &treestate, false)?;
     let mut delete_blobs: Vec<(String, Option<Id>)> = Vec::new();
     let mut writes: Vec<WriteEntry> = Vec::new();
@@ -169,19 +191,21 @@ pub async fn commit(
         return Err(ClientError::NothingToCommit);
     }
 
-    // ---- the changeset itself: parent is the working copy's current changeset (a
-    // bed that has never grown anywhere commits a root changeset).
-    let session = Session::open(&bed).await?;
-    let repo = bed.config().repo.clone();
-    let parent = match bed.config().current_cs.as_deref() {
-        Some(hex) => {
-            let id = Id::from_str(hex).map_err(|_| ClientError::NoCurrentCs)?;
-            // A parent the server no longer knows (restarted server)
-            // must fail before anything is uploaded.
-            session.get_changeset(id, "commit").await?;
-            Some(id)
-        }
-        None => None,
+    // The parent: the previous pending tip when the queue is non-empty
+    // (chained offline commits — the server does not have that tip yet),
+    // else the working copy's current changeset (a bed that has never
+    // grown anywhere commits a root changeset).
+    let mut queue = bed.queue()?;
+    let mut parent_from_config = false;
+    let parent = match queue.tip()? {
+        Some(tip) => Some(tip),
+        None => match bed.config().current_cs.as_deref() {
+            Some(hex) => {
+                parent_from_config = true;
+                Some(Id::from_str(hex).map_err(|_| ClientError::NoCurrentCs)?)
+            }
+            None => None,
+        },
     };
 
     let (time_secs, tz_min) = now_stamp();
@@ -202,31 +226,82 @@ pub async fn commit(
     // The scan only ever produces flat relative paths, but the codec is the
     // authority on changeset shape — fail here, before any upload, if
     // anything is off.
-    validate_changeset(&cs, true).map_err(|e| {
+    let invalid = |e: gardenbed_model::codec::CodecError| {
         ClientError::ConfigInvalid(format!("the created changeset is not valid: {e}"))
-    })?;
+    };
+    validate_changeset(&cs, true).map_err(invalid)?;
+    let canonical = cs.canonical_bytes().map_err(invalid)?;
+    let cs_id = cs.id().map_err(invalid)?;
 
-    // ---- two-phase upload. `inline` covers small blobs within the total
-    // request budget (the server skips content it already has); other blobs go first,
-    // cache-write before wire so a killed commit never uploads twice.
-    let objects = bed.objects()?;
-    let mut inline: Vec<(Id, Vec<u8>)> = Vec::new();
-    let mut heavy: Vec<(Id, Vec<u8>)> = Vec::new();
-    let mut inline_bytes = 0usize;
+    // The treestate patch this commit's state move applies — also the
+    // `pending_files` rows when the commit is queued.
+    let files: Vec<PendingFile> = writes
+        .iter()
+        .map(|w| PendingFile {
+            path: w.path.clone(),
+            blob_id: w.blob,
+            mode: w.mode,
+            size: w.size,
+            mtime_ns: w.mtime_ns,
+        })
+        .collect();
+
+    // The distinct changed blobs, classified exactly as the upload will
+    // send them (same content at several paths uploads once).
+    let mut blobs: Vec<(Id, Vec<u8>)> = Vec::new();
     let mut seen: HashMap<Id, ()> = HashMap::new();
     for w in &writes {
         if seen.insert(w.blob, ()).is_some() {
-            continue; // same content at several paths uploads once
+            continue;
         }
-        if w.content.len() <= INLINE_BLOB_LIMIT
-            && w.content.len() <= INLINE_TOTAL_LIMIT - inline_bytes
-        {
-            inline_bytes += w.content.len();
-            inline.push((w.blob, w.content.clone()));
-        } else {
-            heavy.push((w.blob, w.content.clone()));
-        }
+        blobs.push((w.blob, w.content.clone()));
     }
+    let (inline, heavy) = split_inline(blobs);
+
+    // ---- connect. A connect-time failure is the one condition that
+    // queues: the server is unreachable, not refusing.
+    let session = match Session::open(&bed).await {
+        Ok(session) => session,
+        Err(e) if crate::queue::is_connect_error(&e) => {
+            // ---- offline: stage every changed blob into the local cache
+            // (sync re-uploads from there), record the queue row, and
+            // perform the exact online state move.
+            let objects = bed.objects()?;
+            for (id, content) in inline.iter().chain(&heavy) {
+                if !objects.has(*id)? {
+                    objects.put_blob(content)?;
+                }
+            }
+            let pending = queue.enqueue(cs_id, parent, &canonical, message, &files)?;
+            move_state(&mut bed, &treestate, &changes, &files, cs_id, false)?;
+            return Ok(CommitOutcome {
+                cs_id,
+                parent,
+                added: changes.iter().filter(|c| c.op == Op::Add).count(),
+                modified: changes.iter().filter(|c| c.op == Op::Modify).count(),
+                deleted: changes.iter().filter(|c| c.op == Op::Delete).count(),
+                renamed,
+                blobs_inline: inline.len(),
+                blobs_uploaded: 0,
+                queued: true,
+                pending,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+
+    // A parent the server no longer knows (restarted server) must fail
+    // before anything is uploaded. Skipped for a pending tip — the server
+    // legitimately does not have it yet.
+    if parent_from_config && let Some(id) = parent {
+        session.get_changeset(id, "commit").await?;
+    }
+
+    // ---- upload. `inline` covers small blobs within the total request
+    // budget (the server skips content it already has); other blobs go first,
+    // cache-write before wire so a killed commit never uploads twice.
+    let repo = bed.config().repo.clone();
+    let objects = bed.objects()?;
     let mut uploaded = 0usize;
     for (id, content) in &heavy {
         // Cache-first: once the bytes are in `.bed/objects`, a rerun after
@@ -234,12 +309,12 @@ pub async fn commit(
         // exception is caught by the retry below).
         if !objects.has(*id)? {
             objects.put_blob(content)?;
-            put_blob_heavy(&session, &repo, *id, content).await?;
+            put_blob_heavy(&session, &repo, *id, content, "commit").await?;
             uploaded += 1;
         }
     }
 
-    let cs_id = match session
+    let ack = match session
         .client
         .create_changeset(&repo, &cs, inline.clone())
         .await
@@ -254,7 +329,7 @@ pub async fn commit(
             // every heavy blob again and retry once — from here on the
             // server provably has them.
             for (id, content) in &heavy {
-                put_blob_heavy(&session, &repo, *id, content).await?;
+                put_blob_heavy(&session, &repo, *id, content, "commit").await?;
                 uploaded += 1;
             }
             match session
@@ -280,6 +355,11 @@ pub async fn commit(
             });
         }
     };
+    // Content-addressed: the server's answer must be the id prepare
+    // computed locally, byte-exactly.
+    if ack != cs_id {
+        return Err(ClientError::BlobHashMismatch(ack));
+    }
     // The inline blobs are now known-good on the server; keep them in
     // the local cache too so future reads never re-fetch them.
     for (id, content) in &inline {
@@ -289,33 +369,7 @@ pub async fn commit(
     }
 
     // ---- commit the local state. From here on the commit has happened.
-    bed.config_mut().current_cs = Some(cs_id.to_hex());
-    bed.save_config()?;
-    bed.heads().append(cs_id)?;
-    for c in &changes {
-        match c.op {
-            Op::Delete => {
-                treestate.remove(&c.path)?;
-            }
-            Op::Add | Op::Modify | Op::Rename => {
-                if let Some(src) = &c.src_path {
-                    treestate.remove(src)?;
-                }
-                let w = writes
-                    .iter()
-                    .find(|w| w.path == c.path)
-                    .expect("every created write came from a scanned working file");
-                treestate.upsert(&TreestateEntry {
-                    path: c.path.clone(),
-                    blob_id: w.blob,
-                    mode: w.mode,
-                    size: w.size,
-                    mtime_ns: w.mtime_ns,
-                    hint: HINT_VERIFIED,
-                })?;
-            }
-        }
-    }
+    move_state(&mut bed, &treestate, &changes, &files, cs_id, false)?;
 
     Ok(CommitOutcome {
         cs_id,
@@ -326,11 +380,92 @@ pub async fn commit(
         renamed,
         blobs_inline: inline.len(),
         blobs_uploaded: uploaded,
+        queued: false,
+        pending: 0,
     })
+}
+
+/// Moves the bed onto `cs_id` after the changeset exists (on the server,
+/// or in the queue): `config.current_cs`, a new heads tip, and treestate
+/// rows refreshed to the freshly observed blob ids, modes and stat
+/// metadata. Every write is idempotent, so recovery replays it freely;
+/// in recovery (`recovering`) the heads append becomes check-then-append,
+/// the one write that is not naturally idempotent.
+pub(crate) fn move_state(
+    bed: &mut WorkingCopy,
+    treestate: &crate::treestate::Treestate,
+    changes: &[Change],
+    files: &[PendingFile],
+    cs_id: Id,
+    recovering: bool,
+) -> Result<(), ClientError> {
+    bed.config_mut().current_cs = Some(cs_id.to_hex());
+    bed.save_config()?;
+    let heads = bed.heads();
+    if recovering && heads.read()?.contains(&cs_id) {
+        // The crashed run appended this tip already.
+    } else {
+        heads.append(cs_id)?;
+    }
+    for c in changes {
+        match c.op {
+            Op::Delete => {
+                treestate.remove(&c.path)?;
+            }
+            Op::Add | Op::Modify | Op::Rename => {
+                if let Some(src) = &c.src_path {
+                    treestate.remove(src)?;
+                }
+                let f = files
+                    .iter()
+                    .find(|f| f.path == c.path)
+                    .expect("every created write came from a scanned working file");
+                treestate.upsert(&TreestateEntry {
+                    path: c.path.clone(),
+                    blob_id: f.blob_id,
+                    mode: f.mode,
+                    size: f.size,
+                    mtime_ns: f.mtime_ns,
+                    hint: HINT_VERIFIED,
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Classifies distinct blobs into the inline payload (each within
+/// [`INLINE_BLOB_LIMIT`], together within [`INLINE_TOTAL_LIMIT`]) and the
+/// heavy ones `PutBlob` must stream first — the same split the upload and
+/// `bed sync` apply.
+pub(crate) fn split_inline(blobs: Vec<(Id, Vec<u8>)>) -> (Vec<(Id, Vec<u8>)>, Vec<(Id, Vec<u8>)>) {
+    let mut inline = Vec::new();
+    let mut heavy = Vec::new();
+    let mut inline_bytes = 0usize;
+    for (id, content) in blobs {
+        if content.len() <= INLINE_BLOB_LIMIT && content.len() <= INLINE_TOTAL_LIMIT - inline_bytes
+        {
+            inline_bytes += content.len();
+            inline.push((id, content));
+        } else {
+            heavy.push((id, content));
+        }
+    }
+    (inline, heavy)
 }
 
 /// Renders a [`CommitOutcome`] in the working copy voice the CLI prints.
 pub fn render_outcome(outcome: &CommitOutcome) -> String {
+    let mut out = String::new();
+    if outcome.queued {
+        // The offline queue line comes first: it says where the commit
+        // landed, before the working-copy details.
+        out.push_str(&format!(
+            "queued as {} ({} pending — run bed sync when online)\n",
+            outcome.cs_id.short(),
+            outcome.pending,
+        ));
+    }
     let n = outcome.added + outcome.modified + outcome.deleted + outcome.renamed;
     let mut parts = Vec::new();
     if outcome.added > 0 {
@@ -349,14 +484,14 @@ pub fn render_outcome(outcome: &CommitOutcome) -> String {
         Some(p) => format!(" (was {})", p.short()),
         None => " — initial changeset".to_owned(),
     };
-    let mut out = format!(
+    out.push_str(&format!(
         "created changeset {}: {} change(s) ({})\nworking copy at {}{}\n",
         outcome.cs_id.short(),
         n,
         parts.join(", "),
         outcome.cs_id.short(),
         was,
-    );
+    ));
     if outcome.blobs_uploaded > 0 {
         out.push_str(&format!(
             "{} blob(s) uploaded separately, {} sent inline\n",
@@ -485,12 +620,14 @@ fn mode_of(meta: &std::fs::Metadata) -> i64 {
     }
 }
 
-/// Streams one heavy blob to the server's `PutBlob`.
-async fn put_blob_heavy(
+/// Streams one heavy blob to the server's `PutBlob`. `command` names the
+/// caller ("commit" or "sync") in RPC error messages.
+pub(crate) async fn put_blob_heavy(
     session: &Session,
     repo: &str,
     id: Id,
     content: &[u8],
+    command: &'static str,
 ) -> Result<(), ClientError> {
     let chunks: Vec<Vec<u8>> = content.chunks(PUT_BLOB_CHUNK).map(<[u8]>::to_vec).collect();
     match session
@@ -501,7 +638,7 @@ async fn put_blob_heavy(
         Ok(received) if received == id => Ok(()),
         Ok(received) => Err(ClientError::BlobHashMismatch(received)),
         Err(status) => Err(ClientError::Rpc {
-            command: "commit",
+            command,
             code: status.code(),
             message: status.message().to_owned(),
         }),
@@ -592,7 +729,7 @@ fn build_changes(
 }
 
 /// The treestate's §4 mode code → the model's [`Mode`].
-pub(crate) fn mode_code_to_mode(code: i64) -> Mode {
+fn mode_code_to_mode(code: i64) -> Mode {
     match code {
         crate::treestate::MODE_EXEC => Mode::Exec,
         crate::treestate::MODE_SYMLINK => Mode::Symlink,
