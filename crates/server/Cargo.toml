@@ -23,6 +23,7 @@ gardenbed-protocol = { path = "../protocol" }
 log = "0.4"
 prost = "0.14"
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
@@ -40,6 +41,7 @@ tonic = { version = "0.14.6", default-features = false, features = [
     "codegen",
     "channel",
 ] }
+toml = "1"
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }

@@ -14,6 +14,8 @@
 //! (`not_found`), bad input (`invalid_argument`), and semantic precondition
 //! violations (`failed_precondition`).
 
+pub mod auth;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -858,12 +860,22 @@ impl From<ServerError> for Status {
 /// `Gardenbed` trait (all 17 RPCs of v0.1.md §5).
 pub struct GardenbedService {
     repo: Arc<Repo>,
+    auth: Option<Arc<auth::AuthPolicy>>,
 }
 
 impl GardenbedService {
     /// A service over `repo` (shared behind an `Arc`).
     pub fn new(repo: Arc<Repo>) -> Self {
-        GardenbedService { repo }
+        GardenbedService { repo, auth: None }
+    }
+
+    /// A service over `repo` that authenticates bearer tokens against
+    /// `policy` (see [`auth`]); `None` auth means an open server.
+    pub fn with_auth(repo: Arc<Repo>, policy: auth::AuthPolicy) -> Self {
+        GardenbedService {
+            repo,
+            auth: Some(Arc::new(policy)),
+        }
     }
 
     /// The request's `repo` field: validated non-empty and logged. Every
@@ -877,6 +889,23 @@ impl GardenbedService {
         }
         log::debug!("request rpc={rpc} repo={repo}");
         Ok(repo)
+    }
+
+    /// Enforces the token policy for `repo` before any store is touched.
+    /// With no policy configured the server is open (back-compat).
+    fn authorize(&self, token: Option<&str>, repo: &str, needed: auth::Role) -> Result<(), Status> {
+        let Some(policy) = &self.auth else {
+            return Ok(());
+        };
+        match policy.check(token, repo, needed) {
+            auth::Decision::Allow => Ok(()),
+            auth::Decision::Anonymous => Err(Status::permission_denied(format!(
+                "access to repository \"{repo}\" requires a token; set GARDENBED_TOKEN or send an \"authorization: Bearer <token>\" header"
+            ))),
+            auth::Decision::Denied => Err(Status::permission_denied(format!(
+                "access to repository \"{repo}\" denied for this token; ask an administrator for access or use a token with the right role"
+            ))),
+        }
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -894,6 +923,14 @@ impl GardenbedService {
         if let Some(c) = self.repo.counter(name) {
             c.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The bearer token from `authorization` metadata (`Bearer <token>`),
+    /// if present and well-formed.
+    fn token(meta: &tonic::metadata::MetadataMap) -> Option<&str> {
+        let value = meta.get("authorization")?.to_str().ok()?;
+        let token = value.strip_prefix("Bearer ")?;
+        (!token.is_empty()).then_some(token)
     }
 }
 
@@ -915,8 +952,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::RootTreeResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "RootTree")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let tree = self.repo.root_tree(cs_id)?;
         Ok(Response::new(pb::RootTreeResp {
@@ -928,8 +966,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::GetTreeReq>,
     ) -> Result<Response<pb::TreeResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "GetTree")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         self.bump("get_tree");
         let id = Self::id(&req.id, "id")?;
         let Some(tree) = self.repo.get_tree(id)? else {
@@ -944,8 +983,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::GetBlobReq>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "GetBlob")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         self.bump("get_blob");
         let id = Self::id(&req.id, "id")?;
         let Some(content) = self.repo.get_blob(id)? else {
@@ -962,8 +1002,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::ChangesetMsg>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "GetChangeset")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let cs = self.repo.get_changeset(cs_id)?;
         let msg = pb::ChangesetMsg::try_from(&cs).map_err(|e| {
@@ -976,7 +1017,7 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<Streaming<pb::PutBlobChunk>>,
     ) -> Result<Response<pb::PutBlobResp>, Status> {
-        let mut stream = request.into_inner();
+        let (meta, _, mut stream) = request.into_parts();
         // The first frame MUST be the header naming the repo (client
         // streaming has no unary request message).
         let first = stream.message().await?.ok_or_else(|| {
@@ -996,6 +1037,7 @@ impl Gardenbed for GardenbedService {
             }
         };
         self.repo_field(&repo_name, "PutBlob")?;
+        self.authorize(Self::token(&meta), &repo_name, auth::Role::Write)?;
 
         let mut body = Vec::new();
         while let Some(chunk) = stream.message().await? {
@@ -1024,8 +1066,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::CreateChangesetReq>,
     ) -> Result<Response<pb::CreateChangesetResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "CreateChangeset")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
         let msg = req
             .cs
             .ok_or_else(|| Status::invalid_argument("CreateChangesetReq carries no changeset"))?;
@@ -1056,8 +1099,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::MergeBaseReq>,
     ) -> Result<Response<pb::MergeBaseResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "MergeBase")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
         let base = self.repo.merge_base(a, b)?;
@@ -1070,8 +1114,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::IsAncestorReq>,
     ) -> Result<Response<pb::IsAncestorResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "IsAncestor")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
         let is_ancestor = self.repo.is_ancestor(a, b)?;
@@ -1082,8 +1127,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::DiffReq>,
     ) -> Result<Response<Self::DiffStream>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "Diff")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
         let changes = self.repo.diff(a, b)?;
@@ -1095,8 +1141,9 @@ impl Gardenbed for GardenbedService {
     }
 
     async fn log(&self, request: Request<pb::LogReq>) -> Result<Response<Self::LogStream>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "Log")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let entries = self.repo.log(cs_id, req.limit)?;
         let items = entries.into_iter().map(|(id, cs)| {
@@ -1115,8 +1162,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::BlameReq>,
     ) -> Result<Response<Self::BlameStream>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "Blame")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let ranges = self.repo.blame(cs_id, &req.path)?;
         let items = ranges.into_iter().map(|(lo, hi, cs)| {
@@ -1133,8 +1181,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::ListRefsReq>,
     ) -> Result<Response<Self::ListRefsStream>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "ListRefs")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         let refs = self.repo.list_refs()?;
         let items = refs.into_iter().map(|(name, cs_id)| {
             Ok(pb::RefEntry {
@@ -1157,8 +1206,9 @@ impl Gardenbed for GardenbedService {
         // → `invalid_argument` with the minimum-length hint). A full
         // 64-hex token stays a ref name here — clients parse those as ids
         // before any lookup.
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "GetRef")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
@@ -1172,8 +1222,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::CasRefReq>,
     ) -> Result<Response<pb::CasResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "CasRef")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
@@ -1198,8 +1249,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::RebaseReq>,
     ) -> Result<Response<pb::RebaseResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "Rebase")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let new_parent = Self::id(&req.new_parent, "new_parent")?;
         let id = self.repo.rebase(cs_id, new_parent)?;
@@ -1212,8 +1264,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::PublishReq>,
     ) -> Result<Response<pb::PublishResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "Publish")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let id = self.repo.publish(cs_id)?;
         Ok(Response::new(pb::PublishResp {
@@ -1225,8 +1278,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::MergeReq>,
     ) -> Result<Response<pb::MergeResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "Merge")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let target = Self::id(&req.target, "target")?;
         let author = req
@@ -1250,8 +1304,9 @@ impl Gardenbed for GardenbedService {
         &self,
         request: Request<pb::GetStatsReq>,
     ) -> Result<Response<pb::StatsResp>, Status> {
-        let req = request.into_inner();
+        let (meta, _, req) = request.into_parts();
         self.repo_field(&req.repo, "GetStats")?;
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
         Ok(Response::new(pb::StatsResp {
             counters: self.repo.stats().into_iter().collect(),
         }))
