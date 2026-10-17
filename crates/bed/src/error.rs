@@ -141,6 +141,29 @@ pub enum ClientError {
         message: String,
     },
 
+    /// A merge was refused for semantic conflicts: the server lists every
+    /// conflicting path; resolution belongs in the working copy.
+    #[error(
+        "merge conflicts on: {paths}\n  \
+         next step: edit the conflicting files, commit, and merge again"
+    )]
+    MergeConflict {
+        /// The conflicting paths, comma-separated server message style.
+        paths: String,
+    },
+
+    /// A merge was refused locally: the working copy has uncommitted
+    /// work that the post-merge checkout would put at risk. Checked
+    /// before the RPC so the server stores nothing on refusal.
+    #[error(
+        "merge refuses a dirty working copy — commit or preserve local work \
+         first:\n{detail}"
+    )]
+    MergeDirtyWorkingCopy {
+        /// The `bed status` rendering of what is dirty.
+        detail: String,
+    },
+
     /// The command needs a current changeset and the working copy has none.
     #[error(
         "this working copy has no current changeset — create one with `bed clone` or \
