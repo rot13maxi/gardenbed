@@ -11,15 +11,15 @@ is needed. Tool calls do not create changesets or update refs.
 cargo build -p gardenbed-mcp
 # Query repository storage over stdio:
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  | gardenbed-mcp --root /srv/repository
+  | gardenbed-mcp --root /srv/gardenbed --repo myrepo
 ```
 
 Options:
 
 | Flag | Meaning |
 |---|---|
-| `--root <DIR>` (required) | The server's data dir: its `objects/` object store and `metadata.sqlite3` metadata database — the same directory `gardenbed-server --root` serves. |
-| `--repo <NAME>` | Accepted for forward compatibility; v0.1 servers are single-repo and the name is validated but otherwise unused (the API carries a repo field from day one, v0.1.md §1). |
+| `--root <DIR>` (required) | The server's root directory — the same directory `gardenbed-server --root` serves. |
+| `--repo <NAME>` | The repository name under the root (default `default`, the name a v0.1 root serves as). The session answers from this repository only; an unknown name exits 1 listing what the root serves. |
 
 The server speaks newline-delimited JSON-RPC 2.0 on stdin/stdout. EOF on
 stdin ends it cleanly (exit 0); a server that will not open exits 1
@@ -35,7 +35,7 @@ Any MCP client that launches stdio servers can attach. The generic shape:
   "mcpServers": {
     "gardenbed": {
       "command": "gardenbed-mcp",
-      "args": ["--root", "/srv/repository"]
+      "args": ["--root", "/srv/gardenbed", "--repo", "myrepo"]
     }
   }
 }

@@ -7,7 +7,36 @@ tags, and the verification record for a release lives in
 
 ## Unreleased
 
+### Added
+
+- **Multi-repository serving** (v0.2.md §5, M11): one server process
+  serves any number of repositories from a root directory
+  (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); the
+  directory tree is the registry. Repositories open lazily on first
+  request (singleflighted), `--max-repos` (default 256) caps open handles
+  with LRU eviction of idle ones, and per-repository request counters
+  stay per-repository. Unknown repository names fail `not_found` listing
+  the served names; illegal and reserved names fail `invalid_argument`.
+- `gardenbed-server import --repo` and `export --repo` target a named
+  repository; per-repository git mirrors live at
+  `<root>/<repo>/git-mirror.git`.
+- `gardenbed-server move --from NAME --into NEW-NAME` renames a
+  repository under the root; history is byte-identical after the move.
+- `bed clone http://host:port/<repo>` (M12): an http(s) URL's path names
+  the repository; `--repo` wins on conflict. URL-clone and `--repo`-flag
+  clone produce identical working-copy configs.
+- `gardenbed-mcp --repo` is load-bearing: the named repository is the
+  only one the session answers from; an unknown name exits 1 listing
+  what the root serves.
+
 ### Changed
+
+- `gardenbed-server --root` takes the server root (one subdirectory per
+  repository) rather than a single repository directory. A root laid out
+  the v0.1 way (stores at the top level) keeps serving unchanged as the
+  repository named `default`, so existing roots need no migration; use
+  `gardenbed-server move --from default --into NAME` to adopt the
+  per-directory layout.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names

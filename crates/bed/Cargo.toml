@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+http = "1"
 gardenbed-model.workspace = true
 # Not in `[workspace.dependencies]` yet; path until the orchestrator adds it.
 gardenbed-store = { path = "../store" }
