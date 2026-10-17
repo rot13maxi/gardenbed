@@ -419,7 +419,7 @@ pub fn parse_author(raw: &str) -> Result<(String, String), ClientError> {
 
 /// The wall-clock identity stamp: Unix seconds plus the local zone offset
 /// in minutes east of UTC (git-native, never normalized).
-fn now_stamp() -> (u64, i32) {
+pub(crate) fn now_stamp() -> (u64, i32) {
     let now = chrono::Local::now();
     let secs = now.timestamp().max(0) as u64;
     let tz_min = now.offset().local_minus_utc() / 60;
