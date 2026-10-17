@@ -1002,11 +1002,13 @@ dependencies = [
  "log",
  "prost",
  "rusqlite",
+ "serde",
  "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tokio-stream",
+ "toml",
  "tonic",
  "zstd",
 ]

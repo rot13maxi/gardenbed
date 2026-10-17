@@ -14,6 +14,7 @@
 //! schemes natively.
 
 use std::collections::BTreeMap;
+use std::str::FromStr;
 
 use gardenbed_model as model;
 use tokio_stream::{Stream, StreamExt};
@@ -60,6 +61,9 @@ pub enum CasOutcome {
 #[derive(Debug, Clone)]
 pub struct GardenbedClient {
     inner: pb::gardenbed_client::GardenbedClient<Channel>,
+    /// The full `authorization` header value (`Bearer <token>`), attached
+    /// to every request when set.
+    token: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
 impl GardenbedClient {
@@ -91,7 +95,16 @@ impl GardenbedClient {
         let channel = Endpoint::from_shared(endpoint.to_owned())?
             .connect()
             .await?;
-        Ok(Self::from_channel(channel))
+        let mut client = Self::from_channel(channel);
+        // GARDENBED_TOKEN, when set in the environment, authenticates every
+        // request (bed and the daemon forward it; see docs/cli.md). This is
+        // the single knob bed exposes — no CLI flag, no config key.
+        if let Ok(token) = std::env::var("GARDENBED_TOKEN")
+            && !token.is_empty()
+        {
+            client = client.with_token(&token);
+        }
+        Ok(client)
     }
 
     /// Wraps an already-established channel (e.g. from
@@ -99,7 +112,41 @@ impl GardenbedClient {
     pub fn from_channel(channel: Channel) -> Self {
         Self {
             inner: pb::gardenbed_client::GardenbedClient::new(channel),
+            token: None,
         }
+    }
+
+    /// Authenticates every request with `token` (a `Bearer` authorization
+    /// header). Panics if `token` is not a valid header value (printable
+    /// ASCII); tokens come from trusted configuration.
+    pub fn with_token(mut self, token: &str) -> Self {
+        self.token = Some(
+            tonic::metadata::MetadataValue::from_str(&format!("Bearer {token}"))
+                .expect("token must be a printable-ASCII header value"),
+        );
+        self
+    }
+
+    /// Sets (or clears) the raw `authorization` header value sent with every
+    /// request. The daemon uses this to forward a downstream client's
+    /// credentials per request; `None` sends no header.
+    pub fn with_auth_value(
+        mut self,
+        value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    ) -> Self {
+        self.token = value;
+        self
+    }
+
+    /// Wraps `msg` in a request carrying this client's credentials.
+    fn request<T>(&self, msg: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(msg);
+        if let Some(value) = &self.token {
+            request
+                .metadata_mut()
+                .insert("authorization", value.clone());
+        }
+        request
     }
 
     /// The underlying generated tonic client, for callers that need
@@ -127,7 +174,7 @@ impl GardenbedClient {
             cs_id: id_to_bytes(cs_id),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.root_tree(req).await?.into_inner();
+        let resp = inner.root_tree(self.request(req)).await?.into_inner();
         resp.tree_id
             .map(|b| wire_id(&b, "RootTreeResp.tree_id"))
             .transpose()
@@ -140,7 +187,7 @@ impl GardenbedClient {
             id: id_to_bytes(id),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.get_tree(req).await?.into_inner();
+        let resp = inner.get_tree(self.request(req)).await?.into_inner();
         wire_to_model(model::Tree::try_from(resp), "TreeResp")
     }
 
@@ -155,7 +202,7 @@ impl GardenbedClient {
             id: id_to_bytes(id),
         };
         let mut inner = self.inner.clone();
-        Ok(inner.get_blob(req).await?.into_inner())
+        Ok(inner.get_blob(self.request(req)).await?.into_inner())
     }
 
     /// Fetch one changeset.
@@ -169,7 +216,7 @@ impl GardenbedClient {
             cs_id: id_to_bytes(cs_id),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.get_changeset(req).await?.into_inner();
+        let resp = inner.get_changeset(self.request(req)).await?.into_inner();
         wire_to_model(model::Changeset::try_from(resp), "ChangesetMsg")
     }
 
@@ -196,7 +243,7 @@ impl GardenbedClient {
         });
         let frames = tokio_stream::once(header).chain(chunks);
         let mut inner = self.inner.clone();
-        let resp = inner.put_blob(frames).await?.into_inner();
+        let resp = inner.put_blob(self.request(frames)).await?.into_inner();
         wire_id(&resp.id, "PutBlobResp.id")
     }
 
@@ -232,7 +279,10 @@ impl GardenbedClient {
             inline_blobs: inline,
         };
         let mut inner = self.inner.clone();
-        let resp = inner.create_changeset(req).await?.into_inner();
+        let resp = inner
+            .create_changeset(self.request(req))
+            .await?
+            .into_inner();
         wire_id(&resp.id, "CreateChangesetResp.id")
     }
 
@@ -249,7 +299,7 @@ impl GardenbedClient {
             b: id_to_bytes(b),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.merge_base(req).await?.into_inner();
+        let resp = inner.merge_base(self.request(req)).await?.into_inner();
         resp.id.map(|b| wire_id(&b, "MergeBaseResp.id")).transpose()
     }
 
@@ -266,7 +316,11 @@ impl GardenbedClient {
             b: id_to_bytes(b),
         };
         let mut inner = self.inner.clone();
-        Ok(inner.is_ancestor(req).await?.into_inner().is_ancestor)
+        Ok(inner
+            .is_ancestor(self.request(req))
+            .await?
+            .into_inner()
+            .is_ancestor)
     }
 
     /// Stream the change list between the trees of `a` and `b` (a -> b).
@@ -283,7 +337,7 @@ impl GardenbedClient {
             b: id_to_bytes(b),
         };
         let mut inner = self.inner.clone();
-        Ok(inner.diff(req).await?.into_inner())
+        Ok(inner.diff(self.request(req)).await?.into_inner())
     }
 
     /// Log from `cs_id`, newest first, at most `limit` entries (0 =
@@ -301,7 +355,7 @@ impl GardenbedClient {
             limit,
         };
         let mut inner = self.inner.clone();
-        Ok(inner.log(req).await?.into_inner())
+        Ok(inner.log(self.request(req)).await?.into_inner())
     }
 
     /// First-parent lineage blame of one path at `cs_id`, with rename
@@ -318,7 +372,7 @@ impl GardenbedClient {
             path: path.to_owned(),
         };
         let mut inner = self.inner.clone();
-        Ok(inner.blame(req).await?.into_inner())
+        Ok(inner.blame(self.request(req)).await?.into_inner())
     }
 
     // ------------------------------------------------------------- refs
@@ -329,7 +383,7 @@ impl GardenbedClient {
             repo: repo.to_owned(),
         };
         let mut inner = self.inner.clone();
-        Ok(inner.list_refs(req).await?.into_inner())
+        Ok(inner.list_refs(self.request(req)).await?.into_inner())
     }
 
     /// One ref's value; `None` when the ref does not exist.
@@ -339,7 +393,7 @@ impl GardenbedClient {
             name: name.to_owned(),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.get_ref(req).await?.into_inner();
+        let resp = inner.get_ref(self.request(req)).await?.into_inner();
         resp.cs_id
             .map(|b| wire_id(&b, "GetRefResp.cs_id"))
             .transpose()
@@ -362,7 +416,7 @@ impl GardenbedClient {
             new: id_to_bytes(new),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.cas_ref(req).await?.into_inner();
+        let resp = inner.cas_ref(self.request(req)).await?.into_inner();
         match resp.result {
             Some(pb::cas_resp::Result::Won(true)) => Ok(CasOutcome::Won),
             Some(pb::cas_resp::Result::Won(false)) => {
@@ -393,7 +447,7 @@ impl GardenbedClient {
             new_parent: id_to_bytes(new_parent),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.rebase(req).await?.into_inner();
+        let resp = inner.rebase(self.request(req)).await?.into_inner();
         wire_id(&resp.id, "RebaseResp.id")
     }
 
@@ -405,7 +459,7 @@ impl GardenbedClient {
             cs_id: id_to_bytes(cs_id),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.publish(req).await?.into_inner();
+        let resp = inner.publish(self.request(req)).await?.into_inner();
         wire_id(&resp.id, "PublishResp.id")
     }
 
@@ -434,7 +488,7 @@ impl GardenbedClient {
             committer: Some(pb::IdentityMsg::from(committer)),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.merge(req).await?.into_inner();
+        let resp = inner.merge(self.request(req)).await?.into_inner();
         Ok((wire_id(&resp.id, "MergeResp.id")?, resp.up_to_date))
     }
 
@@ -444,7 +498,7 @@ impl GardenbedClient {
             repo: repo.to_owned(),
         };
         let mut inner = self.inner.clone();
-        let resp = inner.get_stats(req).await?.into_inner();
+        let resp = inner.get_stats(self.request(req)).await?.into_inner();
         Ok(resp.counters.into_iter().collect())
     }
 }

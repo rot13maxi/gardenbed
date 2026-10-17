@@ -43,6 +43,23 @@ pub fn bed(dir: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Runs the real `bed` binary in `dir` with `GARDENBED_TOKEN` set (an
+/// authed server's bearer token). Returns (exit code, stdout, stderr).
+pub fn bed_with_token(dir: &Path, args: &[&str], token: &str) -> (i32, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bed"))
+        .current_dir(dir)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("GARDENBED_TOKEN", token)
+        .output()
+        .expect("bed binary spawns");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
 /// Runs the real `bed` binary in `dir`, returning raw (exit code, stdout,
 /// stderr) bytes — for byte-exact output comparisons (`bed file`).
 pub fn bed_raw(dir: &Path, args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
@@ -117,6 +134,46 @@ impl Server {
     /// `listening on <addr>` stdout line.
     pub async fn spawn(root: &Path) -> Self {
         let mut child = tokio::process::Command::new(server_bin())
+            .arg("--addr")
+            .arg("127.0.0.1:0")
+            .arg("--root")
+            .arg(root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("gardenbed-server binary spawns");
+        let stdout = child.stdout.take().expect("server stdout piped");
+        let line = timeout(Duration::from_secs(30), async {
+            let mut lines = BufReader::new(stdout).lines();
+            lines
+                .next_line()
+                .await
+                .expect("server stdout open")
+                .expect("server prints a line")
+        })
+        .await
+        .expect("server announces itself within 30s");
+        let addr = line
+            .strip_prefix("listening on ")
+            .unwrap_or_else(|| panic!("expected a listening line, got {line:?}"))
+            .to_owned();
+        Server {
+            child,
+            addr,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Spawns the server binary over `root` with token auth from
+    /// `auth_path` (`serve --auth`), waiting for its `listening on
+    /// <addr>` stdout line. `spawn` (no auth) stays the open-server
+    /// default.
+    pub async fn spawn_with_auth(root: &Path, auth_path: &Path) -> Self {
+        let mut child = tokio::process::Command::new(server_bin())
+            .arg("serve")
+            .arg("--auth")
+            .arg(auth_path)
             .arg("--addr")
             .arg("127.0.0.1:0")
             .arg("--root")
@@ -406,6 +463,31 @@ pub fn bed_via_daemon(daemon: &Daemon, dir: &Path, args: &[&str]) -> (i32, Strin
         .env("NO_COLOR", "1")
         .env("GARDENBED_DAEMON", &daemon.socket)
         .env("XDG_CACHE_HOME", &daemon.cache_home)
+        .output()
+        .expect("bed binary spawns");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Runs the real `bed` binary in `dir` **through the daemon** and with
+/// `GARDENBED_TOKEN` set: the token must survive bed → daemon → authed
+/// server. Returns (exit code, stdout, stderr).
+pub fn bed_via_daemon_with_token(
+    daemon: &Daemon,
+    dir: &Path,
+    args: &[&str],
+    token: &str,
+) -> (i32, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bed"))
+        .current_dir(dir)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("GARDENBED_DAEMON", &daemon.socket)
+        .env("XDG_CACHE_HOME", &daemon.cache_home)
+        .env("GARDENBED_TOKEN", token)
         .output()
         .expect("bed binary spawns");
     (

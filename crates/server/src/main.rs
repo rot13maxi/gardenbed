@@ -10,6 +10,9 @@
 //!       ephemeral port; the bound address is printed to stdout).
 //!     * `--root` — repository directory (required): holds `<root>/objects/`
 //!       and `<root>/metadata.sqlite3`, created if missing.
+//!     * `--auth` — optional token auth config (`auth.toml`; `serve`
+//!       subcommand only): bearer-token access to repositories. Without
+//!       it the server is open.
 //!
 //! * `gardenbed-server import --from <repo> --root DIR [--limit N]
 //!   [--renames on|off] [--ref <pattern>...]` — ingests a git repository
@@ -62,6 +65,11 @@ enum Command {
         /// `<root>/metadata.sqlite3`.
         #[arg(long)]
         root: Option<PathBuf>,
+        /// Token auth config (`auth.toml`): `[tokens.<token>]` entries with
+        /// `repos` (names, or `*` for any) and `role` (read/write/admin).
+        /// Without this flag the server is open.
+        #[arg(long, value_name = "PATH")]
+        auth: Option<PathBuf>,
     },
     /// Import Git history into a repository.
     Import {
@@ -137,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        Some(Command::Serve { addr, root }) => serve(addr, root).await,
+        Some(Command::Serve { addr, root, auth }) => serve(addr, root, auth).await,
         Some(Command::Export {
             root,
             into,
@@ -150,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
-        None => serve(args.addr, args.root).await,
+        None => serve(args.addr, args.root, None).await,
     }
 }
 
@@ -225,6 +233,7 @@ fn run_import(
 async fn serve(
     addr_arg: String,
     root_arg: Option<PathBuf>,
+    auth: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(root) = root_arg.filter(|p| !p.as_os_str().is_empty()) else {
         eprintln!("error: --root is required (the repository directory)");
@@ -247,14 +256,26 @@ async fn serve(
         // total; with nodelay, 0.66 s — see docs/release-0.1.md).
         .with_nodelay(Some(true));
     let bound = incoming.local_addr()?;
+    // Auth is loaded before the listening line: a config error must abort
+    // startup without ever advertising an address.
+    let service = match auth {
+        Some(path) => {
+            let policy = gardenbed_server::auth::AuthPolicy::load(&path).unwrap_or_else(|msg| {
+                eprintln!("error: {msg}");
+                std::process::exit(2);
+            });
+            log::info!("token auth enabled ({} tokens)", policy.token_count());
+            GardenbedService::with_auth(repo, policy)
+        }
+        None => GardenbedService::new(repo),
+    };
     // The bound address goes to stdout: it is the contract for tests and
     // scripts that need to learn an ephemeral port.
     println!("listening on {bound}");
     log::info!("gardenbed-server listening addr={bound}");
-
     Server::builder()
         .add_service(gardenbed_protocol::gardenbed_server::GardenbedServer::new(
-            GardenbedService::new(repo),
+            service,
         ))
         .serve_with_incoming_shutdown(incoming, shutdown_signal())
         .await?;

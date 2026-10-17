@@ -379,7 +379,28 @@ Usage: gardenbed-server serve [OPTIONS]
 ```
 
 Serves the gRPC API. Takes the same `--addr`/`--root` flags; this is the
-default when no subcommand is given.
+default when no subcommand is given (then only the top-level flags
+apply).
+
+| flag | meaning |
+|---|---|
+| `--auth <PATH>` | optional token auth config (`auth.toml`): `[tokens.<token>]` entries, each with `repos` (repository names, or `*` for any) and `role` (`read`, `write`, or `admin`; admin implies write, write implies read). Without the flag the server is open. A malformed file refuses startup |
+
+Clients authenticate with the gRPC `authorization: Bearer <token>`
+metadata; `bed` sends it when `GARDENBED_TOKEN` is set in its
+environment. Anonymous or insufficient tokens get `PERMISSION_DENIED`
+naming the repository and the next step.
+
+```toml
+# auth.toml — gardenbed-server serve --auth auth.toml
+[tokens."operator-token"]
+repos = ["garden"]
+role = "write"
+
+[tokens."auditor-token"]
+repos = ["*"]        # any repository
+role = "read"
+```
 
 ### gardenbed-server import
 

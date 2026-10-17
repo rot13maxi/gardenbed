@@ -60,6 +60,20 @@ default `127.0.0.1:9418`), `import`, `export` (see
 [docs/cli.md](cli.md)). The bound address is printed on stdout's first
 line (`listening on …`) — the contract scripts rely on.
 
+**Token auth (`serve --auth <auth.toml>`, v0.2).** Optional bearer-token
+authentication with per-repository roles: each `[tokens.<token>]` entry
+lists the repositories it may access (`*` matches any) and a role —
+`read` (object and history RPCs), `write` (also object upload, ref
+writes, publish, merge), or `admin` (implies write). Enforcement is
+centralized in `GardenbedService::authorize`, checked for every RPC
+before any store is touched; credentials ride the gRPC `authorization:
+Bearer <token>` metadata, which `bed` sends when `GARDENBED_TOKEN` is
+set and the daemon forwards verbatim. Without `--auth` the server is
+open (every v0.1 workflow unchanged); with it, anonymous or
+insufficient tokens get `PERMISSION_DENIED` naming the repository and
+the next step, and unauthorized callers learn nothing about repository
+existence.
+
 **Revspec resolution (`Repo::get_ref`, also served by the `GetRef`
 RPC).** One resolver funnels every id-taking surface:
 

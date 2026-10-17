@@ -13,7 +13,9 @@
 //! * [`convert`] — `TryFrom` bridges between wire messages and model types,
 //!   mapping malformed wire data to [`ConversionError`].
 //! * [`client`] — a thin typed wrapper [`GardenbedClient`] over the generated
-//!   tonic client (TCP and unix-socket endpoints).
+//!   tonic client (TCP and unix-socket endpoints), with optional bearer
+//!   token auth (see [`GardenbedClient::with_token`]; `connect` picks up
+//!   `GARDENBED_TOKEN` from the environment).
 
 pub mod client;
 pub mod convert;
