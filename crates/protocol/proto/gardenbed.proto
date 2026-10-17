@@ -333,7 +333,6 @@ message MergeResp {
   bool up_to_date = 2;
 }
 
-// Fast-forwards ref "main" to `cs_id`: asserts IsAncestor(current main,
 // Fast-forwards a ref to `cs_id`: asserts IsAncestor(current ref value,
 // cs_id), then CAS-moves the ref (v0.1.md D5). Violating the ancestry
 // precondition fails with FAILED_PRECONDITION.
