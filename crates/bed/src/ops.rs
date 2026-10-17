@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::str::FromStr;
 use tokio_stream::StreamExt as _;
 use tonic::Code;
 
@@ -381,6 +382,7 @@ fn bed_state_note(skipped: &[String]) -> String {
 /// an interrupted refresh is repaired by simply running switch again.
 pub async fn switch(state_dir: &Path, spec: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "switch")?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;
     let session = Session::open(&bed).await?;
     let cs = session.resolve(&parsed, "switch").await?;
@@ -495,6 +497,7 @@ pub async fn file(
 /// to the rebased one.
 pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
     let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
     let session = Session::open(&bed).await?;
     let current = session.resolve_current_cs(&bed, "rebase").await?;
@@ -565,6 +568,7 @@ pub async fn publish(
     force: bool,
 ) -> Result<String, ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "publish")?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "publish").await?;
@@ -622,6 +626,47 @@ fn require_current_cs(bed: &WorkingCopy) -> Result<(), ClientError> {
         .ok_or(ClientError::NoCurrentCs)
 }
 
+/// Refuses a mutating ref/head command while offline commits are queued:
+/// moving the working copy's base before the queue drains would strand
+/// the pending chain off the new history. Works offline (queue state is
+/// local). A clean queue is a no-op.
+fn refuse_pending(bed: &WorkingCopy, command: &'static str) -> Result<(), ClientError> {
+    let pending = bed.queue()?.count()?;
+    if pending > 0 {
+        return Err(ClientError::PendingCommits { command, pending });
+    }
+    Ok(())
+}
+
+/// Refuses a read command whose target changeset is a pending tip: the
+/// changeset itself is local, but its parents may only exist on the
+/// server, and these commands answer from the server's walk. With no
+/// explicit target the working copy's current changeset is the check.
+fn refuse_pending_target(bed: &WorkingCopy, cs: Option<&str>) -> Result<(), ClientError> {
+    let queue = bed.queue()?;
+    let pending = queue.count()?;
+    if pending == 0 {
+        return Ok(());
+    }
+    let target = match cs {
+        Some(spec) => crate::revspec::CsOrRef::parse(spec)?.as_id(),
+        None => bed
+            .config()
+            .current_cs
+            .as_deref()
+            .and_then(|hex| Id::from_str(hex).ok()),
+    };
+    if let Some(id) = target
+        && queue.contains(id)?
+    {
+        return Err(ClientError::PendingCs {
+            cs: id.short(),
+            pending,
+        });
+    }
+    Ok(())
+}
+
 /// Resolves the changeset a read command should answer at: an explicit
 /// `<cs-or-ref>` when given, else the working copy's current changeset.
 async fn resolve_target(
@@ -651,8 +696,12 @@ pub async fn log(
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending tip's parents may only exist on the server; log answers
+    // from the server's walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, cs)?;
     let session = Session::open(&bed).await?;
     let cs_id = resolve_target(&session, &bed, cs, "log").await?;
+
     let summaries = session.log(cs_id, limit.unwrap_or(0), "log").await?;
     let entries: Vec<LogEntry> = summaries.iter().map(log_entry_of).collect();
     Ok(render::render_log(&entries))
@@ -705,6 +754,10 @@ pub async fn diff(
     if a.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending side's tree may only exist on the server; diff answers
+    // from the server's tree walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, a)?;
+    refuse_pending_target(&bed, b)?;
 
     // The no-argument form is context-aware: local modifications beat the
     // committed-diff fallback. Explicit arguments never consult the
