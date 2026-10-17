@@ -130,6 +130,20 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// The most recently *stored* changeset ids, newest arrival first,
+    /// capped at `limit` (`0` = none).
+    ///
+    /// This is arrival order — when the row first landed in the store —
+    /// with **no graph semantics**: no ancestry filtering, no ref
+    /// filtering, no date ordering. Unpublished changesets (rows no ref
+    /// can reach, e.g. working copies committed straight to the server)
+    /// are included; surfacing them is the point. A re-put idempotent
+    /// changeset keeps its original arrival position.
+    ///
+    /// Required method: a store that cannot answer this must say so at
+    /// compile time, not silently return an empty history.
+    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError>;
+
     /// Store bytes in the derived-data cache ("derived data"). `kind` is a short
     /// tag naming the derived-data type, e.g. `"skiplist"`. Overwrites any
     /// previous value for the same `(kind, cs)` key.

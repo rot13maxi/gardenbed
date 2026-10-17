@@ -32,6 +32,13 @@ use gardenbed_store::{
 };
 
 pub mod repos;
+/// The build fingerprint: a SHA-256 over `crates/server/src/**` file
+/// contents at build time (`build.rs`). The test harness compares it
+/// against the same digest computed over the *current* sources to catch a
+/// binary built from different tree state — mtime checks are blind to
+/// that (`bed switch` materializes sources with commit-time mtimes;
+/// dogfood finding #12's core).
+pub const SRC_DIGEST: &str = env!("GARDENBED_SERVER_SRC_DIGEST");
 
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
 /// must be uploaded with `PutBlob` first (v0.1.md §5).
@@ -451,6 +458,24 @@ impl Repo {
     /// All refs as `(name, id)`, sorted by name.
     pub fn list_refs(&self) -> Result<Vec<(String, Id)>, ServerError> {
         Ok(self.metadata.list_refs()?)
+    }
+
+    /// The most recently *stored* changesets, newest arrival first, as
+    /// `(changeset id, changeset)` pairs, capped at `limit` (`0` =
+    /// unlimited — the whole arrival log).
+    ///
+    /// Unlike [`Repo::log`] this has no graph semantics: **unpublished
+    /// changesets are included** (working copies commit directly to the
+    /// server, so a changeset no ref can reach is the normal shape of
+    /// agent work-in-progress, not corruption). Arrival order, not commit
+    /// dates: see [`MetadataStore::recent_changesets`].
+    pub fn activity(&self, limit: u32) -> Result<Vec<(Id, Changeset)>, ServerError> {
+        let ids = self
+            .metadata
+            .recent_changesets(if limit == 0 { u32::MAX } else { limit })?;
+        ids.into_iter()
+            .map(|id| Ok((id, self.get_changeset(id)?)))
+            .collect()
     }
 
     /// Resolves a client-facing `<cs-or-ref>` argument: a ref's current
@@ -1431,6 +1456,9 @@ mod revspec_tests {
             git: Option<&str>,
         ) -> Result<Id, StoreError> {
             self.inner.put_validated_changeset(cs, root, rows, git)
+        }
+        fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
+            self.inner.recent_changesets(limit)
         }
         fn changeset_ids_in_id_range(
             &self,

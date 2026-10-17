@@ -74,7 +74,22 @@ pub fn bed_async(dir: &Path, args: &[&str]) -> tokio::process::Child {
 /// Locates the built `gardenbed-server` binary. Order: the
 /// `BED_SERVER_BIN` override, then the workspace `target/{debug,release}`
 /// directory (the profile is probed both ways, debug first in debug
-/// builds). Panics with actionable advice when absent.
+/// builds). Panics with actionable advice when absent or stale — the
+/// binary is not a bin target of this package, so `cargo test -p
+/// gardenbed` never rebuilds it, and a stale binary fails
+/// protocol-dependent tests in ways that look like code regressions
+/// (dogfood finding #12). Two staleness oracles, both loud:
+///
+/// * mtime: the binary must be no older than the newest source;
+/// * content digest: the binary's embedded build fingerprint
+///   (`gardenbed_server::SRC_DIGEST`, hashed by `crates/server/build.rs`)
+///   must equal the same digest computed over the *current* sources —
+///   mtime alone is blind to tree-state staleness (`bed switch`
+///   materializes sources with commit-time mtimes, so a binary built
+///   from different tree state can pass a fresh mtime).
+///
+/// `BED_SERVER_BIN` overrides skip both — an externally provided binary
+/// is trusted as-is.
 pub fn server_bin() -> PathBuf {
     if let Ok(path) = std::env::var("BED_SERVER_BIN") {
         let path = PathBuf::from(path);
@@ -88,6 +103,12 @@ pub fn server_bin() -> PathBuf {
     let workspace_target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| manifest.join("..").join("..").join("target"));
+    let server_src = manifest
+        .join("..")
+        .join("server")
+        .join("src")
+        .canonicalize()
+        .expect("crates/server/src exists next to crates/bed");
     let profiles: &[&str] = if cfg!(debug_assertions) {
         &["debug", "release"]
     } else {
@@ -95,17 +116,109 @@ pub fn server_bin() -> PathBuf {
     };
     for profile in profiles {
         let candidate = workspace_target.join(profile).join("gardenbed-server");
-        if candidate.is_file() {
-            return candidate;
+        if !candidate.is_file() {
+            continue;
         }
+        let binary_age = candidate
+            .metadata()
+            .and_then(|m| m.modified())
+            .expect("gardenbed-server binary mtime");
+        let mut src_age = None;
+        for entry in walk_files(&server_src) {
+            let Ok(age) = entry.metadata().and_then(|m| m.modified()) else {
+                continue;
+            };
+            if src_age.is_none_or(|age0| age > age0) {
+                src_age = Some(age);
+            }
+        }
+        let src_age = src_age.unwrap_or_else(|| {
+            panic!(
+                "no source files found under {} — staleness check is broken",
+                server_src.display()
+            )
+        });
+        assert!(
+            src_age <= binary_age,
+            "gardenbed-server binary under {} is STALE — it is older than \
+             crates/server sources (dogfood finding #12: `cargo test -p \
+             gardenbed` does not rebuild it). Rebuild first: `cargo build \
+             -p gardenbed-server`",
+            candidate.display()
+        );
+        assert!(
+            current_server_digest(&server_src) == gardenbed_server::SRC_DIGEST,
+            "gardenbed-server binary under {} was built from DIFFERENT \
+             server sources (its embedded build fingerprint does not match \
+             the working copy's crates/server/src — dogfood finding #12: \
+             mtimes look fresh but the tree changed under the binary, e.g. \
+             a bed switch). Rebuild first: `cargo build -p gardenbed-server`",
+            candidate.display()
+        );
+        return candidate;
     }
     panic!(
         "gardenbed-server binary not found under {} — run \
-         `cargo build --workspace` first (or set BED_SERVER_BIN)",
+         `cargo build -p gardenbed-server` first (or set BED_SERVER_BIN)",
         workspace_target.display()
     )
 }
 
+/// The same digest `crates/server/build.rs` embeds: SHA-256 over
+/// (sorted rel-path, length, content) of every file under `src/` —
+/// deterministic, independent of readdir order and mtimes.
+fn current_server_digest(server_src: &Path) -> String {
+    use std::collections::BTreeMap;
+
+    use sha2::{Digest, Sha256};
+
+    let manifest = server_src
+        .parent()
+        .expect("server src has a parent (crates/server)");
+    let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
+    for path in walk_files(server_src) {
+        let rel = path
+            .strip_prefix(manifest)
+            .expect("file under crates/server");
+        files.insert(
+            rel.to_path_buf(),
+            std::fs::read(&path).expect("src readable"),
+        );
+    }
+    assert!(!files.is_empty(), "no server sources to hash");
+    let mut hasher = Sha256::new();
+    for (rel, content) in &files {
+        hasher.update(rel.to_string_lossy().as_bytes());
+        hasher.update(content.len().to_le_bytes());
+        hasher.update(content);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// Every regular file under `dir`, recursively (test-fixture scale:
+/// `crates/server/src` is a few dozen files).
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
 /// One running server: the spawned `gardenbed-server` process, its
 /// bound address, and a client for stats polling.
 pub struct Server {

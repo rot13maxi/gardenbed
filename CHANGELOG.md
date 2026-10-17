@@ -48,8 +48,24 @@ tags, and the verification record for a release lives in
   heatmap and authors chart on Overview, and per-changeset diffstat
   chips. Browse directory pages render the directory's README
   GitHub-style (client-side, injection-escaped markdown subset; relative
-  links and images resolve to the viewed revision's own files). See
-  [docs/web.md](docs/web.md). Verified by in-memory router
+  links and images resolve to the viewed revision's own files).
+  Changeset and compare rows expand into real unified diffs (in-page
+  Myers over both sides fetched at their revisions, with common
+  prefix/suffix trimming, a 3000-line budget that renders a
+  "too many lines to diff" note instead of freezing the page, and DOM
+  built lazily only for expanded blocks); the UI polls
+  `/api/refs` and toasts when the selected ref moves; blame gutters
+  shade by relative age. New endpoints `/api/files` (path listing) and
+  `/api/search` (case-insensitive content grep) back the `t` file
+  finder, the topbar grep box (`#/search` route), and `j`/`k` keyboard
+  navigation with a `?` help overlay. Multi-worker visibility: the
+  Overview gains a Workers panel (per-author unpublished drafts,
+  watchlist), an Events feed (publishes, rebases, landings), and a
+  `#/review/<id>` route with the full diff and read-only land commands;
+  backed by `MetadataStore::recent_changesets`, `Repo::activity`, and
+  `GET /api/activity` (arrival order, unpublished included). See
+  [docs/web.md](docs/web.md).
+  Verified by in-memory router
   integration tests (`crates/web/tests/api.rs`) and a Playwright
   end-to-end suite (`e2e/`) that drives a real browser through every
   page against the seeded repository.
@@ -100,46 +116,43 @@ tags, and the verification record for a release lives in
   of silently cloning `default`.
 
 
-- **`bed diff` renders renames and submodule pointer hunks** (v0.2
-  D22/D23): a pure rename renders git's `R100` form (`similarity index
-  100%` / `rename from` / `rename to`) in every diff form — the
-  changeset-scoped forms (`bed diff <cs>`, no-arg on a clean copy)
-  render from the changeset's recorded `Rename` op, and the two-sided
-  form pairs a delete with a write of the identical blob at render
-  time, the same rule `bed commit` pairs by. A moved-and-edited file
-  still renders as a delete plus a write — no similarity below 100% is
-  ever claimed (divergences §6 residual). Submodule pointers render
-  git's `Subproject commit <sha>` hunks on add, delete, and retarget,
-  with the real upstream SHA from the padded gitlink id — replacing the
-  v0.1 `Binary files … differ` line (divergences §7 residual:
-  gitlink↔regular typechanges still render mode lines only). Every
-  rendered shape reapplies with `git apply` (gitlink entries via
-  `--cached`). Verified by letter/byte parity with `git diff-tree -M`
-  and `--submodule=short` on generated rename/gitlink histories, plus
-  real-`git apply` tests (`crates/bed/tests/read_path.rs`,
-  `crates/bed/tests/render_patch.rs`). The MCP `diff` tool is
-  unchanged, keeping its `--no-renames` letter parity deliberately.
-
-- **`bed` honors `.gitignore` for untracked-file discovery**: `bed
-  status` and `bed commit` now read `.gitignore` files from the working
-  copy (root plus one per directory walked) and hide matching untracked
-  files — the dogfood gap where every cargo `target/` landed in status
-  and rode into commits. Supported subset: blank lines, `#` comments,
-  trailing `/` (dir-only), `*` `?` `**` globs, a leading `/` anchor, and
-  bracket expressions (`[…]` character ranges like `*.[oa]` and POSIX
-  `[:class:]` forms). Deliberately unsupported: `!` negation and
-  global excludes. Git semantics are kept where they matter: ignore
-  never un-tracks (tracked files keep reporting changes, and tracked
-  content defeats directory pruning), an ignored directory with no
-  tracked content is pruned wholesale (a fresh `target/` costs one
-  stat), and untracked `.gitignore` files themselves still report.
-  Matching uses `gix-glob` (already in the workspace lock via the
-  `gardenbed-git` dependency). Verified against `git check-ignore`
-  behavior (including bracket expressions) and by integration tests
-  (`crates/bed/tests/gitignore.rs`) against a real server process.
-
 ### Fixed
 
+- **Test harness refuses a stale `gardenbed-server` binary** (dogfood
+  findings #12 and #13): `crates/bed/tests/common/mod.rs::server_bin()`
+  panics with the fix command (`cargo build -p gardenbed-server`) when
+  the workspace binary fails either staleness oracle — older mtime than
+  the newest `crates/server/src` source, or (the #12 core) an embedded
+  build fingerprint (`gardenbed_server::SRC_DIGEST`, SHA-256 over
+  `src/**` computed by the new `crates/server/build.rs`) that does not
+  match the digest of the working copy's current sources, catching a
+  binary built from different tree state even when mtimes look fresh
+  (`bed switch` materializes sources with commit-time mtimes). A stale
+  binary otherwise fails protocol-dependent tests in ways that look like
+  code regressions — and, per dogfood #13, a pre-protocol-change server
+  silently turns `bed publish --ref <lane>` into a main publish
+  (proto3 unknown-field skipping; see docs/DOGFOOD.md #13 — restart
+  servers before using `--ref`). `BED_SERVER_BIN` overrides are trusted
+  as-is. Regression proofs in `crates/bed/tests/server_bin_guard.rs`
+  (refusal names the fix command; the tree-state probe holds mtime
+  constant so only the digest can catch it; touches are net-zero). The
+  publish `--ref` ref-row outcomes — new-lane row created + main
+  untouched, force+non-ancestor lane move + main untouched — are pinned
+  in `crates/bed/tests/write_path.rs`.
+
+- **Rename pairing now guards destination and entry kind** (retroactive
+  review of the M19 landing): `bed diff`'s render-time pairing, the
+  scoped forms' recorded-`Rename` rendering, and `bed commit`'s
+  `Op::Rename` recording all pair a delete with a write of the identical
+  blob only when the destination was absent on the old side and the
+  entry kinds match. Pre-fix, a delete paired with a *rewrite of a
+  pre-existing path* or a *cross-kind write* (e.g. a regular file
+  replaced by a symlink whose target equals its content) rendered an
+  `R100` block git apply refuses ("already exists in working directory"
+  / "new mode does not match"); those corners now render git's own
+  `D`+`M` / `D`+`A` shape, which applies. Verified by new unit tests and
+  a real-`git apply` regression pair
+  (`crates/bed/tests/render_patch.rs::guarded_corners_render_delete_plus_write_and_apply`).
 - `bed switch` now prunes directories its removals left empty (dogfood:
   switching off a changeset that introduced `crates/web` left the empty
   `crates/web/{src,static,tests}` behind, so a workspace glob `crates/*`
@@ -203,6 +216,49 @@ tags, and the verification record for a release lives in
   report (`refs_rewound`) plus a loud stderr warning. Tests:
   `crates/git/tests/incremental.rs::rewind_refusal_moves_no_refs_in_multi_ref_import`,
   `crates/git/tests/incremental.rs::limit_import_refuses_rewind_by_default`.
+
+### Changed
+
+
+- **`bed diff` renders renames and submodule pointer hunks** (v0.2
+  D22/D23): a pure rename renders git's `R100` form (`similarity index
+  100%` / `rename from` / `rename to`) in every diff form — the
+  changeset-scoped forms (`bed diff <cs>`, no-arg on a clean copy)
+  render from the changeset's recorded `Rename` op, and the two-sided
+  form pairs a delete with a write of the identical blob at render
+  time — the same rule `bed commit` records one by: same entry kind,
+  destination absent on the old side (git apply refuses anything else).
+  A moved-and-edited file
+  still renders as a delete plus a write — no similarity below 100% is
+  ever claimed (divergences §6 residual). Submodule pointers render
+  git's `Subproject commit <sha>` hunks on add, delete, and retarget,
+  with the real upstream SHA from the padded gitlink id — replacing the
+  v0.1 `Binary files … differ` line (divergences §7 residual:
+  gitlink↔regular typechanges still render mode lines only). Every
+  rendered shape reapplies with `git apply` (gitlink entries via
+  `--cached`). Verified by letter/byte parity with `git diff-tree -M`
+  and `--submodule=short` on generated rename/gitlink histories, plus
+  real-`git apply` tests (`crates/bed/tests/read_path.rs`,
+  `crates/bed/tests/render_patch.rs`). The MCP `diff` tool is
+  unchanged, keeping its `--no-renames` letter parity deliberately.
+
+- **`bed` honors `.gitignore` for untracked-file discovery**: `bed
+  status` and `bed commit` now read `.gitignore` files from the working
+  copy (root plus one per directory walked) and hide matching untracked
+  files — the dogfood gap where every cargo `target/` landed in status
+  and rode into commits. Supported subset: blank lines, `#` comments,
+  trailing `/` (dir-only), `*` `?` `**` globs, a leading `/` anchor, and
+  bracket expressions (`[…]` character ranges like `*.[oa]` and POSIX
+  `[:class:]` forms). Deliberately unsupported: `!` negation and
+  global excludes. Git semantics are kept where they matter: ignore
+  never un-tracks (tracked files keep reporting changes, and tracked
+  content defeats directory pruning), an ignored directory with no
+  tracked content is pruned wholesale (a fresh `target/` costs one
+  stat), and untracked `.gitignore` files themselves still report.
+  Matching uses `gix-glob` (already in the workspace lock via the
+  `gardenbed-git` dependency). Verified against `git check-ignore`
+  behavior (including bracket expressions) and by integration tests
+  (`crates/bed/tests/gitignore.rs`) against a real server process.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
