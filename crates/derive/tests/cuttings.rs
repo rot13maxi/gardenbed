@@ -266,37 +266,52 @@ fn facts_match_exact_blob_semantics() {
 }
 
 #[test]
-fn every_changeset_writes_a_row_eagerly() {
+fn cuttings_rows_are_written_lazily_not_eagerly() {
     let (h, ids) = fixture();
-    let (_, _engine, metadata) = setup(&h, true);
+    let (_, engine, metadata) = setup(&h, true);
     for (i, cs) in ids.iter().enumerate() {
+        assert!(
+            metadata
+                .derived_get(DERIVED_CUTTINGS, *cs)
+                .expect("derived_get")
+                .is_none(),
+            "cs{i} has a cuttings row after eager ingest — cuttings must be lazy \
+             (its derivation walks the whole parent tree; the M5 \
+             size-independence budget forbids that on the write path)"
+        );
+    }
+    // First query computes and persists the row; the read-back proves it.
+    for (i, cs) in ids.iter().enumerate() {
+        engine.cuttings_entry(*cs).expect("lazy compute");
         let bytes = metadata
             .derived_get(DERIVED_CUTTINGS, *cs)
             .expect("derived_get")
-            .unwrap_or_else(|| panic!("cs{i} has no cuttings row after eager ingest"));
+            .unwrap_or_else(|| panic!("cs{i} has no cuttings row after lazy query"));
         assert!(!bytes.is_empty());
     }
 }
 
 #[test]
-fn lazy_and_eager_bytes_are_identical() {
+fn eager_and_lazy_ingest_paths_compute_identical_cuttings() {
     let (h, ids) = fixture();
-    let (ids_a, _engine_a, meta_a) = setup(&h, true);
+    let (_ids_a, engine_a, meta_a) = setup(&h, true);
     let (_, engine_b, meta_b) = setup(&h, false);
     for (i, cs) in ids.iter().enumerate() {
+        let entry = engine_a.cuttings_entry(*cs).expect("A computes");
         let a = meta_a
             .derived_get(DERIVED_CUTTINGS, *cs)
             .expect("get A")
-            .expect("eager row");
-        let entry = engine_b.cuttings_entry(*cs).expect("B computes");
+            .expect("lazy row after compute");
+        let entry_b = engine_b.cuttings_entry(*cs).expect("B computes");
         let b = meta_b
             .derived_get(DERIVED_CUTTINGS, *cs)
             .expect("get B")
             .expect("lazy row after compute");
         assert_eq!(a, b, "cuttings bytes differ at cs index {i}");
         assert_eq!(entry.encode(), a, "decoded entry re-encodes identically");
+        assert_eq!(entry_b.encode(), a, "both engines agree");
     }
-    let _ = ids_a;
+    let _ = _ids_a;
 }
 
 #[test]
@@ -532,8 +547,10 @@ fn registry_lists_the_four_kinds_in_order() {
 }
 
 /// Wiping derived data and rebuilding through the eager path rewrites
-/// exactly the registered kinds — nothing more, nothing less — and an
-/// unregistered kind's row is left untouched and never read.
+/// exactly the registered kinds with eager hooks — nothing more,
+/// nothing less. Cuttings is lazy-only: the rebuild leaves its rows
+/// empty, the lazy getter restores them, and an unregistered kind's row
+/// is left untouched and never read.
 #[test]
 fn eager_rebuild_covers_exactly_the_registry() {
     let (h, _ids) = fixture();
@@ -565,13 +582,33 @@ fn eager_rebuild_covers_exactly_the_registry() {
                 .derived_get(k.name, *cs)
                 .expect("get")
                 .unwrap_or_else(|| panic!("{} row missing at cs{i}", k.name));
-            assert!(
-                !bytes.is_empty() || k.name == DERIVED_TREE,
-                "{} row empty at cs{i}",
-                k.name
-            );
+            if k.name == DERIVED_CUTTINGS {
+                // Lazy-only kind: the eager rebuild must NOT restore it.
+                assert!(
+                    bytes.is_empty(),
+                    "cuttings row restored eagerly at cs{i} — it must stay lazy"
+                );
+            } else {
+                assert!(
+                    !bytes.is_empty() || k.name == DERIVED_TREE,
+                    "{} row empty at cs{i}",
+                    k.name
+                );
+            }
         }
     }
+    // The lazy getter restores the wiped cuttings rows on demand.
+    engine
+        .cuttings_entry(ids[1])
+        .expect("lazy restore after wipe");
+    assert!(
+        !metadata
+            .derived_get(DERIVED_CUTTINGS, ids[1])
+            .expect("get")
+            .unwrap()
+            .is_empty(),
+        "lazy restore wrote the row"
+    );
     let sentinel = metadata
         .derived_get(foreign_kind, ids[0])
         .expect("foreign get")
@@ -580,7 +617,9 @@ fn eager_rebuild_covers_exactly_the_registry() {
 }
 
 /// The eager and batched (rows-for-new) paths produce byte-identical
-/// rows for every registered kind across several generated histories.
+/// rows for every registered kind **with hooks** across several
+/// generated histories. Cuttings is lazy-only: neither path writes its
+/// rows, and the lazy getter produces the same bytes from either store.
 #[test]
 fn eager_and_batched_rows_are_byte_identical() {
     for seed in [777u64, 31337, 424242] {
@@ -595,6 +634,7 @@ fn eager_and_batched_rows_are_byte_identical() {
         // Eager path.
         let (objects_a, metadata_a) = stores();
         let ids = ingest(&objects_a, &metadata_a, &h, true);
+        let engine_a = Engine::new(objects_a.clone(), metadata_a.clone());
 
         // Batched path: rows prepared without writes, then stored.
         let (objects_b, metadata_b) = stores();
@@ -607,8 +647,8 @@ fn eager_and_batched_rows_are_byte_identical() {
                 .expect("rows for new");
             assert_eq!(
                 rows.len(),
-                derived_kinds().len(),
-                "one row per registered kind at cs{i}"
+                derived_kinds().len() - 1, // cuttings contributes no row
+                "one row per hooked kind at cs{i}"
             );
             for row in rows {
                 metadata_b
@@ -617,12 +657,7 @@ fn eager_and_batched_rows_are_byte_identical() {
             }
         }
 
-        for k in [
-            DERIVED_TREE,
-            DERIVED_SKIPLIST,
-            DERIVED_PATHSUMMARY,
-            DERIVED_CUTTINGS,
-        ] {
+        for k in [DERIVED_TREE, DERIVED_SKIPLIST, DERIVED_PATHSUMMARY] {
             for (i, cs) in ids.iter().enumerate() {
                 let a = metadata_a
                     .derived_get(k, *cs)
@@ -634,6 +669,25 @@ fn eager_and_batched_rows_are_byte_identical() {
                     .unwrap_or_else(|| panic!("{k} row B missing at cs{i}"));
                 assert_eq!(a, b, "{k} bytes differ between paths at cs{i}");
             }
+        }
+
+        // Cuttings: no rows from either write path, identical lazy bytes.
+        for (i, cs) in ids.iter().enumerate() {
+            for (label, meta) in [("A", &metadata_a), ("B", &metadata_b)] {
+                assert!(
+                    meta.derived_get(DERIVED_CUTTINGS, *cs)
+                        .expect("get")
+                        .is_none(),
+                    "cuttings row {label} present at cs{i} — must be lazy"
+                );
+            }
+            let a = engine_a.cuttings_entry(*cs).expect("A lazy");
+            let b = engine_b.cuttings_entry(*cs).expect("B lazy");
+            assert_eq!(
+                a.encode(),
+                b.encode(),
+                "lazy cuttings bytes differ between stores at cs{i}"
+            );
         }
     }
 }

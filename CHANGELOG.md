@@ -25,6 +25,19 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- **Token auth and per-repository roles**: `gardenbed-server serve
+  --auth <auth.toml>` maps bearer tokens to repositories (exact names or
+  `*`) and roles (`read` < `write` < `admin`). Every RPC is checked
+  centrally — after the repo field is read, before any store is touched:
+  reads need `read`+, writes (`PutBlob`, `CreateChangeset`, `CasRef`,
+  `Rebase`, `Publish`, `Merge`) need `write`+; unauthorized requests get
+  `PERMISSION_DENIED` naming the repository and the next step, and
+  repository existence is never leaked to unauthorized callers. `bed`
+  sends its token from `GARDENBED_TOKEN`; the daemon forwards
+  credentials end to end; `gardenbed-mcp --token` is accepted for
+  forward compatibility (in-process access needs none). Without `--auth`
+  the server is open (v0.1 back-compat, proven by the unchanged
+  open-server suite).
 - **Server-side two-parent merge** (v0.2.md D9–D11, M9/M10): `Repo::merge`
   builds one changeset with `parents = [ours, theirs]` whose changes are
   the diff `tree(ours) → merged tree`, stored through the ordinary

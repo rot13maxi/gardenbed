@@ -122,14 +122,16 @@ Gardenbed is an early implementation at version 0.1 plus the v0.2
 feature wave. It supports a single repository per server, filesystem
 object storage, SQLite metadata, sparse working copies, server-side
 replay and merge, a read-only FUSE mount of any changeset, an optional
-local caching daemon, and Git import/export.
+local caching daemon, optional token auth with per-repository roles,
+and Git import/export.
 
-Writes require a connection to the server. There is no authentication,
-garbage collection, or offline commit queue yet. Blame follows
-first-parent history and renames; copy detection is exact-blob only.
-Git roundtrips preserve commit IDs for supported histories; signed
-commits, non-UTF-8 metadata, and other exceptions are documented in
-[Git interoperability limits](docs/divergences.md).
+Writes require a connection to the server. There is no garbage
+collection or offline commit queue yet; authentication is optional
+(`gardenbed-server serve --auth auth.toml`; without it the server is
+open). Blame follows first-parent history and renames; copy detection
+is exact-blob only. Git roundtrips preserve commit IDs for supported
+histories; signed commits, non-UTF-8 metadata, and other exceptions are
+documented in [Git interoperability limits](docs/divergences.md).
 
 Verification includes differential tests against Git (including
 1,000-pair merge and copy-detection oracles), process-kill recovery
