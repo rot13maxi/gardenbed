@@ -103,7 +103,7 @@ async fn setup(opts: GenOptions) -> World {
     let dir = temp_root();
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let head = common::ingest(&seed, &dir.path().join("server"));
+    let head = common::ingest(&seed, &dir.path().join("server").join("garden"));
     let server = Server::spawn(&dir.path().join("server")).await;
     assert_eq!(head, seed.head);
     World {
@@ -343,8 +343,8 @@ async fn commit_p50_is_size_independent_10k_vs_1m() {
     const SMALL_FILES: usize = 100;
 
     let dir = temp_root();
-    let small_repo = dir.path().join("server-10k");
-    let big_repo = dir.path().join("server-1m");
+    let small_repo = dir.path().join("server-10k").join("garden");
+    let big_repo = dir.path().join("server-1m").join("garden");
 
     // Fixture ingest (uncounted, in-process). 1M files arrive as ~100
     // changesets of 10k adds each.
@@ -353,8 +353,8 @@ async fn commit_p50_is_size_independent_10k_vs_1m() {
     build_sized_repo(&big_repo, 1_000_000, 10_000);
     println!("fixtures ingested in {:.1?} (10k + 1M files)", t0.elapsed());
 
-    let mut small_server = Server::spawn(&small_repo).await;
-    let mut big_server = Server::spawn(&big_repo).await;
+    let mut small_server = Server::spawn(small_repo.parent().unwrap()).await;
+    let mut big_server = Server::spawn(big_repo.parent().unwrap()).await;
 
     // One fresh bed per rep: clone, sparse the small/ subtree, rewrite its
     // 100 files, commit. Only the commit is timed.

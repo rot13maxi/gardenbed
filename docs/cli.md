@@ -61,23 +61,25 @@ Usage: bed [OPTIONS] <COMMAND>
 Usage: bed clone [OPTIONS] <SERVER>
 ```
 
-`<SERVER>` — the repository server endpoint: `http(s)://host:port` or
-`unix:///path/to/socket`.
+`<SERVER>` — the repository server endpoint: `http(s)://host:port[/repo]`
+or `unix:///path/to/socket`. An http(s) URL's path names the repository
+(the URL addresses the repository, not just the server); no path selects
+`default`.
 
 | flag | meaning |
 |---|---|
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
-| `--repo <REPO>` | repository name (default: `default`) |
+| `--repo <REPO>` | repository name (default: from the URL path, else `default`; the flag wins on conflict) |
 | `--ref <REF>` | starting ref; defaults to `main`, then `master` or `trunk` |
 | `--sparse <PATH>...` | sparse prefixes to record (repeat or list several); materialize with `bed sparse add` |
 
 ```sh
-bed clone http://127.0.0.1:9418
-# created working copy for default at http://127.0.0.1:9418
+bed clone http://127.0.0.1:9418/myrepo
+# created working copy for myrepo at http://127.0.0.1:9418
 # current changeset: b273e12d1c6f11ee (main)
 # no files materialized — select paths with `bed sparse add <path>`
 
-bed clone http://127.0.0.1:9418 --ref master --sparse src docs
+bed clone http://127.0.0.1:9418 --repo myrepo --ref master --sparse src docs
 ```
 
 A ref the server does not have is refused — no working copy is created:
@@ -348,14 +350,15 @@ Usage: gardenbed-server [OPTIONS] [COMMAND]
 | option | meaning |
 |---|---|
 | `--addr <ADDR>` | listen address (`host:port`; `:0` picks an ephemeral port), default `127.0.0.1:9418` |
-| `--root <ROOT>` | repository directory; must be a non-empty path (created if missing) — holds `<root>/objects` and `<root>/metadata.sqlite3` |
-| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode |
+| `--root <ROOT>` | the server root directory (created if missing): one subdirectory per repository (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); a v0.1 root (stores at the top level) serves unchanged as repository `default` |
+| `--max-repos <N>` | cap on simultaneously open repositories (LRU eviction above it), default 256; local (`--root`) mode only |
+| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode. Scaled mode serves one repository; the request's `repo` name is a label, not a directory |
 
 Without a subcommand, the top-level `--addr`/`--root` flags serve the
 gRPC API — the printed address is the contract for scripts:
 
 ```sh
-gardenbed-server --addr 127.0.0.1:9418 --root /tmp/gardenbed-repo
+gardenbed-server --addr 127.0.0.1:9418 --root /tmp/gardenbed
 # listening on 127.0.0.1:9418
 ```
 
@@ -407,6 +410,39 @@ Serves the gRPC API. Takes the same `--addr`/`--root`/`--storage` flags
 (see [scaled storage](#scaled-storage)); this is the default when no
 subcommand is given.
 
+For its lifetime the server holds an exclusive lock on
+`<root>/gardenbed.lock`: a second server over the same root refuses to
+start (`cannot lock the server root`), and `gardenbed-server move`
+refuses to run while the lock is held.
+
+### gardenbed-server move
+
+```text
+Usage: gardenbed-server move [OPTIONS] --root <ROOT> --from <FROM> --into <INTO>
+```
+
+Renames a repository under the server root (the two renames: stores,
+then the git mirror when present). Both stores are path-free and
+self-contained, so history is byte-identical after the move; the vacated
+name stops being served.
+
+An **offline operation**: stop the server first. The move checkpoints
+the repository's WAL into `metadata.sqlite3` before renaming (committed
+rows may legally live only in the WAL sidecar), carries `-wal`/`-shm`
+along, and refuses — non-zero exit, nothing changed — while a server is
+serving the root or any other process holds the database.
+
+| flag | meaning |
+|---|---|
+| `--root <ROOT>` | the server root directory |
+| `--from <FROM>` | the repository's current name |
+| `--into <INTO>` | the new name (must not name an existing repository or directory) |
+
+```sh
+gardenbed-server move --root /tmp/gardenbed --from default --into myrepo
+# moved repository default to myrepo (/tmp/gardenbed/myrepo), history byte-identical
+```
+
 ### gardenbed-server import
 
 ```text
@@ -417,8 +453,9 @@ Imports a git repository's history into the Gardenbed stores.
 
 | flag | meaning |
 |---|---|
-| `--from <FROM>` | git repository: a local path (bare or working tree) or a URL. URLs are cloned (mirror) into `<root>/git-mirror.git` and refreshed on re-use |
-| `--root <ROOT>` | gardenbed repository directory (created if missing) |
+| `--from <FROM>` | git repository: a local path (bare or working tree) or a URL. URLs are cloned (mirror) into the repository's `git-mirror.git` and refreshed on re-use |
+| `--root <ROOT>` | the server root directory: one subdirectory per repository |
+| `--repo <REPO>` | repository name under the root (default `default`) |
 | `--limit <LIMIT>` | ingest only the newest N commits (topological suffix; slice boundaries are re-rooted as full-tree root changesets) |
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
@@ -455,8 +492,8 @@ any non-descendant move — but sideways merges onto shared history count
 only what is actually unreachable) are permitted with just the warning.
 
 ```sh
-gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed-repo \
-    --ref refs/heads/master --renames on
+gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed \
+    --repo myrepo --ref refs/heads/master --renames on
 # 2 commits (2 new, 0 skipped), 9 objects, 1 ref(s) moved, 0.24s (8 commits/s)
 ```
 
@@ -475,14 +512,15 @@ report; `--mapping FILE` writes it as TSV for verification.
 
 | flag | meaning |
 |---|---|
-| `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
+| `--root <ROOT>` | the server root directory (one subdirectory per repository) |
+| `--repo <REPO>` | repository name under the root (default `default`) |
 | `--into <INTO>` | destination git repository: created as a bare sha1 repository when missing, accepted as-is when present |
 | `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
 | `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback) |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
 
 ```sh
-gardenbed-server export --root /tmp/gardenbed-repo --into /tmp/export.git \
+gardenbed-server export --root /tmp/gardenbed --repo myrepo --into /tmp/export.git \
     --mapping /tmp/mapping.tsv
 # 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
 git -C /tmp/export.git fsck --strict   # clean
@@ -498,8 +536,8 @@ Usage: gardenbed-mcp [OPTIONS] --root <DIR>
 
 | flag | meaning |
 |---|---|
-| `--root <DIR>` (required) | the server's data directory (its `objects/` object store and `metadata.sqlite3` metadata database) |
-| `--repo <NAME>` | repo name; accepted and validated for forward compatibility (v0.1 servers are single-repo; the API carries a repo field from day one, docs/v0.1.md §1) |
+| `--root <DIR>` (required) | the server's root directory |
+| `--repo <NAME>` | repository name under the root (default `default`); the session answers from this repository only — an unknown name exits 1 listing what the root serves |
 
 Newline-delimited JSON-RPC 2.0 on stdin/stdout, one response line per
 request; diagnostics go to stderr only. Serves tools `log`, `diff`,
@@ -507,7 +545,7 @@ request; diagnostics go to stderr only. Serves tools `log`, `diff`,
 
 ```sh
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  | gardenbed-mcp --root /tmp/gardenbed-repo
+  | gardenbed-mcp --root /tmp/gardenbed --repo myrepo
 
-gardenbed-mcp --root /tmp/gardenbed-repo --repo default < requests.jsonl
+gardenbed-mcp --root /tmp/gardenbed --repo myrepo < requests.jsonl
 ```
