@@ -204,7 +204,14 @@ All local state lives under `--state-dir` (default `./.bed`):
   A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
 - **Status** uses mtime/size as hints and hashes only suspects;
-  `--full-scan` forces the correctness path.
+  `--full-scan` forces the correctness path. Untracked discovery honors
+  `.gitignore` files read from the working copy (root plus one per walked
+  directory — `crates/bed/src/ignore.rs`): the git subset of blank lines,
+  comments, trailing `/`, `*` `?` `**`, and a leading `/` anchor, with
+  git's precedence that ignore never un-tracks. Ignored directories with
+  no tracked content are pruned from the walk (a cargo `target/` costs
+  one stat); `!` negation, character classes, and global excludes are
+  unsupported.
 - **Atomic checkout** stages complete files and symlinks before replacing
   working entries. When the selected state directory and destination are
   on different mounts, staging happens beside the destination so the final
