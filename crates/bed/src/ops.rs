@@ -11,16 +11,17 @@
 //!   `.bed/objects`, with bounded parallelism, so every command is
 //!   resumable and idempotent by construction.
 
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::path::Path;
+use std::str::FromStr;
+
 use gardenbed_model::codec::validate_path;
 use gardenbed_model::{Id, Mode, TreeKind};
 use gardenbed_protocol::client::GardenbedClient;
 use gardenbed_protocol::convert::{mode_from_wire, op_from_wire};
 use gardenbed_protocol::pb::{ChangeMsg, ChangesetSummary};
 use gardenbed_store::ObjectStore as _;
-use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::Write;
-use std::path::Path;
 use tokio_stream::StreamExt as _;
 use tonic::Code;
 
@@ -381,6 +382,7 @@ fn bed_state_note(skipped: &[String]) -> String {
 /// an interrupted refresh is repaired by simply running switch again.
 pub async fn switch(state_dir: &Path, spec: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "switch")?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;
     let session = Session::open(&bed).await?;
     let cs = session.resolve(&parsed, "switch").await?;
@@ -495,6 +497,7 @@ pub async fn file(
 /// to the rebased one.
 pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
     let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
     let session = Session::open(&bed).await?;
     let current = session.resolve_current_cs(&bed, "rebase").await?;
@@ -559,6 +562,7 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
 /// stays where it is — publishing publishes, it does not move.
 pub async fn publish(state_dir: &Path) -> Result<String, ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "publish")?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "publish").await?;
@@ -610,6 +614,47 @@ fn require_current_cs(bed: &WorkingCopy) -> Result<(), ClientError> {
         .ok_or(ClientError::NoCurrentCs)
 }
 
+/// Refuses a mutating ref/head command while offline commits are queued:
+/// moving the working copy's base before the queue drains would strand
+/// the pending chain off the new history. Works offline (queue state is
+/// local). A clean queue is a no-op.
+fn refuse_pending(bed: &WorkingCopy, command: &'static str) -> Result<(), ClientError> {
+    let pending = bed.queue()?.count()?;
+    if pending > 0 {
+        return Err(ClientError::PendingCommits { command, pending });
+    }
+    Ok(())
+}
+
+/// Refuses a read command whose target changeset is a pending tip: the
+/// changeset itself is local, but its parents may only exist on the
+/// server, and these commands answer from the server's walk. With no
+/// explicit target the working copy's current changeset is the check.
+fn refuse_pending_target(bed: &WorkingCopy, cs: Option<&str>) -> Result<(), ClientError> {
+    let queue = bed.queue()?;
+    let pending = queue.count()?;
+    if pending == 0 {
+        return Ok(());
+    }
+    let target = match cs {
+        Some(spec) => crate::revspec::CsOrRef::parse(spec)?.as_id(),
+        None => bed
+            .config()
+            .current_cs
+            .as_deref()
+            .and_then(|hex| Id::from_str(hex).ok()),
+    };
+    if let Some(id) = target
+        && queue.contains(id)?
+    {
+        return Err(ClientError::PendingCs {
+            cs: id.short(),
+            pending,
+        });
+    }
+    Ok(())
+}
+
 /// Resolves the changeset a read command should answer at: an explicit
 /// `<cs-or-ref>` when given, else the working copy's current changeset.
 async fn resolve_target(
@@ -639,6 +684,9 @@ pub async fn log(
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending tip's parents may only exist on the server; log answers
+    // from the server's walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, cs)?;
     let session = Session::open(&bed).await?;
     let cs_id = resolve_target(&session, &bed, cs, "log").await?;
     let summaries = session.log(cs_id, limit.unwrap_or(0), "log").await?;
@@ -659,23 +707,12 @@ fn log_entry_of(summary: &ChangesetSummary) -> LogEntry {
     }
 }
 
-/// `bed diff [<a> [<b>]]` — rendered git-diff-like, always under a
-/// one-line header naming what is being diffed (empty diffs included).
+/// `bed diff [<a> [<b>]]` — the tree diff between two changesets (rename
+/// detection off, server-side), rendered git-diff-like.
 ///
-/// * **No arguments, dirty working copy** — every modified or deleted
-///   tracked file under the sparse selection, diffed against the current
-///   changeset (local bytes vs the blob at `current_cs`); the header
-///   names the working copy and the changeset. Untracked files are not
-///   part of a working-copy diff (git parity), so a copy dirty only by
-///   untracked files falls back to the committed diff below.
-/// * **No arguments, otherwise clean working copy** — the current
-///   changeset against its first parent; the header names both changesets.
-/// * **One argument** — that changeset against its first parent. A root
-///   changeset has no parent: the header says so, with an empty body.
-/// * **Two arguments** — `a → b`. Changeset arguments always mean
-///   changesets, in every form. The header claims "first parent" only
-///   when the older side really is the newer's parent; otherwise it
-///   names both sides. Identical sides state that and render nothing.
+/// With no arguments: the current changeset against its first parent (a
+/// root changeset has nothing to diff against — empty output). With one
+/// argument: that changeset against its first parent. With two: `a → b`.
 pub async fn diff(
     state_dir: &Path,
     a: Option<&str>,
@@ -685,72 +722,47 @@ pub async fn diff(
     if a.is_none() {
         require_current_cs(&bed)?;
     }
-
-    // The no-argument form is context-aware: local modifications beat the
-    // committed-diff fallback. Explicit arguments never consult the
-    // working copy.
-    if (a, b) == (None, None) {
-        let current = bed.config().current_cs.clone().expect("required above");
-        let current = crate::revspec::CsOrRef::parse(&current)?;
-        let current = match current {
-            crate::revspec::CsOrRef::Id(id) => id,
-            crate::revspec::CsOrRef::Ref(_) => {
-                unreachable!("current_cs is stored as 64 lowercase hex")
-            }
-        };
-        if let Some(report) = working_copy_diff(&bed, current).await? {
-            return Ok(report);
-        }
-    }
-
+    // A pending side's tree may only exist on the server; diff answers
+    // from the server's tree walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, a)?;
+    refuse_pending_target(&bed, b)?;
     let session = Session::open(&bed).await?;
-
     // Resolve sides; fill in first parents client-side as needed.
-    // `first_parent_wording` is true only when the older side really is
-    // the newer's first parent — the header must not lie about ancestry.
-    let (older, newer, first_parent_wording) = match (a, b) {
+    let (older, newer) = match (a, b) {
         (Some(a), Some(b)) => {
             let pa = crate::revspec::CsOrRef::parse(a)?;
             let pb = crate::revspec::CsOrRef::parse(b)?;
-            let older = session.resolve(&pa, "diff").await?;
-            let newer = session.resolve(&pb, "diff").await?;
-            let first_parent_wording = session.first_parent(newer, "diff").await? == Some(older);
-            (older, newer, first_parent_wording)
+            (
+                session.resolve(&pa, "diff").await?,
+                session.resolve(&pb, "diff").await?,
+            )
         }
         (Some(a), None) => {
             // One side: that changeset against its first parent. A root
-            // changeset has no parent — the header says so, body empty.
+            // changeset has no parent — nothing to diff, empty output.
             let newer = session
                 .resolve(&crate::revspec::CsOrRef::parse(a)?, "diff")
                 .await?;
             match session.first_parent(newer, "diff").await? {
-                Some(older) => (older, newer, true),
-                None => return Ok(root_header(newer)),
+                Some(older) => (older, newer),
+                None => return Ok(String::new()),
             }
         }
         (None, Some(_)) => {
             return Err(ClientError::ConfigInvalid(
-                "bed diff takes two changesets, or none for the working copy \
-                 (dirty) or the current changeset vs its parent (clean)"
-                    .into(),
+                "bed diff takes two changesets, or none for the current one vs its parent".into(),
             ));
         }
         (None, None) => {
             let newer = session.resolve_current_cs(&bed, "diff").await?;
             match session.first_parent(newer, "diff").await? {
-                Some(older) => (older, newer, true),
-                None => return Ok(root_header(newer)), // a root: nothing to diff
+                Some(older) => (older, newer),
+                None => return Ok(String::new()), // a root: nothing to diff
             }
         }
     };
     if older == newer {
-        // An empty diff still prints its header: it names both sides and
-        // states the fact that they are equal.
-        return Ok(format!(
-            "diff of {} against {} — both sides are equal\n",
-            older.short(),
-            newer.short()
-        ));
+        return Ok(String::new());
     }
 
     let changes = session.diff(older, newer, "diff").await?;
@@ -765,111 +777,7 @@ pub async fn diff(
             .get_blob(id)?
             .ok_or(ClientError::BlobHashMismatch(id))
     };
-    let body = render::render_diff(&entries, &content_of)?;
-    let header = if first_parent_wording {
-        format!("diff of {} against its first parent", newer.short())
-    } else {
-        format!("diff of {} against {}", older.short(), newer.short())
-    };
-    Ok(format!("{header}\n{body}"))
-}
-
-/// The self-describing header of a root changeset's diff: no parent to
-/// diff against, so the body is empty but the header still prints.
-fn root_header(cs: Id) -> String {
-    format!("diff of {} — a root changeset has no parent\n", cs.short())
-}
-
-/// The working-copy half of the no-argument `bed diff`: local bytes vs
-/// the current changeset, for every modified or deleted tracked file
-/// under the sparse selection. `Ok(None)` means the working copy has
-/// nothing diffable — clean, or dirty only by untracked files (the
-/// renderer covers modified/deleted paths only, git parity) — and the
-/// caller falls back to the committed diff.
-async fn working_copy_diff(bed: &WorkingCopy, current: Id) -> Result<Option<String>, ClientError> {
-    let sparse = bed.config().sparse.clone();
-    let treestate = bed.treestate()?;
-    let root = bed.workspace_root();
-    let report = crate::status::scan_status(&root, &sparse, &treestate, false)?;
-    if report.modified.is_empty() && report.deleted.is_empty() {
-        return Ok(None);
-    }
-
-    let session = Session::open(bed).await?;
-    let mut entries: Vec<DiffEntry> = Vec::new();
-    let mut wanted: HashSet<Id> = HashSet::new();
-    for path in report.modified.iter().chain(report.deleted.iter()) {
-        let row = treestate.lookup(path)?.expect("scanned paths have rows");
-        if row.mode == crate::treestate::MODE_GITLINK {
-            continue; // never materialized; nothing working-copy-local to diff
-        }
-        let old_side = render::DiffSide {
-            blob: row.blob_id,
-            mode: crate::commit::mode_code_to_mode(row.mode),
-        };
-        wanted.insert(row.blob_id);
-        let new_side = match observe_working_bytes(&root, path)? {
-            Some((bytes, mode)) => {
-                let blob = gardenbed_model::blob_id(&bytes);
-                // Cache the local bytes so the renderer's cache-first
-                // content lookup finds them.
-                bed.objects()?.put_blob(&bytes)?;
-                Some(render::DiffSide { blob, mode })
-            }
-            // Gone, or replaced by a directory: a local deletion renders
-            // as a removal to /dev/null.
-            None => None,
-        };
-        entries.push(DiffEntry {
-            path: path.clone(),
-            op: render::classify(Some(old_side), new_side),
-            old: Some(old_side),
-            new: new_side,
-        });
-    }
-    session.fetcher().blobs(&wanted).await?;
-    let objects = bed.objects()?;
-    let content_of = |id: Id| -> Result<Vec<u8>, ClientError> {
-        objects
-            .get_blob(id)?
-            .ok_or(ClientError::BlobHashMismatch(id))
-    };
-    let body = render::render_diff(&entries, &content_of)?;
-    Ok(Some(format!(
-        "diff of working copy against {}\n{body}",
-        current.short()
-    )))
-}
-
-/// Reads the new side of a working-copy diff at `root/rel`, with the
-/// scanner's metadata discipline (`status::observe`, `commit`'s
-/// `read_working`): `symlink_metadata` first, never following — a
-/// symlink's content is its link-target bytes (what `commit` records, so
-/// a dangling target is still a faithful symlink), and only regular
-/// files are read. `Ok(None)` when the path is gone or was replaced by
-/// a directory — both render as deletions.
-fn observe_working_bytes(root: &Path, rel: &str) -> Result<Option<(Vec<u8>, Mode)>, ClientError> {
-    let on_disk = root.join(rel);
-    let meta = match fs::symlink_metadata(&on_disk) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if meta.is_dir() {
-        return Ok(None); // replaced by a directory: a deletion
-    }
-    use std::os::unix::ffi::OsStrExt as _;
-    if meta.file_type().is_symlink() {
-        let bytes = fs::read_link(&on_disk)?.as_os_str().as_bytes().to_vec();
-        return Ok(Some((bytes, Mode::Symlink)));
-    }
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = if meta.permissions().mode() & 0o111 != 0 {
-        Mode::Exec
-    } else {
-        Mode::Regular
-    };
-    Ok(Some((fs::read(&on_disk)?, mode)))
+    render::render_diff(&entries, &content_of)
 }
 
 /// Converts wire `ChangeMsg`s into render entries. The wire carries only

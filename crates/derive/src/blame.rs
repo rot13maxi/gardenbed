@@ -163,14 +163,21 @@ impl BlobCache {
         if self.entries.iter().any(|(k, _)| *k == id) {
             return;
         }
-        self.bytes += blob.content.len();
+        // Approximate weight: the content plus one 8-byte range per line.
+        // Both insertion and eviction use the same formula (the capacity
+        // estimate of `lines`, matching what `record_ranges` allocates),
+        // so the accounting is self-consistent even though it is not an
+        // exact allocation census.
+        let weight = |b: &Arc<CachedBlob>| b.content.capacity() + b.lines.capacity() * 8;
+        self.bytes += weight(&blob);
         self.entries.push((id, blob));
         while self.entries.len() > self.cap_entries || self.bytes > self.cap_bytes {
             let Some((_, evicted)) = self.entries.first() else {
                 break;
             };
-            self.bytes -= evicted.content.len();
+            let w = weight(evicted);
             self.entries.remove(0);
+            self.bytes -= w;
         }
     }
 }

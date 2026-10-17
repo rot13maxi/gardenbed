@@ -6,5 +6,3 @@
 fuzz/target/
 fuzz/artifacts/
 __pycache__/
-test-results/
-playwright-report/

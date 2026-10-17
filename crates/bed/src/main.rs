@@ -88,6 +88,12 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
 
         Command::Status { full_scan } => {
             let bed = WorkingCopy::open(&cli.state_dir)?;
+            // The pending line comes first and works offline: the queue
+            // is purely local state.
+            let pending = bed.queue()?.count()?;
+            if pending > 0 {
+                println!("{pending} pending commit(s) not yet on the server — run bed sync");
+            }
             let sparse = bed.config().sparse.clone();
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");
@@ -174,6 +180,31 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             Ok(0)
         }
 
+        Command::Sync => {
+            let report = gardenbed::queue::sync(&cli.state_dir).await?;
+            for id in &report.synced {
+                println!("synced {}", id.short());
+            }
+            match &report.failure {
+                None => {
+                    if report.synced.is_empty() {
+                        println!("nothing to sync — the queue is empty");
+                    } else {
+                        println!("synced {} commit(s), queue empty", report.synced.len());
+                    }
+                    Ok(0)
+                }
+                Some(e) => {
+                    println!("sync stopped: {e}");
+                    println!(
+                        "{} commit(s) still pending — run bed sync when online",
+                        report.remaining
+                    );
+                    Ok(1)
+                }
+            }
+        }
+
         Command::Blame { path, cs } => {
             validate_path_arg(path)?;
             if let Some(cs) = cs {
@@ -199,22 +230,8 @@ async fn run_sparse(cli: &Cli, command: &SparseCommand) -> Result<i32, ClientErr
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");
             } else {
-                // A selected prefix with no materialized rows matches
-                // nothing at the current changeset — say so, instead of
-                // letting a dead selection look like live coverage.
-                // (Offline like the rest of the command: the treestate's
-                // rows are the materialized truth.)
-                let materialized: std::collections::HashSet<String> =
-                    bed.treestate()?.all_paths()?.into_iter().collect();
                 for prefix in sparse {
-                    let covered = materialized.iter().any(|path| {
-                        gardenbed::sparse::in_sparse(path, std::slice::from_ref(prefix))
-                    });
-                    if covered {
-                        println!("{prefix}");
-                    } else {
-                        println!("{prefix} (empty at this changeset)");
-                    }
+                    println!("{prefix}");
                 }
             }
             Ok(0)
