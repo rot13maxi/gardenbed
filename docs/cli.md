@@ -316,6 +316,7 @@ Usage: gardenbed-server [OPTIONS] [COMMAND]
 |---|---|
 | `--addr <ADDR>` | listen address (`host:port`; `:0` picks an ephemeral port), default `127.0.0.1:9418` |
 | `--root <ROOT>` | repository directory; must be a non-empty path (created if missing) — holds `<root>/objects` and `<root>/metadata.sqlite3` |
+| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode |
 
 Without a subcommand, the top-level `--addr`/`--root` flags serve the
 gRPC API — the printed address is the contract for scripts:
@@ -330,14 +331,48 @@ one-time validation of previously uncertified reachable history before moving
 refs; later restarts reuse that frontier. See [publication validation](validation.md)
 for migration behavior and certificate guarantees.
 
+### Scaled storage
+
+`serve` (and `import`/`export`, below) accept `--storage <config.toml>`
+to open off-box backends instead of the local `--root` layout — the
+horizontal scale-out tier ([docs/scale-out-design.md](scale-out-design.md)).
+The file selects one backend per storage contract:
+
+```toml
+[metadata]
+backend = "postgres"            # or "sqlite" (root = "/path/to/repo")
+url = "postgres://user:pass@host:5432/gardenbed"
+
+[objects]
+backend = "s3"                  # or "fs" (root = "/path/to/repo")
+endpoint = "http://minio:9000"
+bucket = "gardenbed"
+region = "us-east-1"
+access_key = "..."
+secret_key = "..."
+path_style = true
+```
+
+```sh
+gardenbed-server --storage config.toml serve --addr 0.0.0.0:9418
+GARDENBED_STORAGE=/etc/gardenbed/storage.toml gardenbed-server serve
+```
+
+The `sqlite`/`fs` branches point at the same `<root>/metadata.sqlite3`
+and `<root>/objects` layout that `--root` mode opens, so a config file
+can address an existing local repository. A ready-made compose stack
+(Postgres + MinIO + N replicas) lives in `tools/scale/`; see
+[tools/scale/README.md](../tools/scale/README.md).
+
 ### gardenbed-server serve
 
 ```text
 Usage: gardenbed-server serve [OPTIONS]
 ```
 
-Serves the gRPC API. Takes the same `--addr`/`--root` flags; this is the
-default when no subcommand is given.
+Serves the gRPC API. Takes the same `--addr`/`--root`/`--storage` flags
+(see [scaled storage](#scaled-storage)); this is the default when no
+subcommand is given.
 
 ### gardenbed-server import
 
@@ -355,6 +390,7 @@ Imports a git repository's history into the Gardenbed stores.
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
 | `--allow-rewind` | permit ref moves that would lose changesets (force-push parity) |
+| `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback). Note: URL `--from` values require local mode — scaled mode imports a local path |
 
 **Backward ref moves (rewinds).** When an incremental import moves a ref
 to a tip that is not a descendant of the ref's current value (e.g. the
@@ -403,6 +439,7 @@ report; `--mapping FILE` writes it as TSV for verification.
 | `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
 | `--into <INTO>` | destination git repository: created as a bare sha1 repository when missing, accepted as-is when present |
 | `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
+| `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback) |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
 
 ```sh
