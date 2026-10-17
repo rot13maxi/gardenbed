@@ -17,29 +17,43 @@
 //! Scale-out: [`StorageConfig`] parses one TOML file selecting a backend
 //! per side and opens both (see `docs/scale-out-design.md`); the
 //! Postgres and S3 backends bridge their async clients to the sync
-//! traits through a private driver-thread runtime.
+//! traits through a private driver-thread runtime. All of it sits behind
+//! the `scale` feature (on by default; `--no-default-features` builds a
+//! pure-local store with only fs/sqlite/memory).
 
-mod config;
-mod driver;
 mod error;
 mod fs;
 mod memory;
-mod postgres;
-mod s3;
 mod sqlite;
 mod traits;
 
-pub use config::MetadataConfig;
-pub use config::ObjectsConfig;
-pub use config::S3Config;
-pub use config::StorageConfig;
+#[cfg(feature = "scale")]
+mod config;
+#[cfg(feature = "scale")]
+mod driver;
+#[cfg(feature = "scale")]
+mod postgres;
+#[cfg(feature = "scale")]
+mod s3;
+
 pub use error::StoreError;
 pub use fs::FsObjectStore;
 pub use memory::MemoryStore;
-pub use postgres::PostgresMetadataStore;
-pub use s3::S3ObjectStore;
 pub use sqlite::SqliteMetadataStore;
 pub use traits::DerivedRow;
 pub use traits::MetadataStore;
 pub use traits::ObjectStore;
 pub use traits::RefCas;
+
+#[cfg(feature = "scale")]
+pub use config::MetadataConfig;
+#[cfg(feature = "scale")]
+pub use config::ObjectsConfig;
+#[cfg(feature = "scale")]
+pub use config::S3Config;
+#[cfg(feature = "scale")]
+pub use config::StorageConfig;
+#[cfg(feature = "scale")]
+pub use postgres::PostgresMetadataStore;
+#[cfg(feature = "scale")]
+pub use s3::S3ObjectStore;

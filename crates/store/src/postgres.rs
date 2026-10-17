@@ -445,6 +445,18 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         self.driver.block_on(async move {
             let mut conn = pool.get().await.map_err(pg_err)?;
             let tx = conn.transaction().await.map_err(pg_err)?;
+            // INSERT ... ON CONFLICT DO NOTHING first, then verify the
+            // resulting row: under READ COMMITTED two concurrent identical
+            // calls can both see the mapping absent (a SELECT-then-INSERT
+            // race), so the insert — not the select — must be the claim.
+            // The same shape as `write_changeset`'s mapping block.
+            tx.execute(
+                "INSERT INTO git_map(git_sha, cs) VALUES($1, $2) \
+                 ON CONFLICT DO NOTHING",
+                &[&sha, &cs_bytes],
+            )
+            .await
+            .map_err(pg_err)?;
             let by_sha = tx
                 .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[&sha])
                 .await
@@ -458,7 +470,8 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                     if row.get::<_, Vec<u8>>(0) == cs_bytes
                         && existing_sha.get::<_, String>(0) == sha =>
                 {
-                    // already recorded, exactly as requested
+                    // exactly the mapping requested (ours or a concurrent
+                    // identical call's — either way, idempotent Ok)
                 }
                 (Some(row), _) => {
                     let other = id_from_bytea(row.get(0))?;
@@ -474,14 +487,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                         existing_sha.get::<_, String>(0)
                     )));
                 }
-                (None, None) => {
-                    tx.execute(
-                        "INSERT INTO git_map(git_sha, cs) VALUES($1, $2)",
-                        &[&sha, &cs_bytes],
-                    )
-                    .await
-                    .map_err(pg_err)?;
-                }
+                // Unreachable: the insert above guarantees a row for at
+                // least one of the two lookups.
+                (None, None) => {}
             }
             tx.commit().await.map_err(pg_err)?;
             Ok(())
