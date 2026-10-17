@@ -75,7 +75,6 @@ pub enum ServerError {
     /// Merge hit semantic conflicts; the paths are listed in the message.
     #[error("merge conflicts on: {}", .0.join(", "))]
     MergeConflict(Vec<String>),
-
     /// Publish named "main" in the `ref` field: main publishes stay the
     /// plain (ref-less) request form, gated on protocol review.
     #[error(
@@ -995,12 +994,12 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
-            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
             ServerError::RebaseConflict(_)
             | ServerError::NotFastForward
             | ServerError::LaneNotFastForward { .. }
             | ServerError::PublishRewind { .. } => Status::failed_precondition(e.to_string()),
             ServerError::MainRefReserved => Status::invalid_argument(e.to_string()),
+            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
         }
     }
 }
