@@ -1,4 +1,10 @@
-# feat/merge landing procedure (pre-staged, holds until p8's ping)
+# feat/merge landing procedure (pre-staged; RE-CHECK APPROVED, holds for p5)
+
+p8 approved the re-check at 24d4a3d9babfbaf1 on 2026-10-17 (verified in the
+9419 clone: RebaseConflict mapping, merge handler, both must-fix repros, all
+four LOW fixes, 4-arg publish union, stack integrity a22af3d -> 6 cs -> tip).
+Cleared for everything EXCEPT the main publish — that waits on p5's
+multi-repo landing + p8's ping.
 
 State: git branch `wip/merge-rebase-onto-dc49e06` @ 5aca8c7 (pushed to origin).
 Bed scratch import root: /tmp/gb-merge-rebase-bed (in flight).
@@ -22,6 +28,9 @@ Live lane ref feat/merge = f19510ee (old parents, do not touch until landing).
 5. git side: push wip branch commits onto feat/merge (ff or force-with-lease)
    so git and bed agree; delete the wip branch; redeploy binaries in the
    same motion (bed + gardenbed-server).
+6. Send p8 the main changeset id; p9's export+push rides the batch.
+7. merge3-zealous follow-up (77cedc2 semantics) queues AFTER landing —
+   separate review cycle, p4's branch is the vehicle.
 
 Gate evidence for the current tip (5aca8c7): fmt clean; clippy 0 on
 derive/server/bed/protocol/git/harness/mcp; bed merge 5/5; server merge 8/8;
