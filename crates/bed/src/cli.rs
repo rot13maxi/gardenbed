@@ -119,17 +119,8 @@ pub enum Command {
         new_parent: String,
     },
 
-    /// Publish the current changeset by fast-forwarding a ref (default
-    /// `main`; a named ref is the lane-agent form).
-    Publish {
-        /// The ref to fast-forward (default: `main`). `main` must use the
-        /// plain form.
-        #[arg(long = "ref", value_name = "REF")]
-        ref_name: Option<String>,
-        /// Permit a non-fast-forward (rewind) move of a named ref.
-        #[arg(long)]
-        force: bool,
-    },
+    /// Publish the current changeset by fast-forwarding `main`.
+    Publish,
 
     /// Show first-parent line attribution, following renames.
     Blame {
@@ -361,17 +352,7 @@ mod tests {
             other => panic!("expected Rebase, got {other:?}"),
         }
         match parsed(&["publish"]).command {
-            Command::Publish { ref_name, force } => {
-                assert!(ref_name.is_none());
-                assert!(!force);
-            }
-            other => panic!("expected Publish, got {other:?}"),
-        }
-        match parsed(&["publish", "--ref", "feat/scale-out", "--force"]).command {
-            Command::Publish { ref_name, force } => {
-                assert_eq!(ref_name.as_deref(), Some("feat/scale-out"));
-                assert!(force);
-            }
+            Command::Publish => {}
             other => panic!("expected Publish, got {other:?}"),
         }
         match parsed(&["blame", "src/lib.rs"]).command {

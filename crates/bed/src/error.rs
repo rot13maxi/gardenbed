@@ -141,16 +141,6 @@ pub enum ClientError {
         message: String,
     },
 
-    /// A gitlink blob id that does not follow the canonical padding
-    /// convention (upstream git SHA-1 left-padded with twelve zero bytes)
-    /// was asked to render as a `Subproject commit <sha>` hunk. There is
-    /// no honest pointer to name — refuse rather than render a SHA git
-    /// would apply as a wrong target.
-    #[error(
-        "gitlink blob id {0} is not a zero-padded submodule SHA — cannot render a Subproject commit hunk"
-    )]
-    InvalidGitlinkId(Id),
-
     /// The command needs a current changeset and the working copy has none.
     #[error(
         "this working copy has no current changeset — create one with `bed clone` or \
@@ -253,19 +243,16 @@ pub enum ClientError {
     #[error("{0:?} keeps changing while committing — rerun `bed commit`")]
     FileChanged(String),
 
-    /// `publish` was refused because the target ref is no longer where this
-    /// working copy's changeset grew from — a fast-forward CAS lost to a
-    /// moved ref.
+    /// `publish` was refused because `main` is no longer where this working copy's
+    /// changeset grew from — a fast-forward CAS lost to a moved ref.
     #[error(
-        "cannot publish {cs}: it does not fast-forward `{ref}`{tip}\n  \
-         rebase this changeset onto the new {ref} (`bed rebase {ref}`) and publish again"
+        "cannot publish {cs}: it does not fast-forward `main`{tip}\n  \
+         rebase this changeset onto the new main (`bed rebase main`) and publish again"
     )]
     PublishNotFastForward {
         /// The changeset that was being published (short form).
         cs: String,
-        /// The ref that was being published to.
-        r#ref: String,
-        /// The ref's current tip (short form), when the server said.
+        /// `main`'s current tip (short form), when the server said.
         tip: String,
     },
 }

@@ -51,7 +51,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `diff` | diff the working copy (when dirty by modified/deleted tracked files) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
-| `publish` | fast-forward a ref (default `main`) to the current changeset |
+| `publish` | fast-forward `main` to the current changeset |
 | `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
 
@@ -225,17 +225,6 @@ With arguments, both are always changesets: `A` is the older side; with
 Every diff prints a one-line header naming what is being diffed, so the
 modes are distinguishable at a glance — empty diffs included (identical
 sides state they are equal; a root changeset says it has no parent).
-
-Renders are git-shaped beyond the header: a pure rename (the recorded
-`Rename` op, or — between two arbitrary changesets — a delete and a
-write of the identical blob, the rule `bed commit` pairs by) renders
-git's `R100` form (`similarity index 100%`, `rename from`, `rename
-to`); a moved-and-edited file renders a delete plus a write (no
-similarity below 100% is ever claimed). A submodule pointer renders
-`Subproject commit <sha>` hunks on add, delete, and retarget — the real
-upstream SHA — and every rendered shape reapplies with `git apply`
-(gitlink entries under `git apply --cached`).
-
 The first-parent wording appears only when the older side really is the
 newer's first parent; any other pair names both sides:
 
@@ -295,26 +284,12 @@ bed rebase main
 Usage: bed publish [OPTIONS]
 ```
 
-Fast-forwards a ref to the current changeset (a compare-and-swap: one
+Fast-forwards `main` to the current changeset (a compare-and-swap: one
 winner per race; a loser is told the new tip).
-
-| flag | meaning |
-|---|---|
-| `--state-dir <DIR>` | local state directory (default `./.bed`) |
-| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form) |
-| `--force` | permit a non-fast-forward (rewind) move of a named ref |
-
-A named ref is the lane-agent form: agents committing off-main publish
-their branch so a fresh clone's `bed switch <branch>` resolves to the new
-tip. A lane ref gets the same rewind guard as `import`: a non-descendant
-move is refused (the error names the ref, both tips, and what falls off)
-unless `--force` is passed.
 
 ```sh
 bed publish
 # published b273e12d1c6f11ee — `main` now points to it
-bed publish --ref feat/scale-out
-# published 9d1c4b7e2a5f8d3c — `feat/scale-out` now points to it
 ```
 
 ### bed blame
