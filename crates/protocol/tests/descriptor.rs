@@ -43,6 +43,7 @@ const RPCS: &[(&str, bool, bool)] = &[
     ("CasRef", false, false),
     ("Rebase", false, false),
     ("Publish", false, false),
+    ("Merge", false, false),
     ("GetStats", false, false),
 ];
 
@@ -204,6 +205,7 @@ fn rpc_input_output_types_match_the_spec() {
         ("CasRef", "CasRefReq", "CasResp"),
         ("Rebase", "RebaseReq", "RebaseResp"),
         ("Publish", "PublishReq", "PublishResp"),
+        ("Merge", "MergeReq", "MergeResp"),
         ("GetStats", "GetStatsReq", "StatsResp"),
     ];
     for m in service().method.iter() {

@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use gardenbed_derive::{BlameRange, Engine};
 use gardenbed_model::codec::validate_changeset;
-use gardenbed_model::{Change, Changeset, Id, Mode, blob_id};
+use gardenbed_model::{Change, Changeset, Id, Identity, Mode, blob_id};
 use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
@@ -72,6 +72,10 @@ pub enum ServerError {
     /// CAS was lost to a concurrent publish after the check passed).
     #[error("publish refused: \"main\" is not an ancestor of the given changeset")]
     NotFastForward,
+    /// Merge hit semantic conflicts; the paths are listed in the message.
+    #[error("merge conflicts on: {}", .0.join(", "))]
+    MergeConflict(Vec<String>),
+
     /// Publish named "main" in the `ref` field: main publishes stay the
     /// plain (ref-less) request form, gated on protocol review.
     #[error(
@@ -725,6 +729,58 @@ impl Repo {
         Ok(from_old.difference(&from_new).count() as u64)
     }
 
+    /// Server-side two-parent merge (v0.2.md D9-D11): merges `theirs`'
+    /// tree into `ours`' over their merge base and stores one changeset
+    /// `parents = [ours, theirs]` whose changes are the diff
+    /// `tree(ours) -> merged tree` - through the ordinary
+    /// [`Repo::create_changeset`] path (zero new storage, zero new
+    /// validation). Returns `(id, up_to_date)`; when `theirs` is already
+    /// an ancestor of `ours`, answers `(ours, true)` and stores nothing.
+    ///
+    /// Conflicts are a hard error listing every conflicting path
+    /// ([`ServerError::MergeConflict`], `FAILED_PRECONDITION`, rebase's
+    /// shape) - nothing is stored beyond unreferenced merged blobs,
+    /// harmless by construction. Unrelated histories (no merge base)
+    /// fail naming the operation.
+    pub fn merge(
+        &self,
+        ours: Id,
+        theirs: Id,
+        message: &str,
+        author: &gardenbed_model::Identity,
+        committer: &gardenbed_model::Identity,
+    ) -> Result<(Id, bool), ServerError> {
+        // Both sides must exist (clear 404s before any derivation).
+        self.get_changeset(ours)?;
+        self.get_changeset(theirs)?;
+        // Up to date: theirs already an ancestor of ours (every
+        // changeset is an ancestor of itself, so ours == theirs counts).
+        if self.is_ancestor(theirs, ours)? {
+            return Ok((ours, true));
+        }
+        let base = self.merge_base(ours, theirs)?.ok_or_else(|| {
+            ServerError::Invalid(format!(
+                "merge refused: {ours} and {theirs} share no common ancestor (unrelated histories cannot be merged)"
+            ))
+        })?;
+        let changes = match self.engine.merge_tree_changes(Some(base), ours, theirs)? {
+            Ok(changes) => changes,
+            Err(conflicts) => return Err(ServerError::MergeConflict(conflicts)),
+        };
+        let merged = gardenbed_model::Changeset {
+            parents: vec![ours, theirs],
+            changes,
+            message: message.to_owned(),
+            author: author.clone(),
+            committer: committer.clone(),
+            signature: None,
+        };
+        // The ordinary create path: validation, blob resolution (merged
+        // blobs are already objects objects), derived rows, one txn.
+        let id = self.create_changeset(&merged, &BTreeMap::new())?;
+        Ok((id, false))
+    }
+
     /// A snapshot of the request counters, sorted by name.
     pub fn stats(&self) -> BTreeMap<String, u64> {
         self.stats.snapshot()
@@ -939,6 +995,7 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
+            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
             ServerError::RebaseConflict(_)
             | ServerError::NotFastForward
             | ServerError::LaneNotFastForward { .. }
@@ -1318,6 +1375,29 @@ impl Gardenbed for GardenbedService {
         let id = self.repo.publish(cs_id, ref_name, req.force)?;
         Ok(Response::new(pb::PublishResp {
             id: id_to_bytes(id),
+        }))
+    }
+
+    async fn merge(
+        &self,
+        request: Request<pb::MergeReq>,
+    ) -> Result<Response<pb::MergeResp>, Status> {
+        let req = request.into_inner();
+        self.repo_field(&req.repo, "Merge")?;
+        let cs_id = Self::id(&req.cs_id, "cs_id")?;
+        let target = Self::id(&req.target, "target")?;
+        let author = req
+            .author
+            .map(Identity::from)
+            .ok_or_else(|| Status::invalid_argument("MergeReq carries no author"))?;
+        let committer = req
+            .committer
+            .map(Identity::from)
+            .ok_or_else(|| Status::invalid_argument("MergeReq carries no committer"))?;
+        let (id, up_to_date) = self.repo.merge(cs_id, target, &req.message, &author, &committer)?;
+        Ok(Response::new(pb::MergeResp {
+            id: id_to_bytes(id),
+            up_to_date,
         }))
     }
 
