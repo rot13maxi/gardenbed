@@ -38,7 +38,8 @@ const PIKE: (&str, &str) = ("Pike Rowan", "pike@example.com");
 const MOSS: (&str, &str) = ("Moss Hale", "moss@example.com");
 
 /// One file-level edit in a seeded changeset. Content is static so the
-/// whole history is compile-time data.
+/// whole history is compile-time data — except the generated stress
+/// body, which is owned (`WriteOwned`).
 enum Edit {
     /// `path` gains `content` with `mode` (Add or Modify chosen by the
     /// caller — the op is part of the pinned history shape).
@@ -46,6 +47,13 @@ enum Edit {
         op: Op,
         path: &'static str,
         content: &'static str,
+        mode: Mode,
+    },
+    /// Like `Write`, with owned content (the generated stress fixture).
+    WriteOwned {
+        op: Op,
+        path: &'static str,
+        content: String,
         mode: Mode,
     },
     Delete(&'static str),
@@ -72,6 +80,23 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
 
     let mut tip: Option<Id> = None;
 
+    // Shared body for Edit::Write / Edit::WriteOwned after both have
+    // their content as bytes.
+    macro_rules! do_write {
+        ($op:expr, $path:expr, $content:expr, $mode:expr, $inline:ident, $changes:ident) => {{
+            let content: &[u8] = $content;
+            let id = blob_id(content);
+            $inline.insert(id.to_hex(), content.to_vec());
+            $changes.push(Change {
+                path: $path.to_owned(),
+                op: $op,
+                blob: Some(id),
+                src_path: None,
+                mode: $mode,
+            });
+        }};
+    }
+
     /// One changeset on an explicit parent list (the merge + side-branch
     /// commits use this directly; `commit!` below is the linear chain).
     macro_rules! commit_at {
@@ -88,15 +113,10 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
             let mut changes: Vec<Change> = Vec::new();
             $(match $edit {
                 Edit::Write { op, path, content, mode } => {
-                    let id = blob_id(content.as_bytes());
-                    inline.insert(id.to_hex(), content.as_bytes().to_vec());
-                    changes.push(Change {
-                        path: path.to_owned(),
-                        op,
-                        blob: Some(id),
-                        src_path: None,
-                        mode,
-                    });
+                    do_write!(op, path, content.as_bytes(), mode, inline, changes);
+                }
+                Edit::WriteOwned { op, path, content, mode } => {
+                    do_write!(op, path, content.as_bytes(), mode, inline, changes);
                 }
                 Edit::Delete(path) => changes.push(Change {
                     path: path.to_owned(),
@@ -388,18 +408,15 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
     // garden.js wholesale — 6000 lines, none matching the old side, so a
     // naive Myers trace would explode. The web UI must render its
     // 'too many lines to diff' note instead of ~12000 hidden rows.
-    // Edit::Write wants &'static content; the stress body is generated,
-    // so leak it — seed() runs once per process.
-    let stress: &'static str = Box::leak(stress_garden_js().into_boxed_str());
     commit_at!(
         17,
         MOSS,
         vec![published],
         "Stress fixture: rewrite garden.js wholesale",
-        [Edit::Write {
+        [Edit::WriteOwned {
             op: Op::Modify,
             path: "garden.js",
-            content: stress,
+            content: stress_garden_js(),
             mode: Mode::Regular,
         }]
     );

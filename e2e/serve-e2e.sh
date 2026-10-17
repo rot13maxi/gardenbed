@@ -7,13 +7,24 @@ set -eu
 
 ROOT=/tmp/gardenbed-web-e2e-root
 WORKSPACE="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
-BIN="$WORKSPACE/target/debug/gardenbed-web"
+
+# Binary lives under the target dir; honor a globally-set CARGO_TARGET_DIR
+# (cargo resolves a relative one against the directory you BUILD from, so
+# cd to the workspace for both).
+case "${CARGO_TARGET_DIR-}" in
+  "")  TARGET="$WORKSPACE/target" ;;
+  /*)  TARGET="$CARGO_TARGET_DIR" ;;
+  *)   TARGET="$WORKSPACE/$CARGO_TARGET_DIR" ;;
+esac
+BIN="$TARGET/debug/gardenbed-web"
 
 pkill -f "gardenbed-web --root $ROOT" 2>/dev/null || true
 
 # Self-sufficient: Playwright launches the webServer before globalSetup,
-# so the build must live here, not in a setup hook.
-cargo build -p gardenbed-web --manifest-path "$WORKSPACE/Cargo.toml" 1>&2
+# so the build must live here, not in a setup hook. cd first so a relative
+# CARGO_TARGET_DIR resolves against the workspace, matching BIN above.
+cd "$WORKSPACE"
+cargo build -p gardenbed-web 1>&2
 
 rm -rf "$ROOT"
 "$BIN" seed --root "$ROOT" >/dev/null

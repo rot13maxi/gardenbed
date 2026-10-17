@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { rmSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 
 /**
  * Unseeded repository: the overview must render refs (none) and request
@@ -12,12 +13,23 @@ const EMPTY_ROOT = "/tmp/gardenbed-web-e2e-empty";
 const PORT = 18442;
 const URL = `http://127.0.0.1:${PORT}`;
 
+// Honor a globally-set CARGO_TARGET_DIR like serve-e2e.sh does (relative
+// values resolve against the workspace, matching cargo's build cwd there).
+const WORKSPACE = join(__dirname, "..", "..");
+const cargoTarget = process.env.CARGO_TARGET_DIR;
+const TARGET_DIR = cargoTarget
+  ? isAbsolute(cargoTarget)
+    ? cargoTarget
+    : join(WORKSPACE, cargoTarget)
+  : join(WORKSPACE, "target");
+const BIN = join(TARGET_DIR, "debug", "gardenbed-web");
+
 let srv: ChildProcess;
 
 test.beforeAll(async () => {
   rmSync(EMPTY_ROOT, { recursive: true, force: true });
   srv = spawn(
-    `${__dirname}/../../target/debug/gardenbed-web`,
+    BIN,
     ["--root", EMPTY_ROOT, "--addr", `127.0.0.1:${PORT}`],
     { stdio: ["ignore", "pipe", "inherit"] },
   );
