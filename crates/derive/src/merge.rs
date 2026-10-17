@@ -283,31 +283,15 @@ fn walk(
     if theirs == base {
         return Ok(()); // theirs unchanged: keep ours
     }
-    if ours.is_none() {
-        // Ours lacks the directory. Base did too: theirs added content
-        // here — a pure add, adopted wholesale.
-        if base.is_none() {
-            extend_prefixed(&*engine.objects, changes, dir, None, theirs)?;
-            return Ok(());
-        }
-        // Ours deleted this subtree; theirs changed something inside.
-        // Conflict at file-path granularity: the paths theirs changed
-        // vs base are the modify/delete conflicts git reports. Paths
-        // theirs also deleted are mutual deletes — clean.
-        changed_paths_opts(engine, base, theirs, dir, conflicts, depth, true)?;
-        return Ok(());
-    }
-    if theirs.is_none() {
-        // Theirs deleted this subtree (base had it); ours changed it.
-        // If ours changed nothing vs base, the merge is theirs' delete;
-        // otherwise the changed paths conflict.
-        if changed_paths(engine, base, ours, dir, &mut Vec::new(), depth)?.is_empty() {
-            extend_prefixed(&*engine.objects, changes, dir, ours, None)?;
-        } else {
-            changed_paths_opts(engine, base, ours, dir, conflicts, depth, true)?;
-        }
-        return Ok(());
-    }
+    // `None` here is the empty tree, never a deleted subtree: the root
+    // call passes `derive_tree`'s `Option<Id>` (None = empty root), and
+    // the child recursion passes `Dir` entries' tree ids, which are
+    // always `Some` (`apply` omits empty subtrees from parent entries).
+    // A side that emptied its root therefore merges entry by entry
+    // below — an absent name is ours' delete, and a name theirs added
+    // on top of an absent base is a clean add — exactly like any other
+    // divergence. (Treating a None root as "deleted the subtree" would
+    // conflict theirs' root-level adds against ours' empty tree.)
     // Both sides have a directory here; merge entry by entry.
     let b_tree = load_or_default(&*engine.objects, base)?;
     let o_tree = load_or_default(&*engine.objects, ours)?;
@@ -454,6 +438,14 @@ fn merge_entry(
                     eo.and_then(|o| o.tree),
                     e.tree,
                 )?;
+                Ok(())
+            }
+            // Theirs added a directory where neither base nor ours had
+            // one (ours == base == absent): a pure add — diff it in
+            // from nothing (`take` is file-only: a Dir entry carries a
+            // tree id, not a blob).
+            (None, Some(e)) if e.kind == TreeKind::Dir => {
+                extend_prefixed(&*engine.objects, changes, &path, None, e.tree)?;
                 Ok(())
             }
             // Anything else present on theirs' side is a file entry
