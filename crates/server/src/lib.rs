@@ -1026,12 +1026,12 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
-            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
             ServerError::RebaseConflict(_)
             | ServerError::NotFastForward
             | ServerError::LaneNotFastForward { .. }
             | ServerError::PublishRewind { .. } => Status::failed_precondition(e.to_string()),
             ServerError::MainRefReserved => Status::invalid_argument(e.to_string()),
+            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
         }
     }
 }
