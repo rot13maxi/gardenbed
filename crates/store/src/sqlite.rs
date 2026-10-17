@@ -123,6 +123,27 @@ impl SqliteMetadataStore {
             .map_err(|_| StoreError::Db("metadata connection lock poisoned".into()))
     }
 
+/// Folds the WAL into the database and truncates it: anything that
+/// relocates the database by renaming files (a repository move) must
+/// first fold the WAL in or the moved database is missing committed
+/// rows. Fails when another connection holds the database — the busy
+/// flag from the checkpoint itself (a pinned WAL means another reader
+/// or writer holds it past the 5 s busy timeout, and the move must be
+/// refused rather than succeed while carrying an untruncated `-wal`).
+pub fn wal_checkpoint_truncate(&self) -> Result<(), StoreError> {
+    let conn = self.lock_write()?;
+    let (busy, _log, _checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(db_err)?;
+    if busy != 0 {
+        return Err(StoreError::Db(
+            "wal_checkpoint(TRUNCATE) was busy: another connection holds the database".into(),
+        ));
+    }
+    Ok(())
+}
     /// Runs `f` in one immediate transaction on the write connection;
     /// commits on `Ok`, rolls back on `Err`.
     fn in_tx<T>(
