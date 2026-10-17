@@ -93,10 +93,11 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// Diff two changesets (default: the current changeset vs its first
-    /// parent).
+    /// Diff the working copy against the current changeset (when dirty),
+    /// or two changesets (default: the current one vs its first parent).
+    /// Every diff prints a header naming what is being diffed.
     Diff {
-        /// The older side: changeset id or ref. With `b` omitted: diffs
+        /// The older side: changeset id or ref. With `b` omitted, diffs
         /// against this changeset's first parent.
         a: Option<String>,
         /// The newer side: changeset id or ref.
@@ -120,8 +121,17 @@ pub enum Command {
         new_parent: String,
     },
 
-    /// Publish the current changeset by fast-forwarding `main`.
-    Publish,
+    /// Publish the current changeset by fast-forwarding a ref (default
+    /// `main`; a named ref is the lane-agent form).
+    Publish {
+        /// The ref to fast-forward (default: `main`). `main` must use the
+        /// plain form.
+        #[arg(long = "ref", value_name = "REF")]
+        ref_name: Option<String>,
+        /// Permit a non-fast-forward (rewind) move of a named ref.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Show first-parent line attribution, following renames.
     Blame {
@@ -353,7 +363,17 @@ mod tests {
             other => panic!("expected Rebase, got {other:?}"),
         }
         match parsed(&["publish"]).command {
-            Command::Publish => {}
+            Command::Publish { ref_name, force } => {
+                assert!(ref_name.is_none());
+                assert!(!force);
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+        match parsed(&["publish", "--ref", "feat/scale-out", "--force"]).command {
+            Command::Publish { ref_name, force } => {
+                assert_eq!(ref_name.as_deref(), Some("feat/scale-out"));
+                assert!(force);
+            }
             other => panic!("expected Publish, got {other:?}"),
         }
         match parsed(&["blame", "src/lib.rs"]).command {

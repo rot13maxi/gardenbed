@@ -2,24 +2,28 @@
 //! ([`gardenbed::render::render_diff`]).
 //!
 //! The unit tests in `render.rs` pin each entry class alone; these pin the
-//! combined output: a diff mixing text, binary, and gitlink entries must
-//! come out as one patch `git apply` parses entry-by-entry — binary blobs
-//! render git's `Binary files … differ` line (never lossy U+FFFD hunks),
-//! gitlink entries render mode lines only (the import's gitlink blob ids
-//! are synthetic padded ids, so no honest `Subproject commit` line exists),
-//! and a payload-free entry without mode lines still carries the
-//! `---`/`+++` markers git apply needs to consume it without leaking its
-//! name into the next entry's parse.
+//! combined output: a diff mixing text, binary, gitlink, and rename
+//! entries must come out as one patch `git apply` parses entry-by-entry —
+//! binary blobs render git's `Binary files … differ` line (never lossy
+//! U+FFFD hunks), gitlink entries render git's `Subproject commit` hunks
+//! from the SHA zero-padded in the blob id, pure renames render git's
+//! `R100` form, and a payload-free entry without mode lines still carries
+//! the `---`/`+++` markers git apply needs to consume it without leaking
+//! its name into the next entry's parse.
+//!
+//! Every shape here is additionally proven against real `git apply` in
+//! [`git_apply_accepts_every_rendered_shape`].
+use std::process::Command;
 
 use gardenbed::render::{DiffEntry, DiffOp, DiffSide, render_diff};
 use gardenbed_model::{Id, Mode, blob_id};
 
-/// A gitlink blob id as the import stores it: the upstream git SHA-1
-/// zero-padded to 32 bytes — a synthetic id for content bed never holds.
+/// A gitlink blob id as the import/generator store it: the upstream git
+/// SHA-1 zero-padded to 32 bytes — the id *is* the padding, never a hash.
 fn gitlink_id(byte: u8) -> Id {
     let mut padded = [0u8; 32];
     padded[12..].copy_from_slice(&[byte; 20]);
-    blob_id(&padded)
+    Id::from_bytes(padded)
 }
 
 fn entry(path: &str, op: DiffOp, old: Option<(Id, Mode)>, new: Option<(Id, Mode)>) -> DiffEntry {
@@ -28,6 +32,22 @@ fn entry(path: &str, op: DiffOp, old: Option<(Id, Mode)>, new: Option<(Id, Mode)
         op,
         old: old.map(|(blob, mode)| DiffSide { blob, mode }),
         new: new.map(|(blob, mode)| DiffSide { blob, mode }),
+        src_path: None,
+    }
+}
+
+fn rename_entry(
+    dst: &str,
+    src: &str,
+    old: Option<(Id, Mode)>,
+    new: Option<(Id, Mode)>,
+) -> DiffEntry {
+    DiffEntry {
+        path: dst.to_owned(),
+        op: DiffOp::Rename,
+        old: old.map(|(blob, mode)| DiffSide { blob, mode }),
+        new: new.map(|(blob, mode)| DiffSide { blob, mode }),
+        src_path: Some(src.to_owned()),
     }
 }
 
@@ -70,17 +90,16 @@ fn mixed_text_binary_gitlink_patch_is_git_apply_shaped() {
         ),
         // Binary add: `/dev/null` on the old side.
         entry("art/new.png", DiffOp::Add, None, Some((png, Mode::Regular))),
-        // Gitlink add: the `new file mode 160000` line alone — the metadata
-        // carries the header, so no markers and no content of any kind.
+        // Gitlink add: git's own gitlink-add form minus the `index` line
+        // (git's abbreviation length is dynamic; the Subproject hunk
+        // carries the full SHA).
         entry(
             "vendor/lib",
             DiffOp::Add,
             None,
             Some((gitlink_id(0x19), Mode::Gitlink)),
         ),
-        // Gitlink pointer change: no mode lines exist (both sides are
-        // 160000) and no honest Subproject sha — markers plus git's
-        // binary-differ line keep the entry one git apply parses.
+        // Gitlink pointer change: git's one-line swap hunk.
         entry(
             "vendor/other",
             DiffOp::Modify,
@@ -94,6 +113,13 @@ fn mixed_text_binary_gitlink_patch_is_git_apply_shaped() {
             DiffOp::Modify,
             Some((script, Mode::Regular)),
             Some((script, Mode::Exec)),
+        ),
+        // Pure rename: git's R100 form, content never fetched.
+        rename_entry(
+            "docs/moved.md",
+            "docs/old.md",
+            Some((text_old, Mode::Regular)),
+            Some((text_old, Mode::Regular)),
         ),
     ];
 
@@ -116,15 +142,25 @@ new file mode 100644
 Binary files /dev/null and b/art/new.png differ
 diff --git a/vendor/lib b/vendor/lib
 new file mode 160000
+--- /dev/null
++++ b/vendor/lib
+@@ -0,0 +1 @@
++Subproject commit 1919191919191919191919191919191919191919
 diff --git a/vendor/other b/vendor/other
 --- a/vendor/other
 +++ b/vendor/other
-Binary files a/vendor/other and b/vendor/other differ
+@@ -1 +1 @@
+-Subproject commit 2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a
++Subproject commit 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a
 diff --git a/script/build.sh b/script/build.sh
 old mode 100644
 new mode 100755
 --- a/script/build.sh
 +++ b/script/build.sh
+diff --git a/docs/old.md b/docs/moved.md
+similarity index 100%
+rename from docs/old.md
+rename to docs/moved.md
 "
     );
 }
@@ -164,4 +200,191 @@ fn binary_and_gitlink_output_never_transcodes_bytes() {
     );
     assert!(out.is_ascii(), "binary entries must not transcode: {out:?}");
     assert!(!out.contains('\u{FFFD}'), "lossy replacement in output");
+}
+
+/// `git apply --check` must accept every patch shape bed renders, and the
+/// applied results must match what git's own diff of the same change
+/// produces — the strongest acceptance oracle available outside the
+/// fixture harness. Runs in a throwaway git repo under the cargo target
+/// dir; skips (with a panic) when no `git` is on PATH.
+#[test]
+fn git_apply_accepts_every_rendered_shape() {
+    use std::fs;
+    use std::path::PathBuf;
+
+    let git = env_var_git();
+    let root = std::env::var("CARGO_TARGET_TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("gardenbed-render-patch"));
+    let dir = root.join("git-apply");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    run(git, &dir, &["init", "-q"]);
+    run(git, &dir, &["config", "user.name", "T"]);
+    run(git, &dir, &["config", "user.email", "t@t"]);
+    run(git, &dir, &["config", "core.quotePath", "false"]);
+
+    // ---- regular text add + rename + mode-flip rename + gitlink shapes.
+    let moved_content = b"line one\nline two\n".to_vec();
+    let script_content = b"#!/bin/sh\nset -e\n".to_vec();
+
+    fs::write(dir.join("old.txt"), &moved_content).unwrap();
+    fs::write(dir.join("other.sh"), &script_content).unwrap();
+    run(git, &dir, &["add", "."]);
+    run(git, &dir, &["commit", "-qm", "base"]);
+
+    // Build the bed-rendered patch for: rename old.txt→new.txt (pure),
+    // rename+mode-flip other.sh→run.sh, gitlink add vendor/sub.
+    let text = blob_id(&moved_content);
+    let script = blob_id(&script_content);
+    let sub_add = gitlink_id(0x33);
+    let content_of = move |id: Id| {
+        if id == text {
+            Ok(moved_content.clone())
+        } else if id == script {
+            Ok(script_content.clone())
+        } else {
+            panic!("renderer fetched a blob the store lacks: {id}")
+        }
+    };
+    let entries = [
+        rename_entry(
+            "new.txt",
+            "old.txt",
+            Some((text, Mode::Regular)),
+            Some((text, Mode::Regular)),
+        ),
+        rename_entry(
+            "run.sh",
+            "other.sh",
+            Some((script, Mode::Regular)),
+            Some((script, Mode::Exec)),
+        ),
+        entry(
+            "vendor/sub",
+            DiffOp::Add,
+            None,
+            Some((sub_add, Mode::Gitlink)),
+        ),
+    ];
+    let patch = render_diff(&entries, &content_of).unwrap();
+    fs::write(dir.join("bed.patch"), &patch).unwrap();
+
+    // git apply must accept the patch; then the working tree must carry
+    // the move (old names gone, new names present, right modes).
+    run(git, &dir, &["apply", "--check", "bed.patch"]);
+    run(git, &dir, &["apply", "bed.patch"]);
+    assert!(dir.join("new.txt").is_file(), "rename applied: dst exists");
+    assert!(!dir.join("old.txt").exists(), "rename applied: src gone");
+    assert!(dir.join("run.sh").is_file());
+    let mode = fs::symlink_metadata(dir.join("run.sh"))
+        .unwrap()
+        .permissions();
+    use std::os::unix::fs::PermissionsExt as _;
+    assert!(
+        mode.mode() & 0o111 != 0,
+        "rename+mode applied: {:o}",
+        mode.mode() & 0o777
+    );
+
+    // The gitlink add: a Subproject hunk applies onto the index as a
+    // 160000 entry (git apply refuses submodule adds on the worktree
+    // path; --cached is git's own form's acceptance surface).
+    run(git, &dir, &["apply", "--cached", "bed.patch"]);
+    let ls = out_of(git, &dir, &["ls-files", "-s", "vendor/sub"]);
+    assert_eq!(
+        ls.trim(),
+        format!("160000 {} 0\tvendor/sub", hex40(0x33)),
+        "gitlink add applied to the index"
+    );
+
+    // ---- gitlink pointer change + delete (on a fresh base).
+    fs::write(dir.join("base2.txt"), b"base\n").unwrap();
+    run(git, &dir, &["add", "base2.txt"]);
+    run(git, &dir, &["commit", "-qm", "base2"]);
+    run(
+        git,
+        &dir,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{},vendor/ptr", hex40(0x44)),
+        ],
+    );
+    run(git, &dir, &["commit", "-qm", "pointer"]);
+
+    let old_ptr = gitlink_id(0x44);
+    let new_ptr = gitlink_id(0x55);
+    let entries = [entry(
+        "vendor/ptr",
+        DiffOp::Modify,
+        Some((old_ptr, Mode::Gitlink)),
+        Some((new_ptr, Mode::Gitlink)),
+    )];
+    let patch = render_diff(&entries, &|_| Ok(vec![])).unwrap();
+    fs::write(dir.join("ptr.patch"), &patch).unwrap();
+    run(git, &dir, &["apply", "--check", "--cached", "ptr.patch"]);
+    run(git, &dir, &["apply", "--cached", "ptr.patch"]);
+    let ls = out_of(git, &dir, &["ls-files", "-s", "vendor/ptr"]);
+    assert_eq!(
+        ls.trim(),
+        format!("160000 {} 0\tvendor/ptr", hex40(0x55)),
+        "pointer change applied to the index"
+    );
+
+    let entries = [entry(
+        "vendor/ptr",
+        DiffOp::Delete,
+        Some((new_ptr, Mode::Gitlink)),
+        None,
+    )];
+    let patch = render_diff(&entries, &|_| Ok(vec![])).unwrap();
+    fs::write(dir.join("del.patch"), &patch).unwrap();
+    run(git, &dir, &["apply", "--check", "--cached", "del.patch"]);
+    run(git, &dir, &["apply", "--cached", "del.patch"]);
+    let ls = out_of(git, &dir, &["ls-files", "-s", "vendor/ptr"]);
+    assert_eq!(ls.trim(), "", "gitlink delete applied to the index");
+}
+
+fn hex40(byte: u8) -> String {
+    let hex = format!("{byte:02x}");
+    hex.repeat(20)
+}
+
+fn env_var_git() -> &'static str {
+    // The fixture harness elsewhere pins `git` via its own discovery; a
+    // plain `git` on PATH covers every environment these tests run in.
+    "git"
+}
+
+fn run(git: &str, dir: &std::path::Path, args: &[&str]) {
+    let out = Command::new(git)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}{}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn out_of(git: &str, dir: &std::path::Path, args: &[&str]) -> String {
+    let out = Command::new(git)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}{}",
+        args,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }

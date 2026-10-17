@@ -110,6 +110,28 @@ pub async fn sync_sparse(
         outcome.removed += 1;
     }
 
+    // After the whole removal pass, prune directories the removals left
+    // empty — deepest first, each ancestor at most once. Only directories
+    // that contain nothing at all disappear; the working-copy root and
+    // the state directory are never candidates, and untracked content
+    // blocks pruning by making the directory non-empty.
+    let mut pruned: Vec<String> = obsolete
+        .iter()
+        .filter_map(|path| path.rsplit_once('/').map(|(dir, _)| dir.to_owned()))
+        .collect();
+    // Deepest first: pruning a child may empty its parent, never the
+    // reverse — parents must be visited after everything inside them.
+    pruned.sort_by(|a, b| {
+        b.matches('/')
+            .count()
+            .cmp(&a.matches('/').count())
+            .then_with(|| a.cmp(b))
+    });
+    pruned.dedup();
+    for dir in pruned {
+        disk.prune_empty(&dir, sparse)?;
+    }
+
     for (path, file) in &target {
         if preserve.contains(path) {
             continue;

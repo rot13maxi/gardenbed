@@ -592,7 +592,7 @@ fn build_changes(
 }
 
 /// The treestate's §4 mode code → the model's [`Mode`].
-fn mode_code_to_mode(code: i64) -> Mode {
+pub(crate) fn mode_code_to_mode(code: i64) -> Mode {
     match code {
         crate::treestate::MODE_EXEC => Mode::Exec,
         crate::treestate::MODE_SYMLINK => Mode::Symlink,

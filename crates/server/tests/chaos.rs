@@ -621,7 +621,7 @@ async fn drive(ctx: CallCtx, class: Class, i: usize) -> Outcome {
                 Err(_) => return Outcome::Failed("Publish (pre-read)"),
             };
             let target = ctx.publish_target;
-            match client.publish(REPO, target).await {
+            match client.publish(REPO, target, None, false).await {
                 Ok(id) => {
                     assert_eq!(id, target, "Publish echoes the published changeset");
                     Outcome::Published(target, before)
