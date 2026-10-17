@@ -47,6 +47,16 @@ Bed scratch import root: /tmp/gb-merge-rebase-bed (ref
 refs/heads/wip/merge-replay-a0ae00a). Live lane ref feat/merge = f19510ee
 (old parents, do not touch until landing).
 
+## Process traps in force (dogfood #13, #14)
+
+- #14: import prints its report line ONLY on success — a MISSING report
+  line means the import FAILED. Never pipe import/export output through
+  tail/exit-swallowing filters; run bare (or redirect to a file), check
+  the report line AND the exit code before trusting the result. Same
+  class as the mid-run test-log pipe trap.
+- #13: restart servers before using `publish --ref` against them
+  (old-server + new-client = ref dropped, silent main publish).
+
 ## When p8 sends "main is ready, land" with changeset id CS:
 
 1. If p5's landing touched any lane files (server/repos.rs, sqlite.rs,
