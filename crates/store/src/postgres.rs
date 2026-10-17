@@ -86,7 +86,8 @@ impl PostgresMetadataStore {
     /// expected on a trusted network or a local compose network.
     pub fn open(url: &str) -> Result<Self, StoreError> {
         let driver = Driver::new("gardenbed-pg-driver");
-        let pool = driver.block_on(async {
+        let url = url.to_owned();
+        let pool = driver.block_on(async move {
             let config: tokio_postgres::Config = url
                 .parse()
                 .map_err(|e| StoreError::Invalid(format!("invalid postgres url: {e}")))?;
@@ -135,8 +136,9 @@ impl PostgresMetadataStore {
             .map(|row| (row.kind.clone(), row.cs.as_bytes().to_vec(), row.bytes.clone()))
             .collect();
         let parents: Vec<Vec<u8>> = cs.parents.iter().map(|p| p.as_bytes().to_vec()).collect();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let mut conn = self.pool.get().await.map_err(pg_err)?;
+            let mut conn = pool.get().await.map_err(pg_err)?;
             let tx = conn.transaction().await.map_err(pg_err)?;
 
             if validated_tree.is_some() {
@@ -272,8 +274,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         // same id gets the idempotent path, not a constraint error.
         let id = Id::from_bytes(Sha256::digest(&canonical).into());
         let canonical = canonical.clone();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let mut conn = self.pool.get().await.map_err(pg_err)?;
+            let mut conn = pool.get().await.map_err(pg_err)?;
             let tx = conn.transaction().await.map_err(pg_err)?;
             let inserted = tx
                 .execute(
@@ -303,8 +306,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
 
     fn get_changeset(&self, id: Id) -> Result<Option<(Changeset, Vec<u8>)>, StoreError> {
         let key = id.as_bytes().to_vec();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             let row = conn
                 .query_opt("SELECT canonical FROM changesets WHERE id = $1", &[&key])
                 .await
@@ -324,8 +328,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
     fn resolve_ref(&self, name: &str) -> Result<Option<Id>, StoreError> {
         check_ref_name(name)?;
         let name = name.to_owned();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             let row = conn
                 .query_opt("SELECT cs FROM refs WHERE name = $1", &[&name])
                 .await
@@ -338,8 +343,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
     }
 
     fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError> {
-        self.driver.block_on(async {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let conn = pool.get().await.map_err(pg_err)?;
             let rows = conn
                 .query("SELECT name, cs FROM refs ORDER BY name", &[])
                 .await
@@ -360,8 +366,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         // One guarded statement per path (D6), inside one transaction so
         // the Conflict re-read cannot observe a value newer than the one
         // that blocked the write.
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let mut conn = self.pool.get().await.map_err(pg_err)?;
+            let mut conn = pool.get().await.map_err(pg_err)?;
             let tx = conn.transaction().await.map_err(pg_err)?;
             let outcome = match expected_bytes {
                 Some(expected_bytes) => {
@@ -429,8 +436,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
     fn record_git_mapping(&self, git_sha_hex: &str, cs: Id) -> Result<(), StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
         let cs_bytes = cs.as_bytes().to_vec();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let mut conn = self.pool.get().await.map_err(pg_err)?;
+            let mut conn = pool.get().await.map_err(pg_err)?;
             let tx = conn.transaction().await.map_err(pg_err)?;
             let by_sha = tx
                 .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[&sha])
@@ -477,8 +485,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
 
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             let row = conn
                 .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[&sha])
                 .await
@@ -492,8 +501,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
 
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
         let key = cs.as_bytes().to_vec();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             let row = conn
                 .query_opt("SELECT git_sha FROM git_map WHERE cs = $1", &[&key])
                 .await
@@ -509,8 +519,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
     ) -> Result<Vec<Id>, StoreError> {
         let lo = lo.to_vec();
         let hi = hi_exclusive.map(<[u8]>::to_vec);
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             // Same PK range seek as SQLite; Postgres binds optionals as
             // separate statement shapes (no `$2 IS NULL` trick with a
             // unified plan for bytea).
@@ -544,8 +555,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         let kind = kind.to_owned();
         let cs_bytes = cs.as_bytes().to_vec();
         let bytes = bytes.to_vec();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             conn.execute(
                 "INSERT INTO derived(kind, cs, bytes) VALUES($1, $2, $3) \
                  ON CONFLICT (kind, cs) DO UPDATE SET bytes = EXCLUDED.bytes",
@@ -561,8 +573,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         check_kind(kind)?;
         let kind = kind.to_owned();
         let cs_bytes = cs.as_bytes().to_vec();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             let row = conn
                 .query_opt(
                     "SELECT bytes FROM derived WHERE kind = $1 AND cs = $2",
@@ -585,8 +598,9 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
 
     fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
         let key = cs.as_bytes().to_vec();
+        let pool = self.pool.clone();
         self.driver.block_on(async move {
-            let conn = self.pool.get().await.map_err(pg_err)?;
+            let conn = pool.get().await.map_err(pg_err)?;
             let row = conn
                 .query_opt(
                     "SELECT root_tree FROM validated_changesets_v1 WHERE cs = $1",
