@@ -19,8 +19,22 @@
 //! top level — serves unchanged as repository `default`, the name `bed
 //! clone` and `gardenbed-mcp` already fall back to; `gardenbed-server move`
 //! performs the two renames explicitly.
+//!
+//! ## The move contract
+//!
+//! [`RepoSet::move_repo`] relocates repository files, and repository files
+//! are *not* the whole story with SQLite in WAL mode: committed rows may
+//! legally live in `metadata.sqlite3-wal` (the store commits with
+//! `synchronous=NORMAL`), and a live connection holds `-shm` plus the
+//! inode. So a move must checkpoint the WAL into the database first, must
+//! carry `-wal`/`-shm` along with it, and must refuse to run while any
+//! process has the repository open — a serving server holds an exclusive
+//! flock on `<root>/gardenbed.lock` for exactly this check. The move is
+//! an offline operation: stop the server, move, restart.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -32,6 +46,12 @@ pub const DEFAULT_REPO: &str = "default";
 
 /// The default open-handle cap (`--max-repos`).
 pub const DEFAULT_MAX_REPOS: usize = 256;
+
+/// The advisory lockfile a serving server holds on the root for its
+/// lifetime: `gardenbed-server move` (and any second server) refuses to
+/// run while it is held, because renaming repository files under a live
+/// sqlite connection strands the WAL and the SHM.
+pub const ROOT_LOCK: &str = "gardenbed.lock";
 
 /// Names a repository directory can never take (v0.2.md §5 layout rules):
 /// reserved for root-level files a repository must not shadow.
@@ -56,6 +76,38 @@ pub fn valid_repo_name(name: &str) -> bool {
         return false;
     }
     !RESERVED_NAMES.contains(&name)
+}
+
+/// Takes the root's advisory lock without waiting: `Ok(file)` means no
+/// other process holds the root (the returned file releases on drop —
+/// a serving server holds it for its lifetime), `Err(None)` means one
+/// does. Both callers want the immediate answer: a second server must
+/// fail fast rather than queue behind the first, and a move must refuse.
+pub fn try_lock_root(root: &Path) -> Result<File, Option<RepoResolveError>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(root.join(ROOT_LOCK))
+        .map_err(|e| {
+            Some(RepoResolveError::Open {
+                name: root.display().to_string(),
+                source: ServerError::Store(gardenbed_store::StoreError::Io(format!(
+                    "cannot open {}: {e}",
+                    root.join(ROOT_LOCK).display()
+                ))),
+            })
+        })?;
+    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(rustix::io::Errno::WOULDBLOCK) => Err(None),
+        Err(e) => Err(Some(RepoResolveError::Open {
+            name: root.display().to_string(),
+            source: ServerError::Store(gardenbed_store::StoreError::Io(e.to_string())),
+        })),
+    }
 }
 
 /// Why a repo name failed to resolve: not a legal name
@@ -107,6 +159,14 @@ impl RepoHandle {
         &self.repo
     }
 
+    /// The handle's request counters — the same `Arc` the [`Repo`] bumps,
+    /// so they survive eviction: a reopen reuses this handle's counters
+    /// through [`Repo::reopen_like`], keeping them cumulative for the name
+    /// across open epochs.
+    fn counters(&self) -> &Arc<crate::Stats> {
+        self.repo().counters()
+    }
+
     fn stamp(&self, clock: &AtomicU64) {
         self.last_used
             .store(clock.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
@@ -127,6 +187,11 @@ pub struct RepoSet {
     /// under the write lock; reads take the read lock only to clone an
     /// already-open `Arc`.
     open: RwLock<HashMap<String, Arc<RepoHandle>>>,
+    /// Request counters by name, parked across evictions: an evicted
+    /// repository reopens with the same counters, because they count the
+    /// name's RPCs (cumulative since the server started), not the open
+    /// epoch.
+    counters: Mutex<HashMap<String, Arc<crate::Stats>>>,
     /// Monotonic clock for LRU stamps.
     clock: AtomicU64,
     /// Bound on concurrent opens (makes the singleflight map lock a real
@@ -158,6 +223,7 @@ impl RepoSet {
             root: root.to_path_buf(),
             max_repos: max_repos.max(1),
             open: RwLock::new(HashMap::new()),
+            counters: Mutex::new(HashMap::new()),
             clock: AtomicU64::new(1),
             open_gate: Mutex::new(()),
         }
@@ -333,26 +399,58 @@ impl RepoSet {
             return Ok(h);
         }
         let dir = self.repo_dir(name);
-        let repo = Repo::open(&dir).map_err(|source| RepoResolveError::Open {
-            name: name.to_owned(),
-            source,
-        })?;
-        let handle = Arc::new(RepoHandle {
-            repo: Arc::new(repo),
-            uses: AtomicU64::new(1),
-            last_used: AtomicU64::new(0),
-        });
-        handle.stamp(&self.clock);
+        // The registry recheck under the write lock closes the
+        // resolve/rename race: `exists()` above ran lock-free, and a
+        // `move` between the two would leave `Repo::open` creating a
+        // fresh empty repository at the vacated name instead of failing
+        // NotFound. `Repo::open` creates missing stores, so this is the
+        // last point the directory can be checked authoritatively.
         {
             let mut map = self.open.write().map_err(|_| RepoResolveError::Open {
                 name: name.to_owned(),
                 source: ServerError::Invalid("repo map lock poisoned".into()),
             })?;
+            if !Self::still_served(&dir, name) {
+                return Err(RepoResolveError::NotFound {
+                    name: name.to_owned(),
+                    served: self.served_list(),
+                });
+            }
+            let mut repo = Repo::open(&dir).map_err(|source| RepoResolveError::Open {
+                name: name.to_owned(),
+                source,
+            })?;
+            // Counters are per-name and cumulative: a repository evicted
+            // earlier keeps its counts when it reopens.
+            if let Ok(parked) = self.counters.lock()
+                && let Some(stats) = parked.get(name)
+            {
+                repo.adopt_counters(stats);
+            }
+            let handle = Arc::new(RepoHandle {
+                repo: Arc::new(repo),
+                uses: AtomicU64::new(1),
+                last_used: AtomicU64::new(0),
+            });
+            if let Ok(mut parked) = self.counters.lock() {
+                parked.insert(name.to_owned(), handle.counters().clone());
+            }
+            handle.stamp(&self.clock);
             map.insert(name.to_owned(), handle.clone());
             self.evict_locked(&mut map);
+            log::debug!("repository {name} opened from {}", dir.display());
+            Ok(handle)
         }
-        log::debug!("repository {name} opened from {}", dir.display());
-        Ok(handle)
+    }
+
+    /// The under-lock half of [`RepoSet::exists`]: the directory still
+    /// holds a repository (`Repo::open` would otherwise create one), and
+    /// a legacy `default` is still a legacy root.
+    fn still_served(dir: &Path, name: &str) -> bool {
+        if name == DEFAULT_REPO {
+            return Self::is_legacy_root(dir);
+        }
+        Self::is_repo_dir(dir)
     }
 
     /// Evicts LRU handles over the cap, closing only zero-use handles.
@@ -402,6 +500,12 @@ impl RepoSet {
     /// byte-identical after the move (M11.4). Refuses unless `from` exists,
     /// `to` does not, both names are valid, and the server's legacy-layout
     /// rules hold (`default` may only move away from a legacy root).
+    ///
+    /// An offline operation by contract (see the module docs): refuses
+    /// while a server is serving the root (its advisory lock on
+    /// [`ROOT_LOCK`] is held) and checkpoints the repository's WAL into
+    /// the database before renaming, so no committed row is left behind
+    /// in a stranded `metadata.sqlite3-wal`.
     pub fn move_repo(&self, from: &str, to: &str) -> Result<PathBuf, RepoResolveError> {
         if !valid_repo_name(from) || !valid_repo_name(to) {
             return Err(RepoResolveError::InvalidName {
@@ -441,19 +545,33 @@ impl RepoSet {
                 reason: "the destination directory already exists".into(),
             });
         }
-        // The source must not be open (its sqlite connection holds the
-        // file); the set never holds the legacy `default` open across a
-        // move started before any request, so require it closed.
+        // No process may be serving this root: a live server's sqlite
+        // connections keep the WAL/SHM open against the database inode, so
+        // renaming under it strands committed data (the advisory lock is
+        // the server's side of that contract).
+        let _root_lock = try_lock_root(&self.root).map_err(|_| RepoResolveError::InvalidName {
+            name: from.to_owned(),
+            reason: "a server is serving this root — stop it before moving \
+                         repositories (move is an offline operation)"
+                .into(),
+        })?;
+        // The source must not be open in this process either (its sqlite
+        // connection holds the file).
         if self.open_names().contains(&from.to_owned()) {
-            // Close it explicitly: drop our handle so the sqlite connection
-            // releases, then proceed (in-process callers only; the binary
-            // calls this before serving).
-            let mut map = self.open.write().map_err(|_| RepoResolveError::Open {
+            return Err(RepoResolveError::InvalidName {
                 name: from.to_owned(),
-                source: ServerError::Invalid("repo map lock poisoned".into()),
-            })?;
-            map.remove(from);
+                reason: "the repository is open in this process — it cannot be moved \
+                         while requests may still reach it"
+                    .into(),
+            });
         }
+        // Fold the WAL into the database before renaming: with
+        // synchronous=NORMAL committed rows may legally live only in
+        // `metadata.sqlite3-wal`, and the rename below would strand them.
+        // The open is refused (busy) when another connection holds the
+        // database — a live server, a stray `gardenbed-mcp`, an importer —
+        // which is exactly when the move must not happen.
+        Self::checkpoint(&from_dir, from)?;
         let do_rename = |from: &Path, to: &Path| -> Result<(), RepoResolveError> {
             std::fs::rename(from, to).map_err(|e| RepoResolveError::Open {
                 name: from.display().to_string(),
@@ -461,13 +579,21 @@ impl RepoSet {
             })
         };
         if legacy && from == DEFAULT_REPO {
-            // Legacy move: create `<root>/<to>`, move `objects/` and
-            // `metadata.sqlite3` into it, then the mirror if present.
+            // Legacy move: create `<root>/<to>`, move the stores into it,
+            // then the mirror if present. The WAL sidecars travel with the
+            // database (post-checkpoint they should not exist, but a
+            // crashed former server may have left empty ones behind).
             std::fs::create_dir_all(&to_dir).map_err(|e| RepoResolveError::Open {
                 name: to.to_owned(),
                 source: ServerError::Store(gardenbed_store::StoreError::Io(e.to_string())),
             })?;
-            for entry in ["objects", "metadata.sqlite3", "git-mirror.git"] {
+            for entry in [
+                "objects",
+                "metadata.sqlite3",
+                "metadata.sqlite3-wal",
+                "metadata.sqlite3-shm",
+                "git-mirror.git",
+            ] {
                 let src = self.root.join(entry);
                 if src.exists() {
                     do_rename(&src, &to_dir.join(entry))?;
@@ -475,9 +601,38 @@ impl RepoSet {
             }
             Ok(to_dir)
         } else {
+            // The directory rename carries -wal/-shm with it
+            // automatically; post-checkpoint they are absent (or empty
+            // leftovers, harmless at the new path).
             do_rename(&from_dir, &to_dir)?;
             Ok(to_dir)
         }
+    }
+
+    /// Folds the repository's WAL into `metadata.sqlite3` and truncates it,
+    /// so a subsequent file rename cannot strand committed rows. Opens the
+    /// database through the store (same journal/busy configuration as a
+    /// server) and drops the connection again before returning.
+    fn checkpoint(dir: &Path, name: &str) -> Result<(), RepoResolveError> {
+        use gardenbed_store::SqliteMetadataStore;
+        let db = dir.join("metadata.sqlite3");
+        if !db.is_file() {
+            return Ok(()); // objects-only repository: nothing to checkpoint
+        }
+        let store = SqliteMetadataStore::open(&db).map_err(|e| RepoResolveError::Open {
+            name: name.to_owned(),
+            source: ServerError::Store(e),
+        })?;
+        store
+            .wal_checkpoint_truncate()
+            .map_err(|e| RepoResolveError::Open {
+                name: name.to_owned(),
+                source: ServerError::Store(gardenbed_store::StoreError::Db(format!(
+                    "cannot checkpoint the WAL (another connection is likely holding \
+                     the database): {e}"
+                ))),
+            })?;
+        Ok(())
     }
 }
 

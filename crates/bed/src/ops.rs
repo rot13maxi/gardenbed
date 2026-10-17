@@ -80,7 +80,7 @@ pub async fn clone_with_ref(
     // path names it (`http://host:port/<repo>`; no path ⇒ `default`).
     // `--repo` wins on conflict. The endpoint itself is the scheme +
     // authority; the path never reaches the connection.
-    let (endpoint, url_repo) = split_repo_url(server);
+    let (endpoint, url_repo) = split_repo_url(server)?;
     let repo = match (repo, url_repo) {
         (Some(r), _) if !r.trim().is_empty() => r.trim().to_owned(),
         (Some(_), _) => {
@@ -162,37 +162,39 @@ pub async fn clone_with_ref(
 /// scheme pass through untouched — only http(s) addresses repositories in
 /// the URL (the daemon socket is a machine-local transport, not an
 /// address).
-fn split_repo_url(server: &str) -> (String, Option<String>) {
+///
+/// A path of more than one segment (`http://host:port/a/b`) is refused:
+/// it cannot name a repository (repository names are single path-free
+/// segments), and silently treating it as `default` would send the server
+/// a name the user never typed.
+fn split_repo_url(server: &str) -> Result<(String, Option<String>), ClientError> {
     let Ok(uri) = http::Uri::try_from(server) else {
-        return (server.to_owned(), None); // not a URL: pass through
+        return Ok((server.to_owned(), None)); // not a URL: pass through
     };
     match uri.scheme_str() {
         Some("http" | "https") => {}
-        _ => return (server.to_owned(), None),
+        _ => return Ok((server.to_owned(), None)),
     }
     let path = uri.path().trim_matches('/');
+    let endpoint = || {
+        format!(
+            "{}://{}",
+            uri.scheme_str().unwrap_or("http"),
+            uri.authority().map(|a| a.as_str()).unwrap_or("")
+        )
+    };
     if path.is_empty() {
-        // No path: rebuild the endpoint from scheme + authority only.
-        let mut endpoint = String::new();
-        if let Some(scheme) = uri.scheme_str() {
-            endpoint.push_str(scheme);
-            endpoint.push_str("://");
-        }
-        if let Some(auth) = uri.authority() {
-            endpoint.push_str(auth.as_str());
-        }
-        return (endpoint, None);
+        return Ok((endpoint(), None));
     }
-    // One path segment only: `host:port/a/b` names no repository.
     if path.contains('/') {
-        return (server.trim_end_matches('/').to_owned(), None);
+        return Err(ClientError::BadServerUrl {
+            server: server.to_owned(),
+            reason: "the URL path has more than one segment; a clone URL names at most \
+                     one repository (http://host:port/<repo>)"
+                .into(),
+        });
     }
-    let endpoint = format!(
-        "{}://{}",
-        uri.scheme_str().unwrap_or("http"),
-        uri.authority().map(|a| a.as_str()).unwrap_or("")
-    );
-    (endpoint, Some(path.to_owned()))
+    Ok((endpoint(), Some(path.to_owned())))
 }
 
 /// [`clone_with_ref`] without `--ref`: the starting ref is left to the

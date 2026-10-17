@@ -322,6 +322,11 @@ Usage: gardenbed-server serve [OPTIONS]
 Serves the gRPC API. Takes the same `--addr`/`--root` flags; this is the
 default when no subcommand is given.
 
+For its lifetime the server holds an exclusive lock on
+`<root>/gardenbed.lock`: a second server over the same root refuses to
+start (`cannot lock the server root`), and `gardenbed-server move`
+refuses to run while the lock is held.
+
 ### gardenbed-server move
 
 ```text
@@ -332,6 +337,12 @@ Renames a repository under the server root (the two renames: stores,
 then the git mirror when present). Both stores are path-free and
 self-contained, so history is byte-identical after the move; the vacated
 name stops being served.
+
+An **offline operation**: stop the server first. The move checkpoints
+the repository's WAL into `metadata.sqlite3` before renaming (committed
+rows may legally live only in the WAL sidecar), carries `-wal`/`-shm`
+along, and refuses — non-zero exit, nothing changed — while a server is
+serving the root or any other process holds the database.
 
 | flag | meaning |
 |---|---|

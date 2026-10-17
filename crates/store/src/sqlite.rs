@@ -81,6 +81,21 @@ impl SqliteMetadataStore {
         })
     }
 
+    /// Flushes the WAL into the database and truncates it, so committed
+    /// data stops living in `metadata.sqlite3-wal`. With
+    /// `synchronous=NORMAL` a commit legally leaves the database file
+    /// itself untouched and the committed rows in the WAL; anything that
+    /// relocates the database by renaming files (a repository move) must
+    /// first fold the WAL in or the moved database is missing committed
+    /// rows. Fails when another connection holds the database (the
+    /// busy timeout applies) — which is exactly the caller's signal to
+    /// refuse the relocation.
+    pub fn wal_checkpoint_truncate(&self) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+            .map_err(db_err)
+    }
+
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
         self.conn
             .lock()

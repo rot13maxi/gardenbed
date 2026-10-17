@@ -70,8 +70,11 @@ the same methods, which is why MCP and CLI answers agree by construction
 **Subcommands** (binary): `serve` (default — gRPC on `--addr`,
 default `127.0.0.1:9418`; `--max-repos` caps open repositories),
 `import` and `export` (both take `--repo NAME`), `move` (renames a
-repository; see [docs/cli.md](cli.md)). The bound address is printed on
-stdout's first line (`listening on …`) — the contract scripts rely on.
+repository — an offline operation: it checkpoints the repository's WAL,
+carries the sidecar files, and refuses while a server holds the root's
+`gardenbed.lock`; see [docs/cli.md](cli.md)). The bound address is
+printed on stdout's first line (`listening on …`) — the contract scripts
+rely on.
 
 **Revspec resolution (`Repo::get_ref`, also served by the `GetRef`
 RPC).** One resolver funnels every id-taking surface:

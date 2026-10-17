@@ -260,10 +260,24 @@ step_import() {
 
 # ------------------------------------------------------------ 2. serve
 
-step_serve() {
-    log "## 2. serve (gardenbed-server, ephemeral port)"
-    log ""
-    "$SERVER_BIN" --addr 127.0.0.1:0 --root "$SERVER_ROOT" \
+# The server runs on a fixed port for the whole demo: a working copy
+# records the server URL at clone time, and the move block below stops
+# and restarts the server (moves are offline operations) — the URL must
+# survive the restarts. The port is probed for availability first.
+pick_server_port() {
+    local port
+    for port in 19410 19411 19412 19413 19414; do
+        if ! (echo >/dev/tcp/127.0.0.1/$port) 2>/dev/null; then
+            echo "$port"
+            return 0
+        fi
+    done
+    bad "no free demo server port in 19410-19414"
+    return 1
+}
+
+start_server() { # <port>
+    "$SERVER_BIN" --addr "127.0.0.1:$1" --root "$SERVER_ROOT" \
         >"$W/server.log" 2>"$W/server.err" &
     SERVER_PID=$!
     local addr=""
@@ -278,11 +292,27 @@ step_serve() {
     done
     if [[ $addr == "listening on "* ]]; then
         SERVER_URL="http://${addr#listening on }"
-        ok "server listening at $SERVER_URL"
     else
         bad "server never announced a listening address"
         return 1
     fi
+}
+
+stop_server() { # <reason>
+    if [[ ${SERVER_PID:-} ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+    fi
+    SERVER_PID=""
+    ok "server stopped ($1)"
+}
+
+step_serve() {
+    log "## 2. serve (gardenbed-server, fixed port)"
+    log ""
+    SERVER_PORT=$(pick_server_port) || return 1
+    start_server "$SERVER_PORT"
+    ok "server listening at $SERVER_URL"
     log ""
     return 0
 }
@@ -313,15 +343,20 @@ step_clone() {
         bad "clone materialized $strangers file(s) — v0.1 clone must materialize nothing"
     fi
 
-    # Multi-repository (v0.2.md §5, M12.3): a second repository appears
-    # under the same root mid-demo, served by the same process, and a URL
-    # clone with no --repo flag addresses it by path alone.
+    # Multi-repository (v0.2.md §5, M12.3): a repository is renamed under
+    # the server root mid-demo, and a URL clone with no --repo flag
+    # addresses it by path alone. The move is an offline operation: it
+    # refuses to run while a server holds the root (its sqlite
+    # connections would strand the WAL), so the demo stops the server,
+    # moves, and restarts it on the same fixed port.
+    stop_server "moves are offline operations"
     if ! out=$(cd "$W" && "$SERVER_BIN" move --root "$SERVER_ROOT" \
             --from garden --into orchard); then
         bad "gardenbed-server move failed: $out"
         return 1
     fi
-    ok "repository garden moved to orchard (same server process)"
+    ok "repository garden moved to orchard (WAL checkpointed, files renamed)"
+    start_server "$SERVER_PORT"
     mkdir -p "$W/orchard-copy"
     if ! out=$(cd "$W/orchard-copy" && "$BED_BIN" clone "$SERVER_URL/orchard" 2>&1); then
         bad "URL clone of the renamed repository failed: $out"
@@ -339,11 +374,15 @@ step_clone() {
     else
         bad "the vacated name's error does not name the served list: $out"
     fi
+    # Export and MCP below want `garden` back — another offline move.
+    stop_server "moving orchard back to garden"
     if ! out=$(cd "$W" && "$SERVER_BIN" move --root "$SERVER_ROOT" \
             --from orchard --into garden); then
         bad "moving the repository back failed: $out"
         return 1
     fi
+    ok "repository orchard moved back to garden"
+    start_server "$SERVER_PORT"
     log ""
     return 0
 }

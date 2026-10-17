@@ -310,6 +310,30 @@ async fn serve(
         eprintln!("error: cannot create server root {}: {e}", root.display());
         e
     })?;
+    // Hold the root's advisory lock for the process lifetime: it makes a
+    // second server over the same root fail fast, and it lets
+    // `gardenbed-server move` refuse while this server is live (renaming
+    // repository files under open sqlite connections strands the WAL).
+    // Taken without waiting — a second server must refuse, not queue.
+    let _root_lock = match gardenbed_server::repos::try_lock_root(&root) {
+        Ok(lock) => lock,
+        Err(Some(e)) => {
+            eprintln!(
+                "error: cannot lock the server root (is another gardenbed-server \
+                 serving {}?): {e}",
+                root.display()
+            );
+            std::process::exit(2);
+        }
+        Err(None) => {
+            eprintln!(
+                "error: cannot lock the server root: another gardenbed-server is \
+                 already serving {} — stop it first",
+                root.display()
+            );
+            std::process::exit(2);
+        }
+    };
     let set = Arc::new(gardenbed_server::repos::RepoSet::new(&root, max_repos));
     if gardenbed_server::repos::RepoSet::is_legacy_root(&root) {
         log::info!(

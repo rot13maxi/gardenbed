@@ -22,6 +22,10 @@ tags, and the verification record for a release lives in
   `<root>/<repo>/git-mirror.git`.
 - `gardenbed-server move --from NAME --into NEW-NAME` renames a
   repository under the root; history is byte-identical after the move.
+  The move is an **offline operation**: it refuses (non-zero exit,
+  nothing changed) while a server is serving the root, and it checkpoints
+  the repository's WAL and carries `metadata.sqlite3-wal`/`-shm` with the
+  database, so committed rows are never stranded at the old path.
 - `bed clone http://host:port/<repo>` (M12): an http(s) URL's path names
   the repository; `--repo` wins on conflict. URL-clone and `--repo`-flag
   clone produce identical working-copy configs.
@@ -36,7 +40,18 @@ tags, and the verification record for a release lives in
   the v0.1 way (stores at the top level) keeps serving unchanged as the
   repository named `default`, so existing roots need no migration; use
   `gardenbed-server move --from default --into NAME` to adopt the
-  per-directory layout.
+  per-directory layout. A serving server holds an exclusive advisory
+  lock on `<root>/gardenbed.lock` for its lifetime: a second server over
+  the same root refuses to start, and repository resolution rechecks the
+  directory under the open gate so a concurrent move cannot recreate an
+  empty repository at a vacated name.
+- Per-repository request counters are cumulative per name for the
+  server's lifetime: LRU eviction closes idle repositories, and a reopen
+  keeps counting where the evicted epoch left off (`get_stats` no longer
+  resets after churn).
+- `bed clone` refuses an http(s) URL whose path has more than one
+  segment (`http://host:port/a/b` — it cannot name a repository) instead
+  of silently cloning `default`.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names

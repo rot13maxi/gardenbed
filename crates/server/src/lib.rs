@@ -96,6 +96,11 @@ impl ServerError {
 /// Per-repo request counters (debug/test infrastructure). Bumped by the gRPC
 /// handlers for the four counted RPCs only — never by internal [`Repo`]
 /// calls, so a test can prove an RPC really crossed the wire.
+///
+/// Shared by `Arc` between the [`Repo`] and its [`crate::repos::RepoHandle`]:
+/// LRU eviction closes and may later reopen a repository, and the counters
+/// are cumulative for the *name*, not the open epoch — a reopen must keep
+/// counting where the previous epoch left off.
 #[derive(Debug, Default)]
 struct Stats {
     get_tree: AtomicU64,
@@ -126,7 +131,7 @@ pub struct Repo {
     objects: Arc<dyn ObjectStore>,
     metadata: Arc<dyn MetadataStore>,
     engine: Engine,
-    stats: Stats,
+    stats: Arc<Stats>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -163,7 +168,7 @@ impl Repo {
             objects,
             metadata,
             engine,
-            stats: Stats::default(),
+            stats: Arc::new(Stats::default()),
         }
     }
 
@@ -579,6 +584,18 @@ impl Repo {
     /// A snapshot of the request counters, sorted by name.
     pub fn stats(&self) -> BTreeMap<String, u64> {
         self.stats.snapshot()
+    }
+    /// The shared counters behind [`Repo::stats`] — shared with the
+    /// owning [`crate::repos::RepoHandle`] so eviction cannot reset them.
+    pub(crate) fn counters(&self) -> &Arc<Stats> {
+        &self.stats
+    }
+
+    /// Swaps in an earlier epoch's counters (an eviction reopen keeping
+    /// the name's counts cumulative). No effect on already-served
+    /// snapshots.
+    pub(crate) fn adopt_counters(&mut self, stats: &Arc<Stats>) {
+        self.stats = stats.clone();
     }
 
     /// The stats counters (bumped by the gRPC handlers only).

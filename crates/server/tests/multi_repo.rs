@@ -719,6 +719,255 @@ async fn legacy_root_serves_as_default_and_move_preserves_bytes() {
     server.shutdown().await;
 }
 
+// ------------------------------------------------ M11.4 (move, regression)
+
+/// The reviewer's end-to-end repro, as a test: publish through the wire
+/// against a live server (committing through `synchronous=NORMAL`, so the
+/// published changeset legitimately lives in `metadata.sqlite3-wal`),
+/// then move the repository from a *second process*. The move must refuse
+/// while the server is live (exit non-zero, root untouched), and after a
+/// clean stop the move must carry the published changeset with it: a
+/// fresh server over the moved root serves the post-publish `main`, not
+/// the stale pre-publish value the stranded-WAL bug produced.
+#[tokio::test]
+async fn move_after_wire_publish_serves_the_published_changeset() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["garden"]);
+
+    // Seed through the wire: root changeset + `main`, then a published
+    // child — CreateChangeset and CasRef both commit through WAL.
+    let server = ServerProc::spawn(&root, None).await;
+    let client = server.client().await;
+    let root_content = b"root\n";
+    let root_cs = cs(Vec::new(), vec![add("f.txt", root_content)], "root", 1);
+    let id_root = commit(&client, "garden", &root_cs, &[root_content]).await;
+    client
+        .cas_ref("garden", "main", None, id_root)
+        .await
+        .expect("initial cas wins");
+    let tip_content = b"published\n";
+    let tip_cs = cs(
+        vec![id_root],
+        vec![add("g.txt", tip_content)],
+        "published",
+        2,
+    );
+    let id_child = commit(&client, "garden", &tip_cs, &[tip_content]).await;
+    let outcome = client
+        .cas_ref("garden", "main", Some(id_root), id_child)
+        .await
+        .expect("cas answered");
+    assert!(
+        matches!(outcome, gardenbed_protocol::client::CasOutcome::Won),
+        "the publish won the cas"
+    );
+    drop(client);
+
+    // The published tip is what a reader sees through this server.
+    let got = server
+        .client()
+        .await
+        .get_ref("garden", "main")
+        .await
+        .expect("get_ref")
+        .expect("main exists");
+    assert_eq!(got, id_child, "main holds the published changeset");
+
+    // The WAL is real: committed data lives in it (synchronous=NORMAL),
+    // never folded into the database file. This is the bug's fuel.
+    let wal = root.join("garden").join("metadata.sqlite3-wal");
+    assert!(
+        wal.is_file(),
+        "the WAL sidecar exists while the server lives"
+    );
+
+    // A move from a second process while the server is live: refused,
+    // non-zero, root untouched. (The same refusal `gardenbed-server move`
+    // prints; exercised through the real binary below.)
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
+        .arg("--root")
+        .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
+        .output()
+        .expect("move runs");
+    assert!(
+        !moved.status.success(),
+        "move while the server is live must fail: {}",
+        String::from_utf8_lossy(&moved.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&moved.stderr);
+    assert!(
+        stderr.contains("stop it before moving"),
+        "the refusal explains itself: {stderr}"
+    );
+    assert!(
+        root.join("garden").join("metadata.sqlite3").is_file(),
+        "the live move changed nothing"
+    );
+
+    // Stop the server; the move now succeeds and checkpoints the WAL.
+    server.shutdown().await;
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
+        .arg("--root")
+        .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
+        .output()
+        .expect("move runs");
+    assert!(
+        moved.status.success(),
+        "move after shutdown: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+
+    // A fresh server over the root serves the *published* changeset at
+    // `orchard/main` — the stranded-WAL bug served the pre-publish value.
+    let server = ServerProc::spawn(&root, None).await;
+    let client = server.client().await;
+    let got = client
+        .get_ref("orchard", "main")
+        .await
+        .expect("get_ref")
+        .expect("main exists");
+    assert_eq!(got, id_child, "the published changeset survived the move");
+    // The published changeset's own row, not just the ref pointer.
+    let got = client
+        .get_ref("orchard", "main")
+        .await
+        .expect("get_ref")
+        .expect("main exists");
+    assert_eq!(got, id_child, "the moved repo still resolves main");
+    // And the database file itself carries the rows (the WAL was folded
+    // in, not stranded at the old path).
+    assert!(
+        !root.join("garden").exists(),
+        "nothing was left at the vacated name"
+    );
+    server.shutdown().await;
+}
+
+/// A second server over a root the first server already serves refuses
+/// to start (the root's advisory lock is held), instead of silently
+/// double-serving one set of files.
+#[tokio::test]
+async fn second_server_over_a_live_root_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["garden"]);
+    let first = ServerProc::spawn(&root, None).await;
+    // The spawn awaited the `listening on` line, which the server prints
+    // only after taking the root lock — so the lock is provably held.
+    let client = first.client().await;
+    // One real RPC against the first server exercises resolution end to
+    // end (the four counters exist and read zero).
+    let stats = client.get_stats("garden").await.expect("stats answer");
+    assert_eq!(stats.len(), 4, "all four counters present: {stats:?}");
+    assert!(
+        stats.values().all(|v| *v == 0),
+        "no counted RPCs yet: {stats:?}"
+    );
+
+    let second = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("--addr")
+        .arg("127.0.0.1:0")
+        .arg("--root")
+        .arg(&root)
+        .output()
+        .expect("second server runs");
+    assert!(
+        !second.status.success(),
+        "a second server over a live root must refuse"
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        stderr.contains("cannot lock the server root"),
+        "the refusal names the lock: {stderr}"
+    );
+    first.shutdown().await;
+
+    // With the first gone, a new server starts cleanly.
+    let third = ServerProc::spawn(&root, None).await;
+    let client = third.client().await;
+    let err = client.get_stats("nope").await.expect_err("not found");
+    assert_eq!(err.code(), Code::NotFound);
+    third.shutdown().await;
+}
+
+// ------------------------------------------------ LOW-1 (stats regression)
+
+/// Counters are cumulative per name, not per open epoch: with
+/// `--max-repos 1`, touching `beta` evicts `alpha`, and `alpha`'s next
+/// request must reopen it with its earlier counts intact (the eviction
+/// bug reset them — get_stats under-reported after churn).
+#[tokio::test]
+async fn stats_survive_lru_eviction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["alpha", "beta"]);
+    let server = ServerProc::spawn(&root, Some(1)).await;
+    let client = server.client().await;
+
+    // One counted RPC on alpha (CreateChangeset): a root changeset with
+    // an inline blob.
+    let content = b"alpha root\n";
+    let root_cs = cs(Vec::new(), vec![add("f.txt", content)], "root", 1);
+    let _id = commit(&client, "alpha", &root_cs, &[content]).await;
+
+    // alpha's create_changeset must read 1 before the churn.
+    let stats = client.get_stats("alpha").await.expect("alpha stats");
+    assert_eq!(stats.get("create_changeset"), Some(&1), "counted once");
+
+    // Evict alpha: cap is 1, so resolving beta must close alpha.
+    let beta_stats = client.get_stats("beta").await.expect("beta stats");
+    assert!(
+        beta_stats.values().all(|v| *v == 0),
+        "beta starts clean: {beta_stats:?}"
+    );
+
+    // alpha again — reopened after eviction. Its counts survive.
+    let stats = client.get_stats("alpha").await.expect("alpha stats again");
+    assert_eq!(
+        stats.get("create_changeset"),
+        Some(&1),
+        "counters survive eviction: {stats:?}"
+    );
+    server.shutdown().await;
+}
+
+// ------------------------------------------------ LOW-2 (URL validation)
+
+/// A multi-segment http path (`http://host:port/a/b`) cannot name a
+/// repository (names are single path-free segments) and must be refused
+/// at clone time, not silently treated as `default` — the server would
+/// then report a repository the user never typed.
+#[tokio::test]
+async fn multi_segment_clone_url_is_refused() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["garden"]);
+    let server = ServerProc::spawn(&root, None).await;
+
+    let wc = dir.path().join("wc");
+    std::fs::create_dir_all(&wc).unwrap();
+    let (code, stdout, stderr) = bed(&wc, &["clone", &format!("{}/a/b", server.http())]);
+    assert_ne!(code, 0, "multi-segment URL must be refused");
+    let out = format!("{stdout}{stderr}");
+    assert!(
+        out.contains("at most one repository"),
+        "the error names the rule: {out}"
+    );
+    // No working copy was created for the refused clone.
+    assert!(
+        !wc.join(".bed").exists(),
+        "the refused clone left no working copy"
+    );
+    server.shutdown().await;
+}
+
 // ------------------------------------------------------------------ M12.1
 
 /// URL-clone and `--repo`-flag clone produce identical config values.
