@@ -309,6 +309,30 @@ message RebaseResp {
   bytes id = 1;
 }
 
+// Server-side two-parent merge (v0.2.md D9-D11): merges `target`'s tree
+// into `cs_id`'s over their merge base and stores one changeset
+// `parents = [cs_id, target]` whose changes are the diff
+// `tree(cs_id) -> merged tree`. Semantic conflicts abort the RPC with
+// FAILED_PRECONDITION listing every conflicting path. When `target` is
+// already an ancestor of `cs_id`, the response is `up_to_date` with
+// `id = cs_id` and nothing is stored.
+message MergeReq {
+  string repo = 1;
+  bytes cs_id = 2;
+  bytes target = 3;
+  string message = 4;
+  // Author and committer identities (git-native seconds + tz offset in
+  // minutes), the same shape CreateChangeset carries.
+  IdentityMsg author = 5;
+  IdentityMsg committer = 6;
+}
+
+// The merge changeset's id, or the current id when `up_to_date`.
+message MergeResp {
+  bytes id = 1;
+  bool up_to_date = 2;
+}
+
 // Fast-forwards ref "main" to `cs_id`: asserts IsAncestor(current main,
 // cs_id), then CAS-moves "main" (v0.1.md D5). Violating the ancestry
 // precondition fails with FAILED_PRECONDITION.

@@ -49,13 +49,8 @@
 //!   skipped without touching any object; mapped history is not descended
 //!   (sound because git ids are content-addressed). A re-import of an
 //!   unchanged repository writes zero objects.
-//! * **Force pushes** move refs like any update (CAS); old objects and
-//!   their mapping rows remain (valid, merely unreachable). But a ref
-//!   move that would make previously-published changesets unreachable is
-//!   never silent: the import reports it in
-//!   [`ImportReport::refs_rewound`] (ref name, old and new tips, how many
-//!   changesets fell off), and — unless [`ImportOptions::allow_rewind`]
-//!   is set — fails with [`ImportError::Ref`] before touching the ref.
+//! * **Force pushes** are a non-event: refs simply move (CAS), old
+//!   objects and their mapping rows remain (valid, merely unreachable).
 //! * **`limit`** imports the newest `N` commits as a suffix of the
 //!   topological order; slice boundaries are re-rooted (full-tree root
 //!   changesets) and out-of-slice extra parents are dropped. This is a
@@ -113,7 +108,7 @@ pub use error::{ExportError, ImportError};
 pub use export::{ExportOptions, ExportReport, export_to_path};
 pub use import::import_from_path;
 pub use options::ImportOptions;
-pub use report::{ImportReport, RefRewind};
+pub use report::ImportReport;
 
 use std::path::Path;
 use std::process::Command;

@@ -49,5 +49,4 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 tempfile = "3"
 tokio-stream = "0.1"
-tokio-postgres = "0.7"
 zstd = "0.13"
