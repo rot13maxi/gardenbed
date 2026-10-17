@@ -1028,6 +1028,19 @@ async fn file_side_at(
     }
 }
 
+/// Whether `path` names nothing under `cs`'s tree — the rename-pairing
+/// guard: an `R100` block is honest only for a destination that was
+/// absent on the old side (git apply refuses a rename onto a path that
+/// already exists).
+async fn dst_absent_at(
+    session: &Session,
+    cs: Id,
+    path: &str,
+    wanted: &mut HashSet<Id>,
+) -> Result<bool, ClientError> {
+    Ok(file_side_at(session, cs, path, wanted).await?.is_none())
+}
+
 /// Builds render entries for the scoped diff forms (`bed diff <cs>`, and
 /// the no-argument form on an otherwise-clean copy), where `newer` is
 /// diffed against exactly its first parent — the delta base its recorded
@@ -1070,8 +1083,12 @@ async fn build_scoped_entries(
                     ))
                 })?;
                 let src_old = file_side_at(session, older, &src, &mut wanted).await?;
+                let dst_absent = dst_absent_at(session, older, &change.path, &mut wanted).await?;
                 if let Some(old) = src_old
-                    && new_side.is_some_and(|n| n.blob == old.blob)
+                    && new_side.is_some_and(|n| {
+                        n.blob == old.blob && render::same_entry_kind(n.mode, old.mode)
+                    })
+                    && dst_absent
                 {
                     entries.push(DiffEntry {
                         path: change.path,
@@ -1082,9 +1099,12 @@ async fn build_scoped_entries(
                     });
                     continue;
                 }
-                // Moved and edited: no similarity below 100% is ever
-                // claimed — the move expands to a delete at the source
-                // path and a write at the destination.
+                // Not renderable as a pure rename — moved-and-edited, or
+                // a guarded corner (the destination existed on the old
+                // side, or the kinds differ): no similarity below 100% is
+                // ever claimed — the move expands to a delete at the
+                // source path and a write at the destination, git's own
+                // applicable shape.
                 let dst_old = file_side_at(session, older, &change.path, &mut wanted).await?;
                 entries.push(DiffEntry {
                     path: src,
@@ -1188,52 +1208,12 @@ async fn build_paired_entries(
         });
     }
 
-    pair_renames(&mut entries);
+    render::pair_renames(&mut entries);
 
     // Fetch everything the renderer will read, cache-first, before any
     // output is produced.
     session.fetcher().blobs(&wanted).await?;
     Ok(entries)
-}
-
-/// Pairs delete + write entries carrying an identical blob into renames,
-/// in place — the same rule `bed commit` uses to record one. For each
-/// write (in path order) the first unconsumed delete of the same blob at
-/// a different path becomes its source; the paired entry keeps the
-/// write's position (git prints renames at the destination's slot) and
-/// the consumed delete is dropped. Modes may differ — git prints `old
-/// mode`/`new mode` inside an `R100` entry. A moved-and-edited file
-/// (blobs differ) keeps the delete + write shape.
-fn pair_renames(entries: &mut Vec<DiffEntry>) {
-    // Candidate sources — one-sided deletes — in path order.
-    let sources: Vec<usize> = (0..entries.len())
-        .filter(|&i| entries[i].old.is_some() && entries[i].new.is_none())
-        .collect();
-    let mut used = vec![false; sources.len()];
-    let mut drop = vec![false; entries.len()];
-    for w in 0..entries.len() {
-        let Some(new) = entries[w].new else { continue };
-        let Some(s) = (0..sources.len()).find(|&s| {
-            !used[s]
-                && sources[s] != w
-                && entries[sources[s]].path != entries[w].path
-                && entries[sources[s]].old.is_some_and(|o| o.blob == new.blob)
-        }) else {
-            continue;
-        };
-        used[s] = true;
-        let d = sources[s];
-        entries[w].op = render::DiffOp::Rename;
-        entries[w].src_path = Some(entries[d].path.clone());
-        entries[w].old = entries[d].old;
-        drop[d] = true;
-    }
-    *entries = entries
-        .drain(..)
-        .enumerate()
-        .filter(|(i, _)| !drop[*i])
-        .map(|(_, e)| e)
-        .collect();
 }
 
 /// `bed blame <path> [--cs id-or-ref]` — first-parent lineage blame of one

@@ -195,14 +195,22 @@ on generated histories: the 25%-edit rename histories render
 (`moved_and_edited_files_render_delete_plus_write`), never a spurious
 rename block.
 
-**Residual — pairing-rule corners:** the two-argument form pairs a
-delete with *any* write of the identical blob (add, modify, or
-typechange — `commit`'s rule), where git's `-M` only pairs adds. In the
-corner "path deleted at `src` while an unrelated path is *modified* to
-the same blob" (only reachable with duplicate blob content across
-paths), bed prints `R100` where git prints a `D` plus an `M`. Generated
-histories mint globally unique blob content per write, so the corner
-cannot occur there; it needs a hand-crafted duplicate-content pair.
+**Residual — pairing-rule corners:** pairing matches `commit`'s
+recorded-rename rule — a delete plus a *new* path of the identical blob
+and the same entry kind — where git's `-M` heuristic scores content
+similarity across arbitrary adds and modifies. Two letter divergences
+follow, both counted: git may pair an *edited* rename bed cannot (a
+`R<similarity<100>` entry where bed prints delete + write, the residual
+above), and git may pair a *cross-kind* move as one entry where bed
+prints `D` plus `A` (bed never pairs across entry kinds — git apply
+refuses a cross-kind `R100` with "new mode does not match"). Both
+corners need hand-crafted content (duplicate blob bytes across paths, or
+a symlink whose target equals a deleted file's content); generated
+histories mint globally unique blob content per write, so neither occurs
+there. Pre-fix, pairing also matched *rewrites of pre-existing paths*,
+rendering an `R100` git apply refuses ("already exists in working
+directory"); that is fixed — pairing requires the destination to have
+been absent on the old side (`guarded_corners_render_delete_plus_write_and_apply`).
 
 **Repro:** commit a moved-and-edited file (`git mv a b && edit b && bed
 commit`) and run `bed diff <cs>`: `a` renders a `deleted file mode`
