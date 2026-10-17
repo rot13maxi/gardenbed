@@ -209,6 +209,38 @@ impl Session {
         }
     }
 
+    /// Server-side two-parent merge of `target` into `cs` (v0.2.md
+    /// D9-D11): one changeset `parents = [cs, target]` whose changes are
+    /// the diff `tree(cs) -> merged tree`. Conflicts map to
+    /// [`ClientError::Rpc`] (FAILED_PRECONDITION, every conflicting path
+    /// in the message); an already-merged target answers
+    /// `(cs, true)` with nothing stored.
+    pub async fn merge(
+        &self,
+        cs: Id,
+        target: Id,
+        message: &str,
+        author: &gardenbed_model::Identity,
+        committer: &gardenbed_model::Identity,
+        command: &'static str,
+    ) -> Result<(Id, bool), ClientError> {
+        match self
+            .client
+            .merge(&self.repo, cs, target, message, author, committer)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                Err(ClientError::MissingCs(cs))
+            }
+            Err(status) => Err(ClientError::Rpc {
+                command,
+                code: status.code(),
+                message: status.message().to_owned(),
+            }),
+        }
+    }
+
     /// The first parent of `cs`, or `None` for a root changeset.
     pub async fn first_parent(
         &self,
