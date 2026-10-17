@@ -129,6 +129,13 @@ impl WorkingCopy {
         Treestate::open(&self.state_dir.join("index.sqlite3"))
     }
 
+    /// Opens the offline commit queue (the `pending` tables inside
+    /// `.bed/index.sqlite3`, created on demand so v0.1 working copies load
+    /// unchanged).
+    pub fn queue(&self) -> Result<crate::queue::Queue, ClientError> {
+        crate::queue::Queue::open(&self.state_dir.join("index.sqlite3"))
+    }
+
     /// Opens the local CAS cache (`.bed/objects`) — the object store's
     /// `FsObjectStore`, reused as-is. The store root is `.bed` itself
     /// (`FsObjectStore::open` appends `objects/`), so objects live at the
