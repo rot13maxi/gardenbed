@@ -334,6 +334,30 @@ Imports a git repository's history into the Gardenbed stores.
 | `--limit <LIMIT>` | ingest only the newest N commits (topological suffix; slice boundaries are re-rooted as full-tree root changesets) |
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
+| `--allow-rewind` | permit ref moves that would lose changesets (force-push parity) |
+
+**Backward ref moves (rewinds).** When an incremental import moves a ref
+to a tip that is not a descendant of the ref's current value (e.g. the
+git repository's `main` is *behind* the store's published `main`, or a
+force push rewrote the tip), the import:
+
+* **fails with a non-zero exit by default** when the move would actually
+  lose changesets — the error names the ref, both tips, the number of
+  changesets that would fall off, and the escape hatch. Nothing is
+  moved: the refusal happens before any ref is touched.
+* with `--allow-rewind`, performs the move (force-push parity: old
+  objects and mapping rows remain, merely unreachable) and prints a
+  loud multi-line `warning:` to stderr naming the ref, the old and new
+  tip, and how many changesets may no longer be reachable from the ref.
+* counts the fell-off changesets exactly via a metadata-only BFS over
+  parent edges (no git or object reads); `--limit` imports report the
+  count as uncounted, because slice re-rooting breaks real ancestry.
+
+Forward moves (the common incremental case) are silent, exactly as
+before. Rewinds that lose nothing (a moved-back tip that is an ancestor
+of the current value is impossible by definition — the check fires on
+any non-descendant move — but sideways merges onto shared history count
+only what is actually unreachable) are permitted with just the warning.
 
 ```sh
 gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed-repo \

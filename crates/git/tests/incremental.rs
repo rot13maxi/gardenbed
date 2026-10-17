@@ -252,7 +252,16 @@ fn force_push_reimports_cleanly() {
     assert_ne!(old_tip, new_tip);
     git_out(&["update-ref", "refs/heads/main", &new_tip, &old_tip]);
 
-    let report = import(&fixture.repo, &fixture.garden, &Default::default());
+    // The rewritten tip makes main move sideways off the old tip — a
+    // rewind that loses the old tip's changeset, so it needs the flag.
+    let report = import(
+        &fixture.repo,
+        &fixture.garden,
+        &ImportOptions {
+            allow_rewind: true,
+            ..Default::default()
+        },
+    );
     assert_eq!(report.commits_new, 1, "only the rewritten tip is new");
     assert_eq!(
         report.commits_skipped, 1,
@@ -301,6 +310,141 @@ fn force_push_reimports_cleanly() {
     // The git repo itself is still well-formed (old objects are dangling
     // but valid).
     gardenbed_harness::git_fsck(&fixture.repo).expect("fsck");
+}
+
+/// Importing a repository whose git `main` is BEHIND the store's `main`
+/// (published work ahead of git) is the silent-rewind bug: the default
+/// must refuse the move (non-zero via `ImportError::Ref`) naming the ref
+/// and both tips, and `--allow-rewind` must permit it while reporting it
+/// with the fell-off count. A forward move stays silent.
+#[test]
+fn backward_ref_move_is_refused_then_reported() {
+    let fixture = Fixture::generate(2111, &GenOptions::default());
+    import(&fixture.repo, &fixture.garden, &Default::default());
+    // The store's tip (NOT `fixture.mapping`'s changeset id: rename
+    // detection reshapes changes, so stored ids differ from generated
+    // ones; the git shas still map 1:1).
+    let old_tip = {
+        let (_, metadata, _) = open_stores(&fixture.garden);
+        metadata
+            .resolve_ref("refs/heads/main")
+            .expect("resolve")
+            .expect("main exists after import")
+    };
+
+    // Simulate published-but-not-in-git work: a changeset committed
+    // directly into the gardenbed store and published onto main via CAS.
+    let (objects, metadata, engine) = open_stores(&fixture.garden);
+    let published = {
+        use gardenbed_model::{Change, Identity, Op};
+        let cs = gardenbed_model::Changeset {
+            parents: vec![old_tip],
+            changes: vec![Change {
+                path: "published.txt".into(),
+                op: Op::Add,
+                blob: Some(gardenbed_model::blob_id(b"published work\n")),
+                src_path: None,
+                mode: gardenbed_model::Mode::Regular,
+            }],
+            message: "published from bed\n".into(),
+            author: Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            committer: Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        // The server's own create path (crates/server/src/lib.rs
+        // `create_changeset`): blob in, derived rows, validated put.
+        use gardenbed_store::ObjectStore as _;
+        // The server validates parent history before deriving (its
+        // `validate_history`); imported tips are only certified on
+        // re-import, so do it here explicitly.
+        engine.certify_history(old_tip).expect("certify parent");
+        objects.put_blob(b"published work\n").expect("blob");
+        let cs_id = cs.id().expect("canonical");
+        let root = engine.validated_tree_for_new(&cs).expect("derive tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_id, &cs, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&cs, root, &rows, None)
+            .expect("put changeset");
+        let id = cs_id;
+        let won = metadata
+            .cas_ref("refs/heads/main", Some(old_tip), id)
+            .expect("cas");
+        assert!(matches!(won, gardenbed_store::RefCas::Won { .. }));
+        id
+    };
+    drop((objects, metadata, engine));
+
+    // Default: re-importing the unchanged git repo (whose main is now
+    // BEHIND the published tip) must fail loudly, before moving the ref.
+    let err = try_import(&fixture.repo, &fixture.garden, &Default::default())
+        .expect_err("rewind must be refused by default");
+    match err {
+        ImportError::Ref { name, detail } => {
+            assert_eq!(name, "refs/heads/main");
+            assert!(
+                detail.contains("--allow-rewind"),
+                "error must name the escape hatch: {detail}"
+            );
+            assert!(
+                detail.contains("losing 1 changeset"),
+                "counts the loss: {detail}"
+            );
+        }
+        other => panic!("expected ImportError::Ref, got {other:?}"),
+    }
+    // The refusal happened before any ref was touched.
+    let (_, metadata, _) = open_stores(&fixture.garden);
+    assert_eq!(
+        metadata.resolve_ref("refs/heads/main").expect("resolve"),
+        Some(published),
+        "the ref was not moved by the refused import"
+    );
+    drop(metadata);
+
+    // --allow-rewind: the move is permitted and reported with the count.
+    let report = import(
+        &fixture.repo,
+        &fixture.garden,
+        &ImportOptions {
+            allow_rewind: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(report.refs_rewound.len(), 1, "the rewind is reported");
+    let rewind = &report.refs_rewound[0];
+    assert_eq!(rewind.name, "refs/heads/main");
+    assert_eq!(rewind.old_tip, published);
+    assert_eq!(
+        rewind.fell_off,
+        Some(1),
+        "only the published changeset fell off (the shared imported \
+         history stays reachable from the git tip)"
+    );
+    assert!(report.to_string().contains("1 ref(s) rewound"));
+    let (_, metadata, _) = open_stores(&fixture.garden);
+    assert_eq!(
+        metadata.resolve_ref("refs/heads/main").expect("resolve"),
+        Some(old_tip),
+        "main rewound to the git tip"
+    );
+
+    // Forward moves stay silent: extend git history and re-import.
+    append_commits(&fixture.repo, 1);
+    let report = import(&fixture.repo, &fixture.garden, &Default::default());
+    assert!(report.refs_rewound.is_empty(), "forward move is silent");
+    assert_eq!(report.refs_updated.len(), 1, "the ref moved forward");
 }
 
 /// SHA-256 repositories are rejected with a documented error, never a
