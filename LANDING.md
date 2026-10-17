@@ -26,9 +26,16 @@ c3911cb2, 5740ecd→13543454, f9d50bf→e325fcb, 4012150→a0ae00a). So the
 replayed stack imports as bed changesets descending from a0ae00a — the main
 publish becomes a plain fast-forward, no --force, no re-rebase at ping time.
 
-p8's re-check extension (pending, on the NEW tip id): verify new tip id +
-confirm the disjoint files (crates/web/*, e2e/*, docs/DOGFOOD.md) match
-main's versions exactly + spot-check one union file.
+p8's re-check extension COMPLETE — PASS (2026-10-17, verified read-only
+against the scratch root / 9419 clone): tip d6081ded confirmed, chain
+descends directly from a0ae00a (8 commits; plain fast-forward at publish
+time); tip-vs-main diff = 126 files with exactly the expected composition
+(fuzz corpus churn, web/e2e/DOGFOOD/store-web wholesale from main,
+Cargo.lock regen, 27 genuine merge-span files); union spot-checks passed —
+server lib.rs carries M9+M10 two-parent merge with MergeConflict +
+no-common-ancestor refusal intact, commit.rs M19-adjacent change is only
+now_stamp visibility, M19 pair-guard lives in render.rs:270 verbatim,
+ops.rs has zero pair_renames references. PRE-STAGE APPROVED TO HOLD.
 
 Bed scratch import root: /tmp/gb-merge-rebase-bed (ref
 refs/heads/wip/merge-replay-a0ae00a). Live lane ref feat/merge = f19510ee
