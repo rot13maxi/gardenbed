@@ -290,6 +290,39 @@ bed rebase main
 # fetched <N> tree(s), <M> blob(s)
 ```
 
+### bed merge
+
+```text
+Usage: bed merge [OPTIONS] <TARGET>
+```
+
+Merges `<TARGET>` (a `<cs-or-ref>`) into the current changeset
+(server-side two-parent merge, v0.2.md D9-D11). One new changeset is
+created with `parents = [current, target]` whose changes are the diff
+`tree(current) -> merged tree`; per-file content is merged with a
+three-way line merge over the merge base. Conflicts are hard errors
+listing every conflicting path. When `<TARGET>` is already an ancestor
+of the current changeset nothing is created.
+
+| flag | meaning |
+|---|---|
+| `-m, --message <MSG>` | merge message (default: `merge <TARGET>`) |
+| `--author <NAME-AND-EMAIL>` | author in `Name <email>` form (default: `GARDENBED_AUTHOR`, else committer identity) |
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
+
+```sh
+bed merge main
+# merged 9a41be12d0c6ffee into 77c0aa13b9d2210f as 3d20cc41a8e57b19
+# fetched <N> tree(s), <M> blob(s)
+
+bed merge main          # again
+# already up to date — 9a41be12d0c6ffee is an ancestor of ...; nothing to merge
+```
+
+On conflict the command fails and names the operation, every affected
+path, and the next step (edit the conflicting files, commit, and merge
+again). The working copy is left untouched.
+
 ### bed publish
 
 ```text

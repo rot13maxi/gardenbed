@@ -185,7 +185,13 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
         } => {
             let _bed = WorkingCopy::open(&cli.state_dir)?;
             CsOrRef::parse(target)?;
-            let out = gardenbed::ops::merge(&cli.state_dir, target, message.as_deref(), author.as_deref()).await?;
+            let out = gardenbed::ops::merge(
+                &cli.state_dir,
+                target,
+                message.as_deref(),
+                author.as_deref(),
+            )
+            .await?;
             print!("{out}");
             Ok(0)
         }
