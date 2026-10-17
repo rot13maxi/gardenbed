@@ -1026,12 +1026,12 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
-            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
             ServerError::RebaseConflict(_)
             | ServerError::NotFastForward
             | ServerError::LaneNotFastForward { .. }
             | ServerError::PublishRewind { .. } => Status::failed_precondition(e.to_string()),
             ServerError::MainRefReserved => Status::invalid_argument(e.to_string()),
+            ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
         }
     }
 }
@@ -1424,7 +1424,7 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::MergeReq>,
     ) -> Result<Response<pb::MergeResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Merge")?;
+        let repo = self.repo_guard(&req.repo, "Merge")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let target = Self::id(&req.target, "target")?;
         let author = req
@@ -1435,9 +1435,7 @@ impl Gardenbed for GardenbedService {
             .committer
             .map(Identity::from)
             .ok_or_else(|| Status::invalid_argument("MergeReq carries no committer"))?;
-        let (id, up_to_date) = self
-            .repo
-            .merge(cs_id, target, &req.message, &author, &committer)?;
+        let (id, up_to_date) = repo.merge(cs_id, target, &req.message, &author, &committer)?;
         Ok(Response::new(pb::MergeResp {
             id: id_to_bytes(id),
             up_to_date,
