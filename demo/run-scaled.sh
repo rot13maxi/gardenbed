@@ -111,16 +111,45 @@ stack_up() {
         ok "compose stack already running (reused)"
         return 0
     fi
-    if ! $COMPOSE up -d --wait postgres minio createbuckets \
-        >"$W/compose.log" 2>&1; then
+    # `up --wait` names only the long-running services: a one-shot
+    # service that exits 0 makes `--wait` return 1 (docker/compose
+    # #10596), even though the bucket-creator ran to completion.
+    # createbuckets is started by postgres/minio's depends_on ordering
+    # and is verified below by the bucket's existence.
+    if ! $COMPOSE up -d --wait postgres minio >"$W/compose.log" 2>&1; then
         bad "compose up failed (see $W/compose.log — kept with --keep-work)"
         return 1
     fi
-    ok "postgres + minio up (ports $PG_PORT / $S3_PORT), bucket gardenbed created"
-    return 0
+    ok "postgres + minio up (ports $PG_PORT / $S3_PORT)"
 }
 
 stack_up
+
+# The bucket-creator is a one-shot sidecar (it may not have run yet on a
+# fresh stack): ensure the demo bucket exists, then prove it is readable
+# with a *signed* check. MinIO answers plain bucket-root requests with
+# 403 AccessDenied even when the bucket exists (anonymous S3 has no list
+# permission), so the probe must authenticate like a real client —
+# `mc stat` with the same endpoint/credentials the storage config uses.
+ensure_bucket() {
+    if ! docker compose -f "$COMPOSE_FILE" run --rm createbuckets \
+        >"$W/bucket.log" 2>&1; then
+        bad "bucket creation failed (see $W/bucket.log — kept with --keep-work)"
+        return 1
+    fi
+    local probe
+    probe=$(docker compose -f "$COMPOSE_FILE" run --rm -T \
+        --entrypoint sh minio -c \
+        "mc alias set probe http://minio:9000 $S3_ACCESS_KEY \
+         $S3_SECRET_KEY >/dev/null && mc stat probe/gardenbed" \
+        2>/dev/null | grep -c . || true)
+    if [[ "$probe" -lt 1 ]]; then
+        bad "bucket gardenbed not reachable (mc stat probe failed)"
+        return 1
+    fi
+    ok "bucket gardenbed ready"
+}
+ensure_bucket
 
 # Host-side storage config: same backends as tools/scale/storage.toml,
 # but 127.0.0.1 endpoints (the compose-internal hostnames only resolve
@@ -183,7 +212,7 @@ ok "imported $(git -C "$FIXTURE" rev-list --count main) commits into Postgres + 
 # ------------------------------------------------------------- 4. two replicas
 
 start_replica() { # <name>
-    local name=$1 log=$W/$name.log err=$W/$name.err
+    local name="$1" log="$W/$1.log" err="$W/$1.err"
     "$SERVER_BIN" serve --addr 127.0.0.1:0 --storage "$STORAGE_TOML" \
         >"$log" 2>"$err" &
     local pid=$!
