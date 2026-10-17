@@ -147,7 +147,48 @@ impl ProxyService {
         })
     }
 
-    /// Cache-first tree lookup: shared store, then one upstream `GetTree`,
+    /// One cheap upstream authorization consult. `ListRefs` is the
+    /// probe: a repo-scoped read whose server handler runs `authorize`
+    /// (repo + `Role::Read`) before touching its stores, and it needs
+    /// no object ids — the probe cannot confuse "denied" with "missing
+    /// object".
+    ///
+    /// Cache hits MUST pass this gate. The shared cache is keyed by
+    /// content address only — it cannot know which repository or token a
+    /// blob was fetched under — so serving a hit without consulting the
+    /// upstream would hand cached bytes to a caller the server would
+    /// deny (an anonymous peer, or a token scoped to another repo).
+    /// Correctness beats the cache here: the daemon is a convenience
+    /// tier, not a policy engine. The probe is one round-trip per cache
+    /// hit — the price of not partitioning the cache per credential.
+    async fn authorize_hit(&self, repo: &str, auth: &AuthValue) -> Result<(), Status> {
+        let client = self.upstream.get().await?.with_auth_value(auth.clone());
+        let status = match client.list_refs(repo).await {
+            Ok(mut stream) => {
+                // Drain the (tiny) stream so the call truly completes;
+                // the denial, if any, rides the response headers or the
+                // first item.
+                use tokio_stream::StreamExt as _;
+                while let Some(item) = stream.next().await {
+                    if let Err(status) = item {
+                        if transport_dead(&status) {
+                            self.upstream.reset().await;
+                        }
+                        return Err(status);
+                    }
+                }
+                return Ok(());
+            }
+            Err(status) => status,
+        };
+        if transport_dead(&status) {
+            self.upstream.reset().await;
+        }
+        Err(status)
+    }
+
+    /// Cache-first tree lookup: shared store (after an upstream
+    /// authorization consult), then one upstream `GetTree`,
     /// write-through. Concurrent requests for the same id collapse into a
     /// single fetch.
     async fn tree_from_cache(
@@ -161,6 +202,8 @@ impl ProxyService {
             .get_tree(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
         {
+            // The server — not the cache — decides who may read.
+            self.authorize_hit(repo, &auth).await?;
             let tree = Tree::decode(&bytes)
                 .map_err(|_| Status::internal("shared cache holds an undecodable tree"))?;
             self.cache_hits
@@ -180,6 +223,7 @@ impl ProxyService {
             .get_tree(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
         {
+            self.authorize_hit(repo, &auth).await?;
             let tree = Tree::decode(&bytes)
                 .map_err(|_| Status::internal("shared cache holds an undecodable tree"))?;
             self.cache_hits
@@ -207,9 +251,11 @@ impl ProxyService {
             .map_err(|_| Status::internal("upstream tree cannot be re-encoded"))
     }
 
-    /// Cache-first blob lookup: shared store, else one streamed upstream
-    /// `GetBlob`, reassembled, hash-verified, write-through, then streamed
-    /// back to the caller in chunks.
+    /// Cache-first blob lookup: shared store (after an upstream
+    /// authorization consult), else one streamed upstream `GetBlob`,
+    /// reassembled, hash-verified, write-through, then streamed back to
+    /// the caller in 64 KiB chunks (tonic's default 4 MiB decode limit
+    /// applies per message — one giant chunk would fail the client).
     async fn blob_stream(
         self,
         repo: String,
@@ -221,6 +267,8 @@ impl ProxyService {
             .get_blob(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
         {
+            // The server — not the cache — decides who may read.
+            self.authorize_hit(&repo, &auth).await?;
             self.cache_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(chunked(content));
@@ -262,11 +310,20 @@ impl ProxyService {
     }
 }
 
-/// Wraps `content` as a ready-made `BlobChunk` stream (64 KiB chunks).
+/// The blob chunk size the daemon re-emits, matching the server's
+/// `BLOB_CHUNK_LEN` (64 KiB): tonic's default 4 MiB per-message decode
+/// limit applies on the client side of the daemon's socket, so one
+/// blob-sized chunk would fail any fetch over 4 MiB.
+const BLOB_CHUNK_LEN: usize = 1 << 16;
+
+/// Wraps `content` as a ready-made `BlobChunk` stream in `BLOB_CHUNK_LEN`
+/// pieces — the same shape the server streams.
 fn chunked(content: Vec<u8>) -> BoxStream<pb::BlobChunk> {
-    // One chunk is plenty for the daemon's local socket; splitting only
-    // adds scheduling. The wire shape stays a stream either way.
-    Box::pin(tokio_stream::once(Ok(pb::BlobChunk { data: content })))
+    let chunks: Vec<Vec<u8>> = content
+        .chunks(BLOB_CHUNK_LEN)
+        .map(<[u8]>::to_vec)
+        .collect();
+    Box::pin(tokio_stream::iter(chunks.into_iter().map(|data| Ok(pb::BlobChunk { data }))))
 }
 
 /// True when a tonic status means the daemon's cached upstream channel is
