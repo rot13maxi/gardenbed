@@ -1,0 +1,21 @@
+# The stateless `gardenbed-server` replica image for tools/scale/compose.yaml.
+# Build context is the workspace root (see compose.yaml) so the full
+# workspace — protocol, model, store, derive, git — is in the image.
+#
+# Two stages: cargo build --release in a rust image, then copy the single
+# static-ish binary into a distroless cc runtime (glibc + CA certs, no
+# shell) to keep the runtime layer small.
+
+FROM rust:1-bookworm AS build
+WORKDIR /build
+# Cargo layer caching: manifest first, sources after.
+COPY Cargo.toml Cargo.lock ./
+COPY crates crates
+COPY docs docs
+RUN cargo build --release -p gardenbed-server
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=build /build/target/release/gardenbed-server /usr/local/bin/gardenbed-server
+# Stateless: no volumes, no writable state; all storage is off-box
+# (Postgres + S3 via /etc/gardenbed/storage.toml, mounted by compose).
+ENTRYPOINT ["/usr/local/bin/gardenbed-server"]

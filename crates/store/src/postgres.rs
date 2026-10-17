@@ -133,7 +133,13 @@ impl PostgresMetadataStore {
         let canonical = canonical.to_vec();
         let derived: Vec<(String, Vec<u8>, Vec<u8>)> = derived
             .iter()
-            .map(|row| (row.kind.clone(), row.cs.as_bytes().to_vec(), row.bytes.clone()))
+            .map(|row| {
+                (
+                    row.kind.clone(),
+                    row.cs.as_bytes().to_vec(),
+                    row.bytes.clone(),
+                )
+            })
             .collect();
         let parents: Vec<Vec<u8>> = cs.parents.iter().map(|p| p.as_bytes().to_vec()).collect();
         let pool = self.pool.clone();
@@ -232,8 +238,7 @@ impl PostgresMetadataStore {
                 .map_err(pg_err)?;
             }
             if let Some(root) = validated_tree {
-                let payload: Vec<u8> =
-                    root.map(|rid| rid.as_bytes().to_vec()).unwrap_or_default();
+                let payload: Vec<u8> = root.map(|rid| rid.as_bytes().to_vec()).unwrap_or_default();
                 let previous = tx
                     .query_opt(
                         "SELECT root_tree FROM validated_changesets_v1 WHERE cs = $1",
@@ -668,10 +673,7 @@ fn normalize_git_sha(git_sha_hex: &str) -> Result<String, StoreError> {
 /// length (identical to the SQLite backend's `id_from_blob`).
 fn id_from_bytea(bytes: &[u8]) -> Result<Id, StoreError> {
     Ok(Id::from_bytes(bytes.try_into().map_err(|_| {
-        StoreError::Corrupt(format!(
-            "stored id has {} bytes, expected 32",
-            bytes.len()
-        ))
+        StoreError::Corrupt(format!("stored id has {} bytes, expected 32", bytes.len()))
     })?))
 }
 
