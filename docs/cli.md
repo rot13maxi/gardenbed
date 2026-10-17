@@ -225,6 +225,17 @@ With arguments, both are always changesets: `A` is the older side; with
 Every diff prints a one-line header naming what is being diffed, so the
 modes are distinguishable at a glance — empty diffs included (identical
 sides state they are equal; a root changeset says it has no parent).
+
+Renders are git-shaped beyond the header: a pure rename (the recorded
+`Rename` op, or — between two arbitrary changesets — a delete and a
+write of the identical blob, the rule `bed commit` pairs by) renders
+git's `R100` form (`similarity index 100%`, `rename from`, `rename
+to`); a moved-and-edited file renders a delete plus a write (no
+similarity below 100% is ever claimed). A submodule pointer renders
+`Subproject commit <sha>` hunks on add, delete, and retarget — the real
+upstream SHA — and every rendered shape reapplies with `git apply`
+(gitlink entries under `git apply --cached`).
+
 The first-parent wording appears only when the older side really is the
 newer's first parent; any other pair names both sides:
 
