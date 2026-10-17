@@ -1349,10 +1349,7 @@ fn hunk_edit(rng: &mut StdRng, content: &[u8], n: usize, line_no: &mut u64) -> V
                 // Insert a fresh line after line i.
                 *line_no += 1;
                 let pick = PAIR_LINES[rng.random_range(0..PAIR_LINES.len())];
-                lines.insert(
-                    i + 1,
-                    format!("{:06}: {}", line_no, pick).into_bytes(),
-                );
+                lines.insert(i + 1, format!("{:06}: {}", line_no, pick).into_bytes());
             }
             _ => {
                 // Delete line i (keep at least one line).
