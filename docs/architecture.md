@@ -204,14 +204,7 @@ All local state lives under `--state-dir` (default `./.bed`):
   A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
 - **Status** uses mtime/size as hints and hashes only suspects;
-  `--full-scan` forces the correctness path. Untracked discovery honors
-  `.gitignore` files read from the working copy (root plus one per walked
-  directory — `crates/bed/src/ignore.rs`): the git subset of blank lines,
-  comments, trailing `/`, `*` `?` `**`, and a leading `/` anchor, with
-  git's precedence that ignore never un-tracks. Ignored directories with
-  no tracked content are pruned from the walk (a cargo `target/` costs
-  one stat); `!` negation, character classes, and global excludes are
-  unsupported.
+  `--full-scan` forces the correctness path.
 - **Atomic checkout** stages complete files and symlinks before replacing
   working entries. When the selected state directory and destination are
   on different mounts, staging happens beside the destination so the final
@@ -247,13 +240,7 @@ All local state lives under `--state-dir` (default `./.bed`):
 4. **Mapped-frontier pruning**: commits whose git SHA is already mapped
    are skipped, and mapped history is not descended — sound because git
    ids are content-addressed. Re-importing an unchanged repository writes
-   zero objects; force pushes just move refs (CAS). But a ref move whose
-   new tip is not a descendant of the ref's current value is never
-   silent: the default fails the import before touching the ref
-   (`--allow-rewind` opts in), and the move is always reported in the
-   import report with the count of changesets that fell off the ref
-   (metadata-only BFS over parent edges; `--limit` slices report the
-   count as uncounted).
+   zero objects; force pushes just move refs (CAS).
 5. Each commit lands through `ingest_changeset`: changeset canonical
    bytes, `git_map` row, and derived-data rows in one sqlite transaction
    (byte-identical values to the eager write path — kill+resume is
@@ -300,43 +287,6 @@ divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
   unpublished, unreadable, and reaped by the next rename into that shard.
 
-## 10. Horizontal scale-out
-
-The server tier scales horizontally by moving state off-box: metadata
-into PostgreSQL, objects into S3. Every replica is identical and
-stateless — no leader election, no sharding — because the v0.1
-invariants already carry the concurrency story: ref writes are CAS
-rows (exactly one replica wins a race) and object writes are immutable
-content-addressed puts (re-racing is the same write). The wire protocol
-is unchanged; `bed` still talks to one server address (a load balancer
-in front of N replicas is a deployment concern).
-
-```text
-bed ──gRPC── gardenbed-server replica 1 ─┐
-              gardenbed-server replica 2 ─┼── Postgres (metadata)
-              gardenbed-server replica N ─┘         │
-                                              S3 / MinIO (objects)
-```
-
-Backend selection is one `--storage <config.toml>` flag on `serve`,
-`import`, and `export` (env fallback: `GARDENBED_STORAGE`), selecting
-per-trait backends behind the unchanged `ObjectStore`/`MetadataStore`
-contracts:
-
-| trait | local (default, `--root`) | scale-out (`--storage`) |
-|---|---|---|
-| `ObjectStore` | filesystem at `<root>/objects` (`FsObjectStore`) | S3/MinIO (`S3ObjectStore`) |
-| `MetadataStore` | SQLite at `<root>/metadata.sqlite3` (`SqliteMetadataStore`) | PostgreSQL (`PostgresMetadataStore`) |
-
-The Postgres schema mirrors SQLite's one-to-one (bytea for BLOB), CAS is
-a single guarded `UPDATE ... WHERE` (no advisory locks), S3 writes are
-conditional puts with verify-on-conflict, and every read stays verified
-(length + SHA-256 against the addressed id). The design contract —
-decisions, schema, error semantics — is
-[scale-out-design.md](scale-out-design.md); the deployment artifact is
-`tools/scale/compose.yaml` (Postgres + MinIO + N replicas), with
-`demo/run-scaled.sh` proving cross-replica visibility end to end.
-
 ## Where the contracts live
 
 | contract | document |
@@ -348,4 +298,3 @@ decisions, schema, error semantics — is
 | blame definition | v0.1.md D7 |
 | import mechanics (gitoxide, diff-tree, renames) | v0.1.md D6/D8 |
 | divergences from git | divergences.md (§10.2: zero *silent* divergences) |
-| scale-out backends + deployment | scale-out-design.md (D1–D7) |

@@ -14,7 +14,6 @@ pub mod commit;
 pub mod config;
 pub mod error;
 pub mod heads;
-pub mod ignore;
 pub mod ops;
 pub mod render;
 pub mod revspec;

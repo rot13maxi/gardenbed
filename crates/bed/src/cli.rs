@@ -91,11 +91,10 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// Diff the working copy against the current changeset (when dirty),
-    /// or two changesets (default: the current one vs its first parent).
-    /// Every diff prints a header naming what is being diffed.
+    /// Diff two changesets (default: the current changeset vs its first
+    /// parent).
     Diff {
-        /// The older side: changeset id or ref. With `b` omitted, diffs
+        /// The older side: changeset id or ref. With `b` omitted: diffs
         /// against this changeset's first parent.
         a: Option<String>,
         /// The newer side: changeset id or ref.

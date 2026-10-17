@@ -105,9 +105,22 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> CacheMap<K, V> {
 
     fn put(&mut self, key: K, value: V) {
         let w = (self.weight)(&value);
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
-            self.bytes += w;
+        match self.map.insert(key.clone(), value) {
+            None => {
+                // Fresh key: FIFO order entry and full weight.
+                self.order.push_back(key);
+                self.bytes += w;
+            }
+            Some(old) => {
+                // Re-insert over an existing key: the old value's weight
+                // must come off (it is no longer cached) and the new one
+                // on, or `bytes` drifts upward on every refresh. The key
+                // keeps its original place in the FIFO order — pushing a
+                // duplicate would make later eviction pop a key that is
+                // still cached, leaking both its entry and its weight.
+                self.bytes += w;
+                self.bytes -= (self.weight)(&old);
+            }
         }
         while self.map.len() > self.cap_entries || self.bytes > self.cap_bytes {
             let Some(oldest) = self.order.pop_front() else {

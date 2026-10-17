@@ -17,9 +17,7 @@
 //! - different hash → **modified** (same-size different-content is caught
 //!   exactly here);
 //! - tracked but missing on disk → **deleted**;
-//! - present in the selected paths but unknown to the treestate → **untracked**
-//!   (unless a `.gitignore` covers it — untracked discovery only; see
-//!   [`crate::ignore`]).
+//! - present in the selected paths but unknown to the treestate → **untracked**.
 //!
 //! [`scan_paths`] is the pure core: `(root, sparse, treestate) → a per-path
 //! classification carrying blob ids, modes and hint metadata` — the shape
@@ -140,8 +138,7 @@ impl StatusReport {
 /// walk as a `StatusReport`.
 ///
 /// `full_scan` (the `--full-scan` flag) forces the correctness path: every
-/// tracked file is hashed regardless of hints. `.gitignore` filtering of
-/// untracked discovery applies either way.
+/// tracked file is hashed regardless of hints.
 ///
 /// Only modified/untracked entries carry metadata; the walk order is
 /// deterministic (sorted per directory) but the returned list is not sorted
@@ -162,13 +159,6 @@ pub fn scan_paths(
 
     let tracked_paths = treestate.all_paths()?;
     let tracked: HashSet<String> = tracked_paths.iter().cloned().collect();
-
-    // `--full-scan` verifies tracked content; .gitignore filtering is
-    // untracked-discovery semantics, orthogonal to it, so the walk
-    // always loads ignores.
-    let mut ignores = crate::ignore::Ignores::default();
-    ignores.enter_dir(root, "");
-    let root_scopes = ignores.scopes_in_effect();
 
     // Pass 1 — deleted: tracked, inside the sparse selection, and gone from disk (or
     // replaced by something that is not a file or symlink, e.g. a directory
@@ -237,11 +227,9 @@ pub fn scan_paths(
     }
 
     // Pass 2 — walk the repository within the selected paths: untracked files and
-    // suspects needing a hash. Each directory carries the .gitignore scope
-    // snapshot in effect where it sits, so a nested .gitignore applies to its
-    // own subtree only, and whether the directory itself is ignored.
-    let mut stack: Vec<(String, Vec<usize>, bool)> = vec![(String::new(), root_scopes, false)];
-    while let Some((dir, dir_scopes, dir_ignored)) = stack.pop() {
+    // suspects needing a hash.
+    let mut stack: Vec<String> = vec![String::new()];
+    while let Some(dir) = stack.pop() {
         let abs_dir = if dir.is_empty() {
             root.to_path_buf()
         } else {
@@ -249,12 +237,6 @@ pub fn scan_paths(
         };
         let mut entries: Vec<_> = fs::read_dir(&abs_dir)?.collect::<Result<Vec<_>, _>>()?;
         entries.sort_by_key(|e| e.file_name());
-
-        // This directory's own .gitignore, if any, joins the active set.
-        ignores.restore(dir_scopes);
-        if !dir.is_empty() && !dir_ignored {
-            ignores.enter_dir(&abs_dir, &dir);
-        }
 
         for entry in entries {
             // Repo paths are UTF-8 flat paths; entries whose names are not
@@ -274,27 +256,11 @@ pub fn scan_paths(
                 continue;
             }
             if entry.file_type()?.is_dir() {
-                if !dir_may_hold_selected(&rel, sparse) {
-                    continue;
+                if dir_may_hold_selected(&rel, sparse) {
+                    stack.push(rel);
                 }
-                // An ignored directory with no tracked content inside is
-                // pruned wholesale — the whole point of /target. One with
-                // tracked paths inside is still walked (git semantics:
-                // ignore never un-tracks), but stays ignored, so its
-                // untracked content remains hidden.
-                let child_ignored = dir_ignored || ignores.path_ignored(&rel, true);
-                if child_ignored && !tracked_under(&tracked, &rel) {
-                    continue;
-                }
-                stack.push((rel, ignores.scopes_in_effect(), child_ignored));
             } else if in_sparse(&rel, sparse) {
                 if !tracked.contains(&rel) {
-                    // Untracked discovery is the only thing .gitignore
-                    // filters; tracked files below fall to the tracked
-                    // classification whatever any pattern says.
-                    if dir_ignored || ignores.path_ignored(&rel, false) {
-                        continue;
-                    }
                     items.push(ScanItem {
                         path: rel.clone(),
                         delta: classify_untracked(root, &rel)?,
@@ -308,15 +274,6 @@ pub fn scan_paths(
     }
 
     Ok(items)
-}
-
-/// Are any tracked paths inside the directory `dir` (or equal to it)?
-/// `tracked` is the flat path set; the check is a linear scan of a set
-/// built once per scan.
-fn tracked_under(tracked: &HashSet<String>, dir: &str) -> bool {
-    tracked
-        .iter()
-        .any(|p| p == dir || p.starts_with(&format!("{dir}/")))
 }
 
 /// `bed status`: the same walk as [`scan_paths`], collapsed into the three
@@ -520,15 +477,6 @@ mod tests {
         /// A bed with `src/` selected and the treestate seeded to match the
         /// files on disk (as a completed materialization would leave it).
         fn planted(files: &[(&str, &[u8])]) -> Self {
-            Self::planted_with_sparse(files, "src")
-        }
-
-        /// [`Garden::planted`] with the whole repository (`.`) selected.
-        fn planted_root(files: &[(&str, &[u8])]) -> Self {
-            Self::planted_with_sparse(files, ".")
-        }
-
-        fn planted_with_sparse(files: &[(&str, &[u8])], sparse: &str) -> Self {
             let dir = tempfile::tempdir().unwrap();
             let mut bed = crate::workspace::WorkingCopy::init(
                 &dir.path().join(".bed"),
@@ -536,7 +484,7 @@ mod tests {
                 "garden",
             )
             .unwrap();
-            bed.config_mut().sparse.push(sparse.to_owned());
+            bed.config_mut().sparse.push("src".to_owned());
             bed.save_config().unwrap();
 
             let ts = bed.treestate().unwrap();
@@ -824,60 +772,5 @@ mod tests {
         assert_eq!(report.untracked, ["normal"]);
         assert!(report.modified.is_empty());
         assert!(report.deleted.is_empty());
-    }
-
-    #[test]
-    fn gitignore_hides_untracked_files_but_not_tracked_changes() {
-        let g = Garden::planted(&[("src/a.rs", b"hello")]);
-        fs::write(g.dir.path().join(".gitignore"), "/target\n*.tmp\n").unwrap();
-        fs::create_dir_all(g.dir.path().join("target/debug")).unwrap();
-        fs::write(g.dir.path().join("target/debug/x"), b"build junk").unwrap();
-        fs::write(g.dir.path().join("src/draft.tmp"), b"temp").unwrap();
-        // A tracked file keeps reporting changes whatever the patterns say.
-        fs::write(g.dir.path().join("src/a.rs"), b"changed").unwrap();
-
-        let report = g.scan(false);
-        assert_eq!(report.modified, ["src/a.rs"]);
-        assert!(report.untracked.is_empty(), "{:?}", report.untracked);
-    }
-
-    #[test]
-    fn gitignore_prunes_a_directory_only_when_it_holds_no_tracked_paths() {
-        // target/ is ignored, but a tracked file lives inside it: the
-        // directory is still walked, the tracked edit still reports, and
-        // the untracked sibling stays hidden (git semantics — ignore
-        // never un-tracks, and tracked content defeats pruning).
-        let g = Garden::planted_root(&[("target/tracked.rs", b"hello")]);
-        fs::write(g.dir.path().join(".gitignore"), "/target\n").unwrap();
-        fs::write(g.dir.path().join("target/tracked.rs"), b"changed").unwrap();
-        fs::write(g.dir.path().join("target/fresh.rs"), b"new").unwrap();
-
-        let report = g.scan(false);
-        assert_eq!(report.modified, ["target/tracked.rs"]);
-        // The untracked root .gitignore still shows (git reports it too);
-        // target/fresh.rs does not — inside an ignored directory.
-        assert_eq!(report.untracked, [".gitignore"]);
-    }
-
-    #[test]
-    fn nested_gitignore_scopes_to_its_subtree_in_the_scan() {
-        let g = Garden::planted_root(&[("src/a.rs", b"hello")]);
-        fs::write(g.dir.path().join("src/.gitignore"), "/local.rs\n").unwrap();
-        fs::write(g.dir.path().join("src/local.rs"), b"hidden").unwrap();
-        fs::write(g.dir.path().join("local.rs"), b"visible").unwrap();
-
-        let report = g.scan(false);
-        // The untracked nested .gitignore itself still shows — git
-        // reports it too; only what its patterns cover is hidden.
-        assert_eq!(report.untracked, ["local.rs", "src/.gitignore"]);
-    }
-
-    #[test]
-    fn no_gitignore_means_untracked_files_report_as_before() {
-        let g = Garden::planted_root(&[("src/a.rs", b"hello")]);
-        fs::create_dir_all(g.dir.path().join("target/debug")).unwrap();
-        fs::write(g.dir.path().join("target/debug/x"), b"build junk").unwrap();
-        let report = g.scan(false);
-        assert_eq!(report.untracked, ["target/debug/x"]);
     }
 }

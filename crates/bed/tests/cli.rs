@@ -98,12 +98,7 @@ fn sparse_list_and_remove_roundtrip_offline() {
 
     let (code, out, _) = bed(&dir, &["sparse", "list"]);
     assert_eq!(code, 0);
-    // Nothing is materialized in this offline fixture, so both prefixes
-    // are marked as matching nothing at the (unreachable) changeset.
-    assert_eq!(
-        out, "src (empty at this changeset)\ndocs (empty at this changeset)\n",
-        "out: {out}"
-    );
+    assert_eq!(out, "src\ndocs\n", "out: {out}");
 
     let (code, out, _) = bed(&dir, &["sparse", "remove", "src", "tests"]);
     assert_eq!(code, 0);
@@ -112,7 +107,7 @@ fn sparse_list_and_remove_roundtrip_offline() {
 
     let (code, out, _) = bed(&dir, &["sparse", "list"]);
     assert_eq!(code, 0);
-    assert_eq!(out, "docs (empty at this changeset)\n", "out: {out}");
+    assert_eq!(out, "docs\n", "out: {out}");
 }
 
 #[test]
@@ -633,10 +628,7 @@ async fn sparse_add_notes_when_the_prefix_matches_nothing() {
     // Both prefixes are recorded in the selected paths.
     let (code, out, _) = bed_in(&w.garden, &["sparse", "list"]);
     assert_eq!(code, 0);
-    assert_eq!(
-        out, "docs\nnowhere (empty at this changeset)\n",
-        "list marks the dead selection: {out}"
-    );
+    assert_eq!(out, "docs\nnowhere\n", "out: {out}");
 }
 
 // ---------------------------------------- FIX-B: short gRPC code in Rpc errors

@@ -9,26 +9,19 @@ tags, and the verification record for a release lives in
 
 ### Added
 
-- **Web GUI**: `gardenbed-web` (`crates/web`) — a read-only web interface
-  over a repository: history timeline, ref cards, changeset detail with a
-  grouped change list, tree browsing with breadcrumbs, file view with
-  line numbers and first-parent blame, diff compare, and the server's
-  request counters. It opens `--root` in process on the same `Repo`
-  service layer as the gRPC server and MCP, serves an embedded
-  no-build-step SPA plus a same-origin JSON API
-  (`/api/refs|log|changeset|tree|file|blame|diff|stats`), and ships a
-  `seed` subcommand that writes a deterministic demo history. The UI
-  includes an agent hand-off dialog ("Use in agent") that generates a
-  copyable connect-and-work prompt from `/api/server-info` plus the refs
-  listing, an SVG commit-graph lane column on History, an activity
-  heatmap and authors chart on Overview, and per-changeset diffstat
-  chips. Browse directory pages render the directory's README
-  GitHub-style (client-side, injection-escaped markdown subset; relative
-  links and images resolve to the viewed revision's own files). See
-  [docs/web.md](docs/web.md). Verified by in-memory router
-  integration tests (`crates/web/tests/api.rs`) and a Playwright
-  end-to-end suite (`e2e/`) that drives a real browser through every
-  page against the seeded repository.
+- Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
+  and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
+  `gardenbed-store` `StorageConfig` (TOML) to select them.
+- `gardenbed-server --storage <config.toml>` (plus `GARDENBED_STORAGE` env
+  fallback) for `serve`, `import`, and `export`: stateless replicas over
+  off-box Postgres + S3 instead of local `--root` mode, which stays the
+  default.
+- `tools/scale/compose.yaml`: a Postgres + MinIO (`pgsty/minio`) + N-replica
+  server deployment (see `tools/scale/README.md`); `crates/server/tests/scale.rs`
+  proves read-your-writes, single-winner CAS, and idempotent creates across
+  replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
+
+### Added
 
 - Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
   and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
@@ -42,55 +35,7 @@ tags, and the verification record for a release lives in
   proves read-your-writes, single-winner CAS, and idempotent creates across
   replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
 
-### Fixed
-
-- `bed switch` now prunes directories its removals left empty (dogfood:
-  switching off a changeset that introduced `crates/web` left the empty
-  `crates/web/{src,static,tests}` behind, so a workspace glob `crates/*`
-  matched a member with no `Cargo.toml` and `cargo check` failed). A
-  directory is pruned only when it contains nothing at all — untracked
-  or ignored content, other directories, or a sparse-selected prefix
-  keep it on disk; the working-copy root and the state directory are
-  never candidates; the sparse selection itself stays recorded in the
-  config regardless of disk state.
-- `bed sparse list` marks selected prefixes that match nothing at the
-  current changeset (suffix ` (empty at this changeset)`), computed
-  offline from the treestate's materialized rows — a dead selection no
-  longer reads like live coverage. Recording empty selections ahead of
-  history is unchanged by design.
-
-- **`gardenbed-server import` no longer silently rewinds refs** when an
-  incremental import moves a ref to a tip that is not a descendant of
-  the ref's current value (e.g. re-importing a git repository whose
-  `main` is behind the store's published `main` — the dogfood incident:
-  published work fell off `main` with exit 0 and no output). Such an
-  import now fails non-zero before any ref is touched when the move
-  would lose changesets, naming the ref, both tips, and the count;
-  `--allow-rewind` opts in (force-push parity) and the move is reported
-  in the import report (`refs_rewound`) plus a loud stderr warning.
-  Fell-off changesets are counted exactly via a metadata-only BFS.
-  Forward moves are unchanged (silent). Tests:
-  `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
-  `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
-
 ### Changed
-
-- **`bed` honors `.gitignore` for untracked-file discovery**: `bed
-  status` and `bed commit` now read `.gitignore` files from the working
-  copy (root plus one per directory walked) and hide matching untracked
-  files — the dogfood gap where every cargo `target/` landed in status
-  and rode into commits. Supported subset: blank lines, `#` comments,
-  trailing `/` (dir-only), `*` `?` `**` globs, and a leading `/` anchor.
-  Deliberately unsupported: `!` negation, character classes, and
-  global excludes. Git semantics are kept where they matter: ignore
-  never un-tracks (tracked files keep reporting changes, and tracked
-  content defeats directory pruning), an ignored directory with no
-  tracked content is pruned wholesale (a fresh `target/` costs one
-  stat), and untracked `.gitignore` files themselves still report.
-  Matching uses `gix-glob` (already in the workspace lock via the
-  `gardenbed-git` dependency). Verified against `git check-ignore`
-  behavior and by integration tests (`crates/bed/tests/gitignore.rs`)
-  against a real server process.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
@@ -105,15 +50,6 @@ tags, and the verification record for a release lives in
   state uses `index.sqlite3` and a `sparse` configuration field. This is a
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
-- No-argument `bed diff` is context-aware and always self-describing: a
-  dirty working copy diffs local bytes against the current changeset
-  (untracked files excluded, git parity; deleted files render as removal
-  to `/dev/null`), while a clean one keeps the current-changeset-vs-
-  first-parent diff. Both modes print a one-line header naming what is
-  being diffed (`diff of working copy against <cs>` /
-  `diff of <cs> against its first parent`); explicit `bed diff A [B]`
-  still means changesets, now with the same header line.
-
 
 ## [0.1.0] - 2026-10-16
 
