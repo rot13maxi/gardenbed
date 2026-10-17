@@ -7,6 +7,22 @@ tags, and the verification record for a release lives in
 
 ## Unreleased
 
+### Added
+
+- **Web GUI**: `gardenbed-web` (`crates/web`) — a read-only web interface
+  over a repository: history timeline, ref cards, changeset detail with a
+  grouped change list, tree browsing with breadcrumbs, file view with
+  line numbers and first-parent blame, diff compare, and the server's
+  request counters. It opens `--root` in process on the same `Repo`
+  service layer as the gRPC server and MCP, serves an embedded
+  no-build-step SPA plus a same-origin JSON API
+  (`/api/refs|log|changeset|tree|file|blame|diff|stats`), and ships a
+  `seed` subcommand that writes a deterministic demo history. See
+  [docs/web.md](docs/web.md). Verified by in-memory router integration
+  tests (`crates/web/tests/api.rs`) and a Playwright end-to-end suite
+  (`e2e/`) that drives a real browser through every page against the
+  seeded repository.
+
 ### Changed
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and

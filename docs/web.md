@@ -1,0 +1,66 @@
+# gardenbed web GUI
+
+`gardenbed-web` is a read-only web interface over a repository: history,
+refs, changeset detail, tree browsing, file view, blame, diff compare, and
+the server's request counters. It opens the server's repository **in
+process** over `--root` (like `gardenbed-mcp`) — every answer comes from
+the same [`gardenbed_server::Repo`](architecture.md) service layer the gRPC
+server and MCP tools use, so the GUI cannot disagree with `bed`. There is
+no working copy anywhere in this path, and nothing here can write to the
+repository: the GUI is an observability surface, not a client.
+
+```sh
+cargo run -p gardenbed-web -- --root /tmp/gardenbed-repo --addr 127.0.0.1:8430
+# listening on 127.0.0.1:8430
+```
+
+Open <http://127.0.0.1:8430> — no build step needed; the UI is embedded in
+the binary. `--addr` defaults to `127.0.0.1:8430`. The bound address is
+printed on stdout's first line, the same contract `gardenbed-server`
+scripts rely on.
+
+Try it on a scratch repository with deterministic demo history:
+
+```sh
+gardenbed-web seed --root /tmp/gardenbed-demo
+gardenbed-web --root /tmp/gardenbed-demo
+# → prints `seeded tip <64-hex>`
+```
+
+`seed` writes the same ten-commit "garden planner" history every time
+(exec file, rename, delete, three authors), then fast-forwards `main`.
+
+## Pages
+
+| Route | Page |
+|---|---|
+| `#/` | Overview: ref cards, request counters, recent history |
+| `#/log` | History timeline from the selected ref |
+| `#/changeset/<id>` | Changeset metadata + grouped change list |
+| `#/browse/<rev>/<path>` | Tree listing with breadcrumbs |
+| `#/file/<rev>/<path>` | File content with line numbers, blame toggle |
+| `#/compare?a=<rev>&b=<rev>` | Diff between two revspecs |
+
+Everywhere a rev is accepted (the global ref selector, compare inputs, URL
+fragments) the shared revspec resolver applies: ref name, full 64-hex id,
+or an unambiguous prefix of at least 8 hex chars — the same rule `bed`
+gets from `GetRef`.
+
+## JSON API
+
+The SPA is a thin client over a same-origin JSON API (contract documented
+in `crates/web/src/lib.rs`). Endpoints: `GET /api/refs`, `/api/log`,
+`/api/changeset`, `/api/tree`, `/api/file`, `/api/blame`, `/api/diff`,
+`/api/stats`. Errors are `{"error": "…"}` with 400 for bad input and 404
+for unknown revisions or paths. `/api/file` caps payloads at 512 KiB
+(`truncated: true`) and encodes non-UTF-8 content as base64.
+
+## Verification
+
+- `crates/web/tests/api.rs` — Rust integration tests driving the router
+  against an in-memory repository (every endpoint's happy path and the
+  error statuses).
+- `e2e/` — Playwright end-to-end suite (`cd e2e && npm test`): builds the
+  binary, seeds the deterministic demo repository, starts the server, and
+  drives a real browser through every page and interaction, including
+  blame attribution, ref selection, error states, and a mobile viewport.
