@@ -114,7 +114,9 @@ impl ServerProc {
 /// The fixture repo root with a published two-changeset history.
 fn fixture_root(dir: &TempDir) -> std::path::PathBuf {
     let root = dir.path().join("root");
-    let repo = gardenbed_server::Repo::open(&root).expect("repo opens");
+    // The registry layout: the repository is served as `garden` (the
+    // name the tests' tokens and RPCs address).
+    let repo = gardenbed_server::Repo::open(&root.join("garden")).expect("repo opens");
     let (c1, b1) = (add("docs/readme.md", b"# hello\n"), b"# hello\n");
     let (c2, b2) = (add("src/main.rs", b"fn main() {}\n"), b"fn main() {}\n");
     let cs1 = cs(Vec::new(), vec![c1.clone(), c2.clone()], "seed", 0);
@@ -128,6 +130,16 @@ fn fixture_root(dir: &TempDir) -> std::path::PathBuf {
     inline2.insert(c3.blob.expect("blob id").to_hex(), b3.to_vec());
     let id2 = repo.create_changeset(&cs2, &inline2).expect("cs2 ingests");
     repo.cas_ref("main", None, id2).expect("main created");
+    // A second repository (`elsewhere`): the per-repo token's own
+    // repo, and a name the wildcard token can reach that `garden`'s
+    // tokens cannot. One commit is enough — it only needs to exist.
+    let other = gardenbed_server::Repo::open(&root.join("elsewhere")).expect("repo opens");
+    let (c4, b4) = (add("note.md", b"away\n"), b"away\n");
+    let cs3 = cs(Vec::new(), vec![c4.clone()], "root", 0);
+    let mut inline3 = BTreeMap::new();
+    inline3.insert(c4.blob.expect("blob id").to_hex(), b4.to_vec());
+    let id3 = other.create_changeset(&cs3, &inline3).expect("cs3 ingests");
+    other.cas_ref("main", None, id3).expect("main created");
     root
 }
 
@@ -243,7 +255,7 @@ async fn auth_matrix() {
         .await
         .unwrap_err();
     assert_denied(&err, REPO);
-    let err = reader.publish(REPO, main).await.unwrap_err();
+    let err = reader.publish(REPO, main, None, false).await.unwrap_err();
     assert_denied(&err, REPO);
 
     // Write token: reads succeed and so do writes (one real commit +
@@ -257,7 +269,7 @@ async fn auth_matrix() {
     let cs_new = cs(vec![main], vec![change.clone()], "from a write token", 2);
     let id = commit(&writer, REPO, &cs_new, &[b"token auth works\n"]).await;
     let published = writer
-        .publish(REPO, id)
+        .publish(REPO, id, None, false)
         .await
         .expect("write token publishes");
     assert_eq!(published, id);
@@ -268,12 +280,13 @@ async fn auth_matrix() {
         .expect("main");
     assert_eq!(main_now, id, "publish fast-forwarded main");
 
-    // Wildcard: `*` matches any repo name (same server root).
+    // Wildcard: `*` matches any repo name — here the second real
+    // repository under the same root.
     let anywhere = server.token("anywhere").await;
     anywhere
-        .get_ref("some-other-name", "main")
+        .get_ref("elsewhere", "main")
         .await
-        .expect("wildcard token reads any repo name");
+        .expect("wildcard token reads any repository under the root");
 
     // Per-repo token: its own repo works, any other repo is denied —
     // even though the server is single-root (no existence leak).

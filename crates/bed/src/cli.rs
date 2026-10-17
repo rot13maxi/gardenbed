@@ -36,10 +36,12 @@ pub struct Cli {
 pub enum Command {
     /// Create a working copy connected to a server; materialize no files.
     Clone {
-        /// Repository server endpoint: `http(s)://host:port` or
-        /// `unix:///path/to/socket`.
+        /// Repository server endpoint: `http(s)://host:port[/repo]` or
+        /// `unix:///path/to/socket`. An http(s) URL's path names the
+        /// repository; no path selects `default`.
         server: String,
-        /// Repository name (default: default).
+        /// Repository name (default: from the URL path, else `default`;
+        /// the flag wins on conflict).
         #[arg(long)]
         repo: Option<String>,
         /// Starting ref. Defaults to `main`, then `master` or `trunk`.
@@ -92,10 +94,11 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// Diff two changesets (default: the current changeset vs its first
-    /// parent).
+    /// Diff the working copy against the current changeset (when dirty),
+    /// or two changesets (default: the current one vs its first parent).
+    /// Every diff prints a header naming what is being diffed.
     Diff {
-        /// The older side: changeset id or ref. With `b` omitted: diffs
+        /// The older side: changeset id or ref. With `b` omitted, diffs
         /// against this changeset's first parent.
         a: Option<String>,
         /// The newer side: changeset id or ref.
@@ -113,14 +116,29 @@ pub enum Command {
         author: Option<String>,
     },
 
-    /// Rebase the current changeset onto another changeset or ref.
+    /// Rebase the current changeset onto another changeset or ref. With
+    /// `--stack`, replay the whole first-parent chain from the merge
+    /// base up to the current changeset, oldest first — a conflict
+    /// anywhere aborts the entire stack (nothing is replayed).
     Rebase {
         /// The new parent: changeset id or ref.
         new_parent: String,
+        /// Replay the entire first-parent stack, not just the tip.
+        #[arg(long)]
+        stack: bool,
     },
 
-    /// Publish the current changeset by fast-forwarding `main`.
-    Publish,
+    /// Publish the current changeset by fast-forwarding a ref (default
+    /// `main`; a named ref is the lane-agent form).
+    Publish {
+        /// The ref to fast-forward (default: `main`). `main` must use the
+        /// plain form.
+        #[arg(long = "ref", value_name = "REF")]
+        ref_name: Option<String>,
+        /// Permit a non-fast-forward (rewind) move of a named ref.
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Merge a changeset or ref into the current changeset (the
     /// server-side two-parent merge). Conflicts abort listing every
@@ -137,6 +155,9 @@ pub enum Command {
         #[arg(long, value_name = "NAME <EMAIL>")]
         author: Option<String>,
     },
+
+    /// Upload queued offline commits to the server.
+    Sync,
 
     /// Show first-parent line attribution, following renames.
     Blame {
@@ -374,13 +395,36 @@ mod tests {
             other => panic!("expected Commit, got {other:?}"),
         }
         match parsed(&["rebase", "main"]).command {
-            Command::Rebase { new_parent } => assert_eq!(new_parent, "main"),
+            Command::Rebase { new_parent, stack } => {
+                assert_eq!(new_parent, "main");
+                assert!(!stack);
+            }
+            other => panic!("expected Rebase, got {other:?}"),
+        }
+        match parsed(&["rebase", "--stack", "main"]).command {
+            Command::Rebase { stack, .. } => assert!(stack),
             other => panic!("expected Rebase, got {other:?}"),
         }
         match parsed(&["publish"]).command {
-            Command::Publish => {}
+            Command::Publish { ref_name, force } => {
+                assert!(ref_name.is_none());
+                assert!(!force);
+            }
             other => panic!("expected Publish, got {other:?}"),
         }
+        match parsed(&["publish", "--ref", "feat/scale-out", "--force"]).command {
+            Command::Publish { ref_name, force } => {
+                assert_eq!(ref_name.as_deref(), Some("feat/scale-out"));
+                assert!(force);
+            }
+            other => panic!("expected Publish, got {other:?}"),
+        }
+        match parsed(&["sync"]).command {
+            Command::Sync => {}
+            other => panic!("expected Sync, got {other:?}"),
+        }
+        // `sync` takes no arguments.
+        assert!(Cli::try_parse_from(["bed", "sync", "extra"]).is_err());
         match parsed(&["blame", "src/lib.rs"]).command {
             Command::Blame { path, cs } => {
                 assert_eq!(path, "src/lib.rs");

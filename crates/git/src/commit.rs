@@ -196,6 +196,53 @@ fn parse_tz(tz: &str) -> ParseResult<i32> {
     Ok(sign * (hh * 60 + mm))
 }
 
+/// Reconstructs the commit object bytes implied by `raw`'s parsed fields,
+/// given the tree and parent git ids it must point at — the exact inverse
+/// of [`parse_commit`] for the reconstructable subset (tree/parent/author/
+/// committer in canonical order, no extra headers, UTF-8 identities,
+/// message verbatim).
+///
+/// Byte-equality with the original object bytes **proves** the commit is
+/// fully represented by the model (v0.2 D21's sparse-capture predicate):
+/// any difference — a `gpgsig`/`mergetag`/`encoding` header, a non-UTF-8
+/// name, a header-order deviation, a message the lossy decode changed —
+/// makes the bytes differ, and the importer captures the original raw.
+pub(crate) fn reconstruct_bytes(
+    raw: &RawCommit,
+    tree_hex: &str,
+    parent_hexes: &[String],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(256 + raw.message.len());
+    body.extend_from_slice(b"tree ");
+    body.extend_from_slice(tree_hex.as_bytes());
+    body.push(b'\n');
+    for hex in parent_hexes {
+        body.extend_from_slice(b"parent ");
+        body.extend_from_slice(hex.as_bytes());
+        body.push(b'\n');
+    }
+    body.extend_from_slice(identity_line("author", &raw.author).as_bytes());
+    body.extend_from_slice(identity_line("committer", &raw.committer).as_bytes());
+    body.push(b'\n');
+    body.extend_from_slice(raw.message.as_bytes());
+    body
+}
+
+/// `author Name <email> secs ±hhmm\n` (the inverse of `parse_identity`).
+fn identity_line(role: &str, who: &gardenbed_model::Identity) -> String {
+    let sign = if who.tz_min < 0 { '-' } else { '+' };
+    let abs = who.tz_min.unsigned_abs();
+    format!(
+        "{role} {} <{}> {} {}{:02}{:02}\n",
+        who.name,
+        who.email,
+        who.time_secs,
+        sign,
+        abs / 60,
+        abs % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{parse_commit, parse_identity};

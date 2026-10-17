@@ -659,3 +659,98 @@ fn m7_3_scripted_qa_agent_answers_like_git() {
     );
     assert_eq!(report.failed, 0, "QA: {}", report.summary());
 }
+
+// ---------------------------------------------------------------- line cap
+
+#[test]
+fn read_capped_line_bounds_and_frame_semantics() {
+    // Within the cap: the line is delivered, terminator stripped, EOF
+    // after it returns None.
+    let mut r = "hello\nworld".as_bytes();
+    let mut buf = String::new();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "hello");
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "world"); // EOF-terminated final line
+    assert_eq!(protocol::read_capped_line(&mut r, &mut buf).unwrap(), None);
+
+    // Empty input is a clean EOF, not an empty oversized line.
+    let mut r: &[u8] = b"";
+    assert_eq!(protocol::read_capped_line(&mut r, &mut buf).unwrap(), None);
+
+    // A lone newline is an in-cap empty line.
+    let mut r = "\n".as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "");
+
+    // Exactly cap bytes plus a newline is still in-cap.
+    let in_cap = format!("{}\n", "x".repeat(protocol::MAX_LINE_LEN));
+    let mut r = in_cap.as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf.len(), protocol::MAX_LINE_LEN);
+
+    // One byte past the cap: oversized, the whole line is skipped, and
+    // the following line is served intact.
+    let over = format!("{}\n{}\n", "y".repeat(protocol::MAX_LINE_LEN + 1), "after");
+    let mut r = over.as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "after");
+
+    // Oversized with no trailing newline until EOF: skipped, then EOF.
+    let over_eof = "z".repeat(protocol::MAX_LINE_LEN + 1);
+    let mut r = over_eof.as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(false)
+    );
+    assert_eq!(protocol::read_capped_line(&mut r, &mut buf).unwrap(), None);
+}
+
+#[test]
+fn m7_4_oversized_line_answered_32600_and_server_keeps_serving() {
+    // A line past the 1 MiB cap must not be buffered without bound: the
+    // server answers -32600 bound to id null, skips the line, and the
+    // next request is served normally.
+    let fixture = gardenbed_mcp::qa::Fixture::build(2, 4);
+    let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+    let mut mcp =
+        McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
+    mcp.handshake().expect("handshake");
+
+    let oversized = format!("{}\n", "q".repeat(protocol::MAX_LINE_LEN + 1));
+    let answer = mcp.raw(&oversized).expect("the oversized line is answered");
+    assert_eq!(answer["id"], json!(null));
+    assert_eq!(code(&answer), protocol::INVALID_REQUEST);
+
+    // The exact cap is still a (huge, unparseable) *line*: -32700, not
+    // the cap error — the boundary sits at cap+1.
+    let at_cap = format!("{}\n", "p".repeat(protocol::MAX_LINE_LEN));
+    let answer = mcp.raw(&at_cap).expect("the at-cap line is answered");
+    assert_eq!(code(&answer), protocol::PARSE_ERROR);
+
+    let ping = mcp
+        .raw(r#"{"jsonrpc":"2.0","id":88,"method":"ping"}"#)
+        .expect("the server keeps serving after an oversized line");
+    assert_eq!(ping["id"], json!(88));
+    assert_eq!(ping["result"], json!({}));
+    let _ = mcp.shutdown().expect("server exits");
+}

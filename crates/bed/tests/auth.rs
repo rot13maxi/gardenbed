@@ -197,12 +197,8 @@ async fn daemon_cache_hit_still_requires_token() {
     );
 
     // The tokened reader keeps working on the same warm cache.
-    let (code, out, err) = bed_via_daemon_with_token(
-        &daemon,
-        &garden,
-        &["sparse", "add", "."],
-        token,
-    );
+    let (code, out, err) =
+        bed_via_daemon_with_token(&daemon, &garden, &["sparse", "add", "."], token);
     assert_eq!(code, 0, "tokened sparse after warm: {err}\n{out}");
 
     daemon.kill().await;
@@ -242,12 +238,8 @@ async fn daemon_cache_hit_respects_repo_scope() {
     // denied through the warm daemon too — the cache serves nothing.
     let scoped = dir.path().join("scoped");
     fs::create_dir_all(&scoped).expect("scoped dir");
-    let (code, out, err) = bed_via_daemon_with_token(
-        &daemon,
-        &scoped,
-        &["clone", &server.http()],
-        "scoped-token",
-    );
+    let (code, out, err) =
+        bed_via_daemon_with_token(&daemon, &scoped, &["clone", &server.http()], "scoped-token");
     assert_eq!(code, 1, "scoped clone exits 1: {err}\n{out}");
     assert!(
         err.contains("denied for this token"),
@@ -287,7 +279,13 @@ async fn daemon_streams_blob_over_4mib() {
     let (code, out, err) = bed_via_daemon(
         &daemon,
         &garden,
-        &["commit", "-m", "big blob", "--author", "A. Gardener <a@bed.example>"],
+        &[
+            "commit",
+            "-m",
+            "big blob",
+            "--author",
+            "A. Gardener <a@bed.example>",
+        ],
     );
     assert_eq!(code, 0, "commit big: {err}\n{out}");
     let (code, out, err) = bed_via_daemon(&daemon, &garden, &["publish"]);

@@ -86,8 +86,39 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
 
         Command::Sparse { command } => run_sparse(cli, command).await,
 
+        Command::Sync => {
+            let report = gardenbed::queue::sync(&cli.state_dir).await?;
+            for id in &report.synced {
+                println!("synced {}", id.short());
+            }
+            match &report.failure {
+                None => {
+                    if report.synced.is_empty() {
+                        println!("nothing to sync — the queue is empty");
+                    } else {
+                        println!("synced {} commit(s), queue empty", report.synced.len());
+                    }
+                    Ok(0)
+                }
+                Some(e) => {
+                    println!("sync stopped: {e}");
+                    println!(
+                        "{} commit(s) still pending — run bed sync when online",
+                        report.remaining
+                    );
+                    Ok(1)
+                }
+            }
+        }
+
         Command::Status { full_scan } => {
             let bed = WorkingCopy::open(&cli.state_dir)?;
+            // The pending line comes first and works offline: the queue
+            // is purely local state.
+            let pending = bed.queue()?.count()?;
+            if pending > 0 {
+                println!("{pending} pending commit(s) not yet on the server — run bed sync");
+            }
             let sparse = bed.config().sparse.clone();
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");
@@ -162,17 +193,25 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             Ok(0)
         }
 
-        Command::Rebase { new_parent } => {
+        Command::Rebase { new_parent, stack } => {
             let _bed = WorkingCopy::open(&cli.state_dir)?;
             CsOrRef::parse(new_parent)?;
-            let out = gardenbed::ops::rebase(&cli.state_dir, new_parent).await?;
+            let out = if *stack {
+                gardenbed::ops::rebase_stack(&cli.state_dir, new_parent).await?
+            } else {
+                gardenbed::ops::rebase(&cli.state_dir, new_parent).await?
+            };
             print!("{out}");
             Ok(0)
         }
 
-        Command::Publish => {
-            let _bed = WorkingCopy::open(&cli.state_dir)?;
-            let out = gardenbed::ops::publish(&cli.state_dir).await?;
+        Command::Publish { ref_name, force } => {
+            if let Some(name) = &ref_name {
+                // A ref-shaped argument must parse as one (the revspec
+                // rules catch bad names before any RPC).
+                gardenbed::revspec::CsOrRef::parse(name)?;
+            }
+            let out = gardenbed::ops::publish(&cli.state_dir, ref_name.as_deref(), *force).await?;
             print!("{out}");
             Ok(0)
         }
@@ -225,8 +264,22 @@ async fn run_sparse(cli: &Cli, command: &SparseCommand) -> Result<i32, ClientErr
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");
             } else {
+                // A selected prefix with no materialized rows matches
+                // nothing at the current changeset — say so, instead of
+                // letting a dead selection look like live coverage.
+                // (Offline like the rest of the command: the treestate's
+                // rows are the materialized truth.)
+                let materialized: std::collections::HashSet<String> =
+                    bed.treestate()?.all_paths()?.into_iter().collect();
                 for prefix in sparse {
-                    println!("{prefix}");
+                    let covered = materialized.iter().any(|path| {
+                        gardenbed::sparse::in_sparse(path, std::slice::from_ref(prefix))
+                    });
+                    if covered {
+                        println!("{prefix}");
+                    } else {
+                        println!("{prefix} (empty at this changeset)");
+                    }
                 }
             }
             Ok(0)

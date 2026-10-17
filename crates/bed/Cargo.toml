@@ -13,8 +13,10 @@ name = "bed"
 path = "src/main.rs"
 
 [dependencies]
+bstr = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
+http = "1"
 gardenbed-model.workspace = true
 # Not in `[workspace.dependencies]` yet; path until the orchestrator adds it.
 gardenbed-store = { path = "../store" }
@@ -25,6 +27,9 @@ gardenbed-store = { path = "../store" }
 # daemon binary and never depends on it being present.
 gardenbed-daemon = { path = "../daemon" }
 gardenbed-protocol = { path = "../protocol" }
+# .gitignore pattern matching for untracked-file discovery (status/commit).
+# Same version the `gix` dependency in crates/git already locks.
+gix-glob = "0.29.0"
 rustix = { version = "1", features = ["fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -61,3 +66,9 @@ gardenbed-harness = { path = "../harness" }
 # for a thin client.
 gardenbed-server = { path = "../server" }
 tempfile = "3"
+# Dev-only: the server_bin() staleness test touches crates/server/src
+# mtimes (dogfood finding #12 regression proof).
+filetime = "0.2"
+# Dev-only: server_bin()'s content-digest staleness oracle (dogfood #12
+# hardening) hashes crates/server/src exactly like crates/server/build.rs.
+sha2 = "0.10"

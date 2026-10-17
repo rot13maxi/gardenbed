@@ -404,16 +404,22 @@ fn ancestors_naive(metadata: &dyn MetadataStore, start: Id) -> Result<HashSet<Id
     Ok(visited)
 }
 
-/// The naive merge base: intersect both ancestor sets, keep the maximal
-/// common ancestors (those that are not proper ancestors of another common
-/// one), and pick deterministically — newest committer seconds, tie-broken
-/// by descending id bytes.
+/// The naive merge base: intersect both ancestor sets (one BFS per side)
+/// and pick deterministically — newest committer seconds, tie-broken by
+/// descending id bytes.
 ///
 /// `git merge-base` returns "the best common ancestor"; when several are
 /// equally best (criss-cross merges) git's choice is implementation-defined,
 /// so this deterministic rule is Gardenbed's documented answer. On v0.1
 /// histories (redundant merges over a linear mainline) the maximal common
 /// ancestor is unique and both agree exactly.
+///
+/// Note the selection rule alone already determines the answer: a maximal
+/// filter (dropping common ancestors that are proper ancestors of another
+/// common one) can never reject the first candidate in the newest-first
+/// order — it is only ever tested against candidates kept *after* it — so
+/// the historical per-candidate ancestry scan was unobservable dead work
+/// (and O(candidates × history) besides). It is deliberately absent.
 fn merge_base_naive_impl(
     metadata: &dyn MetadataStore,
     a: Id,
@@ -424,36 +430,18 @@ fn merge_base_naive_impl(
     }
     let anc_a = ancestors_naive(metadata, a)?;
     let anc_b = ancestors_naive(metadata, b)?;
-    let common: Vec<Id> = anc_a.intersection(&anc_b).copied().collect();
-    if common.is_empty() {
-        return Ok(None);
+    let mut candidates: Vec<(u64, Id)> = Vec::new();
+    for c in anc_a.intersection(&anc_b) {
+        let (cs, _) = metadata.get_changeset(*c)?.ok_or(StoreError::NotFound)?;
+        candidates.push((cs.committer.time_secs, *c));
     }
-    let mut candidates: Vec<(u64, Id)> = Vec::with_capacity(common.len());
-    for c in common {
-        let (cs, _) = metadata.get_changeset(c)?.ok_or(StoreError::NotFound)?;
-        candidates.push((cs.committer.time_secs, c));
-    }
+    // Newest committer seconds first, tie-broken by descending id bytes —
+    // the same deterministic order the historical maximal filter consumed.
     candidates.sort_by(|x, y| {
         y.0.cmp(&x.0)
             .then_with(|| y.1.as_bytes().cmp(x.1.as_bytes()))
     });
-    let mut kept: Vec<Id> = Vec::new();
-    for (_, c) in candidates {
-        // c is non-maximal iff it is a proper ancestor of an already-kept
-        // candidate; ancestry is transitive, so the scan order does not
-        // change the maximal set.
-        let mut subsumed = false;
-        for d in &kept {
-            if is_ancestor_naive_impl(metadata, c, *d)? {
-                subsumed = true;
-                break;
-            }
-        }
-        if !subsumed {
-            kept.push(c);
-        }
-    }
-    Ok(kept.first().copied())
+    Ok(candidates.first().map(|&(_, c)| c))
 }
 
 // ------------------------------------------------------- accelerated walk
@@ -591,10 +579,12 @@ impl Engine {
     pub fn is_ancestor(&self, a: Id, b: Id) -> Result<bool, StoreError> {
         match is_ancestor_skiplist_impl(self, a, b) {
             Ok(v) => Ok(v),
-            // Derived-data gaps degrade to the naive walk; genuine store
-            // errors re-surface there.
+            // A derived-data gap (an unknown changeset) degrades to the
+            // naive walk — it may still answer from the plain graph.
+            // Every other failure (Db, Io, Corrupt, …) is a genuine
+            // store error and must propagate, not be retried.
             Err(StoreError::NotFound) => self.is_ancestor_naive(a, b),
-            Err(_) => self.is_ancestor_naive(a, b),
+            Err(e) => Err(e),
         }
     }
 

@@ -28,7 +28,7 @@ use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_server::Repo;
 use tempfile::TempDir;
 
-use common::{REPO, Server, bed, bed_async};
+use common::{REPO, Server, bed, bed_async, bed_raw};
 
 /// A small, fully hand-built history whose files and ids the tests know
 /// exactly: three changesets ending at `head`, ref `main` pointing there.
@@ -83,7 +83,7 @@ fn add(path: &str, content: &[u8], mode: Mode) -> (Change, Vec<u8>) {
 /// an empty garden directory ready for `bed clone`.
 async fn setup() -> World {
     let dir = tempfile::tempdir().expect("tempdir");
-    let root = dir.path().join("server");
+    let root = dir.path().join("server").join(REPO);
     let repo = Repo::open(&root).expect("repo opens");
 
     let (c1, b1) = add("docs/readme.md", b"# hello\n", Mode::Regular);
@@ -150,7 +150,7 @@ async fn setup() -> World {
 
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let server = Server::spawn(&root).await;
+    let server = Server::spawn(root.parent().unwrap()).await;
     World {
         _dir: dir,
         _root: root,
@@ -164,7 +164,10 @@ async fn setup() -> World {
 
 /// Clones a working copy into `garden` and sparses everything, via the real CLI.
 fn plant(w: &World) {
-    let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(
+        &w.garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
     let (code, out, stderr) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "sparse add: {stderr}\n{out}");
@@ -626,6 +629,171 @@ async fn rebase_replays_onto_moved_main_and_conflicts_name_paths() {
     w.server.shutdown().await;
 }
 
+/// `bed rebase --stack`: a 3-deep local stack replays onto a moved main
+/// oldest-first, each replayed link parented on the previous one, and
+/// the working copy lands at the new tip.
+#[tokio::test]
+async fn stack_rebase_replays_the_whole_first_parent_chain() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Build a 3-deep stack of working-copy commits.
+    let mut tips = Vec::new();
+    for i in 1..=3 {
+        fs::write(
+            w.garden.join(format!("src/stack-{i}.rs")),
+            format!("pub fn layer{i}() {{}}\n").as_bytes(),
+        )
+        .unwrap();
+        let (code, out, stderr) = bed(&w.garden, &["commit", "-m", &format!("layer {i}")]);
+        assert_eq!(code, 0, "layer {i}: {stderr}\n{out}");
+        tips.push(current_cs(&w.garden));
+    }
+    let stack_bottom = w
+        .repo
+        .get_changeset(tips[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // Upstream moves main off the stack's base: a fresh file, so every
+    // stack link's Add applies cleanly on top of it.
+    let (up_change, up_content) = add("src/upstream.rs", b"pub fn upstream() {}\n", Mode::Regular);
+    let up_blob = up_change.blob.unwrap();
+    let upstream_cs = cs(
+        vec![stack_bottom],
+        vec![up_change],
+        "upstream",
+        1_700_000_300,
+    );
+    let upstream_id = w
+        .repo
+        .create_changeset(
+            &upstream_cs,
+            &std::collections::BTreeMap::from([(up_blob.to_hex(), up_content)]),
+        )
+        .expect("upstream ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), upstream_id)
+        .expect("main moves");
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "stack rebase: {stderr}\n{out}");
+    assert!(out.contains("rebased 3 change(s)"), "output: {out}");
+    let tip = current_cs(&w.garden);
+    assert_ne!(tip, tips[2], "the working copy moved to the replayed tip");
+
+    // Chain shape: replayed tip -> replayed(2) -> replayed(1) -> upstream.
+    let mut ids = Vec::new();
+    let mut walk = tip;
+    for _ in 0..5 {
+        ids.push(walk);
+        let cs = w.repo.get_changeset(walk).unwrap();
+        walk = cs.parents.first().copied().unwrap();
+    }
+    assert_eq!(ids[3], upstream_id, "the chain roots on the new main");
+    // The ORIGINAL stack links are not reused: every replayed link is a
+    // fresh changeset parented on the previous replay, and none of the
+    // original tips appears in the new chain.
+    for t in &tips {
+        assert!(
+            !ids.contains(t),
+            "original stack link {t:?} was replayed, not reused"
+        );
+    }
+    for id in ids.iter().take(3) {
+        assert_eq!(w.repo.get_changeset(*id).unwrap().parents.len(), 1);
+    }
+    // The union tree: seed + upstream + all three layers.
+    assert!(flat_files(&w.repo, tip).contains_key("src/stack-3.rs"));
+    assert!(flat_files(&w.repo, tip).contains_key("src/upstream.rs"));
+
+    // The working copy came along and is clean.
+    let (code, out, stderr) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "status: {stderr}");
+    assert!(out.contains("working copy is clean"), "status: {out}");
+
+    w.server.shutdown().await;
+}
+
+/// `bed rebase --stack`: a conflict mid-stack aborts the whole stack —
+/// the working copy never moves off its current changeset.
+#[tokio::test]
+async fn stack_rebase_conflict_mid_stack_aborts_clean() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Two working-copy layers.
+    fs::write(w.garden.join("src/layer-a.rs"), b"pub fn a() {}\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "layer a"]);
+    assert_eq!(code, 0, "layer a: {stderr}\n{out}");
+    let first = current_cs(&w.garden);
+
+    // Layer B modifies docs/readme.md — chosen to clash with upstream.
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n layer b\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "layer b"]);
+    assert_eq!(code, 0, "layer b: {stderr}\n{out}");
+    let before = current_cs(&w.garden);
+    let stack_bottom = w
+        .repo
+        .get_changeset(first)
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // Upstream modifies the same readme — the conflict lands when layer
+    // B replays (the SECOND link), after layer A has replayed cleanly.
+    let up_modify = Change {
+        path: "docs/readme.md".into(),
+        op: Op::Modify,
+        blob: Some(blob_id(b"# hello\n\n upstream\n")),
+        src_path: None,
+        mode: Mode::Regular,
+    };
+    let up_blob = up_modify.blob.unwrap();
+    let upstream_cs = cs(
+        vec![stack_bottom],
+        vec![up_modify],
+        "upstream readme",
+        1_700_000_400,
+    );
+    let upstream_id = w
+        .repo
+        .create_changeset(
+            &upstream_cs,
+            &std::collections::BTreeMap::from([(
+                up_blob.to_hex(),
+                b"# hello\n\n upstream\n".to_vec(),
+            )]),
+        )
+        .expect("upstream ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), upstream_id)
+        .expect("main moves");
+
+    // The stack rebase fails: layer A applies, layer B conflicts.
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 1, "a mid-stack conflict must fail: {out}");
+    assert!(stderr.contains("rebase"), "stderr names rebase: {stderr}");
+    // The working copy never moved: still at the pre-rebase tip.
+    assert_eq!(
+        current_cs(&w.garden),
+        before,
+        "an aborted stack rebase leaves the working copy untouched"
+    );
+    // And the disk never moved either: layer B's content is still there.
+    assert_eq!(
+        fs::read_to_string(w.garden.join("docs/readme.md")).unwrap(),
+        "# hello\n\n layer b\n"
+    );
+
+    w.server.shutdown().await;
+}
+
 /// M5 write path 3: a lone publish fast-forwards `main`; a working copy left
 /// behind gets the not-fast-forward refusal with the recipe spelled out.
 #[tokio::test]
@@ -636,7 +804,7 @@ async fn publish_fast_forwards_and_losers_get_the_recipe() {
     // A second bed parks itself at the base tip BEFORE anything moves.
     let other = w._dir.path().join("garden-2");
     fs::create_dir_all(&other).unwrap();
-    let (code, _, stderr) = bed(&other, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(&other, &["clone", &format!("{}/garden", w.server.http())]);
     assert_eq!(code, 0, "{stderr}");
     let (code, _, stderr) = bed(&other, &["sparse", "add", "."]);
     assert_eq!(code, 0, "{stderr}");
@@ -689,7 +857,7 @@ async fn sixteen_concurrent_publishs_exactly_one_wins() {
     for i in 0..N {
         let dir = w._dir.path().join(format!("bed-{i:02}"));
         fs::create_dir_all(dir.join("row")).unwrap();
-        let (code, _, stderr) = bed(&dir, &["clone", &w.server.http()]);
+        let (code, _, stderr) = bed(&dir, &["clone", &format!("{}/garden", w.server.http())]);
         assert_eq!(code, 0, "clone {i}: {stderr}");
         let (code, _, stderr) = bed(&dir, &["sparse", "add", "."]);
         assert_eq!(code, 0, "sparse add {i}: {stderr}");
@@ -770,7 +938,7 @@ async fn chaos_killed_publishs_leave_a_consistent_ref() {
     for i in 0..N {
         let dir = w._dir.path().join(format!("chaos-{i:02}"));
         fs::create_dir_all(dir.join("row")).unwrap();
-        let (code, _, stderr) = bed(&dir, &["clone", &w.server.http()]);
+        let (code, _, stderr) = bed(&dir, &["clone", &format!("{}/garden", w.server.http())]);
         assert_eq!(code, 0, "clone {i}: {stderr}");
         let (code, _, stderr) = bed(&dir, &["sparse", "add", "."]);
         assert_eq!(code, 0, "sparse add {i}: {stderr}");
@@ -994,4 +1162,605 @@ async fn many_small_blobs_fit_the_unary_request_budget() {
 
 fn stats_get(stats: &std::collections::BTreeMap<String, u64>, key: &str) -> u64 {
     stats.get(key).copied().unwrap_or(0)
+}
+
+// ------------------------------------------------------------ diff
+
+/// No-argument `bed diff` is context-aware and always says what it
+/// diffed: a dirty working copy diffs local bytes against the current
+/// changeset; a clean one falls back to the committed current-vs-parent
+/// diff. Both modes are distinguishable at a glance by the header, and
+/// the explicit `A B` form is unchanged (its body is the pinned
+/// regression shape — only the header line is new).
+#[tokio::test]
+async fn no_arg_diff_names_working_copy_when_dirty_and_changesets_when_clean() {
+    let mut w = setup().await;
+    plant(&w);
+    // w.head is cs2: "tend the readme" modified docs/readme.md and added
+    // src/extra.rs, both against cs1.
+
+    // Clean tree: the no-arg diff is cs2 vs cs1, header names changesets.
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "{err}");
+    let cs2 = current_cs(&w.garden);
+    assert!(
+        out.starts_with(&format!(
+            "diff of {} against its first parent\n",
+            cs2.short()
+        )),
+        "header names the changeset: {out}"
+    );
+    let clean_body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(
+        clean_body.contains("docs/readme.md") && clean_body.contains("src/extra.rs"),
+        "committed diff body: {clean_body}"
+    );
+
+    // Dirty tree: the no-arg diff is the working copy against cs2, header
+    // names the working copy. Untracked files are not part of it.
+    fs::write(
+        w.garden.join("src/lib.rs"),
+        b"pub fn bed() { /* local edit */ }\n",
+    )
+    .unwrap();
+    fs::write(w.garden.join("src/untracked.rs"), b"not part of the diff\n").unwrap();
+    fs::remove_file(w.garden.join("notes/todo.txt")).unwrap();
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!("diff of working copy against {}\n", cs2.short())),
+        "header names the working copy: {out}"
+    );
+    assert!(
+        !out.contains("untracked.rs"),
+        "untracked files are not diffed: {out}"
+    );
+    let body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(
+        body.contains("diff --git a/src/lib.rs b/src/lib.rs"),
+        "edit rendered: {body}"
+    );
+    assert!(
+        body.contains("diff --git a/notes/todo.txt b/notes/todo.txt"),
+        "local deletion rendered: {body}"
+    );
+    assert!(
+        body.contains("+++ /dev/null"),
+        "deletion renders to /dev/null: {body}"
+    );
+
+    // Explicit A B form: unchanged semantics, plus the header line. The
+    // body must be byte-identical to the clean no-arg body (both are the
+    // cs1→cs2 diff).
+    let cs1 = {
+        // cs1 is the only parent of cs2.
+        w.repo
+            .get_changeset(cs2)
+            .unwrap()
+            .parents
+            .first()
+            .copied()
+            .unwrap()
+    };
+    let (code, out, err) = bed(&w.garden, &["diff", &cs1.to_hex(), &cs2.to_hex()]);
+    assert_eq!(code, 0, "{err}");
+    let explicit_body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert_eq!(explicit_body, clean_body, "explicit A B body is unchanged");
+
+    w.server.shutdown().await;
+}
+
+/// A tracked symlink retargeted in the working copy: the new side of
+/// `bed diff` shows the *link-target bytes* (what `bed commit` records),
+/// never the target file's content — and a dangling retarget renders too
+/// instead of failing to read.
+#[tokio::test]
+async fn diff_retargeted_symlink_shows_link_target_bytes_not_target_content() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Plant a tracked symlink first; a fresh link is merely untracked.
+    fs::write(w.garden.join("docs/other.md"), b"target file content\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("docs/readme.md", w.garden.join("docs/link.txt")).unwrap();
+    let (code, _, err) = bed(&w.garden, &["commit", "-m", "add a link"]);
+    assert_eq!(code, 0, "{err}");
+
+    // The link bytes bed commit would record for the new target, computed
+    // exactly the way commit does: the link-target bytes.
+    let new_link_bytes = b"docs/other.md".to_vec();
+    #[cfg(unix)]
+    {
+        fs::remove_file(w.garden.join("docs/link.txt")).unwrap();
+        std::os::unix::fs::symlink("docs/other.md", w.garden.join("docs/link.txt")).unwrap();
+    }
+
+    let (code, out, err) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("modified") && out.contains("docs/link.txt"),
+        "retargeted link is modified: {out}"
+    );
+
+    let cs = current_cs(&w.garden);
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!("diff of working copy against {}\n", cs.short())),
+        "header names the working copy: {out}"
+    );
+    assert!(
+        out.contains("diff --git a/docs/link.txt b/docs/link.txt"),
+        "link retarget rendered: {out}"
+    );
+    // The + side must carry the link-target bytes, not the target's
+    // content (git parity: the symlink's "content" is its target path).
+    let body = out.lines().skip(1).collect::<Vec<_>>().join("\n");
+    assert!(
+        body.contains("+docs/other.md"),
+        "new side is the link-target bytes: {body}"
+    );
+    assert!(
+        !body.contains("target file content"),
+        "new side is NOT the target file's content: {body}"
+    );
+
+    // What commit records for the same state must agree byte-for-byte.
+    let (code, _, err) = bed(&w.garden, &["commit", "-m", "retarget the link"]);
+    assert_eq!(code, 0, "{err}");
+    let committed = w
+        .repo
+        .get_changeset(current_cs(&w.garden))
+        .expect("committed changeset");
+    let change = committed
+        .changes
+        .iter()
+        .find(|c| c.path == "docs/link.txt")
+        .expect("link.txt change");
+    assert_eq!(change.blob, Some(gardenbed_model::blob_id(&new_link_bytes)));
+    assert_eq!(change.mode, Mode::Symlink);
+
+    w.server.shutdown().await;
+}
+
+/// A tracked symlink retargeted to a nonexistent path (dangling): the
+/// diff still renders — the link-target bytes exist regardless of
+/// whether the target does — instead of exiting 1 on read.
+#[tokio::test]
+async fn diff_dangling_symlink_renders_instead_of_failing() {
+    let mut w = setup().await;
+    plant(&w);
+
+    fs::remove_file(w.garden.join("docs/readme.md")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("docs/no-such-file.md", w.garden.join("docs/readme.md")).unwrap();
+
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "dangling link renders: {err}");
+    assert!(
+        out.contains("diff --git a/docs/readme.md b/docs/readme.md"),
+        "dangling retarget rendered: {out}"
+    );
+    assert!(
+        out.contains("+docs/no-such-file.md"),
+        "new side is the link-target bytes: {out}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// A tracked file replaced by a directory: status says deleted, and the
+/// diff agrees — it renders as a deletion instead of exiting 1 'Is a
+/// directory'.
+#[tokio::test]
+async fn diff_tracked_file_replaced_by_directory_renders_as_deletion() {
+    let mut w = setup().await;
+    plant(&w);
+
+    fs::remove_file(w.garden.join("notes/todo.txt")).unwrap();
+    fs::create_dir(w.garden.join("notes/todo.txt")).unwrap();
+
+    let (code, out, err) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("deleted") && out.contains("notes/todo.txt"),
+        "status says deleted: {out}"
+    );
+
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "directory replacement renders: {err}");
+    assert!(
+        out.contains("diff --git a/notes/todo.txt b/notes/todo.txt"),
+        "deletion rendered: {out}"
+    );
+    assert!(
+        out.contains("deleted file mode") || out.contains("+++ /dev/null"),
+        "renders as a removal: {out}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The two-argument header claims "first parent" only when it is true:
+/// a non-parent pair names both sides (`diff of <older> against
+/// <newer>`), a real parent pair keeps the first-parent wording.
+#[tokio::test]
+async fn diff_two_arg_header_names_both_sides_for_non_parent_pair() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // A third changeset on top of cs2, so cs1→cs3 is a non-parent pair
+    // while cs2→cs3 is a parent pair.
+    fs::write(
+        w.garden.join("docs/readme.md"),
+        b"# hello\n\n tended more\n",
+    )
+    .unwrap();
+    let (code, _, err) = bed(&w.garden, &["commit", "-m", "third"]);
+    assert_eq!(code, 0, "{err}");
+    let cs3 = current_cs(&w.garden);
+    let cs2 = w.head;
+    let cs1 = w
+        .repo
+        .get_changeset(cs2)
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // Parent pair: first-parent wording.
+    let (code, out, err) = bed(&w.garden, &["diff", &cs2.to_hex(), &cs3.to_hex()]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!(
+            "diff of {} against its first parent\n",
+            cs3.short()
+        )),
+        "parent pair keeps first-parent wording: {out}"
+    );
+
+    // Non-parent pair: both sides named, no ancestry claim.
+    let (code, out, err) = bed(&w.garden, &["diff", &cs1.to_hex(), &cs3.to_hex()]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!(
+            "diff of {} against {}\n",
+            cs1.short(),
+            cs3.short()
+        )),
+        "non-parent pair names both sides: {out}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// Untracked-only dirt does not hijack the no-argument diff: nothing is
+/// modified or deleted, so the diff is the committed current-vs-parent
+/// one (self-describing header included), not a header-only empty
+/// working-copy diff — git parity.
+#[tokio::test]
+async fn diff_untracked_only_dirt_falls_back_to_committed_diff() {
+    let mut w = setup().await;
+    plant(&w);
+
+    fs::write(w.garden.join("src/untracked.rs"), b"not part of the diff\n").unwrap();
+    let (code, out, err) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.contains("untracked") && !out.contains("working copy is clean"),
+        "status is dirty by untracked only: {out}"
+    );
+
+    // The diff must be the committed cs2-vs-cs1 one, header and all.
+    let cs2 = current_cs(&w.garden);
+    let (code, out, err) = bed(&w.garden, &["diff"]);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        out.starts_with(&format!(
+            "diff of {} against its first parent\n",
+            cs2.short()
+        )),
+        "untracked-only dirt falls back to the committed diff: {out}"
+    );
+    assert!(
+        out.contains("diff --git a/docs/readme.md b/docs/readme.md"),
+        "committed body renders: {out}"
+    );
+    assert!(
+        !out.contains("untracked.rs"),
+        "untracked files are not diffed: {out}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The dogfood #10 repro: a lane agent commits off-main and publishes with
+/// `bed publish --ref <branch>`; a FRESH clone's `bed switch <branch>` must
+/// then resolve the branch to the committed tip, not the stale imported one
+/// the ref carried before the publish.
+#[tokio::test]
+async fn publish_ref_advances_lane_and_fresh_switch_sees_it() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // The stale imported lane ref: the branch exists on the server, pointing
+    // at the history the working copy cloned from (the dogfood's
+    // `feat/scale-out` resolving to the imported tip).
+    let lane = "feat/scale-out";
+    w.repo
+        .cas_ref(lane, None, w.head)
+        .expect("lane ref imported");
+
+    // The lane agent commits off-main.
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n lane work\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "lane work"]);
+    assert_eq!(code, 0, "commit: {stderr}\n{out}");
+    let committed = current_cs(&w.garden);
+
+    // `bed publish --ref <branch>` advances the lane ref.
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane]);
+    assert_eq!(code, 0, "publish --ref: {stderr}\n{out}");
+    assert!(
+        out.contains(&format!("`{lane}` now points to it")),
+        "the output names the lane ref: {out}"
+    );
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(committed),
+        "the lane ref advanced to the committed tip"
+    );
+    // main is untouched by a lane publish.
+    assert_eq!(w.repo.get_ref("main").expect("get_ref"), Some(w.head));
+
+    // The fresh clone: `bed switch <branch>` must land on the committed tip.
+    let fresh = w._dir.path().join("garden-fresh");
+    fs::create_dir_all(&fresh).unwrap();
+    let (code, _, stderr) = bed(&fresh, &["clone", &format!("{}/garden", w.server.http())]);
+    assert_eq!(code, 0, "fresh clone: {stderr}");
+    let (code, out, stderr) = bed(&fresh, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "fresh sparse add: {stderr}\n{out}");
+    let (code, out, stderr) = bed(&fresh, &["switch", lane]);
+    assert_eq!(code, 0, "fresh switch: {stderr}\n{out}");
+    assert_eq!(
+        current_cs(&fresh),
+        committed,
+        "switch resolves the lane ref to the published tip, not the stale imported one"
+    );
+    // The materialized file is the lane agent's edit.
+    assert_eq!(
+        fs::read(fresh.join("docs/readme.md")).unwrap(),
+        b"# hello\n\n lane work\n",
+        "the fresh switch materialized the committed content"
+    );
+
+    // `--ref main` is reserved: main publishes stay the plain form.
+    let (code, _, stderr) = bed(&w.garden, &["publish", "--ref", "main"]);
+    assert_eq!(code, 1, "--ref main must be rejected: {stderr}");
+    assert!(
+        stderr.contains("plain form"),
+        "the reserved error names the plain form: {stderr}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// Dogfood #12's freeze-verification bar: `bed publish --ref` to a lane
+/// that does NOT exist yet must CREATE the lane ref row and must NOT
+/// touch `refs/heads/main` — a server-side ref-name drop would move main
+/// while the client still prints the lane's name (exactly the reported
+/// regression signature). Asserts on the ref rows themselves (the
+/// in-process `Repo` reads the same table the sqlite probe would), not on
+/// output text alone.
+#[tokio::test]
+async fn publish_ref_to_new_lane_creates_row_and_never_moves_main() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = "feat/fresh-lane";
+    // No seeded lane ref — this lane has never existed on the server.
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        None,
+        "the lane starts nonexistent"
+    );
+    let main_before = w.repo.get_ref("main").expect("get_ref main");
+
+    // The lane agent commits off-main and publishes to the new lane.
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n fresh lane\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "fresh lane work"]);
+    assert_eq!(code, 0, "commit: {stderr}\n{out}");
+    let committed = current_cs(&w.garden);
+    assert_ne!(
+        committed, w.head,
+        "the lane work is a new changeset, not the imported tip"
+    );
+
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane]);
+    assert_eq!(code, 0, "publish --ref to a new lane: {stderr}\n{out}");
+    assert!(
+        out.contains(&format!("`{lane}` now points to it")),
+        "the output names the lane ref: {out}"
+    );
+    // (a) The lane row was created at the committed tip.
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(committed),
+        "the lane row was created at the published tip"
+    );
+    // (b) main did NOT move — the ref-drop regression would have moved it.
+    assert_eq!(
+        w.repo.get_ref("main").expect("get_ref main"),
+        main_before,
+        "main is untouched by a lane publish"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The force+lane shape the freeze bar requires: `bed publish --ref
+/// <lane> --force` on a PRE-EXISTING NON-ANCESTOR lane row must (a) move
+/// the lane row to the new tip and (b) leave `refs/heads/main` alone.
+/// Also pins the rewind refusal without `--force` (the lane names the
+/// fix) — the path p6's landing will exercise.
+#[tokio::test]
+async fn publish_ref_force_moves_lane_not_main_on_non_ancestor() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = "feat/merge";
+    // A pre-existing lane row at a NON-ANCESTOR tip: commit divergent work
+    // directly through the server (not a child of main's tip), so the
+    // lane publish below is a rewind move, not a fast-forward.
+    let (c, b) = add("docs/divergent.md", b"divergent lane work\n", Mode::Regular);
+    let cs = cs(
+        vec![w.head],
+        vec![c.clone()],
+        "divergent lane work",
+        1_700_000_200,
+    );
+    let mut inline = std::collections::BTreeMap::new();
+    inline.insert(c.blob.unwrap().to_hex(), b);
+    let divergent = w
+        .repo
+        .create_changeset(&cs, &inline)
+        .expect("divergent ingests");
+    w.repo.cas_ref(lane, None, divergent).expect("lane seeded");
+    let main_before = w.repo.get_ref("main").expect("get_ref main");
+
+    // Commit NEW main-side work off main's tip (a sibling of the lane's
+    // divergent commit — same parent, different changeset).
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n main side\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "main-side work"]);
+    assert_eq!(code, 0, "commit: {stderr}\n{out}");
+    let main_side = current_cs(&w.garden);
+
+    // Without --force the rewind is refused, naming the lane and the fix.
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane]);
+    assert_eq!(
+        code, 1,
+        "non-ancestor lane publish must refuse: {out}{stderr}"
+    );
+    assert!(
+        stderr.contains(lane),
+        "the refusal names the lane ref: {stderr}"
+    );
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(divergent),
+        "the refused publish did not move the lane"
+    );
+
+    // With --force the lane row moves to the new tip...
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane, "--force"]);
+    assert_eq!(code, 0, "publish --ref --force: {stderr}\n{out}");
+    assert!(
+        out.contains(&format!("`{lane}` now points to it")),
+        "the output names the lane ref: {out}"
+    );
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(main_side),
+        "(a) the lane row moved to the forced tip"
+    );
+    // ...and (b) main still did not move.
+    assert_eq!(
+        w.repo.get_ref("main").expect("get_ref main"),
+        main_before,
+        "(b) main is untouched even by a forced lane publish"
+    );
+
+    w.server.shutdown().await;
+}
+
+// ------------------------------------------------------- M14 GBLO2
+
+/// M14 wire invariance: a > 2 MiB blob (GBLO2, chunked server-side)
+/// round-trips through the client with byte-exact reassembly, and the
+/// client cache serves the re-read with **zero** new server blob
+/// requests — the envelope is invisible above the object store.
+#[tokio::test]
+async fn chunked_blob_roundtrips_and_rereads_from_cache() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // 3 MiB of incompressible content: several FastCDC chunks, GBLO2
+    // server-side.
+    let mut heavy = Vec::with_capacity(3 << 20);
+    let mut state = 0xB00Cu64;
+    while heavy.len() < 3 << 20 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        heavy.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(w.garden.join("chunked.bin"), &heavy).unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "chunked blob"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    // The new changeset must be on `main` for the second clone to see it.
+    let (code, out, stderr) = bed(&w.garden, &["publish"]);
+    assert_eq!(code, 0, "publish: {stderr}\n{out}");
+
+    let blob = blob_id(&heavy);
+    // Server-side: the object is GBLO2 with a multi-chunk table.
+    let hex = blob.to_hex();
+    let envelope_path = w._root.join("objects").join(&hex[..2]).join(&hex[2..]);
+    let raw = fs::read(&envelope_path).expect("server envelope");
+    assert_eq!(&raw[..5], b"GBLO2", "3 MiB blob stores GBLO2");
+    let count = u32::from_le_bytes(raw[13..17].try_into().unwrap()) as usize;
+    assert!(count >= 2, "3 MiB blob spans several chunks (got {count})");
+    assert_eq!(
+        w.repo.get_blob(blob).unwrap().unwrap(),
+        heavy,
+        "server reads it back byte-exact"
+    );
+
+    // A second, cold working copy fetches the blob over the wire
+    // (GetBlob streamed, reassembled, verified) and caches it locally.
+    let garden2 = w._dir.path().join("garden2");
+    fs::create_dir_all(&garden2).expect("garden2 dir");
+    let client = w.server.client().await;
+    let before = client.get_stats(REPO).await.expect("stats");
+    let (code, out, stderr) = bed(
+        &garden2,
+        // Multi-repo server: the clone URL names the repo.
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
+    assert_eq!(code, 0, "clone: {stderr}\n{out}");
+    let (code, out, stderr) = bed(&garden2, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse: {stderr}\n{out}");
+    let fetched = fs::read(garden2.join("chunked.bin")).expect("materialized");
+    assert_eq!(fetched, heavy, "wire reassembly is byte-exact");
+
+    // The client cache holds the blob (GBLO2 locally too — same envelope,
+    // same threshold rule); a re-read of the same file from a *warm* copy
+    // pulls zero new server blob requests.
+    let cache_path = garden2
+        .join(".bed")
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    let cached = fs::read(&cache_path).expect("client cached the blob");
+    assert_eq!(&cached[..5], b"GBLO2", "client cache stores GBLO2");
+    let (code, out, stderr) = bed_raw(&garden2, &["file", "chunked.bin"]);
+    assert_eq!(code, 0, "file: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(out, heavy, "bed file reads back exact");
+    let mid = client.get_stats(REPO).await.expect("stats");
+
+    // Second full sparse sync from the warm copy: zero duplicate fetches.
+    let (code, out, stderr) = bed(&garden2, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "re-add: {stderr}");
+    assert!(out.contains("0 tree(s) and 0 blob(s)"), "out: {out}");
+    let after = client.get_stats(REPO).await.expect("stats");
+    assert_eq!(
+        stats_get(&mid, "get_blob"),
+        stats_get(&after, "get_blob"),
+        "zero duplicate blob fetches from the warm cache"
+    );
+    assert!(
+        stats_get(&before, "get_blob") < stats_get(&after, "get_blob"),
+        "the cold fetch did hit the server (fixture sanity)"
+    );
+
+    w.server.shutdown().await;
 }

@@ -123,10 +123,29 @@ its SHA-256.
 
 ## 6. Stored object envelope (objects) — informative
 
-On disk, blobs are stored under their `Blob::id` as:
+On disk, blobs are stored under their `Blob::id` in one of two envelopes,
+chosen by raw length (v0.2, docs/v0.2.md §7):
+
+**GBLO1** — content ≤ 1 MiB:
 `"GBLO1"` magic (5 bytes), `raw_len:u64` little-endian, one zstd frame of
-the content. Readers verify the decompressed length and its SHA-256 against
-the addressed Id. Trees and changesets are stored as their canonical
+the content.
+
+**GBLO2** — content > 1 MiB (content-defined chunked):
+`"GBLO2"` magic (5 bytes), `raw_len:u64` little-endian,
+`chunk_count:u32` little-endian, `chunk_count` table entries
+(`chunk_raw_len:u32` LE, `chunk_comp_len:u32` LE each), then `chunk_count`
+zstd frames in chunk order. Boundaries come from FastCDC (min 64 KiB /
+avg 256 KiB / max 1 MiB) — content-defined, hence deterministic for
+identical content; a one-byte tail append leaves every earlier boundary
+fixed. The chunk table at the 4 GiB blob cap is ≤ ~786 KiB.
+
+Readers dispatch on the magic, decode each chunk bounded by its declared
+raw length (frames region exactly the comp lengths; raw lengths summing to
+`raw_len`), reassemble in order, and verify the whole content's SHA-256
+against the addressed Id — the same torn/tamper guarantee as GBLO1.
+Compression and chunking are storage details and never participate in
+identity: `Blob::id` is always SHA-256 of the raw, uncompressed,
+reassembled bytes. Trees and changesets are stored as their canonical
 payloads (with their own format bytes, so no envelope is needed to type
 them).
 

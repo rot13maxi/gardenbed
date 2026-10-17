@@ -130,6 +130,17 @@ pub enum ClientError {
     },
 
     // ------------------------------------------------- server (M4 read path)
+    /// The server URL is malformed in a way the command refuses to guess
+    /// around (e.g. a multi-segment http path, which cannot name a
+    /// repository).
+    #[error("bad server URL {server:?}: {reason}")]
+    BadServerUrl {
+        /// The URL as given.
+        server: String,
+        /// Why it is refused.
+        reason: String,
+    },
+
     /// The server could not be reached. Validation and connection both
     /// happen before any local state is written, so local state is unchanged.
     #[error(
@@ -154,6 +165,38 @@ pub enum ClientError {
         /// The server's explanation.
         message: String,
     },
+
+    /// A merge was refused for semantic conflicts: the server lists every
+    /// conflicting path; resolution belongs in the working copy.
+    #[error(
+        "merge conflicts on: {paths}\n  \
+         next step: edit the conflicting files, commit, and merge again"
+    )]
+    MergeConflict {
+        /// The conflicting paths, comma-separated server message style.
+        paths: String,
+    },
+
+    /// A merge was refused locally: the working copy has uncommitted
+    /// work that the post-merge checkout would put at risk. Checked
+    /// before the RPC so the server stores nothing on refusal.
+    #[error(
+        "merge refuses a dirty working copy — commit or preserve local work \
+         first:\n{detail}"
+    )]
+    MergeDirtyWorkingCopy {
+        /// The `bed status` rendering of what is dirty.
+        detail: String,
+    },
+    /// A gitlink blob id that does not follow the canonical padding
+    /// convention (upstream git SHA-1 left-padded with twelve zero bytes)
+    /// was asked to render as a `Subproject commit <sha>` hunk. There is
+    /// no honest pointer to name — refuse rather than render a SHA git
+    /// would apply as a wrong target.
+    #[error(
+        "gitlink blob id {0} is not a zero-padded submodule SHA — cannot render a Subproject commit hunk"
+    )]
+    InvalidGitlinkId(Id),
 
     /// The command needs a current changeset and the working copy has none.
     #[error(
@@ -257,16 +300,45 @@ pub enum ClientError {
     #[error("{0:?} keeps changing while committing — rerun `bed commit`")]
     FileChanged(String),
 
-    /// `publish` was refused because `main` is no longer where this working copy's
-    /// changeset grew from — a fast-forward CAS lost to a moved ref.
+    /// `publish` was refused because the target ref is no longer where this
+    /// working copy's changeset grew from — a fast-forward CAS lost to a
+    /// moved ref.
     #[error(
-        "cannot publish {cs}: it does not fast-forward `main`{tip}\n  \
-         rebase this changeset onto the new main (`bed rebase main`) and publish again"
+        "cannot publish {cs}: it does not fast-forward `{ref}`{tip}\n  \
+         rebase this changeset onto the new {ref} (`bed rebase {ref}`) and publish again"
     )]
     PublishNotFastForward {
         /// The changeset that was being published (short form).
         cs: String,
-        /// `main`'s current tip (short form), when the server said.
+        /// The ref that was being published to.
+        r#ref: String,
+        /// The ref's current tip (short form), when the server said.
         tip: String,
+    },
+
+    /// A mutating ref/head command was refused because commits are still
+    /// queued offline — syncing first keeps the server's view coherent.
+    #[error(
+        "cannot {command} with {pending} pending commit(s) not yet on the server — \
+         run `bed sync` first"
+    )]
+    PendingCommits {
+        /// The refused command's name.
+        command: &'static str,
+        /// How many commits wait for `bed sync`.
+        pending: usize,
+    },
+
+    /// The requested changeset is queued offline: the object is local, but
+    /// its parents may only exist on the server. Sync uploads it first.
+    #[error(
+        "changeset {cs} is pending — {pending} commit(s) not yet on the server; \
+         run `bed sync` to upload it, or log a synced changeset"
+    )]
+    PendingCs {
+        /// The pending changeset (short form).
+        cs: String,
+        /// How many commits wait for `bed sync`.
+        pending: usize,
     },
 }

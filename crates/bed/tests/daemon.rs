@@ -35,7 +35,7 @@ use std::time::Instant;
 use gardenbed_harness::generator::{GenOptions, GeneratedHistory, generate};
 use tempfile::TempDir;
 
-use common::{Daemon, Server, bed, bed_direct, bed_via_daemon, ingest};
+use common::{Daemon, REPO, Server, bed, bed_direct, bed_via_daemon, ingest};
 
 /// One garden (working copy) plus the daemon fronting its server.
 struct World {
@@ -57,7 +57,7 @@ async fn world(commits: u32) -> World {
             ..GenOptions::default()
         },
     );
-    ingest(&history, &server_root);
+    ingest(&history, &server_root.join(REPO));
     let server = Server::spawn(&server_root).await;
     let daemon = Daemon::spawn(&daemon_root, &server.http()).await;
     World {
@@ -101,9 +101,9 @@ async fn proxy_transparency_byte_identical_outputs() {
     fs::create_dir_all(&direct_dir).expect("dirs");
     fs::create_dir_all(&daemon_dir).expect("dirs");
 
-    let (clone_d, sparse_d) = clone_and_sparse(&via_direct(), &direct_dir, &w.server.http());
+    let (clone_d, sparse_d) = clone_and_sparse(&via_direct(), &direct_dir, &w.server.http_garden());
     let (clone_p, sparse_p) =
-        clone_and_sparse(&via_daemon(&w.daemon), &daemon_dir, &w.server.http());
+        clone_and_sparse(&via_daemon(&w.daemon), &daemon_dir, &w.server.http_garden());
     assert_eq!((clone_d.0, sparse_d.0), (0, 0), "direct run succeeds");
     assert_eq!(
         (clone_p.0, sparse_p.0),
@@ -147,7 +147,7 @@ async fn cross_working_copy_dedup_hits_the_shared_cache() {
     fs::create_dir_all(&b).expect("dirs");
 
     // A warms the shared cache through the daemon.
-    let (c, s) = clone_and_sparse(&via_daemon(&w.daemon), &a, &w.server.http());
+    let (c, s) = clone_and_sparse(&via_daemon(&w.daemon), &a, &w.server.http_garden());
     assert_eq!((c.0, s.0), (0, 0), "A warms the cache: {} {}", c.2, s.2);
 
     let client = w.server.client().await;
@@ -155,7 +155,7 @@ async fn cross_working_copy_dedup_hits_the_shared_cache() {
 
     // B fetches the same objects through the same daemon: the shared
     // cache answers; the server counters must not move.
-    let (c, s) = clone_and_sparse(&via_daemon(&w.daemon), &b, &w.server.http());
+    let (c, s) = clone_and_sparse(&via_daemon(&w.daemon), &b, &w.server.http_garden());
     assert_eq!(
         (c.0, s.0),
         (0, 0),
@@ -225,7 +225,11 @@ async fn daemon_kill_mid_sparse_add_falls_back_and_completes() {
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
 
-    let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &w.daemon,
+        &garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(c, 0, "clone through the daemon: {err}");
 
     // Kill the daemon after clone but before sparse: the fetch-phase
@@ -268,7 +272,11 @@ async fn watcher_edit_drives_the_next_status() {
     let w = world(12).await;
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &w.daemon,
+        &garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(c, 0, "{err}");
     let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");
@@ -305,7 +313,11 @@ async fn mtime_lie_is_caught_under_the_daemon() {
     let w = world(12).await;
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &w.daemon,
+        &garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(c, 0, "{err}");
     let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");
@@ -337,7 +349,11 @@ async fn watcher_loss_degrades_to_full_scan() {
     let w = world(12).await;
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &w.daemon,
+        &garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(c, 0, "{err}");
     let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");
@@ -373,7 +389,11 @@ async fn warm_status_fast_path_outpaces_full_scan() {
     let w = world(30).await;
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &w.daemon,
+        &garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(c, 0, "{err}");
     let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");
@@ -410,7 +430,7 @@ async fn empty_env_var_disables_the_daemon_end_to_end() {
     let w = world(10).await;
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let (c, _, err) = bed_direct(&garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_direct(&garden, &["clone", &format!("{}/garden", w.server.http())]);
     assert_eq!(c, 0, "clone with the daemon disabled: {err}");
     let (c, _, err) = bed_direct(&garden, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");
@@ -420,35 +440,41 @@ async fn empty_env_var_disables_the_daemon_end_to_end() {
     let _ = &w.daemon; // the daemon stays up but must never be consulted
 }
 
-/// M16-6: two working copies (different repos on different servers)
+/// M16-6: two working copies over two repositories of one server,
 /// served concurrently through one daemon.
 #[tokio::test]
 async fn two_repositories_through_one_daemon() {
     let dir = tempfile::tempdir().expect("tempdir");
-    // Server A with repo "alpha", server B with repo "beta".
-    let root_a = dir.path().join("server-a");
-    let root_b = dir.path().join("server-b");
+    // One server root, two repositories under it (the v0.2 registry
+    // layout): "alpha" and "beta" each with their own history.
+    let root = dir.path().join("server");
     let history_a = generate(3, &GenOptions::default());
     let history_b = generate(4, &GenOptions::default());
-    ingest(&history_a, &root_a);
-    ingest(&history_b, &root_b);
-    let server_a = Server::spawn(&root_a).await;
-    let _server_b = Server::spawn(&root_b).await;
+    ingest(&history_a, &root.join("alpha"));
+    ingest(&history_b, &root.join("beta"));
+    let server = Server::spawn(&root).await;
 
-    // One daemon fronting server A only — the repo field rides untouched,
-    // so the same daemon could front either; but a daemon proxies one
-    // upstream, so two repos on *one* server is the concurrency shape.
-    // Give server A both repos via a second ingest under another name.
-    let daemon = Daemon::spawn(&dir.path().join("daemon"), &server_a.http()).await;
+    // One daemon fronting the server — the repo field rides untouched,
+    // so the two working copies select different repositories through
+    // the same daemon and upstream.
+    let daemon = Daemon::spawn(&dir.path().join("daemon"), &server.http()).await;
 
     let wc_a = dir.path().join("wc-a");
     let wc_b = dir.path().join("wc-b");
     fs::create_dir_all(&wc_a).expect("dirs");
     fs::create_dir_all(&wc_b).expect("dirs");
 
-    let (c, _, err) = bed_via_daemon(&daemon, &wc_a, &["clone", &server_a.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &daemon,
+        &wc_a,
+        &["clone", &format!("{}/alpha", server.http())],
+    );
     assert_eq!(c, 0, "A clones through the daemon: {err}");
-    let (c, _, err) = bed_via_daemon(&daemon, &wc_b, &["clone", &server_a.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &daemon,
+        &wc_b,
+        &["clone", &format!("{}/beta", server.http())],
+    );
     assert_eq!(c, 0, "B clones through the same daemon: {err}");
     let (c, _, err) = bed_via_daemon(&daemon, &wc_a, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");
@@ -458,7 +484,7 @@ async fn two_repositories_through_one_daemon() {
     let a = read_all_files(&wc_a);
     let b = read_all_files(&wc_b);
     assert!(!a.is_empty() && !b.is_empty());
-    assert_eq!(a, b, "both working copies serve the same repo concurrently");
+    assert_ne!(a, b, "the two working copies serve different repositories");
 }
 
 /// M16-7: wrong-uid write refusal, end to end, when `setpriv` can drop
@@ -469,7 +495,11 @@ async fn wrong_uid_write_is_refused_when_a_drop_tool_exists() {
     let w = world(8).await;
     let garden = w._dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["clone", &w.server.http()]);
+    let (c, _, err) = bed_via_daemon(
+        &w.daemon,
+        &garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(c, 0, "{err}");
     let (c, _, err) = bed_via_daemon(&w.daemon, &garden, &["sparse", "add", "."]);
     assert_eq!(c, 0, "{err}");

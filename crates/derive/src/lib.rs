@@ -233,9 +233,22 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> CacheMap<K, V> {
 
     fn put(&mut self, key: K, value: V) {
         let w = (self.weight)(&value);
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
-            self.bytes += w;
+        match self.map.insert(key.clone(), value) {
+            None => {
+                // Fresh key: FIFO order entry and full weight.
+                self.order.push_back(key);
+                self.bytes += w;
+            }
+            Some(old) => {
+                // Re-insert over an existing key: the old value's weight
+                // must come off (it is no longer cached) and the new one
+                // on, or `bytes` drifts upward on every refresh. The key
+                // keeps its original place in the FIFO order — pushing a
+                // duplicate would make later eviction pop a key that is
+                // still cached, leaking both its entry and its weight.
+                self.bytes += w;
+                self.bytes -= (self.weight)(&old);
+            }
         }
         while self.map.len() > self.cap_entries || self.bytes > self.cap_bytes {
             let Some(oldest) = self.order.pop_front() else {
@@ -370,7 +383,7 @@ impl Engine {
             }
             let root = self.validated_tree_for_new(&cs)?;
             self.metadata
-                .put_validated_changeset(&cs, root, &[], None)?;
+                .put_validated_changeset(&cs, root, &[], None, None)?;
         }
         Ok(())
     }
@@ -516,6 +529,18 @@ impl Engine {
     /// that do not touch it), so a bounded cache turns most loads into
     /// cache hits. Content addressing makes the entry immortal — the same
     /// id always decodes to the same entries.
+    ///
+    /// The public twin of [`Engine::tree`] for hot paths: same content,
+    /// shared `Arc` instead of a fresh clone, and served from the cache
+    /// (the export's per-commit tree rendering hits the same stable ids
+    /// thousands of times in a row). A missing object surfaces as the
+    /// store's `Corrupt` error — a referenced tree id that is absent is
+    /// corruption, not an absence to report — so no existence probe runs
+    /// first: one store roundtrip per uncached id.
+    pub fn cached_tree_arc(&self, id: Id) -> Result<Option<Arc<Tree>>, StoreError> {
+        Ok(Some(self.decoded_tree(id)?))
+    }
+
     fn decoded_tree(&self, id: Id) -> Result<Arc<Tree>, StoreError> {
         if let Some(tree) = self.lock_trees().get(&id) {
             return Ok(tree);

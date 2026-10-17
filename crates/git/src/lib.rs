@@ -1,11 +1,14 @@
 //! gardenbed-git — Git import and export.
 //!
 //! The **import** direction mirrors a git repository into Gardenbed's
-//! changeset stores. The **export** direction ([`export_to_path`]) renders
-//! those stores back into a real git repository via one `git fast-import`
-//! stream. The trust anchor is differential verification: the harness
-//! replays imported changesets against git's own answers, and the export
-//! roundtrip reproduces byte-identical git SHAs for unsigned histories.
+//! changeset stores. The **export** direction ([`export_to_path`])
+//! renders those stores back into a real git repository with a native
+//! pack writer (v0.2 D20/D21): full objects, no deltas, SHA-1, every
+//! computed commit SHA asserted against the git-mapping table. The trust
+//! anchor is differential verification: the harness replays imported
+//! changesets against git's own answers, and the export roundtrip
+//! reproduces byte-identical git SHAs — including signed and
+//! extra-header commits, via raw-commit capture at import.
 //!
 //! # Semantics
 //!
@@ -49,8 +52,13 @@
 //!   skipped without touching any object; mapped history is not descended
 //!   (sound because git ids are content-addressed). A re-import of an
 //!   unchanged repository writes zero objects.
-//! * **Force pushes** are a non-event: refs simply move (CAS), old
-//!   objects and their mapping rows remain (valid, merely unreachable).
+//! * **Force pushes** move refs like any update (CAS); old objects and
+//!   their mapping rows remain (valid, merely unreachable). But a ref
+//!   move that would make previously-published changesets unreachable is
+//!   never silent: the import reports it in
+//!   [`ImportReport::refs_rewound`] (ref name, old and new tips, how many
+//!   changesets fell off), and — unless [`ImportOptions::allow_rewind`]
+//!   is set — fails with [`ImportError::Ref`] before touching the ref.
 //! * **`limit`** imports the newest `N` commits as a suffix of the
 //!   topological order; slice boundaries are re-rooted (full-tree root
 //!   changesets) and out-of-slice extra parents are dropped. This is a
@@ -75,12 +83,13 @@
 //! * Concurrent imports of the same repository into the same stores race
 //!   on the mapping table (a lost bijection insert aborts the import);
 //!   ref updates themselves are CAS-atomic.
-//! * **Signed commits** are exported unsigned — fast-import cannot emit a
-//!   `gpgsig` header — so their git SHAs differ from the originals
-//!   (counted in [`ExportReport::signed_dropped`]; see
-//!   `docs/divergences.md`).
-//! * Extra commit headers (`encoding`, `mergetag`, `gpgsig-sha256`, …)
-//!   are not modeled on either side of the bridge.
+//! * v0.1 stores have no raw-commit rows: their signed changesets refuse
+//!   loudly at export (the SHA assertion fires before anything ships —
+//!   never a silent divergence); re-import retires the divergence with
+//!   stable changeset ids.
+//! * A `limit`-sliced store exports only when every raw commit's parents
+//!   are inside the export (slice boundaries name below-slice parents;
+//!   the export refuses loudly rather than emit a dangling pack).
 //!
 //! # Errors
 //!
@@ -100,6 +109,11 @@ mod gtree;
 mod import;
 pub mod oid;
 mod options;
+// `pack`'s read side (`read_pack`/`read_idx`) is public for the fuzz
+// target (`fuzz/fuzz_targets/fuzz_pack_reader.rs`) exactly like
+// `difftree` above: random bytes into the reader must never panic and
+// never trust a declared length. Not part of the stabilized surface.
+pub mod pack;
 mod report;
 mod resolve;
 mod transform;
@@ -108,7 +122,7 @@ pub use error::{ExportError, ImportError};
 pub use export::{ExportOptions, ExportReport, export_to_path};
 pub use import::import_from_path;
 pub use options::ImportOptions;
-pub use report::ImportReport;
+pub use report::{ImportReport, RefRewind};
 
 use std::path::Path;
 use std::process::Command;

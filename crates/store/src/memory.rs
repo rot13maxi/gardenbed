@@ -23,6 +23,10 @@ struct MemoryInner {
     trees: HashMap<Id, Vec<u8>>,
     /// Changeset id → (decoded, canonical bytes).
     changesets: HashMap<Id, (Changeset, Vec<u8>)>,
+    /// Insertion order of `changesets`: the arrival log behind
+    /// `recent_changesets`. First arrival wins (idempotent re-puts keep
+    /// the original position), mirroring SQLite's rowid.
+    changeset_arrival: std::collections::VecDeque<Id>,
     /// Ref name → changeset id.
     refs: BTreeMap<String, Id>,
     /// Git SHA (lowercase) → changeset id.
@@ -32,6 +36,9 @@ struct MemoryInner {
     /// Derived-data cache keyed by `(kind, changeset id)`.
     derived: HashMap<(String, Id), Vec<u8>>,
     validated_v1: HashMap<Id, Option<Id>>,
+    /// Sparse raw-commit capture (v0.2 D21): changeset id → verbatim
+    /// git commit object bytes.
+    raw_commits: HashMap<Id, Vec<u8>>,
 }
 
 /// An entirely in-memory store implementing both [`ObjectStore`] and
@@ -145,6 +152,7 @@ impl MetadataStore for MemoryStore {
             Some(_) => Err(StoreError::ImmutabilityViolation(id)),
             None => {
                 s.changesets.insert(id, (cs.clone(), canonical));
+                s.changeset_arrival.push_back(id);
                 Ok(())
             }
         })?;
@@ -251,6 +259,7 @@ impl MetadataStore for MemoryStore {
         root_tree: Option<Id>,
         derived: &[crate::traits::DerivedRow],
         git_sha_hex: Option<&str>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         let canonical = cs
             .canonical_bytes()
@@ -284,6 +293,13 @@ impl MetadataStore for MemoryStore {
             {
                 return Err(StoreError::Invalid("Git mapping is not a bijection".into()));
             }
+            if let Some(raw) = raw_commit
+                && s.raw_commits
+                    .get(&id)
+                    .is_some_and(|existing| existing != raw)
+            {
+                return Err(StoreError::ImmutabilityViolation(id));
+            }
             for row in derived {
                 if row.kind.is_empty() || row.kind.len() > 64 {
                     return Err(StoreError::Invalid(
@@ -291,17 +307,38 @@ impl MetadataStore for MemoryStore {
                     ));
                 }
             }
+            if !s.changesets.contains_key(&id) {
+                s.changeset_arrival.push_back(id); // first arrival only
+            }
             s.changesets.insert(id, (cs.clone(), canonical));
             s.validated_v1.insert(id, root_tree);
             if let Some(sha) = sha {
                 s.git_by_sha.insert(sha.clone(), id);
                 s.git_by_cs.insert(id, sha);
             }
+            if let Some(raw) = raw_commit {
+                s.raw_commits.insert(id, raw.to_vec());
+            }
             for row in derived {
                 s.derived
                     .insert((row.kind.clone(), row.cs), row.bytes.clone());
             }
             Ok(id)
+        })
+    }
+
+    fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read(|s| s.raw_commits.get(&cs).cloned())
+    }
+
+    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
+        self.read(|s| {
+            s.changeset_arrival
+                .iter()
+                .rev()
+                .take(limit as usize)
+                .copied()
+                .collect()
         })
     }
 

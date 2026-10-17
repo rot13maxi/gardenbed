@@ -108,6 +108,12 @@ impl Session {
 
     /// Connects to `endpoint`, caching objects into `objects` on behalf of
     /// `repo`, with at most `concurrency` fetches in flight.
+    ///
+    /// The TCP+HTTP/2 handshake is bounded (`Endpoint::connect_timeout`,
+    /// 5s): a hung server (SIGSTOPped, or a black-holed address) fails
+    /// as a `ClientError::Connect` within the deadline instead of
+    /// blocking indefinitely — which is what lets the offline queue
+    /// treat unreachable as queueable.
     pub async fn connect(
         repo: &str,
         objects: gardenbed_store::FsObjectStore,
@@ -134,12 +140,34 @@ impl Session {
         concurrency: usize,
     ) -> Result<Self, ClientError> {
         let connect_embedded = || async {
-            GardenbedClient::connect(endpoint)
+            let server = endpoint.to_owned();
+            let endpoint =
+                tonic::transport::Endpoint::from_shared(server.clone()).map_err(|e| {
+                    ClientError::Connect {
+                        server: server.clone(),
+                        message: format!("invalid endpoint: {e}"),
+                    }
+                })?;
+            let channel = endpoint
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .connect()
                 .await
                 .map_err(|e| ClientError::Connect {
-                    server: endpoint.to_owned(),
+                    server,
                     message: e.to_string(),
-                })
+                })?;
+            let mut client = GardenbedClient::from_channel(channel);
+            // GARDENBED_TOKEN, when set in the environment, authenticates
+            // every request (the single knob bed exposes — see
+            // `GardenbedClient::connect`). The daemon-path client above
+            // already picked it up through `connect`; the embedded fallback
+            // builds its channel by hand, so apply it here too.
+            if let Ok(token) = std::env::var("GARDENBED_TOKEN")
+                && !token.is_empty()
+            {
+                client = client.with_token(&token);
+            }
+            Ok::<_, ClientError>(client)
         };
         let (client, fallback) = match crate::daemon::socket_path() {
             Some(path) => {
@@ -271,6 +299,21 @@ impl Session {
             Ok(outcome) => Ok(outcome),
             Err(status) if status.code() == tonic::Code::NotFound => {
                 Err(ClientError::MissingCs(cs))
+            }
+            // The conflict contract (v0.2.md D11): FAILED_PRECONDITION
+            // whose message is "merge conflicts on: <paths>" — mapped to
+            // the error that carries the resolution hint.
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && status.message().starts_with("merge conflicts on:") =>
+            {
+                Err(ClientError::MergeConflict {
+                    paths: status
+                        .message()
+                        .trim_start_matches("merge conflicts on:")
+                        .trim()
+                        .to_owned(),
+                })
             }
             Err(status) => Err(ClientError::Rpc {
                 command,

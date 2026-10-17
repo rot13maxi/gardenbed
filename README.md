@@ -43,10 +43,10 @@ In one terminal, import the repository and start the server:
 
 ```sh
 ./target/release/gardenbed-server import \
-  --from /path/to/git-repo --root /tmp/gardenbed-repo
+  --from /path/to/git-repo --root /tmp/gardenbed --repo myrepo
 
 ./target/release/gardenbed-server \
-  --root /tmp/gardenbed-repo --addr 127.0.0.1:9418
+  --root /tmp/gardenbed --addr 127.0.0.1:9418
 ```
 
 In another terminal, create a working copy and fetch a directory:
@@ -55,7 +55,7 @@ In another terminal, create a working copy and fetch a directory:
 BIN="$PWD/target/release"
 mkdir -p /tmp/gardenbed-work && cd /tmp/gardenbed-work
 
-"$BIN/bed" clone http://127.0.0.1:9418
+"$BIN/bed" clone http://127.0.0.1:9418/myrepo
 "$BIN/bed" sparse add src
 "$BIN/bed" status
 ```
@@ -76,7 +76,7 @@ Export published history back to Git:
 
 ```sh
 "$BIN/gardenbed-server" export \
-  --root /tmp/gardenbed-repo --into /tmp/gardenbed-export.git
+  --root /tmp/gardenbed --repo myrepo --into /tmp/gardenbed-export.git
 
 git -C /tmp/gardenbed-export.git fsck --strict
 ```
@@ -111,19 +111,34 @@ tools: `log`, `diff`, `file`, `blame`, and `copies`. It uses stdio and
 requires no working copy:
 
 ```sh
-"$BIN/gardenbed-mcp" --root /tmp/gardenbed-repo
+"$BIN/gardenbed-mcp" --root /tmp/gardenbed --repo myrepo
 ```
 
 See [MCP configuration and tool schemas](docs/mcp.md).
 
+## Web GUI
+
+`gardenbed-web` serves a read-only web interface over the repository —
+history, refs, changeset detail, tree browsing, file view with blame, and
+diff compare — with the UI embedded in the binary:
+
+```sh
+"$BIN/gardenbed-web" --root /tmp/gardenbed-repo
+# listening on 127.0.0.1:8430
+```
+
+No working copy and no frontend build step required. A `seed` subcommand
+writes a deterministic demo repository for trying it out; the Playwright
+suite in `e2e/` verifies every page end to end. See [docs/web.md](docs/web.md).
+
 ## Current scope
 
 Gardenbed is an early implementation at version 0.1 plus the v0.2
-feature wave. It supports a single repository per server, filesystem
-object storage, SQLite metadata, sparse working copies, server-side
-replay and merge, a read-only FUSE mount of any changeset, an optional
-local caching daemon, optional token auth with per-repository roles,
-and Git import/export.
+feature wave. It serves any number of repositories per server, with
+filesystem object storage, SQLite metadata, sparse working copies,
+server-side replay and merge, a read-only FUSE mount of any changeset,
+an optional local caching daemon, optional token auth with
+per-repository roles, and Git import/export.
 
 Writes require a connection to the server. There is no garbage
 collection or offline commit queue yet; authentication is optional
@@ -132,6 +147,15 @@ open). Blame follows first-parent history and renames; copy detection
 is exact-blob only. Git roundtrips preserve commit IDs for supported
 histories; signed commits, non-UTF-8 metadata, and other exceptions are
 documented in [Git interoperability limits](docs/divergences.md).
+
+For horizontal scale-out, the server can instead run as N stateless
+replicas with metadata in PostgreSQL and objects in S3: pass
+`--storage <config.toml>` (or set `GARDENBED_STORAGE`) to `serve`,
+`import`, or `export`, and put a load balancer in front of the
+replicas. The design contract is [scale-out-design.md](docs/scale-out-design.md)
+and a ready-made compose stack (Postgres + MinIO + 3 replicas) lives in
+[tools/scale/](tools/scale/); `demo/run-scaled.sh` proves cross-replica
+visibility end to end.
 
 Verification includes differential tests against Git (including
 1,000-pair merge and copy-detection oracles), process-kill recovery

@@ -1,96 +1,76 @@
-# Divergences from git — v0.1
+# Divergences from git — v0.2
 
 Definition of done §10.2 requires **zero silent divergences** from git on
 covered semantics: every place the bridge differs from git must be
 documented here with a repro. Silent disagreement is a release blocker.
 
 Each entry states what happens, why, what it costs, and how to reproduce
-it. Anything *not* on this list must round-trip exactly: unsigned git
-history imports, exports, and re-imports with byte-identical commit SHAs
-(verified in `crates/git/tests/export.rs`).
+it. Anything *not* on this list must round-trip exactly: imported git
+history — signed, extra-header, and non-UTF-8-identity commits included —
+exports back with byte-identical commit SHAs (verified in
+`crates/git/tests/export.rs`).
 
 ---
 
-## 1. Signed commits are exported unsigned
+## 1. (Retired in v0.2) Signed commits are exported unsigned
 
-**What:** a gardenbed changeset carries an optional `signature`
-(the commit's `gpgsig` header, decoded). `git fast-import` has no grammar
-for attaching extra headers to a commit, so export cannot re-emit a
-signature. Signed changesets are exported **unsigned**, and therefore
-receive a **different git SHA** than the original signed commit. Unsigned
-histories — everything gardenbed generates itself — are unaffected and
-reproduce their SHAs exactly.
+**Retired by raw-commit capture (v0.2 D21).** The importer byte-compares
+each commit's original object bytes with what the model can reconstruct;
+a signature makes them differ, so the original bytes are captured verbatim
+in a sparse side table (`git_raw_commit`, keyed by changeset id) inside
+the ingest transaction, and the export emits them as-is. The SHA is the
+original by definition — no re-signing, no id forking.
 
-**Cost:** `ExportReport::signed_dropped` counts the affected commits.
-Their *trees* still match bit-for-bit; only the commit objects differ
-(a signature is part of the commit payload, hence part of its SHA).
-A re-import of an exported signed history produces new changeset ids for
-those commits — the git↔changeset mapping for them is not a bijection.
+**Repro (now a fidelity proof):**
+`signed_commits_roundtrip_exactly` in `crates/git/tests/export.rs` —
+import a hand-signed commit, export it back, and the exported commit's
+SHA equals the original, `signed_dropped == 0`, and `git cat-file`
+returns the original object bytes.
 
-**Why not fixed:** forging the original bytes would require re-signing
-(with the original key) or carrying a non-canonical commit writer — both
-out of v0.1 scope. Documented, counted, loud.
+**Residual:** v0.1 stores carry no raw rows; exporting their signed
+changesets REFUSES loudly (the SHA assertion fires before anything
+ships — `signed_dropped` is 0 on every successful export). Re-importing
+the git history into a fresh store retires the divergence with stable
+changeset ids (canonical bytes are unchanged).
 
-**Repro** (fake signature — no gpg needed; any `gpgsig` header behaves
-the same):
+## 2. Non-UTF-8 commit bytes are transcoded lossily (narrowed to paths in v0.2)
 
-```sh
-git init -q --bare sigrepo
-TREE=$(git -C sigrepo hash-object -w -t tree --stdin </dev/null)
-BODY="tree $TREE
-author Gopher <g@arden> 1700000000 +0000
-committer Gopher <g@arden> 1700000000 +0000
-gpgsig -----BEGIN PGP SIGNATURE-----
- fake: this header cannot survive a fast-import stream
- -----END PGP SIGNATURE-----
+**What remains:** gardenbed stores `String`s; **path names** that are not
+valid UTF-8 are decoded with `String::from_utf8_lossy` at import (each
+invalid byte becomes U+FFFD). This is tree-level divergence: the derived
+tree differs from git's raw tree, so such commits cannot round-trip, and
+the export now **refuses loudly** (`ExportError::Changeset`: the raw
+commit bytes do not reference the derived tree) rather than emitting a
+transcoded commit with a silently different SHA.
 
-signed!
-"
-SHA=$(printf '%s' "$BODY" | git -C sigrepo hash-object -t commit -w --stdin)
-git -C sigrepo update-ref refs/heads/main "$SHA"
-```
+**What was fixed (v0.2 D21):** non-UTF-8 **identity** bytes (author/
+committer names, emails) and **messages**. The import capture predicate
+byte-compares the reconstruction with the original object; any lossy
+decode makes them differ, so the original bytes are captured and the
+export emits them verbatim — SHA-exact.
 
-Import `sigrepo` (the changeset's `signature` is captured), export it back
-to git: `signed_dropped == 1`, the exported commit's SHA differs from
-`$SHA`, and `git cat-file` on it shows no `gpgsig` header while the tree
-matches. Covered by `signed_commits_drop_their_signature` in
-`crates/git/tests/export.rs`.
+**Repro (fixed half):** `non_utf8_author_roundtrips_exactly` in
+`crates/git/tests/export.rs` — a latin-1 author name roundtrips SHA-exact.
 
-## 2. Non-UTF-8 commit bytes are transcoded lossily
+**Repro (remaining half):** import a repository containing a non-UTF-8
+path name and export it: the export fails with
+`the raw commit bytes do not reference the derived tree`. The
+**raw-tree capture** that would retire this half is gated on the kernel
+import throughput gate (§4 below).
 
-**What:** git commit objects are byte sequences; gardenbed stores
-`String`s. Names, emails, messages, and path names that are not valid
-UTF-8 are decoded with `String::from_utf8_lossy` at **import** (each
-invalid byte becomes U+FFFD). Export writes those `String`s verbatim, so
-such commits do **not** round-trip: the exported commit has the
-transcoded bytes and a different SHA.
+## 3. (Retired in v0.2) Extra commit headers are not modeled
 
-**Cost:** real-world corpora are UTF-8; git itself treats unknown
-encodings as raw bytes only for display. The lossy decode is visible and
-deterministic (same bytes → same replacement chars → same changeset id).
+**Retired by raw-commit capture (v0.2 D21).** `encoding`, `mergetag`,
+`gpgsig-sha256` — any header the model does not carry — makes the
+byte-compare at import fail, so the original bytes are captured raw and
+the export emits them verbatim, SHA-exact.
 
-**Repro:** create a commit whose author name contains an invalid UTF-8
-byte (`printf 'bad \xff name'` via `git commit-tree` env plumbing), import
-it, and observe the stored name contains U+FFFD. An export of that
-changeset writes U+FFFD — never the original `\xff`.
+**Repro (now a fidelity proof):** `extra_header_commits_roundtrip_exactly`
+in `crates/git/tests/export.rs` — a commit with `encoding` and `mergetag`
+headers roundtrips SHA-exact, and the exported object bytes equal the
+original bytes.
 
-## 3. Extra commit headers are not modeled
-
-**What:** headers gardenbed does not model — `encoding`,
-`mergetag`, `gpgsig-sha256` — are dropped on import (their continuation
-lines are consumed but discarded) and never re-emitted on export. Like
-§1 this changes commit bytes, hence SHAs, for commits carrying them.
-
-**Cost:** same shape as §1 — trees are exact; commit objects containing
-those headers differ. `gpgsig-sha256` dropping is *not* counted in
-`signed_dropped` (v0.1 only recognizes the SHA-1 `gpgsig` header); a
-commit carrying both headers is counted once for its SHA-1 signature.
-
-**Repro:** hand-write a commit with an `encoding ISO-8859-1` header via
-`git hash-object -t commit -w --stdin`, import, export: the exported
-commit has no `encoding` header.
-
-## 4. Pre-canonical git tree modes (`100664`) import canonicalized
+## 4. Pre-canonical git tree modes (`100664`) import canonicalized — export half retired
 
 **What:** very old git (April 2005, around the "new git world order"
 re-import of the linux history) wrote regular-file tree entries with the
@@ -108,32 +88,49 @@ changeset** inheriting the parent tree; content changes under those
 modes and structural changes come out exactly as git would shape them;
 no renames are invented.
 
-**Cost:** for pre-canonical history, Gardenbed's derived tree ids differ
-from git's raw tree SHAs **by construction** — ours are canonical, git's
-carry the historical mode bytes. Tree-level comparisons for such commits
-(`git cat-file` on tree objects, non-recursive raw diffs) must normalize
-`100664` ≡ `100644` first. Path/mode/content comparisons via
-`git ls-tree -r` are unaffected: ls-tree displays canonicalized modes.
-This **will** matter for the linux verification sweep: the early history
-contains such commits (e.g. `ce1dc02f7643`, "Fix up some file mode
-differences due to the new git world order.", whose tree differs from
-its first parent's only by three `100664` entries). The same collapse
-covers permission-bit variants of every other entry kind (`100775` ≡
-`100755`, `120777` ≡ `120000`, `160123` ≡ `160000`, dir `040750` ≡
-`040000`); exotic variants outside the file-mode table are rejected
-loudly by the tree parser, as before.
+**Cost (import half — unchanged):** for pre-canonical history,
+Gardenbed's derived tree ids differ from git's raw tree SHAs **by
+construction** — ours are canonical, git's carry the historical mode
+bytes. Tree-level comparisons for such commits (`git cat-file` on tree
+objects, non-recursive raw diffs) must normalize `100664` ≡ `100644`
+first. Path/mode/content comparisons via `git ls-tree -r` are
+unaffected: ls-tree displays canonicalized modes. This **will** matter
+for the linux verification sweep: the early history contains such
+commits (e.g. `ce1dc02f7643`, "Fix up some file mode differences due
+to the new git world order.", whose tree differs from its first
+parent's only by three `100664` entries). The same collapse covers
+permission-bit variants of every other entry kind (`100775` ≡ `100755`,
+`120777` ≡ `120000`, `160123` ≡ `160000`, dir `040750` ≡ `040000`);
+exotic variants outside the file-mode table are rejected loudly by the
+tree parser, as before.
 
-**Why not fixed:** re-canonicalizing historical trees would rewrite git
-object identity (the raw tree SHAs are what corpus pins record), and
-carrying a non-canonical mode column through the changeset model would
-change the wire format for a mode that disappeared from git twenty years
-ago. Documented and handled explicitly (fallback, never a silent skip).
+**Export half (retired in v0.2):** the old export silently re-rendered
+the canonical tree, producing a commit with a **different SHA** than the
+mapping recorded. The native export asserts every computed SHA against
+the git-mapping table (D20): for such commits the raw bytes' tree header
+disagrees with the derived tree, and the export **fails loudly**
+(`ExportError::Changeset`) instead of diverging silently. The
+**raw-tree capture** that would make these exports verbatim is gated on
+the kernel import throughput gate: it is implemented only if capturing
+sparse raw tree bytes keeps a kernel-segment import within ±20% of the
+recorded 278 commits/s. Until then the behavior is: loud refusal on
+export, exact import.
 
-**Repro:** `pre_canonical_100664_mode_fixups_import_via_raw_fallback` in
-`crates/git/tests/edgecases.rs` — hand-crafted trees via
+**Why not fixed outright:** re-canonicalizing historical trees would
+rewrite git object identity (the raw tree SHAs are what corpus pins
+record), and carrying a non-canonical mode column through the changeset
+model would change the wire format for a mode that disappeared from git
+twenty years ago. Documented and handled explicitly (fallback, never a
+silent skip).
+
+**Repro (import half):** `pre_canonical_100664_mode_fixups_import_via_raw_fallback`
+in `crates/git/tests/edgecases.rs` — hand-crafted trees via
 `git hash-object -t tree -w --stdin --literally` (modern git fsck-checks
 fresh tree objects and refuses `100664` without the flag; objects that
 already contain the mode are accepted by plain `git fsck`, warning only).
+
+**Repro (export refusal):** import such a repository, export it — the
+export names the changeset whose raw tree diverges.
 
 ---
 
@@ -162,77 +159,165 @@ every non-blank line in the corpus attributed identically. Matching git
 line-for-line would require reimplementing xdiff's heuristics in the
 derive diff; if exact parity ever matters, that is the fix.
 
-## 6. `bed diff` renders renames as delete + add
+## 6. Renames below 100% similarity render as delete + add (retired v0.2)
 
-**What:** `bed diff` never pairs renames at the render level: a rename
-changeset renders as a delete + an add — two `diff --git` blocks (one
-`deleted file mode`, one `new file mode`) — never git's
-`similarity index 100%` / `rename from` / `rename to` form. The renderer
-consumes the server's tree diff, which runs with rename detection off
-(`Add`/`Modify`/`Delete` per path), and classifies each path by presence
-alone — `DiffOp` has no rename classification — so no rename is ever
-available to pair; the renderer's documented parity target is
-`git diff-tree -r --no-renames` (`crates/bed/src/render.rs`). The MCP
-`diff` tool answers from the same tree diffs, so a rename shows as `D`
-and `A` letters there too.
+**Status:** retired by D22 (v0.2 M19). Pure renames — a moved file whose
+blob is unchanged — render git's `R100` form (`similarity index 100%` /
+`rename from` / `rename to`) in every `bed diff` form. The scoped forms
+(`bed diff <cs>`, and the no-argument form on a clean copy) render from
+the changeset's recorded `Op::Rename`; the two-argument form pairs a
+delete with a write carrying an identical blob at render time — the same
+rule `bed commit` uses to record a rename, so no second pairing
+convention exists. Letter parity with `git diff-tree -M` and byte parity
+of pure-rename changeset bodies (`git diff-tree -M -p`) hold on
+generated rename histories (`pure_renames_render_git_m_parity_and_byte_parity`
+in `crates/bed/tests/read_path.rs`), and rendered rename blocks reapply
+with `git apply` (`git_apply_accepts_every_rendered_shape` in
+`crates/bed/tests/render_patch.rs`). The MCP `diff` tool deliberately
+keeps its v0.1 letter parity (`git diff-tree --no-renames`); that is a
+deliberate scope decision recorded with D22, not an oversight.
 
-**Cost:** purely output fidelity — review parity. Compared with
-`git diff-tree -M` on the QA regression pass's rename pairs, entry
-counts differ (1,318 vs 1,321 and 4,794 vs 5,128 entries), and
-`grep '^rename from '` over `bed diff` output finds 0 hits, so review
-tooling (or a human) diffing working copy's output against rename-aware git sees
-a different shape for every moved file. What is *not* affected: the
-trees and the changesets — imported changesets record renames as git's
-own `-M` detection reported them (the D8 import mechanism,
-`docs/v0.1.md` §3), `commit` pairs a pure rename — a deleted path and an
-added path with the identical blob id — into one canonical `Op::Rename`
-carrying `src_path` (op `3 rename` in the canonical encoding spec's
-`change` table, `docs/canonical-encoding.md`), and patches built from
-the delete + add rendering reapply cleanly with `git apply` (verified in
-the same pass). The identity half of this shape is already catalogued
-under "Explicitly *not* divergences" below: rename vs. delete+add builds
-the same tree and the same commit SHA. Only the rendered diff differs.
+**Residual — moved-and-edited files:** a file that moved *and* changed
+content renders as a delete plus a write, never git's
+`R<similarity<100>` form. Gardenbed claims no similarity score below
+100%, because it has none: the model records rename facts (identical
+blob) and the deterministic delete+write expansion otherwise. git's
+`-M` heuristic would print one `R` block with a similarity index for
+the same change, so review tooling diffing outputs still sees two
+blocks where git prints one. `commit` records these as a delete+add
+pair (never a `Rename`), so the residual matches what the changeset
+records — one model fact, one rendering. Counted from recorded facts
+on generated histories: the 25%-edit rename histories render
+`delete`/`write` pairs exactly for edited moves
+(`moved_and_edited_files_render_delete_plus_write`), never a spurious
+rename block.
 
-**Why not fixed:** render-level similarity pairing is not implemented in
-v0.1 — the diff parity contract was written against `--no-renames` from
-the start. Import-level rename detection is a separate mechanism (D8)
-and does exist; only the render level lacks it. The fix is render-local:
-pair identical-blob delete + add entries at render time (the
-deterministic rule `commit` already applies), or reuse the changeset's
-recorded `Rename` ops for changeset-scoped diffs instead of re-deriving
-from trees — a v0.2 candidate.
+**Residual — pairing-rule corners:** pairing matches `commit`'s
+recorded-rename rule — a delete plus a *new* path of the identical blob
+and the same entry kind — where git's `-M` heuristic scores content
+similarity across arbitrary adds and modifies. Two letter divergences
+follow, both counted: git may pair an *edited* rename bed cannot (a
+`R<similarity<100>` entry where bed prints delete + write, the residual
+above), and git may pair a *cross-kind* move as one entry where bed
+prints `D` plus `A` (bed never pairs across entry kinds — git apply
+refuses a cross-kind `R100` with "new mode does not match"). Both
+corners need hand-crafted content (duplicate blob bytes across paths, or
+a symlink whose target equals a deleted file's content); generated
+histories mint globally unique blob content per write, so neither occurs
+there. Pre-fix, pairing also matched *rewrites of pre-existing paths*,
+rendering an `R100` git apply refuses ("already exists in working
+directory"); that is fixed — pairing requires the destination to have
+been absent on the old side (`guarded_corners_render_delete_plus_write_and_apply`).
 
-**Repro:** commit a pure rename (or import a history containing one) and
-run `bed diff <cs>` — that changeset against its first parent. The old
-path renders as a `deleted file mode` block and the new path as a
-`new file mode` block, while `git diff-tree -M --name-status` on the
-same pair shows the two paths as a single rename entry.
+**Repro:** commit a moved-and-edited file (`git mv a b && edit b && bed
+commit`) and run `bed diff <cs>`: `a` renders a `deleted file mode`
+block and `b` a `new file mode` block; `git diff-tree -M
+--name-status` prints one `R` entry. A pure move in the same changeset
+renders one rename block, matching git.
 
-## 7. Gitlink pointer changes render as a binary-differ line
+## 7. Gitlink↔regular typechanges render mode lines only (retired v0.2)
 
-**What:** a submodule pointer change in `bed diff` renders the gitlink's
-mode lines (`new file mode 160000` / `deleted file mode 160000` /
-`old mode` + `new mode` for a typechange) plus git's binary one-liner
-`Binary files a/<p> and b/<p> differ` — not git's
-`@@ -1 +1 @@` hunk with `-Subproject commit <sha>` / `+Subproject commit
-<sha>`. Gitlink blobs in the canonical model are synthetic padded ids
-(the import convention, `docs/canonical-encoding.md`), not git's
-submodule SHAs, so emitting a `Subproject commit` line would write bytes
-git would then apply as a *wrong* pointer target.
+**Status:** retired by D23 (v0.2 M19) for the gitlink add, delete, and
+pointer-change cases. All three render git's `Subproject commit <sha>`
+form — the real upstream SHA read from the gitlink's padded blob id
+(twelve zero bytes + SHA-1, `docs/canonical-encoding.md`) — as `new
+file mode 160000` + a one-line add hunk, `deleted file mode 160000` +
+`--- a/<p>` + a one-line delete hunk, and `--- a/<p>` / `+++ b/<p>` +
+a one-line swap respectively. The retired v0.1 shape (`Binary files …
+differ`) is gone: `git apply --cached` accepts the add and pointer
+forms (`git_apply_accepts_every_rendered_shape` in
+`crates/bed/tests/render_patch.rs`), and rendered SHAs match `git
+diff-tree --submodule=short` on the same changesets
+(`gitlink_pointer_changes_render_subproject_hunks`). One formal byte
+difference stays: git prints an `index` line on gitlink entries; bed
+omits it, as on every entry (bed does not abbreviate ids dynamically),
+and `git apply` accepts both.
 
-**Cost:** review parity, and one patch consequence: `git apply` refuses
-the pointer-change entry (`cannot apply binary patch … without full
-index line`) where git's own `Subproject commit` form applies. The
-refusal is per-entry and parse-safe — other entries in the same patch
-still apply (the pre-fix renderer leaked the gitlink's path into the
-next entry's parse and poisoned the whole patch). Gitlink
-additions/deletions render mode lines only and apply cleanly. The
-faithful oracle for pointer targets remains `git diff --submodule` /
-`git submodule status`.
+**Residual — gitlink↔regular typechange:** a path that was a regular
+file and becomes a gitlink (or back) renders its `old mode`/`new mode`
+lines only — no content hunk of either shape — the v0.1 typechange
+form. git prints the mode lines plus a content/`Subproject commit`
+hybrid. The renderer treats a typechange between entry kinds as
+shapeless (neither bytes nor a pointer to render); rendering both
+sides' shapes in one block is a v0.2+ candidate.
 
-**Why not fixed:** an honest `Subproject commit` line needs git's real
-submodule SHAs imported and stored as first-class ids — model work, not
-render work. A v0.2 candidate alongside rename pairing (§6).
+**Repro:** in a history with submodules, `bed diff <cs>` on a changeset
+that retargets one prints the `-Subproject commit <old>` /
+`+Subproject commit <new>` hunk; a path switching from a regular file
+to a gitlink prints only `old mode`/`new mode`.
+
+## 8. Merge is rename-blind (v0.2.md D9)
+
+**What:** the merge walk pairs entries by path only. A rename on one
+side is indistinguishable from a delete+add pair, so rename/rename
+(both sides rename the same file to different destinations) merges as
+two independent add/add pairs — each new path conflicts only when the
+file's content also changed on both sides; rename/delete merges as
+delete (one side) vs modify (the other, at the old path), a
+modify/delete conflict naming the *original* path. Git's
+`merge-ort` detects the renames and reports rename/rename or
+rename/delete conflicts at both endpoints.
+
+**Repro:**
+
+```sh
+git init rr && cd rr && git config user.email a@b.c && git config user.name A
+echo x > f && git add f && git commit -qm base
+git checkout -qb o && git mv f one && git commit -qm "ours renames f->one"
+git checkout -q main && git checkout -qb t && git mv f two && git commit -qm "theirs renames f->two"
+git merge-tree --write-tree o t   # git: rename/rename conflict at one, two, f
+```
+
+Gardenbed merges this cleanly (`one` and `two` both appear; the two
+adds touch different paths), where git refuses.
+
+**Cost:** a rename/rename or rename/delete merge can silently succeed
+where git would stop for review; blame stays correct either way —
+renames are recorded as `Op::Rename` with `src_path`, and blame follows
+`src_path` down the first-parent chain regardless of how the merge was
+classified. The content merge itself never mixes up files: it only ever
+pairs a path with itself across the three trees.
+
+**Why not fixed:** rename detection at merge time needs a similarity
+heuristic over candidate (deleted, added) pairs on each side — the same
+machinery git's `-M` uses, deliberately absent from the model so far
+(v0.1.md D8 imports renames only because git reports them). The
+divergence is documented as the v0.2 boundary: renames must be resolved
+by hand (rename on one side + edit on the other merges correctly as
+modify at the surviving path).
+
+## 9. Criss-cross merge bases pick a deterministic tie-break, not git's
+
+**What:** when the two merge candidates have multiple equally-good
+merge bases (a criss-cross history), git's `merge-base` picks one
+implementation-defined candidate; gardenbed's `merge_base` resolves the
+tie deterministically — newest committer timestamp first, then
+descending id bytes — and the merge then runs against exactly that base.
+
+**Repro:**
+
+```sh
+git init cc && cd cc && git config user.email a@b.c && git config user.name A
+echo base > f && git add f && git commit -qm base
+git checkout -qb a && echo A > f && git commit -qam a
+git checkout -qb b main && echo B > f && git commit -qam b
+git checkout -q a && git merge -q -m ab b 2>/dev/null || true
+git checkout -q b && git merge -q -m ba a 2>/dev/null || true
+# `a` and `b` now have two merge bases (the two cross-merges)
+git merge-base a b   # git picks one; gardenbed may pick the other
+```
+
+**Cost:** a criss-cross merge can differ from git's in *which* hunks
+count as "ours changed" vs "theirs changed" around the differing base
+region — occasionally flipping a clean merge to a conflict (or the
+reverse) relative to git's choice. Both answers are defensible; only
+one is ours, and it is stable across runs, replicas and rebuilds.
+
+**Why not fixed:** "recursive merge" (merging the bases first, as
+`merge-ort` does) multiplies conflict surfaces and can invent
+intermediate trees that exist in neither history; the v0.2 spec (D10)
+chose the deterministic single-base rule knowingly. The tie-break
+order is part of the merge contract and tested for stability.
 
 ## 8. Merge is rename-blind (v0.2.md D9)
 
@@ -316,9 +401,10 @@ invisible to git's identity:
 
 * **Rename vs. delete+add.** The generator commits pure renames (identical
   blob id) as one `Rename`; moved-and-edited files commit as a delete+add
-  pair (no similarity heuristic). Import keeps git's `-M` renames;
-  export emits fast-import `M` + `D` for a rename, never `R`. All three
-  shapes build the same tree and the same commit SHA.
+  pair (no similarity heuristic). Import keeps git's `-M` renames; the
+  native pack export writes git tree objects, which carry no rename
+  information at all — every shape builds the same tree and the same
+  commit SHA.
 * **Gitlink padding.** A submodule pointer's gardenbed blob id is the
   upstream git SHA-1 left-padded with twelve zero bytes; export strips
   the padding and writes `M 160000 <sha> <path>`. Byte-identical to the
@@ -327,10 +413,5 @@ invisible to git's identity:
   empty email (`<>`) is stored and re-exported as-is; `git fsck --strict`
   accepts both, and the identity line is reproduced byte-for-byte.
 * **Raw timezone offsets.** Identity timestamps are stored as epoch
-  seconds plus the original `±hhmm` offset and re-emitted raw — never
+  seconds plus the original `±hhmm` offset and are re-emitted raw — never
   normalized to UTC — so dates round-trip exactly.
-* **Marks do not persist.** Each export is one `git fast-import` run
-  with one mark namespace; marks are re-issued deterministically per run
-  (blobs sorted by id, commits in topological order) and the final
-  `--export-marks` file is left in place (path in
-  `ExportReport::marks_path`).

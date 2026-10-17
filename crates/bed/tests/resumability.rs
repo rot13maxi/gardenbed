@@ -76,13 +76,13 @@ async fn setup() -> World {
         .expect("generate never fails");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let server = dir.path().join("server");
+    let server = dir.path().join("server").join(common::REPO);
     let garden1 = dir.path().join("garden-one");
     let garden2 = dir.path().join("garden-two");
     fs::create_dir_all(&garden1).expect("garden one");
     fs::create_dir_all(&garden2).expect("garden two");
     let head = common::ingest(&history, &server);
-    let server = Server::spawn(&server).await;
+    let server = Server::spawn(server.parent().unwrap()).await;
     World {
         _dir: dir,
         garden1,
@@ -189,7 +189,10 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
     let client = world.server.client().await;
     let (t0, b0) = world.server.counted(&client).await;
 
-    let (code, _, stderr) = bed(&world.garden1, &["clone", &world.server.http()]);
+    let (code, _, stderr) = bed(
+        &world.garden1,
+        &["clone", &format!("{}/garden", world.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
 
     // ---- cycle A: SIGKILL a quarter of the way through the blob fetch ----
@@ -259,7 +262,10 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
     let client = world.server.client().await;
     let (t0, b0) = world.server.counted(&client).await;
 
-    let (code, _, stderr) = bed(&world.garden2, &["clone", &world.server.http()]);
+    let (code, _, stderr) = bed(
+        &world.garden2,
+        &["clone", &format!("{}/garden", world.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
     let (t2, b2) = world.server.counted(&client).await;
     assert_eq!((t2, b2), (t0, b0), "clone itself fetches no objects");

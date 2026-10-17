@@ -8,8 +8,8 @@ Use the standard terms in [Terminology](terminology.md). Repository storage uses
 
 ```text
 bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
-                        (optional)                    ├─ metadata: SQLite
-                                                      └─ objects: filesystem CAS
+                        (optional)                    ├─ <root>/<repo>/metadata.sqlite3
+                                                      └─ <root>/<repo>/objects/
 bed ──gRPC──────────────────────────────────────────┘   (direct, no daemon)
 gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 ```
@@ -31,8 +31,9 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 `crates/protocol/proto/gardenbed.proto` — with
 [docs/canonical-encoding.md](canonical-encoding.md), it *is* the published
 protocol (D4). The tonic service `Gardenbed` exposes 17 RPCs; every
-request carries `repo` (single-repo in v0.1, the field is wire format
-from day one, v0.1.md §1).
+request carries `repo` — the field selects the repository it applies to
+(wire format from day one, v0.1.md §1; load-bearing since multi-repo
+serving, v0.2.md §5).
 
 | group | RPCs | notes |
 |---|---|---|
@@ -48,17 +49,32 @@ enum values are the spec's op/mode bytes; timestamps stay git-native
 (epoch seconds + tz offset in minutes) — that is what makes export
 reproduce identical git SHAs.
 
-## 2. Server (`gardenbed-server`, lib `gardenbed_server::Repo`)
+## 2. Server (`gardenbed-server`, lib `gardenbed_server::RepoSet`)
 
-`Repo` wires one repository's stores (`<root>/objects` + `<root>/metadata.sqlite3`)
-and holds the semantics every surface shares — the `bed` binary's gRPC
-service and `gardenbed-mcp` call the same methods, which is why MCP and
-CLI answers agree by construction (v0.1.md §M7.1).
+The server serves any number of repositories from one root directory:
+`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3` (v0.2.md §5).
+The directory tree is the registry — a repository exists iff its
+directory holds either store; serving a new repository is a directory
+plus a request, no restart. `RepoSet` opens repositories lazily on first
+request (singleflighted), keeps per-repository stats, and caps open
+handles with `--max-repos` (LRU eviction of idle handles; a v0.1 root
+with stores at the top level serves unchanged as the repository named
+`default`). Every handler resolves its request's `repo` field through
+`RepoSet::resolve` — the one seam where authentication slots in later.
+
+`Repo` wires one repository's stores and holds the semantics every
+surface shares — the `bed` binary's gRPC service and `gardenbed-mcp` call
+the same methods, which is why MCP and CLI answers agree by construction
+(v0.1.md §M7.1).
 
 **Subcommands** (binary): `serve` (default — gRPC on `--addr`,
-default `127.0.0.1:9418`), `import`, `export` (see
-[docs/cli.md](cli.md)). The bound address is printed on stdout's first
-line (`listening on …`) — the contract scripts rely on.
+default `127.0.0.1:9418`; `--max-repos` caps open repositories),
+`import` and `export` (both take `--repo NAME`), `move` (renames a
+repository — an offline operation: it checkpoints the repository's WAL,
+carries the sidecar files, and refuses while a server holds the root's
+`gardenbed.lock`; see [docs/cli.md](cli.md)). The bound address is
+printed on stdout's first line (`listening on …`) — the contract scripts
+rely on.
 
 **Token auth (`serve --auth <auth.toml>`, v0.2).** Optional bearer-token
 authentication with per-repository roles: each `[tokens.<token>]` entry
@@ -171,11 +187,20 @@ Under the server root, the object store lives at `<root>/objects`, and
 <root>/objects/<2 hex>/<62 hex>
 ```
 
-- **Blobs** are stored under `SHA-256(raw content)` in the §6 envelope:
-  `"GBLO1"` magic (5 bytes) · `raw_len: u64` little-endian · one zstd
-  frame. Compression is a storage detail, never identity; on read, the
-  decompressed length and the SHA-256 are verified against the addressed
-  id — a torn or tampered object can never be handed back as wrong bytes.
+- **Blobs** are stored under `SHA-256(raw content)` in one of two
+  envelopes, chosen by size (v0.2 §7): content ≤ 1 MiB uses the §6
+  envelope (`"GBLO1"` magic (5 bytes) · `raw_len: u64` little-endian ·
+  one zstd frame); content > 1 MiB uses the chunked `"GBLO2"` envelope
+  (`magic · raw_len: u64 LE · chunk_count: u32 LE · table of
+  (chunk_raw_len, chunk_comp_len) pairs · per-chunk zstd frames`).
+  Chunk boundaries come from FastCDC (min 64 KiB / avg 256 KiB / max
+  1 MiB) — content-defined, so identical content yields an identical
+  chunk table in every process. Compression and chunking are storage
+  details, never identity; on read, the reader dispatches on the magic,
+  decodes each chunk bounded by its declared length, reassembles, and
+  verifies the SHA-256 of the whole against the addressed id — a torn
+  or tampered object (one corrupted chunk included) can never be handed
+  back as wrong bytes.
 - **Trees and changesets** are stored as their canonical payload bytes
   (their own format bytes type them; no envelope).
 - **Immutability** is load-bearing: putting an existing id with different
@@ -212,8 +237,8 @@ All local state lives under `--state-dir` (default `./.bed`):
 .bed/index.sqlite3      sqlite: files(path PK, blob_id, mode,
                     size, mtime_ns, hint) — the hint marks rows whose
                     size+mtime were hash-verified at write time
-.bed/objects/       local CAS cache — the same GBLO1 envelope and
-                    2-level sharding as object store
+.bed/objects/       local CAS cache — the same GBLO1/GBLO2 envelopes
+                    and 2-level sharding as object store
 .bed/heads          local stack tips
 ```
 
@@ -228,7 +253,14 @@ All local state lives under `--state-dir` (default `./.bed`):
   A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
 - **Status** uses mtime/size as hints and hashes only suspects;
-  `--full-scan` forces the correctness path.
+  `--full-scan` forces the correctness path. Untracked discovery honors
+  `.gitignore` files read from the working copy (root plus one per walked
+  directory — `crates/bed/src/ignore.rs`): the git subset of blank lines,
+  comments, trailing `/`, `*` `?` `**`, a leading `/` anchor, and bracket
+  expressions (`[…]` ranges and POSIX `[:class:]` forms), with
+  git's precedence that ignore never un-tracks. Ignored directories with
+  no tracked content are pruned from the walk (a cargo `target/` costs
+  one stat); `!` negation and global excludes are unsupported.
 - **Atomic checkout** stages complete files and symlinks before replacing
   working entries. When the selected state directory and destination are
   on different mounts, staging happens beside the destination so the final
@@ -317,7 +349,13 @@ loop, `EROFS` for every mutation, and both unmount paths.
 4. **Mapped-frontier pruning**: commits whose git SHA is already mapped
    are skipped, and mapped history is not descended — sound because git
    ids are content-addressed. Re-importing an unchanged repository writes
-   zero objects; force pushes just move refs (CAS).
+   zero objects; force pushes just move refs (CAS). But a ref move whose
+   new tip is not a descendant of the ref's current value is never
+   silent: the default fails the import before touching the ref
+   (`--allow-rewind` opts in), and the move is always reported in the
+   import report with the count of changesets that fell off the ref
+   (metadata-only BFS over parent edges; `--limit` slices report the
+   count as uncounted).
 5. Each commit lands through `ingest_changeset`: changeset canonical
    bytes, `git_map` row, and derived-data rows in one sqlite transaction
    (byte-identical values to the eager write path — kill+resume is
@@ -340,6 +378,7 @@ keyed by `(changeset, path)`. Attribution is anchored per-line to
 `git blame --first-parent` on all corpora — the only documented
 divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
 §5).
+
 
 ## 8.5. The local daemon (v0.2 M16)
 
@@ -444,6 +483,43 @@ Unrelated histories (no merge base) fail naming the operation.
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
   unpublished, unreadable, and reaped by the next rename into that shard.
 
+## 11. Horizontal scale-out
+
+The server tier scales horizontally by moving state off-box: metadata
+into PostgreSQL, objects into S3. Every replica is identical and
+stateless — no leader election, no sharding — because the v0.1
+invariants already carry the concurrency story: ref writes are CAS
+rows (exactly one replica wins a race) and object writes are immutable
+content-addressed puts (re-racing is the same write). The wire protocol
+is unchanged; `bed` still talks to one server address (a load balancer
+in front of N replicas is a deployment concern).
+
+```text
+bed ──gRPC── gardenbed-server replica 1 ─┐
+              gardenbed-server replica 2 ─┼── Postgres (metadata)
+              gardenbed-server replica N ─┘         │
+                                              S3 / MinIO (objects)
+```
+
+Backend selection is one `--storage <config.toml>` flag on `serve`,
+`import`, and `export` (env fallback: `GARDENBED_STORAGE`), selecting
+per-trait backends behind the unchanged `ObjectStore`/`MetadataStore`
+contracts:
+
+| trait | local (default, `--root`) | scale-out (`--storage`) |
+|---|---|---|
+| `ObjectStore` | filesystem at `<root>/objects` (`FsObjectStore`) | S3/MinIO (`S3ObjectStore`) |
+| `MetadataStore` | SQLite at `<root>/metadata.sqlite3` (`SqliteMetadataStore`) | PostgreSQL (`PostgresMetadataStore`) |
+
+The Postgres schema mirrors SQLite's one-to-one (bytea for BLOB), CAS is
+a single guarded `UPDATE ... WHERE` (no advisory locks), S3 writes are
+conditional puts with verify-on-conflict, and every read stays verified
+(length + SHA-256 against the addressed id). The design contract —
+decisions, schema, error semantics — is
+[scale-out-design.md](scale-out-design.md); the deployment artifact is
+`tools/scale/compose.yaml` (Postgres + MinIO + N replicas), with
+`demo/run-scaled.sh` proving cross-replica visibility end to end.
+
 ## Where the contracts live
 
 | contract | document |
@@ -455,3 +531,4 @@ Unrelated histories (no merge base) fail naming the operation.
 | blame definition | v0.1.md D7 |
 | import mechanics (gitoxide, diff-tree, renames) | v0.1.md D6/D8 |
 | divergences from git | divergences.md (§10.2: zero *silent* divergences) |
+| scale-out backends + deployment | scale-out-design.md (D1–D7) |

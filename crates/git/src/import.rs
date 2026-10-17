@@ -45,7 +45,7 @@ use crate::graph::{Arena, Node, read_commit};
 use crate::gtree::{GEntry, GKind};
 use crate::oid::GitOid;
 use crate::options::ImportOptions;
-use crate::report::ImportReport;
+use crate::report::{ImportReport, RefRewind};
 use crate::resolve::{GitObjects, MAX_TREE_DEPTH, gitlink_blob_id};
 use crate::transform::repair_dir_to_file;
 
@@ -156,7 +156,7 @@ pub fn import_from_path(
                 continue; // already counted in the skip pass above
             }
             let sha_hex = node.oid.to_hex();
-            let raw = read_commit(&repo, node.oid, &sha_hex)?;
+            let (raw, raw_bytes) = read_commit(&repo, node.oid, &sha_hex)?;
             let (parents, changes) = build_changes(
                 &mut git_objects,
                 &arena.nodes,
@@ -168,10 +168,42 @@ pub fn import_from_path(
             let cs = Changeset {
                 parents,
                 changes,
-                message: raw.message,
-                author: raw.author,
-                committer: raw.committer,
-                signature: raw.signature,
+                message: raw.message.clone(),
+                author: raw.author.clone(),
+                committer: raw.committer.clone(),
+                signature: raw.signature.clone(),
+            };
+            // Sparse raw-commit capture (v0.2 D21): reconstruct the commit
+            // bytes the model can produce and byte-compare with the
+            // original. The parents used here are the ones the model will
+            // link — the same filter `build_changes` applied — because
+            // that is what the export reconstructs from. Byte-identical ⇒
+            // provably reconstructable, no row. Anything else (a
+            // signature, an unmodeled header such as encoding/mergetag,
+            // non-UTF-8 identity bytes, header-order drift, or a re-rooted
+            // limit-slice boundary whose model parents were dropped) ⇒
+            // capture the original verbatim so export can emit it
+            // SHA-exact — or, for slice boundaries whose raw bytes name
+            // parents below the slice, refuse loudly instead of emitting
+            // a dangling pack.
+            let model_parent_hexes: Vec<String> = if reroot.contains(idx) {
+                // Re-rooted slice boundary: the model stores no parents.
+                Vec::new()
+            } else {
+                node.parents
+                    .iter()
+                    .filter_map(|p| {
+                        let pn = &arena.nodes[*p as usize];
+                        pn.cs.map(|_| pn.oid.to_hex())
+                    })
+                    .collect()
+            };
+            let reconstructed =
+                crate::commit::reconstruct_bytes(&raw, &raw.tree.to_hex(), &model_parent_hexes);
+            let raw_capture = if reconstructed == raw_bytes {
+                None
+            } else {
+                Some(raw_bytes.as_slice())
             };
             // Batched ingest: the changeset row, the git mapping and the
             // derived-data rows (tree cache, skiplist, path summary) land in
@@ -189,7 +221,7 @@ pub fn import_from_path(
             }
             let root = engine.validated_tree_for_new(&cs)?;
             let rows = engine.derived_rows_for_validated_tree(cs_id, &cs, root)?;
-            metadata.put_validated_changeset(&cs, root, &rows, Some(&sha_hex))?;
+            metadata.put_validated_changeset(&cs, root, &rows, Some(&sha_hex), raw_capture)?;
             arena.nodes[*idx as usize].cs = Some(cs_id);
             report.commits_new += 1;
             if report.commits_new % 25_000 == 0 {
@@ -214,6 +246,30 @@ pub fn import_from_path(
     }
 
     // ---- refs: compare-and-swap onto the fresh tips -------------------
+    // Two phases, so that a refusal moves NOTHING: phase 1 validates every
+    // selected ref (rewind detection included) and collects all would-be
+    // refusals; only if none exist does phase 2 perform the moves. Running
+    // the gate per-ref inside a single loop would leave refs sorted before
+    // the offending one already moved when the import aborts.
+    struct PlannedRef {
+        name: String,
+        current: Option<Id>,
+        target: Id,
+        rewind: Option<RefRewind>,
+    }
+    // One would-be refusal: a non-descendant ref move that `allow_rewind`
+    // does not permit. All of them are aggregated into a single error, so
+    // no offending ref is dropped from the report when an earlier one
+    // already tripped the gate.
+    struct Refusal {
+        name: String,
+        old: Id,
+        target: Id,
+        // `None` under `--limit` (slice re-rooting breaks real ancestry).
+        fell_off: Option<u64>,
+    }
+    let mut planned: Vec<PlannedRef> = Vec::with_capacity(selected.len());
+    let mut refusals: Vec<Refusal> = Vec::new();
     for (name, tip) in &selected {
         let Some(idx) = arena.index.get(tip) else {
             return Err(ImportError::Other(format!(
@@ -234,11 +290,92 @@ pub fn import_from_path(
         if current == Some(target) {
             continue; // already there: unchanged re-import
         }
-        match metadata.cas_ref(name, current, target)? {
-            gardenbed_store::RefCas::Won { .. } => report.refs_updated.push((name.clone(), target)),
+        // Backward-move detection (force-push reporting): when the ref had
+        // a previous value and the new tip is not a descendant of it, the
+        // ref moves backward (or sideways onto rewritten history) and the
+        // operator must see it — published work can silently fall off the
+        // ref otherwise. The move stays permitted with `allow_rewind`
+        // (force-push parity); without it the import fails before any ref
+        // is touched. `--limit` imports refuse too (the count is not
+        // computable there, but refusing the non-descendant move itself is
+        // the safe default); full imports refuse only when changesets
+        // would actually be lost, so sideways moves onto shared history
+        // still only warn.
+        let rewind = if let Some(old) = current
+            && !engine.is_ancestor(old, target)?
+        {
+            // Count what falls off: changesets reachable from the old
+            // tip but not from the new one. Both sets come from the
+            // metadata's own parent edges — no git reads, no object
+            // reads — and each changeset row is fetched once (visited
+            // set), only on the rewind path itself.
+            let fell_off = if opts.limit.is_some() {
+                // Slice re-rooting stores out-of-slice parents as root
+                // changesets, so real ancestry is not recoverable from
+                // the imported graph: report, do not count.
+                None
+            } else {
+                Some(count_fell_off(metadata.as_ref(), old, target)?)
+            };
+            if !opts.allow_rewind && (fell_off.is_none() || fell_off.unwrap_or(0) > 0) {
+                refusals.push(Refusal {
+                    name: name.clone(),
+                    old,
+                    target,
+                    fell_off,
+                });
+            }
+            Some(RefRewind {
+                name: name.clone(),
+                old_tip: old,
+                new_tip: target,
+                fell_off,
+            })
+        } else {
+            None
+        };
+        planned.push(PlannedRef {
+            name: name.clone(),
+            current,
+            target,
+            rewind,
+        });
+    }
+    if !refusals.is_empty() {
+        // The loss phrase per refusal: exact count for full imports,
+        // "uncounted" under `--limit`.
+        let loss = |r: &Refusal| match r.fell_off {
+            Some(n) => format!("losing {n} changeset(s)"),
+            None => "losing changesets (uncounted under --limit)".to_owned(),
+        };
+        let hatch = "re-run with --allow-rewind to permit this";
+        let moves = refusals
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}, backward from {} to {}, {}",
+                    r.name,
+                    r.old.to_hex(),
+                    r.target.to_hex(),
+                    loss(r)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ImportError::Ref {
+            name: refusals[0].name.clone(),
+            detail: format!("import would move refs backward: {moves}; {hatch}"),
+        });
+    }
+    for m in planned {
+        if let Some(rewind) = m.rewind {
+            report.refs_rewound.push(rewind);
+        }
+        match metadata.cas_ref(&m.name, m.current, m.target)? {
+            gardenbed_store::RefCas::Won { .. } => report.refs_updated.push((m.name, m.target)),
             gardenbed_store::RefCas::Conflict { current } => {
                 return Err(ImportError::Ref {
-                    name: name.clone(),
+                    name: m.name,
                     detail: format!("lost a concurrent update: the ref now points at {current}"),
                 });
             }
@@ -247,8 +384,49 @@ pub fn import_from_path(
     // Legacy frontier certification may recreate missing tree objects.
     report.objects_written = counting.written();
     report.refs_updated.sort_by(|a, b| a.0.cmp(&b.0));
+    report.refs_rewound.sort_by(|a, b| a.name.cmp(&b.name));
     report.elapsed = started.elapsed();
     Ok(report)
+}
+
+/// How many changesets are reachable from `old` but not from `new` — the
+/// work that falls off a rewound ref. Both directions' ancestor sets are
+/// collected by two independent plain BFS walks over the metadata's parent
+/// edges (changeset rows only; no objects, no git), each row fetched once
+/// per walk — the shared subgraph is fetched twice, once by each walk, so
+/// the cost is O(old-reachable + new-reachable) sqlite row reads.
+fn count_fell_off(
+    metadata: &dyn gardenbed_store::MetadataStore,
+    old: Id,
+    new: Id,
+) -> Result<u64, ImportError> {
+    let mut from_old: HashSet<Id> = HashSet::new();
+    let mut queue = vec![old];
+    from_old.insert(old);
+    while let Some(x) = queue.pop() {
+        let (cs, _) = metadata
+            .get_changeset(x)?
+            .ok_or_else(|| ImportError::Other(format!("dangling changeset {x} under a ref")))?;
+        for p in &cs.parents {
+            if from_old.insert(*p) {
+                queue.push(*p);
+            }
+        }
+    }
+    let mut from_new: HashSet<Id> = HashSet::new();
+    let mut queue = vec![new];
+    from_new.insert(new);
+    while let Some(x) = queue.pop() {
+        let (cs, _) = metadata
+            .get_changeset(x)?
+            .ok_or_else(|| ImportError::Other(format!("dangling changeset {x} under a ref")))?;
+        for p in &cs.parents {
+            if from_new.insert(*p) {
+                queue.push(*p);
+            }
+        }
+    }
+    Ok(from_old.difference(&from_new).count() as u64)
 }
 
 /// Whether this node must be re-rooted: it has parents in git, but its

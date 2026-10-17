@@ -1,11 +1,21 @@
 //! `metadata` — the SQLite metadata store: changesets, refs, the git-SHA
 //! mapping table, and the derived-data cache.
 //!
-//! Opened in WAL mode with a 5 s busy timeout so readers never block writers
-//! and contending writers queue instead of failing. All mutations are
+//! Opened in WAL mode with a 5 s busy timeout. All mutations are
 //! transactional; in particular [`MetadataStore::cas_ref`] performs its
 //! read-and-compare inside one `BEGIN IMMEDIATE` transaction, making a ref
 //! swap a single atomic compare-and-swap.
+//!
+//! Concurrency contract: WAL journaling lets any number of connections
+//! read the last committed snapshot without blocking a writer or each
+//! other, but SQLite still allows only one writer at a time. This store
+//! therefore opens one dedicated write connection, guarded by a mutex and
+//! used for every mutation, plus a pool of reader connections (4 by
+//! default, [`SqliteMetadataStore::open_with_readers`]) checked out one
+//! per concurrent read. Reads on a WAL snapshot see the state as of the
+//! last commit when the read began — the same data the single-connection
+//! design served, just without serializing readers behind a writer (or
+//! each other) in-process.
 
 use crate::StoreError;
 use gardenbed_model::Changeset;
@@ -45,16 +55,29 @@ CREATE TABLE IF NOT EXISTS derived (
     bytes BLOB NOT NULL,
     PRIMARY KEY (kind, cs)
 );
+CREATE TABLE IF NOT EXISTS git_raw_commit (
+    cs   BLOB PRIMARY KEY REFERENCES changesets(id),
+    data BLOB NOT NULL
+);
 ";
+
+/// zstd level for raw-commit frames — fixed for determinism (D21).
+pub(crate) const ZSTD_LEVEL: i32 = 3;
+
+/// Sanity bound on a decompressed raw commit (64 MiB): far above any real
+/// commit object, small enough to refuse a corrupt frame's huge claim.
+pub(crate) const MAX_RAW_COMMIT: usize = 64 * 1024 * 1024;
 
 /// The SQLite (metadata) metadata store.
 ///
-/// Cloning-free sharing: wrap in an `Arc` and share across threads; all
-/// access serializes on one connection guarded by a mutex, and every
-/// mutation is a transaction. WAL mode keeps readers unblocked.
+/// Cloning-free sharing: wrap in an `Arc` and share across threads. One
+/// dedicated write connection (guarded by a mutex) serves every mutation
+/// as a transaction; reads borrow pooled read connections, which WAL
+/// journaling keeps unblocked by writes and by each other.
 #[derive(Debug)]
 pub struct SqliteMetadataStore {
-    conn: Mutex<Connection>,
+    write_conn: Mutex<Connection>,
+    read_pool: Vec<Mutex<Connection>>,
 }
 
 impl SqliteMetadataStore {
@@ -62,11 +85,38 @@ impl SqliteMetadataStore {
     ///
     /// Configures WAL journaling, `synchronous=NORMAL` (crash-safe against
     /// process kill; power-loss durability comes from the WAL), a 5 s busy
-    /// timeout, and creates the schema if absent.
+    /// timeout, and creates the schema if absent. The read pool holds the
+    /// default of 4 reader connections.
     pub fn open(path: &Path) -> Result<Self, StoreError> {
+        Self::open_with_readers(path, 4)
+    }
+
+    /// [`SqliteMetadataStore::open`] with an explicit read-pool size.
+    ///
+    /// `readers` = 0 restores the pre-pool single-connection shape (every
+    /// read borrows the write connection's mutex, so reads serialize
+    /// behind writes exactly as before).
+    pub fn open_with_readers(path: &Path, readers: usize) -> Result<Self, StoreError> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent).map_err(|e| StoreError::Io(e.to_string()))?;
         }
+        let conn = Self::open_conn(path)?;
+        conn.execute_batch(SCHEMA).map_err(db_err)?;
+        let mut read_pool = Vec::with_capacity(readers);
+        for _ in 0..readers {
+            // Same pragmas as the write connection: the pool is
+            // indistinguishable from it except for never writing.
+            read_pool.push(Mutex::new(Self::open_conn(path)?));
+        }
+        Ok(SqliteMetadataStore {
+            write_conn: Mutex::new(conn),
+            read_pool,
+        })
+    }
+
+    /// Opens one connection with the full pragma set (WAL, 5 s busy
+    /// timeout, synchronous=NORMAL); the caller applies the schema.
+    fn open_conn(path: &Path) -> Result<Connection, StoreError> {
         let conn = Connection::open(path).map_err(db_err)?;
         conn.busy_timeout(Duration::from_secs(5)).map_err(db_err)?;
         // journal_mode returns the resulting mode as a row, hence query_row.
@@ -75,25 +125,51 @@ impl SqliteMetadataStore {
             .map_err(db_err)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(db_err)?;
-        conn.execute_batch(SCHEMA).map_err(db_err)?;
-        Ok(SqliteMetadataStore {
-            conn: Mutex::new(conn),
-        })
+        Ok(conn)
     }
 
-    fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
-        self.conn
+    fn lock_write(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        self.write_conn
             .lock()
             .map_err(|_| StoreError::Db("metadata connection lock poisoned".into()))
     }
 
-    /// Runs `f` in one immediate transaction; commits on `Ok`, rolls back on
-    /// `Err`.
+    /// Flushes the WAL into the database and truncates it, so committed
+    /// data stops living in `metadata.sqlite3-wal`. With
+    /// `synchronous=NORMAL` a commit legally leaves the database file
+    /// itself untouched and the committed rows in the WAL; anything that
+    /// relocates the database by renaming files (a repository move) must
+    /// first fold the WAL in or the moved database is missing committed
+    /// rows.
+    ///
+    /// The PRAGMA answers even when it could not finish: its result row
+    /// is `(busy, log, checkpointed)` and `busy != 0` means another
+    /// connection is holding frames the checkpoint cannot pass (an open
+    /// read transaction, a writer mid-commit). That is exactly the
+    /// caller's signal to refuse the relocation, so it is surfaced as
+    /// [`StoreError::Db`] rather than reported as success.
+    pub fn wal_checkpoint_truncate(&self) -> Result<(), StoreError> {
+        let conn = self.lock_write()?;
+        let (busy, _log, _checkpointed): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(db_err)?;
+        if busy != 0 {
+            return Err(StoreError::Db(
+                "WAL checkpoint is blocked by another connection holding the database".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Runs `f` in one immediate transaction on the write connection;
+    /// commits on `Ok`, rolls back on `Err`.
     fn in_tx<T>(
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
-        let mut conn = self.lock()?;
+        let mut conn = self.lock_write()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_err)?;
@@ -105,6 +181,18 @@ impl SqliteMetadataStore {
             Err(e) => Err(e), // dropping `tx` rolls back
         }
     }
+
+    /// Borrows a connection for reading: a pooled reader when one is
+    /// free, else the write connection's mutex (the pool never grows
+    /// past its fixed size, so excess readers queue exactly as before).
+    fn read_conn(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {
+        for r in &self.read_pool {
+            if let Ok(guard) = r.try_lock() {
+                return Ok(guard);
+            }
+        }
+        self.lock_write()
+    }
 }
 
 impl SqliteMetadataStore {
@@ -114,6 +202,7 @@ impl SqliteMetadataStore {
         git_sha_hex: Option<&str>,
         derived: &[crate::traits::DerivedRow],
         validated_tree: Option<Option<Id>>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         use sha2::Digest;
         let sha = git_sha_hex.map(normalize_git_sha).transpose()?;
@@ -226,6 +315,44 @@ impl SqliteMetadataStore {
                     .map_err(db_err)?;
                 }
             }
+            if let Some(raw) = raw_commit {
+                // Sparse capture (D21): keep any existing row for the same
+                // bytes; a different row is an immutability violation
+                // (content addressing means the same changeset id always
+                // reconstructs the same original commit).
+                let previous: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT data FROM git_raw_commit WHERE cs = ?1",
+                        params![id.as_bytes()],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(db_err)?;
+                let previous = previous
+                    .map(|frame| {
+                        // Rows are zstd frames; compare the *bytes* they
+                        // decode to, so a level change never fabricates an
+                        // immutability violation.
+                        zstd::bulk::decompress(&frame, MAX_RAW_COMMIT)
+                            .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+                    })
+                    .transpose()?;
+                match previous {
+                    Some(bytes) if bytes == raw => {}
+                    Some(_) => {
+                        return Err(StoreError::ImmutabilityViolation(id));
+                    }
+                    None => {
+                        let frame = zstd::bulk::compress(raw, ZSTD_LEVEL)
+                            .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))?;
+                        tx.execute(
+                            "INSERT INTO git_raw_commit(cs, data) VALUES(?1, ?2)",
+                            params![id.as_bytes(), frame],
+                        )
+                        .map_err(db_err)?;
+                    }
+                }
+            }
             Ok(())
         })?;
         Ok(id)
@@ -262,7 +389,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
     }
 
     fn get_changeset(&self, id: Id) -> Result<Option<(Changeset, Vec<u8>)>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         let canonical: Option<Vec<u8>> = conn
             .prepare_cached("SELECT canonical FROM changesets WHERE id = ?1")
             .map_err(db_err)?
@@ -280,7 +407,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
 
     fn resolve_ref(&self, name: &str) -> Result<Option<Id>, StoreError> {
         check_ref_name(name)?;
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         let cs: Option<Vec<u8>> = conn
             .prepare_cached("SELECT cs FROM refs WHERE name = ?1")
             .map_err(db_err)?
@@ -291,7 +418,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
     }
 
     fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         let mut stmt = conn
             .prepare("SELECT name, cs FROM refs ORDER BY name")
             .map_err(db_err)?;
@@ -409,7 +536,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
 
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         let cs: Option<Vec<u8>> = conn
             .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
             .map_err(db_err)?
@@ -420,7 +547,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
     }
 
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         conn.prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
             .map_err(db_err)?
             .query_row(params![cs.as_bytes()], |r| r.get(0))
@@ -428,12 +555,30 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .map_err(db_err)
     }
 
+    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
+        let conn = self.read_conn()?;
+        // Arrival order is insertion order; `rowid` is monotonic with it.
+        // Published vs. unpublished is deliberately not filtered: the
+        // point of this query is surfacing ref-less rows.
+        let mut stmt = conn
+            .prepare_cached("SELECT id FROM changesets ORDER BY rowid DESC LIMIT ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![limit], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(id_from_blob(&row.map_err(db_err)?)?);
+        }
+        Ok(out)
+    }
+
     fn changeset_ids_in_id_range(
         &self,
         lo: &[u8],
         hi_exclusive: Option<&[u8]>,
     ) -> Result<Vec<Id>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         // `id` is the PRIMARY KEY BLOB, so a unique index backs it and both
         // bounds seek; the one-bound shape keeps that index seek when the
         // upper bound overflowed away (an all-F prefix).
@@ -459,7 +604,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
 
     fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
         check_kind(kind)?;
-        let conn = self.lock()?;
+        let conn = self.lock_write()?;
         conn.prepare_cached("INSERT OR REPLACE INTO derived(kind, cs, bytes) VALUES(?1, ?2, ?3)")
             .map_err(db_err)?
             .execute(params![kind, cs.as_bytes(), bytes])
@@ -469,7 +614,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
 
     fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
         check_kind(kind)?;
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         let bytes: Option<Vec<u8>> = conn
             .prepare_cached("SELECT bytes FROM derived WHERE kind = ?1 AND cs = ?2")
             .map_err(db_err)?
@@ -485,11 +630,11 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         git_sha_hex: &str,
         derived: &[crate::traits::DerivedRow],
     ) -> Result<Id, StoreError> {
-        self.write_changeset(canonical, Some(git_sha_hex), derived, None)
+        self.write_changeset(canonical, Some(git_sha_hex), derived, None, None)
     }
 
     fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
-        let conn = self.lock()?;
+        let conn = self.read_conn()?;
         let bytes: Option<Vec<u8>> = conn
             .query_row(
                 "SELECT root_tree FROM validated_changesets_v1 WHERE cs = ?1",
@@ -509,17 +654,44 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .transpose()
     }
 
+    fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.read_conn()?;
+        let frame: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM git_raw_commit WHERE cs = ?1",
+                params![cs.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        // One zstd frame per row (D21: `data BLOB zstd`), level fixed for
+        // determinism — matching the blob-envelope convention.
+        frame
+            .map(|f| {
+                zstd::bulk::decompress(&f, MAX_RAW_COMMIT)
+                    .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+            })
+            .transpose()
+    }
+
     fn put_validated_changeset(
         &self,
         cs: &Changeset,
         root_tree: Option<Id>,
         derived: &[crate::traits::DerivedRow],
         git_sha_hex: Option<&str>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         let canonical = cs
             .canonical_bytes()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        self.write_changeset(&canonical, git_sha_hex, derived, Some(root_tree))
+        self.write_changeset(
+            &canonical,
+            git_sha_hex,
+            derived,
+            Some(root_tree),
+            raw_commit,
+        )
     }
 }
 
