@@ -550,6 +550,98 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     ))
 }
 
+/// `bed merge <target> [-m MESSAGE] [--author …]` — merge a changeset or
+/// ref into the working copy's current changeset (the server-side
+/// two-parent merge, v0.2.md D9–D11), then move the working copy onto
+/// the merge changeset rebase-shaped.
+///
+/// The server returns the merge changeset's id, or refuses with
+/// `FAILED_PRECONDITION` naming every conflicting path — surfaced as
+/// [`ClientError::Rpc`], verbatim (resolution belongs in the working
+/// copy; nothing is stored on conflict). When the target is already an
+/// ancestor of the current changeset, the answer is up to date: the
+/// working copy stays where it is. On success the working copy treats
+/// the result like a `rebase`/`switch`: the sparse selection is
+/// re-planned and re-synced at the merged changeset, the config moves,
+/// and the heads stack is re-pointed from the old changeset to the
+/// merge.
+pub async fn merge(
+    state_dir: &Path,
+    target: &str,
+    message: Option<&str>,
+    author: Option<&str>,
+) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
+    let parsed = crate::revspec::CsOrRef::parse(target)?;
+    let session = Session::open(&bed).await?;
+    let current = session.resolve_current_cs(&bed, "merge").await?;
+    let theirs = session.resolve(&parsed, "merge").await?;
+
+    // The merge is the server's decision; conflicts come back as a
+    // FAILED_PRECONDITION whose message lists every conflicting path.
+    let message = message
+        .map(|m| m.to_owned())
+        .unwrap_or_else(|| format!("merge {target}"));
+    let (name, email) = crate::commit::resolve_author(author)?;
+    let (time_secs, tz_min) = crate::commit::now_stamp();
+    let identity = gardenbed_model::Identity {
+        name,
+        email,
+        time_secs,
+        tz_min,
+    };
+    let (merged, up_to_date) = session
+        .merge(
+            current,
+            theirs,
+            &message,
+            &identity,
+            &identity,
+            "merge",
+        )
+        .await?;
+    if up_to_date {
+        return Ok(format!(
+            "already up to date — {} is an ancestor of {}; nothing to merge\n",
+            theirs.short(),
+            current.short(),
+        ));
+    }
+
+    // Move the working copy like `rebase` does: plan the sparse
+    // selection at the merge changeset, then fetch + sync.
+    // `.bed`-shaded repo paths never reach the state directory; say
+    // what was skipped.
+    let root = session.root_tree(merged, "merge").await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
+    let (plan, bed_state) = exclude_bed_state(plan);
+    let treestate = bed.treestate()?;
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
+        &prefixes,
+        plan,
+        session.fetcher(),
+        &treestate,
+    )
+    .await?;
+    bed.config_mut().current_cs = Some(merged.to_hex());
+    bed.save_config()?;
+    bed.heads().repoint(current, merged)?;
+
+    Ok(format!(
+        "merged {} into {} as {}\n\
+         fetched {} tree(s), {} blob(s)\n{}{}\n",
+        theirs.short(),
+        current.short(),
+        merged.short(),
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        bed_state_note(&bed_state),
+        outcome.summarize(),
+    ))
+}
+
 /// `bed publish` — fast-forward `main` to the working copy's current changeset.
 ///
 /// The server enforces the ancestry precondition with a
