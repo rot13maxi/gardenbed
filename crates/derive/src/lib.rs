@@ -24,12 +24,15 @@ mod ancestry;
 mod apply;
 mod blame;
 mod diff;
+mod merge;
 mod pathsummary;
 mod xdiff;
 
 pub use ancestry::SegmentEntry;
 pub use blame::BlameRange;
+pub use merge::{Merge3Outcome, merge3};
 pub use pathsummary::{BLOOM_BITS, MAX_SUMMARY_PATHS, PathSummary};
+pub use xdiff::MAX_DIFF_LINES;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
