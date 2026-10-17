@@ -142,6 +142,11 @@ impl ServerProc {
         use tokio::io::{AsyncBufReadExt, BufReader};
         use tokio::time::{Duration, timeout};
 
+        // Multi-repo serving (main fa1f5e9): the registry is the set of
+        // repositories that exist under `root`; create the fixture's repo
+        // before spawning so `garden` resolves.
+        Repo::open(&root.join("garden")).expect("fixture repository opens");
+
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
             .arg("--addr")
             .arg("127.0.0.1:0")
@@ -291,7 +296,9 @@ async fn merge_and_publish_race_one_winner_per_position() {
     let mut publishers = Vec::new();
     for child in children.iter().copied() {
         let c = server.client().await;
-        publishers.push(tokio::spawn(async move { c.publish(repo, child).await }));
+        publishers.push(tokio::spawn(async move {
+            c.publish(repo, child, None, false).await
+        }));
     }
 
     let mut merge_ids = Vec::new();
@@ -370,7 +377,7 @@ async fn merge_then_publish_uses_unchanged_publish_path() {
         .await
         .expect("child created");
     client
-        .publish(repo, child)
+        .publish(repo, child, None, false)
         .await
         .expect("publish of a merge child works with zero publish-code changes");
     let head = client
@@ -650,6 +657,8 @@ fn merge_sigkill_leaves_absent_or_complete_state() {
     for i in 0..ITERATIONS {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
+        // Multi-repo registry: create the fixture repo before spawning.
+        Repo::open(&root.join("garden")).expect("fixture repository opens");
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
             .arg("--addr")
             .arg("127.0.0.1:0")
