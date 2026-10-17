@@ -174,6 +174,24 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             Ok(0)
         }
 
+        Command::Merge {
+            target,
+            message,
+            author,
+        } => {
+            let _bed = WorkingCopy::open(&cli.state_dir)?;
+            CsOrRef::parse(target)?;
+            let out = gardenbed::ops::merge(
+                &cli.state_dir,
+                target,
+                message.as_deref(),
+                author.as_deref(),
+            )
+            .await?;
+            print!("{out}");
+            Ok(0)
+        }
+
         Command::Blame { path, cs } => {
             validate_path_arg(path)?;
             if let Some(cs) = cs {

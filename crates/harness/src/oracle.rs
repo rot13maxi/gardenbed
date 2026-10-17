@@ -437,3 +437,76 @@ pub fn git_hash_object(repo: &Path, content: &[u8]) -> std::io::Result<String> {
 pub fn git_show(repo: &Path, sha: &str, path: &str) -> std::io::Result<Vec<u8>> {
     run_git(repo, &["show", &format!("{sha}:{path}")])
 }
+
+// ------------------------------------------------------------ merge-tree
+
+/// The outcome of `git merge-tree --write-tree <ours> <theirs>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MergeTreeOutcome {
+    /// The merged tree's sha (present even on conflict: the first
+    /// stdout line is always the best-effort tree).
+    pub tree: String,
+    /// False when the merge was clean (exit 0); true on conflict
+    /// (exit 1).
+    pub conflicted: bool,
+    /// Every conflicted path, deduplicated, in first-appearance order
+    /// (empty when clean). Parsed from the stage lines: conflicted
+    /// paths appear with nonzero stage numbers before the message
+    /// block, as `<mode> <sha> <stage>\t<path>`.
+    pub conflicted_paths: Vec<String>,
+}
+
+/// `git merge-tree --write-tree <ours> <theirs>` — the merge oracle
+/// (M9). The merge base is git's own auto-computed one, so the caller
+/// must only compare cases where git's base equals gardenbed's (the
+/// divergent-pair generator guarantees this: both sides branch off the
+/// same mainline commit). Exit code 1 = conflict; anything other than
+/// 0/1 is an error. `--name-only` lists the conflicted paths.
+pub fn git_merge_tree(repo: &Path, ours: &str, theirs: &str) -> std::io::Result<MergeTreeOutcome> {
+    let out = git_cmd(
+        repo,
+        &["merge-tree", "--write-tree", "--name-only", ours, theirs],
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()?;
+    match out.status.code() {
+        Some(0) | Some(1) => {}
+        other => {
+            return Err(std::io::Error::other(format!(
+                "git merge-tree failed (exit {:?}): {}",
+                other,
+                String::from_utf8_lossy(&out.stderr).trim_end()
+            )));
+        }
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut lines = text.lines();
+    let tree = lines
+        .next()
+        .ok_or_else(|| std::io::Error::other("git merge-tree printed no tree sha"))?
+        .to_owned();
+    parse_sha40(&tree)?;
+    let conflicted = out.status.code() == Some(1);
+    // After the tree sha, `--name-only` lists each conflicted path on
+    // its own line (a blank line may precede the messages block).
+    let mut paths: Vec<String> = Vec::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("CONFLICT") || line.starts_with("Auto-merging") {
+            continue; // message block, not a path
+        }
+        if !paths.contains(&line.to_owned()) {
+            paths.push(line.to_owned());
+        }
+    }
+    Ok(MergeTreeOutcome {
+        tree,
+        conflicted,
+        conflicted_paths: paths,
+    })
+}

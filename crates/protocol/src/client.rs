@@ -403,6 +403,35 @@ impl GardenbedClient {
         wire_id(&resp.id, "PublishResp.id")
     }
 
+    /// Server-side two-parent merge of `target` into `cs_id`
+    /// (v0.2.md D9-D11): one changeset `parents = [cs_id, target]` whose
+    /// changes are the diff `tree(cs_id) -> merged tree`. Conflicts abort
+    /// with `FAILED_PRECONDITION` listing every conflicting path. When
+    /// `target` is already an ancestor of `cs_id`, answers `up_to_date`
+    /// with `id = cs_id` and nothing is stored. Returns
+    /// `(id, up_to_date)`.
+    pub async fn merge(
+        &self,
+        repo: &str,
+        cs_id: model::Id,
+        target: model::Id,
+        message: &str,
+        author: &model::Identity,
+        committer: &model::Identity,
+    ) -> Result<(model::Id, bool), Status> {
+        let req = pb::MergeReq {
+            repo: repo.to_owned(),
+            cs_id: id_to_bytes(cs_id),
+            target: id_to_bytes(target),
+            message: message.to_owned(),
+            author: Some(pb::IdentityMsg::from(author)),
+            committer: Some(pb::IdentityMsg::from(committer)),
+        };
+        let mut inner = self.inner.clone();
+        let resp = inner.merge(req).await?.into_inner();
+        Ok((wire_id(&resp.id, "MergeResp.id")?, resp.up_to_date))
+    }
+
     /// Per-repo request counters (debug/test infrastructure).
     pub async fn get_stats(&self, repo: &str) -> Result<BTreeMap<String, u64>, Status> {
         let req = pb::GetStatsReq {
