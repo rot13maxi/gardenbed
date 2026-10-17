@@ -1087,6 +1087,7 @@ dependencies = [
  "gardenbed-derive",
  "gardenbed-harness",
  "gardenbed-model",
+ "gardenbed-server",
  "gardenbed-store",
  "gix",
  "log",
