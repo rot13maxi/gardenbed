@@ -1,5 +1,6 @@
 //! Regression coverage for changeset publication and three-way replay.
 use std::{collections::BTreeMap, sync::Arc};
+use gardenbed_store::ObjectStore;
 
 use gardenbed_model::{Change, Changeset, Identity, Mode, Op, blob_id};
 use gardenbed_server::{Repo, ServerError};
@@ -532,4 +533,197 @@ fn obsolete_layout_is_rejected_without_creating_an_empty_repository() {
         std::fs::read(dir.path().join("seedbed.sqlite3")).unwrap(),
         b"old metadata"
     );
+}
+
+/// The three-way replay's conflict strings, verbatim: descendant edit,
+/// ancestor replacement, and concurrent subtree change under a directory
+/// replacement. These pin the messages clients match on.
+#[test]
+fn rebase_conflict_strings_are_preserved() {
+    let store = Arc::new(MemoryStore::new());
+    let repo = Repo::new(store.clone(), store);
+    for content in [b"old".as_slice(), b"new", b"sub"] {
+        repo.put_blob(content).unwrap();
+    }
+    let base = commit(
+        &repo,
+        &changeset(
+            vec![],
+            vec![change("dir/f", Op::Add, Some(b"old"), Mode::Regular, None)],
+            "base",
+        ),
+    );
+
+    // A concurrent edit to the exact path: "was changed or deleted".
+    let edited = commit(
+        &repo,
+        &changeset(
+            vec![base],
+            vec![change("dir/f", Op::Modify, Some(b"new"), Mode::Regular, None)],
+            "concurrent edit",
+        ),
+    );
+    let modify = commit(
+        &repo,
+        &changeset(
+            vec![base],
+            vec![change("dir/f", Op::Modify, Some(b"sub"), Mode::Regular, None)],
+            "modify",
+        ),
+    );
+    match repo.rebase(modify, edited) {
+        Err(ServerError::RebaseConflict(msgs)) => {
+            assert_eq!(msgs, vec!["\"dir/f\" was changed or deleted".to_owned()]);
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+
+    // A directory replaced by a file where the write's path lands:
+    // "sits under a concurrently changed file".
+    let file_over_dir = commit(
+        &repo,
+        &changeset(
+            vec![base],
+            vec![
+                change("dir", Op::Add, Some(b"new"), Mode::Regular, None),
+                change("dir/f", Op::Delete, None, Mode::Regular, None),
+            ],
+            "dir becomes a file",
+        ),
+    );
+    match repo.rebase(modify, file_over_dir) {
+        Err(ServerError::RebaseConflict(msgs)) => {
+            assert_eq!(
+                msgs,
+                vec!["\"dir/f\" sits under a concurrently changed file".to_owned()]
+            );
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+
+    // A directory replacement swallowing a concurrently changed subtree:
+    // "was changed" naming the directory.
+    let replacement = commit(
+        &repo,
+        &changeset(
+            vec![base],
+            vec![
+                change("dir", Op::Add, Some(b"new"), Mode::Regular, None),
+                change("dir/f", Op::Delete, None, Mode::Regular, None),
+            ],
+            "replace directory",
+        ),
+    );
+    let subtree_edit = commit(
+        &repo,
+        &changeset(
+            vec![base],
+            vec![change("dir/g", Op::Add, Some(b"sub"), Mode::Regular, None)],
+            "subtree addition",
+        ),
+    );
+    match repo.rebase(replacement, subtree_edit) {
+        Err(ServerError::RebaseConflict(msgs)) => {
+            assert!(msgs.contains(&"directory \"dir\" was changed".to_owned()), "{msgs:?}");
+        }
+        other => panic!("expected a conflict, got {other:?}"),
+    }
+
+    // A descendant of the replaced directory that sorts after it (a
+    // non-descendant greater sibling) must NOT trip the subtree check.
+    let sibling = commit(
+        &repo,
+        &changeset(
+            vec![base],
+            vec![change("dir0/x", Op::Add, Some(b"sub"), Mode::Regular, None)],
+            "sibling after dir/",
+        ),
+    );
+    assert!(repo.rebase(replacement, sibling).is_ok());
+}
+
+/// `Repo::log` fetches each changeset exactly once (the push-time decoded
+/// changeset is reused at pop) and keeps git's date-ordered walk with the
+/// FIFO tie-break, limit included.
+#[test]
+fn log_walk_fetches_each_changeset_once_and_keeps_ordering() {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let inner = Arc::new(MemoryStore::new());
+    let counting = Arc::new(CountingMetadata::new(inner.clone()));
+    let repo = Repo::new(inner.clone() as Arc<dyn ObjectStore>, counting.clone());
+
+    // A known graph: r ← a ← c, r ← b, with times chosen so the walk is
+    // c, b, a, r regardless of heap internals (c newest; b older than a
+    // only on ties is irrelevant — give them distinct times).
+    let mut ids = Vec::new();
+    let mut parent = None;
+    for (name, secs) in [("r", 1), ("a", 3), ("c", 5)] {
+        let cs = Changeset {
+            parents: parent.clone().into_iter().collect(),
+            changes: vec![],
+            message: name.into(),
+            author: Identity {
+                name: name.into(),
+                email: "t@e".into(),
+                time_secs: secs,
+                tz_min: 0,
+            },
+            committer: Identity {
+                name: name.into(),
+                email: "t@e".into(),
+                time_secs: secs,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        parent = Some(commit(&repo, &cs));
+        ids.push(parent.unwrap());
+    }
+    let [r, a, c] = [ids[0], ids[1], ids[2]];
+    let b_cs = Changeset {
+        parents: vec![r],
+        changes: vec![],
+        message: "b".into(),
+        author: Identity {
+            name: "b".into(),
+            email: "t@e".into(),
+            time_secs: 4,
+            tz_min: 0,
+        },
+        committer: Identity {
+            name: "b".into(),
+            email: "t@e".into(),
+            time_secs: 4,
+            tz_min: 0,
+        },
+        signature: None,
+    };
+    let b = commit(&repo, &b_cs);
+
+    counting.reads.store(0, Relaxed);
+    let full = repo.log(c, 0).unwrap();
+    let names: Vec<&str> = full.iter().map(|(_, cs)| cs.message.as_str()).collect();
+    assert_eq!(names, vec!["c", "b", "a", "r"], "date-ordered walk");
+    assert_eq!(
+        counting.reads.load(Relaxed),
+        4,
+        "one get_changeset per node"
+    );
+
+    // Limit stops the walk early without disturbing order.
+    counting.reads.store(0, Relaxed);
+    let limited = repo.log(c, 2).unwrap();
+    let names: Vec<&str> = limited.iter().map(|(_, cs)| cs.message.as_str()).collect();
+    assert_eq!(names, vec!["c", "b"]);
+    // c and b popped (2 fetches served from the push-time cache); a is
+    // fetched once at push. b's parent r is never pushed.
+    assert_eq!(counting.reads.load(Relaxed), 1, "parents fetched once at push");
+
+    // A merge head walks both lineages.
+    let merge = changeset(vec![a, b], vec![], "merge");
+    let m = commit(&repo, &merge);
+    let full = repo.log(m, 0).unwrap();
+    let names: Vec<&str> = full.iter().map(|(_, cs)| cs.message.as_str()).collect();
+    assert_eq!(names, vec!["merge", "b", "a", "r"]);
 }

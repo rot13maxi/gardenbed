@@ -286,7 +286,7 @@ pub(crate) fn decode_envelope(raw: &[u8], id: Id) -> Result<Vec<u8>, StoreError>
 /// final SHA-256-vs-id check. Used by `put_blob`'s existence check, which
 /// must distinguish "envelope of *different* content" (immutability
 /// violation) from "structurally corrupt file" (healable).
-fn parse_envelope(raw: &[u8]) -> Result<Vec<u8>, StoreError> {
+pub(crate) fn parse_envelope(raw: &[u8]) -> Result<Vec<u8>, StoreError> {
     if raw.len() < HEADER_LEN {
         return Err(StoreError::Corrupt(format!(
             "envelope is {} bytes, need at least {HEADER_LEN}",
