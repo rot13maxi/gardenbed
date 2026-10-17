@@ -161,10 +161,34 @@ hashed.
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
 | `--full-scan` | hash every tracked file, ignoring the hints |
 
+With offline commits queued (see [`bed commit`](#bed-commit)), the
+pending line prints first, offline:
+
 ```sh
-bed status                   # working copy is clean — nothing modified, deleted, or untracked.
-bed status --full-scan
+bed status
+# 1 pending commit(s) not yet on the server — run bed sync
+# working copy is clean — nothing modified, deleted, or untracked.
 ```
+
+### bed sync
+
+```text
+Usage: bed sync [OPTIONS]
+```
+
+Drains the offline commit queue: every pending commit is uploaded
+oldest-first as an idempotent re-upload of content-addressed facts (a
+crash mid-sync costs a re-upload, never a divergence), then the state
+move each offline commit already performed locally is replayed. A
+failure stops the drain at the failing commit and says how many remain;
+`bed switch`, `rebase`, and `publish` refuse while commits are pending.
+
+```sh
+bed sync
+# synced <cs>
+# synced 2 commit(s), queue empty
+```
+
 
 ### bed file
 
@@ -276,6 +300,20 @@ bed commit -m "Describe the change"
 # working copy at b273e12d1c6f11ee (was 984213bc33e9f924)
 ```
 
+When the server is unreachable *at connect time* — and only then; a
+server that answers, even to refuse, is online and its error must be
+seen — the commit completes offline: the changeset is built and
+content-addressed locally, every changed blob is staged into
+`.bed/objects`, and a queue row records what `bed sync` later replays.
+The working copy moves exactly as an online commit's would.
+
+```sh
+bed commit -m "offline work"
+# created changeset <cs>: 1 change(s) (1 added)
+# queued as <cs> — 1 pending — run bed sync when online
+# working copy at <cs> (was <parent>)
+```
+
 ### bed rebase
 
 ```text
@@ -284,12 +322,21 @@ Usage: bed rebase [OPTIONS] <NEW_PARENT>
 
 Replays the current changeset onto a new parent (server-side rebase).
 `<NEW_PARENT>` is a `<cs-or-ref>`. Conflicts are hard errors listing
-every conflicting path.
+every conflicting path. With `--stack`, the whole first-parent chain
+from the merge base of (current, new parent) replays onto the new
+parent, oldest first — each link gets the same per-changeset conflict
+check, a conflict anywhere aborts the entire stack before the working
+copy moves, and unrelated histories or a non-first-parent merge base
+are refused up front.
 
 ```sh
 bed rebase main
 # rebased <cs> onto <new-parent> as <replayed-cs>
 # fetched <N> tree(s), <M> blob(s)
+
+bed rebase --stack main
+# rebased 3 change(s) onto <new-parent> as <new-tip>
+#   <link1> -> <link2> -> <link3>
 ```
 
 ### bed merge
