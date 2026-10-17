@@ -831,6 +831,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "gardenbed-daemon",
  "gardenbed-harness",
  "gardenbed-model",
  "gardenbed-protocol",
