@@ -31,7 +31,13 @@ tags, and the verification record for a release lives in
   shade by relative age. New endpoints `/api/files` (path listing) and
   `/api/search` (case-insensitive content grep) back the `t` file
   finder, the topbar grep box (`#/search` route), and `j`/`k` keyboard
-  navigation with a `?` help overlay. See [docs/web.md](docs/web.md).
+  navigation with a `?` help overlay. Multi-worker visibility: the
+  Overview gains a Workers panel (per-author unpublished drafts,
+  watchlist), an Events feed (publishes, rebases, landings), and a
+  `#/review/<id>` route with the full diff and read-only land commands;
+  backed by `MetadataStore::recent_changesets`, `Repo::activity`, and
+  `GET /api/activity` (arrival order, unpublished included). See
+  [docs/web.md](docs/web.md).
   Verified by in-memory router
   integration tests (`crates/web/tests/api.rs`) and a Playwright
   end-to-end suite (`e2e/`) that drives a real browser through every

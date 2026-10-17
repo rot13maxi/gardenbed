@@ -621,7 +621,8 @@ function buildAgentPrompt(info, refs) {
     "- History queries without checkout: bed log / bed diff / bed file / bed blame accept refs,",
     "  full 64-hex ids, or unambiguous prefixes.",
     "- publish never merges for you; on conflict rebase and republish — your changeset is kept.",
-    "- Only commit inside a sparse working copy after `bed sparse add`-ing the paths you touch.", "",
+    "- Only commit inside a sparse working copy after `bed sparse add`-ing the paths you touch.",
+    "- Review and land changesets through the bed CLI (bed diff / bed rebase / bed publish); this web UI is read-only.", "",
     "Full docs: docs/quickstart.md and docs/cli.md in the gardenbed repository.");
   return L.join("\n");
 }
@@ -1007,13 +1008,21 @@ function hideToast() {
 }
 
 async function showLiveToast(ref, oldCs, newCs) {
-  let suffix = "";
+  let suffix = "", n = null;
   try {
     const log = await api("/api/log?" + qs({ cs: newCs, limit: 50 }));
-    let n = 0, found = false;
-    for (const e of log.entries || []) { if (e.id === oldCs) { found = true; break; } n++; }
-    if (found) suffix = " (+" + n + (n === 1 ? " changeset)" : " changesets)");
+    let count = 0, found = false;
+    for (const e of log.entries || []) { if (e.id === oldCs) { found = true; break; } count++; }
+    if (found) { n = count; suffix = " (+" + n + (n === 1 ? " changeset)" : " changesets)"); }
   } catch (_) { /* count unavailable — ids alone tell the story */ }
+  // the toast is transient; the events panel is the durable record
+  recordEvent({
+    kind: "publish",
+    key: "p:" + oldCs + ":" + newCs,
+    text: shortId(oldCs, 8) + " → " + shortId(newCs, 8) +
+      (n !== null ? " · +" + n + " changeset" + (n === 1 ? "" : "s") : ""),
+    ts: Math.floor(Date.now() / 1000),
+  });
   if (!toastEl) {
     toastEl = el("div", { id: "live-toast", role: "status" });
     (document.body || document.documentElement).appendChild(toastEl);
@@ -1041,9 +1050,24 @@ async function showLiveToast(ref, oldCs, newCs) {
 
 async function pollTick() {
   if (typeof document !== "undefined" && document.hidden) return; // paused while hidden
-  let data;
-  try { data = await api("/api/refs"); } catch (_) { return; }
+  let data, activity, log = null;
+  try {
+    data = await api("/api/refs");
+    // activity + log let the feed learn rebase/landed transitions on each tick
+    activity = await api("/api/activity?" + qs({ limit: ACTIVITY_LIMIT })).catch(() => ({ changesets: [] }));
+  } catch (_) { return; }
   const fresh = (data && data.refs) || [];
+  const mainRef = fresh.find((r) => r.name === "refs/heads/main");
+  try {
+    log = await api("/api/log?" + qs({ cs: mainRef ? mainRef.cs : currentRev(), limit: 500 }));
+  } catch (_) { log = null; }
+  let deriv2 = null, pub2 = null;
+  if (log) {
+    pub2 = new Set((log.entries || []).map((e) => e.id));
+    const hydrated = await hydrateChangesEntries(activity.changesets || []);
+    deriv2 = buildDerivation(hydrated, pub2);
+    processDerivation(deriv2);
+  }
   const hadBaseline = !!Object.keys(lastTips).length;
   const prev = lastTips;
   lastTips = {};
@@ -1056,9 +1080,24 @@ async function pollTick() {
     for (const r of fresh) sel.appendChild(option(r.name, r.name));
     if (known.has(state.rev)) sel.value = state.rev;
   }
-  if (!hadBaseline) return; // first poll after load only records the baseline
-  const moved = fresh.find((r) => r.name === state.rev && prev[r.name] && prev[r.name] !== r.cs);
-  if (moved) showLiveToast(moved, prev[moved.name], moved.cs);
+  if (hadBaseline) {
+    const moved = fresh.find((r) => r.name === state.rev && prev[r.name] && prev[r.name] !== r.cs);
+    if (moved) await showLiveToast(moved, prev[moved.name], moved.cs); // await: its event lands before repaint
+  }
+  // incremental repaint of the visible overview: landing a watched draft flips
+  // badges in place; touching nothing when nothing relevant changed
+  // (and never re-rendering another route's page).
+  if (overviewLive && isOverviewRoute() && deriv2) {
+    const newKey = statusKey(deriv2, pub2);
+    const newFeed = eventsFeed().length;
+    if (newKey !== overviewLive.key || newFeed !== overviewLive.feedLen) {
+      overviewLive = { key: newKey, feedLen: newFeed, published: pub2 };
+      const watchMeta = await Promise.all(getWatchlist().map((id) =>
+        fetchChangesetCached(id).then((cs) => ({ id: id, cs: cs })).catch(() => ({ id: id, cs: null }))));
+      swapPanel("workers-panel", buildWorkersPanel(deriv2, watchMeta));
+      swapPanel("events-panel", buildEventsPanel());
+    }
+  }
 }
 
 function startLivePoll() {
@@ -1310,6 +1349,301 @@ function onGlobalKey(ev) {
     case "?": toggleKbdHelp(); break;
     default: return;
   }
+}
+
+/* ---------- workspace derivation (multi-worker visibility) ---------- */
+
+const ACTIVITY_LIMIT = 200;
+
+function firstTopSegment(p) { return String(p || "").split("/")[0]; }
+
+/**
+ * /api/activity entries arrive either as full changesets (changes array) or
+ * log-shaped stubs (changes = integer count). Pair detection only needs real
+ * paths for same-author + same-first-line groups, so hydrate just those.
+ */
+function hydrateChangesEntries(all) {
+  const groups = {};
+  for (const c of all) {
+    const k = ((c.author || {}).name || "") + "|" + firstLine(c.message);
+    (groups[k] = groups[k] || []).push(c);
+  }
+  const need = [];
+  for (const k in groups) {
+    if (groups[k].length < 2) continue;
+    for (const c of groups[k]) if (!Array.isArray(c.changes)) need.push(c.id);
+  }
+  const byId = {};
+  return Promise.all(need.map((id) =>
+    fetchChangesetCached(id).then((cs) => { byId[id] = cs; }).catch(() => {})))
+    .then(() => all.map((c) =>
+      Array.isArray(c.changes) ? c : Object.assign({}, c, { changes: (byId[c.id] && byId[c.id].changes) || [] })));
+}
+
+/**
+ * published = ids the ref's log reaches; unpublished = activity minus that.
+ * Rebase pair: distinct ids, same author.name, same message first line, and
+ * at least one shared top-level path segment; the older committer time marks
+ * the superseded side. Entries must be pre-hydrated (hydrateChangesEntries);
+ * tolerates count-shaped `changes` as a belt-and-braces measure.
+ */
+function buildDerivation(activityChangesets, publishedSet) {
+  const all = activityChangesets || [];
+  const published = publishedSet;
+  const unpublished = all.filter((c) => !published.has(c.id));
+  const pairs = [];
+  for (let i = 0; i < all.length; i++) {
+    for (let j = i + 1; j < all.length; j++) {
+      const A = all[i], B = all[j];
+      if (A.id === B.id) continue;
+      if (((A.author || {}).name || "") !== ((B.author || {}).name || "")) continue;
+      if (firstLine(A.message) !== firstLine(B.message)) continue;
+      const chA = Array.isArray(A.changes) ? A.changes : [];
+      const chB = Array.isArray(B.changes) ? B.changes : [];
+      const segsA = new Set(chA.map((c) => firstTopSegment(c.path)));
+      let shared = false;
+      for (const c of chB) {
+        if (segsA.has(firstTopSegment(c.path))) { shared = true; break; }
+      }
+      if (!shared) continue;
+      const ta = (A.committer || {}).time_secs || 0;
+      const tb = (B.committer || {}).time_secs || 0;
+      pairs.push({ kind: "rebase", superseded: ta <= tb ? A : B, current: ta <= tb ? B : A });
+    }
+  }
+  return { all, unpublished, pairs, published };
+}
+
+/* ---------- durable event feed (origin-scoped, cap 200) ---------- */
+
+const EVENTS_KEY = "gb-events";
+const EVENTS_CAP = 200;
+const EVENT_ICONS = { publish: "🚀", rebase: "✏️", landed: "🌱" };
+let eventsFeedCache = null;
+
+function eventsFeed() {
+  if (eventsFeedCache) return eventsFeedCache;
+  let raw = [];
+  try { raw = JSON.parse(safeStorage("get", EVENTS_KEY) || "[]"); } catch (_) { raw = []; }
+  eventsFeedCache = Array.isArray(raw) ? raw : [];
+  return eventsFeedCache;
+}
+function hasEventKey(key) { return eventsFeed().some((e) => e.key === key); }
+function recordEvent(ev) {
+  if (hasEventKey(ev.key)) return false; // dedupe: publish by tips, rebase by new id, landed by id
+  eventsFeed().unshift(ev);
+  eventsFeedCache = eventsFeed().slice(0, EVENTS_CAP);
+  safeStorage("set", EVENTS_KEY, JSON.stringify(eventsFeedCache));
+  return true;
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+function buildEventsPanel() {
+  const panel = el("section", { id: "events-panel", class: "panel" },
+    el("h2", { class: "panel-title" }, "Events"));
+  const feed = eventsFeed();
+  if (!feed.length) {
+    panel.appendChild(emptyState("No events yet", null, "publishes, rebases, and landings are recorded here"));
+    return panel;
+  }
+  const list = el("div", { class: "event-list" });
+  for (const ev of feed.slice(0, 50)) {
+    list.appendChild(el("div", { class: "event-row", dataset: { kind: ev.kind } },
+      el("span", { class: "event-icon", "aria-hidden": "true" }, EVENT_ICONS[ev.kind] || "•"),
+      el("span", { class: "event-text" }, ev.text),
+      el("span", { class: "event-time mono" }, ev.ts ? fmtClock(ev.ts) : "")));
+  }
+  panel.appendChild(list);
+  return panel;
+}
+
+/* ---------- watchlist ("watch a changeset") ---------- */
+
+const WATCH_KEY = "gb-watchlist";
+let watchCache = null;
+
+function getWatchlist() {
+  if (watchCache) return watchCache;
+  let raw = [];
+  try { raw = JSON.parse(safeStorage("get", WATCH_KEY) || "[]"); } catch (_) { raw = []; }
+  watchCache = Array.isArray(raw) ? raw : [];
+  return watchCache;
+}
+function saveWatch() { safeStorage("set", WATCH_KEY, JSON.stringify(watchCache)); }
+
+/** Prefix ≥8: resolve against the activity index client-side, else verify via API. */
+function resolveWatchInput(v) {
+  v = String(v || "").trim();
+  if (v.length < 8) return Promise.reject(new Error("need at least 8 hex chars"));
+  return api("/api/activity?" + qs({ limit: ACTIVITY_LIMIT })).then((act) => {
+    const hits = (act.changesets || []).filter((c) => String(c.id).startsWith(v));
+    if (hits.length === 1) return hits[0].id;
+    return api("/api/changeset?" + qs({ id: v })).then((cs) => cs.id);
+  });
+}
+
+function addWatch(v) {
+  return resolveWatchInput(v).catch(() => v).then((id) => { // unresolved ids land as .missing rows
+    if (!getWatchlist().includes(id)) { watchCache = getWatchlist().concat([id]); saveWatch(); }
+  });
+}
+function removeWatch(id) {
+  watchCache = getWatchlist().filter((x) => x !== id);
+  saveWatch();
+}
+
+function renderWatchRows(list, published) {
+  while (list.firstChild) list.removeChild(list.firstChild);
+  const ids = getWatchlist();
+  if (!ids.length) {
+    list.appendChild(el("div", { class: "watch-hint" }, "watching nothing — paste a changeset id or ≥8-hex prefix above"));
+    return;
+  }
+  for (const id of ids) {
+    const row = el("div", { class: "watch-row", dataset: { id: id } });
+    row.appendChild(el("button", {
+      class: "watch-remove", type: "button", "aria-label": "unwatch",
+      onclick: () => { removeWatch(id); renderWatchRows(list, published); },
+    }, "✕"));
+    const body = el("span", { class: "watch-id mono" }, shortId(id, 12) + "…");
+    row.appendChild(body);
+    list.appendChild(row);
+    fetchChangesetCached(id).then((cs) => {
+      const landed = published && published.has(cs.id);
+      body.textContent = "";
+      body.appendChild(el("a", { class: "mono", href: "#/changeset/" + encodeURIComponent(cs.id) }, shortId(cs.id, 12)));
+      row.appendChild(el("span", { class: landed ? "badge-published" : "badge-draft" }, landed ? "landed" : "draft"));
+      row.appendChild(el("span", { class: "watch-meta" },
+        ((cs.author || {}).name || "?") + " — " + firstLine(cs.message)));
+    }).catch((err) => {
+      row.setAttribute("class", "watch-row missing");
+      row.setAttribute("title", "could not resolve: " + (err && err.message ? err.message : err));
+      body.textContent = String(id).slice(0, 16) + " (unreachable)";
+    });
+  }
+}
+
+/* ---------- derivation → events (rebase + landed) ---------- */
+
+let derivBaseline = false;
+let prevDrafts = new Set();
+
+function processDerivation(d) {
+  for (const p of d.pairs) {
+    const cur = p.current, old = p.superseded;
+    recordEvent({
+      kind: "rebase",
+      key: "r:" + cur.id,
+      text: ((cur.author || {}).name || "?") + " rebased " + firstLine(cur.message) +
+        " (" + shortId(old.id, 8) + " → " + shortId(cur.id, 8) + ")",
+      ts: (cur.committer || {}).time_secs || undefined,
+    });
+  }
+  const byId = {};
+  d.all.forEach((c) => { byId[c.id] = c; });
+  const candidates = new Set(getWatchlist());
+  if (derivBaseline) for (const id of prevDrafts) candidates.add(id);
+  for (const id of candidates) {
+    if (!d.published.has(id)) continue;
+    const cs = byId[id];
+    recordEvent({
+      kind: "landed",
+      key: "l:" + id,
+      text: "landed " + shortId(id, 8) + " — " + (cs ? firstLine(cs.message) : "(outside the activity window)"),
+      ts: cs && cs.committer ? cs.committer.time_secs : undefined,
+    });
+  }
+  prevDrafts = new Set(d.unpublished.map((c) => c.id));
+  derivBaseline = true;
+}
+
+/* ---------- workers panel ---------- */
+
+function buildWorkersPanel(deriv, watchMeta) {
+  const byAuthor = {};
+  const order = [];
+  const putRow = (name, row) => {
+    if (!byAuthor[name]) { byAuthor[name] = []; order.push(name); }
+    byAuthor[name].push(row);
+  };
+  for (const c of deriv.unpublished) {
+    putRow(((c.author || {}).name) || "unknown", { cs: c });
+  }
+  for (const wm of watchMeta || []) {
+    if (!wm.cs) continue;
+    const name = ((wm.cs.author || {}).name) || "unknown";
+    // a watched changeset joins its author's card even once landed
+    if (!(byAuthor[name] || []).some((r) => r.cs.id === wm.cs.id)) putRow(name, { cs: wm.cs });
+  }
+  order.sort((a, b) => {
+    const t = (n) => Math.max(0, ...byAuthor[n].map((r) => (r.cs.committer || {}).time_secs || 0));
+    return t(b) - t(a);
+  });
+  const panel = el("section", { id: "workers-panel", class: "panel" },
+    el("h2", { class: "panel-title" }, "Workers"));
+  if (!order.length) {
+    panel.appendChild(emptyState("No unpublished work", null,
+      "no unpublished work — every changeset reachable from a ref"));
+  } else {
+    const grid = el("div", { class: "worker-grid" });
+    for (const name of order) {
+      const rows = byAuthor[name].slice().sort((a, b) => commitTime(b.cs) - commitTime(a.cs));
+      const drafts = rows.filter((r) => !deriv.published.has(r.cs.id));
+      const hue = idHue(name);
+      const card = el("div", {
+        class: "worker-card", dataset: { author: name },
+        style: "border-left:3px solid hsl(" + hue + ",40%,50%)",
+      });
+      card.appendChild(el("div", { class: "worker-head" },
+        el("span", { class: "worker-name" }, name),
+        drafts.length
+          ? el("span", { class: "badge-draft" }, drafts.length + " draft" + (drafts.length === 1 ? "" : "s"))
+          : el("span", { class: "badge-published" }, "all landed")));
+      const latest = rows[0];
+      if (latest) {
+        card.appendChild(el("a", { class: "worker-latest", href: "#/changeset/" + encodeURIComponent(latest.cs.id) },
+          firstLine(latest.cs.message)));
+        card.appendChild(el("div", { class: "worker-time" },
+          latest.cs.committer ? relativeTime(latest.cs.committer.time_secs) : ""));
+      }
+      for (const r of rows.slice(0, 3)) {
+        const landed = deriv.published.has(r.cs.id);
+        card.appendChild(el("div", { class: "worker-draft-row" },
+          el("span", { class: landed ? "badge-published" : "badge-draft" }, landed ? "landed" : "draft"),
+          el("a", { class: "mono", href: "#/changeset/" + encodeURIComponent(r.cs.id) }, shortId(r.cs.id, 8))));
+      }
+      grid.appendChild(card);
+    }
+    panel.appendChild(grid);
+  }
+  // watchlist controls
+  const watchIn = el("input", {
+    id: "watch-add", class: "input", type: "text",
+    placeholder: "watch a changeset — id or ≥8-hex prefix",
+    "aria-label": "watch a changeset",
+  });
+  const list = el("div", { id: "watch-list" });
+  const errRow = el("div", { class: "watch-err" });
+  const doAdd = () => {
+    const v = watchIn.value.trim();
+    if (!v) return;
+    addWatch(v).then(() => {
+      watchIn.value = "";
+      errRow.textContent = "";
+      renderWatchRows(list, deriv.published);
+    }).catch((err) => { errRow.textContent = String(err && err.message ? err.message : err); });
+  };
+  const watchBtn = el("button", { id: "watch-add-btn", class: "btn btn-sm", type: "button", onclick: doAdd }, "watch");
+  watchIn.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doAdd(); });
+  panel.appendChild(el("div", { class: "watch-add-row" }, watchIn, watchBtn));
+  panel.appendChild(errRow);
+  panel.appendChild(list);
+  renderWatchRows(list, deriv.published);
+  return panel;
 }
 
 /* ---------- readme panel + minimal markdown renderer ----------
@@ -1601,6 +1935,37 @@ function buildReadmePanel(f, rev, rpath) {
 
 const app = () => document.getElementById("app");
 
+/**
+ * Live overview state: when the poll discovers the published set (or the
+ * event feed) changed, we repaint ONLY the workers/events panels in place —
+ * the rest of the overview is left alone. Non-overview routes repaint on
+ * their next render anyway; `overviewLive === null` offroute.
+ */
+let overviewLive = null;
+
+function statusKey(deriv, published) {
+  return getWatchlist().concat(deriv.all.map((c) => c.id))
+    .filter((id, i, a) => published.has(id) && a.indexOf(id) === i)
+    .sort()
+    .join(",");
+}
+
+function isOverviewRoute() {
+  try { return parseHash().segs.length === 0; } catch (_) { return false; }
+}
+
+function swapPanel(id, fresh) {
+  const root = app();
+  if (!root) return;
+  let old = null;
+  for (const c of root.children || []) {
+    if (c.getAttribute && c.getAttribute("id") === id) { old = c; break; }
+  }
+  if (!old) return;
+  root.insertBefore(fresh, old);
+  root.removeChild(old);
+}
+
 function viewOverview(root) {
   document.title = "gardenbed — overview";
   setNav("overview");
@@ -1619,8 +1984,14 @@ function viewOverview(root) {
           throw err;
         })
       : Promise.resolve({ resolved: "", entries: [] });
-    return Promise.all([Promise.resolve(refs), api("/api/stats"), logP]);
-  }).then(([refs, stats, log]) => {
+    const actP = api("/api/activity?" + qs({ limit: ACTIVITY_LIMIT })).catch(() => ({ changesets: [] }));
+    const watchP = Promise.all(getWatchlist().map((id) =>
+      fetchChangesetCached(id).then((cs) => ({ id: id, cs: cs })).catch(() => ({ id: id, cs: null }))));
+    return Promise.all([Promise.resolve(refs), api("/api/stats"), logP, actP, watchP]);
+  }).then(([refs, stats, log, activity, watchMeta]) =>
+    hydrateChangesEntries(activity.changesets || [])
+      .then((hydrated) => ({ refs, stats, log, hydrated, watchMeta }))
+  ).then(({ refs, stats, log, hydrated, watchMeta }) => {
     clear(root);
     const counters = (stats && stats.counters) || {};
     const totalReq = Object.keys(counters).reduce((a, k) => a + (Number(counters[k]) || 0), 0);
@@ -1657,6 +2028,15 @@ function viewOverview(root) {
         el("div", { class: "ref-id" }, shortId(r.cs, 12))));
     }
     if ((refs.refs || []).length) root.appendChild(cards);
+
+    // multi-worker visibility: workers + durable events feed
+    const published = new Set((log.entries || []).map((e) => e.id));
+    const deriv = buildDerivation(hydrated, published);
+    processDerivation(deriv);
+    root.appendChild(buildWorkersPanel(deriv, watchMeta));
+    root.appendChild(buildEventsPanel());
+    overviewLive = null;
+    overviewLive = { key: statusKey(deriv, published), feedLen: eventsFeed().length, published: published };
 
     // two-column: recent history + stats
     const twoCol = el("div", { class: "two-col" });
@@ -1761,7 +2141,8 @@ function viewChangeset(root, id) {
     const idRow = el("div", { class: "cs-id-row" },
       el("span", { class: "cs-id" }, cs.id),
       copyButton(() => cs.id, "copy id"),
-      permalinkButton("copy link to this changeset"));
+      permalinkButton("copy link to this changeset"),
+      el("a", { class: "btn btn-sm review-link", href: "#/review/" + encodeURIComponent(cs.id) }, "review"));
     idRow.id = "cs-header-row"; // keep #cs-header on the panel (hook)
     header.appendChild(idRow);
     header.appendChild(el("div", { class: "cs-message" }, cs.message || "(no message)"));
@@ -2186,6 +2567,63 @@ function viewSearch(root, query) {
   });
 }
 
+function viewReview(root, id) {
+  document.title = "gardenbed — review " + shortId(id, 12);
+  setNav(null);
+  clear(root).appendChild(skeleton(8));
+  Promise.all([
+    api("/api/changeset?" + qs({ id: id })),
+    api("/api/log?" + qs({ cs: currentRev(), limit: 500 })).catch((err) =>
+      err && err.status === 404 ? { entries: [] } : Promise.reject(err)),
+  ]).then(([cs, log]) => {
+    clear(root);
+    document.title = "gardenbed — review " + shortId(cs.id, 12);
+    const published = new Set((log.entries || []).map((e) => e.id));
+    const landed = published.has(cs.id);
+    root.appendChild(el("h1", { class: "page-title" }, "Review"));
+
+    const header = el("header", { id: "review-header", class: "panel" });
+    header.appendChild(el("div", { class: "cs-id-row" },
+      el("span", { class: "cs-id" }, cs.id),
+      copyButton(() => cs.id, "copy id"),
+      el("span", { class: landed ? "badge-published" : "badge-draft" }, landed ? "landed" : "draft"),
+      el("a", { class: "btn btn-sm", href: "#/changeset/" + encodeURIComponent(cs.id) }, "open full page")));
+    header.appendChild(el("div", { class: "cs-message" }, cs.message || "(no message)"));
+    header.appendChild(el("div", { class: "cs-people" },
+      personBlock("author", cs.author),
+      personBlock("committer", cs.committer)));
+    if (cs.parents && cs.parents.length) {
+      const chips = el("div", { class: "parent-chips" });
+      if (cs.parents.length > 1) chips.appendChild(el("span", { class: "badge-merge" }, "merge"));
+      for (const p of cs.parents) {
+        chips.appendChild(el("a", { class: "parent-chip", href: "#/changeset/" + encodeURIComponent(p), title: p }, shortId(p, 12)));
+      }
+      header.appendChild(chips);
+    }
+    root.appendChild(header);
+
+    const chPanel = el("section", { class: "panel" });
+    chPanel.appendChild(el("h2", { class: "panel-title" }, "Changes · " + ((cs.changes || []).length)));
+    chPanel.appendChild(changeList(cs.changes || [], cs.id, cs.parents && cs.parents[0]));
+    root.appendChild(chPanel);
+
+    // read-only: show, never run — the CLI writes
+    const topSeg = firstTopSegment(cs.changes && cs.changes[0] && cs.changes[0].path) || "<crate>";
+    const lines = [
+      "bed diff " + cs.id,
+      "# check: cargo test -p " + topSeg,
+      "bed rebase main && bed publish",
+    ];
+    const cmdPanel = el("section", { class: "panel" },
+      el("h2", { class: "panel-title" }, "Land it"),
+      el("div", { class: "land-commands" },
+        el("div", { class: "land-note" }, "Reads live here; writes happen in bed."),
+        el("pre", { class: "land-pre mono" }, lines.join("\n")),
+        copyButton(() => lines.join("\n"), "copy all")));
+    root.appendChild(cmdPanel);
+  }).catch((err) => mountError(root, err, "Changeset not found"));
+}
+
 function viewNotFound(root, path) {
   document.title = "gardenbed — 404";
   setNav(null);
@@ -2222,6 +2660,7 @@ function parseHash() {
 
 function route() {
   kbdSel = -1; // keyboard selection is per-page
+  overviewLive = null; // repaint-on-poll only lives on the overview
   const root = app();
   const r = parseHash();
   const segs = r.segs;
@@ -2232,6 +2671,9 @@ function route() {
     case "changeset":
       if (!segs[1]) return viewNotFound(root, r.path);
       return viewChangeset(root, segs[1]);
+    case "review":
+      if (!segs[1]) return viewNotFound(root, r.path);
+      return viewReview(root, segs[1]);
     case "browse":
       return viewBrowse(root, segs[1] || "", segs.slice(2).join("/"));
     case "file":
@@ -2246,7 +2688,7 @@ function route() {
 }
 
 /* Test/maintainer handle: intentional, stable, undocumented surface. */
-const __gb = { pollTick, diffLines, buildHunks, fuzzyScore, buildAgentPrompt, shellQuote, shellArg };
+const __gb = { pollTick, diffLines, buildHunks, fuzzyScore, buildAgentPrompt, shellQuote, shellArg, buildDerivation };
 if (typeof window !== "undefined") window.__gb = __gb;
 
 function boot() {

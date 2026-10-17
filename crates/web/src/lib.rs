@@ -27,6 +27,10 @@
 //!   across file blobs: case-insensitive line matches, skipping symlinks,
 //!   gitlinks, and binary blobs, with scan/match/file caps reported as
 //!   `truncated: true`.
+//! * `GET /api/activity?limit=<n>` — the most recently stored changesets
+//!   (newest arrival first, default 50, capped at 200), **including
+//!   unpublished ones** — agent working copies commit straight to the
+//!   server, so ref-less changesets are the heartbeat this feeds.
 //! * `GET /api/stats` — the server's per-RPC counters.
 //! * `GET /api/server-info` — serving-process facts (crate version,
 //!   repository root, bound address) for connect-instructions UIs.
@@ -119,6 +123,7 @@ pub fn router_with_info(repo: Repo, info: ServerInfo) -> Router {
         .route("/api/file", get(handlers::file))
         .route("/api/blame", get(handlers::blame))
         .route("/api/diff", get(handlers::diff))
+        .route("/api/activity", get(handlers::activity))
         .route("/api/files", get(handlers::files))
         .route("/api/search", get(handlers::search))
         .route("/api/stats", get(handlers::stats))
@@ -714,6 +719,40 @@ mod handlers {
                 "files": files_out,
                 "truncated": truncated,
             })))
+        })
+        .await
+    }
+
+    /// `/api/activity`: newest-arrival-first stored changesets, including
+    /// unpublished ones — no revspec, no ref filtering. Default 50,
+    /// capped at 200; entry shape matches `/api/log`'s entries.
+    pub(super) async fn activity(
+        State(s): State<AppState>,
+        Query(q): Query<HashMap<String, String>>,
+    ) -> Result<Json<Value>, ApiError> {
+        blocking(s, move |repo| {
+            let limit: u32 = match q.get("limit") {
+                None => 50,
+                Some(raw) => raw
+                    .parse()
+                    .map_err(|_| ApiError::bad_request(format!("invalid limit {raw:?}")))?,
+            }
+            .min(200);
+            let changesets: Vec<Value> = repo
+                .activity(limit)?
+                .into_iter()
+                .map(|(id, cs)| {
+                    json!({
+                        "id": id.to_hex(),
+                        "parents": cs.parents.iter().map(Id::to_hex).collect::<Vec<_>>(),
+                        "message": cs.message,
+                        "author": identity_json(&cs.author),
+                        "committer": identity_json(&cs.committer),
+                        "changes": cs.changes.len(),
+                    })
+                })
+                .collect();
+            Ok(Json(json!({ "changesets": changesets })))
         })
         .await
     }

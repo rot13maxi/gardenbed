@@ -690,6 +690,134 @@ async fn search_honors_caps() {
     assert_eq!(json["files"][0]["path"], "other.txt");
 }
 
+#[tokio::test]
+async fn activity_lists_newest_arrival_first_including_unpublished() {
+    let (repo, [c1, c2, c3, c4, tip]) = fixture();
+
+    // One unpublished working-copy commit on top of the tip: stored, but
+    // no ref can reach it.
+    let draft_content = b"wip: not for mainline\n";
+    let draft_blob = blob_id(draft_content);
+    let draft = Changeset {
+        parents: vec![tip],
+        changes: vec![Change {
+            path: "draft.txt".to_owned(),
+            op: Op::Add,
+            blob: Some(draft_blob),
+            src_path: None,
+            mode: Mode::Regular,
+        }],
+        message: "wip: unpublished draft".to_owned(),
+        author: ident(6),
+        committer: ident(6),
+        signature: None,
+    };
+    let draft_id = repo
+        .create_changeset(
+            &draft,
+            &BTreeMap::from([(draft_blob.to_hex(), draft_content.to_vec())]),
+        )
+        .unwrap();
+
+    let app = gardenbed_web::router(repo);
+    let (status, json) = get_json(&app, "/api/activity").await;
+    assert_eq!(status, StatusCode::OK);
+    let changesets = json["changesets"].as_array().unwrap();
+    let got: Vec<String> = changesets
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    let expected: Vec<String> = [draft_id, tip, c4, c3, c2, c1]
+        .iter()
+        .map(Id::to_hex)
+        .collect();
+    assert_eq!(got, expected, "arrival order, newest first");
+    // Entry shape matches /api/log.
+    assert_eq!(changesets[0]["message"], "wip: unpublished draft");
+    assert_eq!(changesets[0]["author"]["name"], "Tester 6");
+    assert_eq!(changesets[0]["changes"], 1);
+    assert_eq!(changesets[0]["parents"].as_array().unwrap().len(), 1);
+
+    // limit honored.
+    let (status, json) = get_json(&app, "/api/activity?limit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let got: Vec<&str> = json["changesets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, [draft_id.to_hex(), tip.to_hex()]);
+
+    // Over the cap behaves as the cap (200), not as an error.
+    let (status, json) = get_json(&app, "/api/activity?limit=999").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changesets"].as_array().unwrap().len(), 6);
+
+    let (status, json) = get_json(&app, "/api/activity?limit=nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("limit"));
+}
+
+#[test]
+fn seed_is_deterministic_and_hides_drafts_from_main() {
+    let repo_a = Repo::new(Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+    let repo_b = Repo::new(Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+    let tip_a = gardenbed_web::seed::seed(&repo_a).unwrap().expect("seeded");
+    let tip_b = gardenbed_web::seed::seed(&repo_b).unwrap().expect("seeded");
+    assert_eq!(tip_a, tip_b, "two fresh seeds must be byte-identical");
+    assert_eq!(repo_b.get_ref("main").unwrap(), Some(tip_a));
+    // Second run against a reffed repo is a no-op.
+    assert_eq!(gardenbed_web::seed::seed(&repo_b).unwrap(), None);
+
+    // 16 changesets stored; 12 reachable from main, 4 unpublished. The
+    // four newest arrivals are the drafts, re-newest first (16, 15, 14,
+    // 13 by arrival — v2 of the rebase pair before v1).
+    let activity = repo_a.activity(0).unwrap();
+    assert_eq!(activity.len(), 16);
+    let published: Vec<Id> = repo_a
+        .log(tip_a, 0)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(published.len(), 12);
+    let unpublished: Vec<&(Id, Changeset)> = activity
+        .iter()
+        .filter(|(id, _)| !published.contains(id))
+        .collect();
+    assert_eq!(unpublished.len(), 4);
+    assert_eq!(
+        unpublished[0].1.message, "Add evening mulch reminder",
+        "newest arrival: rebase v2"
+    );
+    assert_eq!(unpublished[0].1.parents, vec![tip_a]);
+    assert_eq!(unpublished[1].1.message, "Add evening mulch reminder"); // v1
+    let c11 = published
+        .iter()
+        .find(|id| repo_a.get_changeset(**id).unwrap().message == "Add rotation notes for 2027")
+        .copied()
+        .expect("c11 reachable from main");
+    assert_eq!(unpublished[1].1.parents, vec![c11]); // v1 sat on c11
+    assert_ne!(
+        unpublished[0].0, unpublished[1].0,
+        "rebase pair must have distinct ids"
+    );
+    assert_eq!(unpublished[2].1.message, "draft: calmer empty-bed colors");
+    assert_eq!(unpublished[2].1.author.name, "Moss Hale");
+    assert_eq!(
+        unpublished[3].1.message,
+        "Draft: drip irrigation sketch\n\nNot ready: zones still hardcoded.\n"
+    );
+    assert_eq!(unpublished[3].1.author.name, "Pike Rowan");
+    assert_eq!(unpublished[3].1.parents, vec![tip_a]);
+    // Timestamps keep increasing across all sixteen commits.
+    for (i, (_, cs)) in activity.iter().enumerate() {
+        let n = (16 - i) as u64;
+        assert_eq!(cs.committer.time_secs, 1_751_500_000 + n * 86_400);
+    }
+}
+
 /// Reference base64 for the fixture's binary blob (kept local so the
 /// assertion pins the server's encoding against an independent
 /// implementation).

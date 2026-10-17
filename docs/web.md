@@ -42,6 +42,18 @@ parents, three authors), then fast-forwards `main`.
 | `#/file/<rev>/<path>` | File content with line numbers, blame toggle (age-heat gutters) |
 | `#/compare?a=<rev>&b=<rev>` | Diff between two revspecs, rows expand into unified patches |
 | `#/search?q=<q>` | Case-insensitive content grep across the tree at the selected ref |
+| `#/review/<id>` | Reviewing one changeset: full diff, parents, publish state, and the read-only `bed` command card for landing it |
+
+The Overview is the multi-worker surface: a **Workers** panel groups
+unpublished changesets by author (and any ids on your localStorage
+watchlist) with draft/landed badges, an **Events** feed records publishes
+(ref moves), detected rebases, and landings as they happen, and the
+activity heatmap sits underneath. Data: `GET /api/activity` lists
+changesets newest-arrival-first *including* ones no ref points at —
+workers commit server-side before they publish — and the UI derives
+published/unpublished by diffing against the `main` walk. All of it is
+read-only: the land commands are printed for copying, writes stay in
+`bed`.
 
 Changeset and compare rows expand into real unified diffs (client-side
 Myers over the old/new file contents fetched at their revisions).

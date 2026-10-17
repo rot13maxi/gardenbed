@@ -21,14 +21,17 @@ test.beforeAll(async () => {
     ["--root", EMPTY_ROOT, "--addr", `127.0.0.1:${PORT}`],
     { stdio: ["ignore", "pipe", "inherit"] },
   );
-  await new Promise<void>((resolve, reject) => {
-    const to = setTimeout(() => reject(new Error("empty-repo server did not start")), 15_000);
-    srv.stdout!.once("data", () => {
-      clearTimeout(to);
-      resolve();
-    });
-    srv.on("exit", (code) => reject(new Error(`empty-repo server exited ${code}`)));
+  const ready = Promise.withResolvers<void>();
+  const to = setTimeout(
+    () => ready.reject(new Error("empty-repo server did not start")),
+    15_000,
+  );
+  srv.stdout!.once("data", () => {
+    clearTimeout(to);
+    ready.resolve();
   });
+  srv.on("exit", (code) => ready.reject(new Error(`empty-repo server exited ${code}`)));
+  await ready.promise;
 });
 
 test.afterAll(() => {

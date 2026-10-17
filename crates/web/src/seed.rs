@@ -1,13 +1,19 @@
-//! A deterministic demo repository: ten changesets of a small "garden
+//! A deterministic demo repository: sixteen changesets of a small "garden
 //! planner" web app, written with fixed identities and timestamps so a
 //! fresh `gardenbed-web seed` produces byte-identical changeset ids every
 //! time. Used by the `seed` subcommand to give the GUI something real to
 //! browse.
 //!
+//! Shape: **twelve published commits on `main`** (a mainline with one
+//! side branch and merge) plus **four unpublished ones** (two draft heads
+//! and a rebase pair) that are stored but ref-less — the shape agent
+//! working copies produce and the activity view exists to surface.
+//!
 //! The history exercises everything the UI renders: adds, modifies, one
 //! pure rename (`plan/spring.md` → `plan/2026.md`), one delete
 //! (`notes.txt`), an executable file (`bin/sow.sh`, [`Mode::Exec`]),
-//! three rotating authors, and multi-paragraph commit messages.
+//! three rotating authors on mainline (two more on the drafts), and
+//! multi-paragraph commit messages.
 
 use std::collections::BTreeMap;
 
@@ -27,6 +33,9 @@ const ROSA: (&str, &str) = ("Rosa Bloom", "rosa@example.com");
 const KEN: (&str, &str) = ("Ken Furrow", "ken@example.com");
 /// Author "C": commits 4, 8.
 const ADA: (&str, &str) = ("Ada Trellis", "ada@example.com");
+/// Unpublished-only authors: the draft commits 13–16.
+const PIKE: (&str, &str) = ("Pike Rowan", "pike@example.com");
+const MOSS: (&str, &str) = ("Moss Hale", "moss@example.com");
 
 /// One file-level edit in a seeded changeset. Content is static so the
 /// whole history is compile-time data.
@@ -294,6 +303,7 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
             mode: Mode::Regular,
         }]
     );
+    let c11 = tip;
 
     commit!(
         12,
@@ -307,9 +317,74 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
         }]
     );
 
-    let tip = tip.expect("seed always creates twelve changesets");
-    repo.cas_ref(DEMO_REF, None, tip)?;
-    Ok(Some(tip))
+    // Publish the twelve-commit mainline; everything after this point is
+    // stored but unreachable from `main` — agent working copies commit
+    // straight to the server, and the GUI's activity view must see them.
+    let published = tip.expect("seed always creates twelve changesets");
+    repo.cas_ref(DEMO_REF, None, published)?;
+
+    // Draft A: an unfinished drip-irrigation sketch on top of the tip.
+    commit!(
+        13,
+        PIKE,
+        "Draft: drip irrigation sketch\n\nNot ready: zones still hardcoded.\n",
+        [Edit::Write {
+            op: Op::Add,
+            path: "plan/drip.md",
+            content: DRIP_MD,
+            mode: Mode::Regular,
+        }]
+    );
+    let _draft_a = tip; // unpublished: never pointed at by a ref
+
+    // Draft B: a calmer resting-bed palette, branched from the same tip —
+    // two unpublished heads that never merge into mainline.
+    commit_at!(
+        14,
+        MOSS,
+        vec![published],
+        "draft: calmer empty-bed colors",
+        [Edit::Write {
+            op: Op::Modify,
+            path: "styles.css",
+            content: STYLES_V3,
+            mode: Mode::Regular,
+        }]
+    );
+    let _draft_b = tip; // unpublished
+
+    // A rebase pair — same author, same message: v1 sat on the rotation
+    // notes commit, v2 was re-based onto the published tip (its file edit
+    // differs by one trailing line, so the ids differ even before
+    // parenting). Both stay unpublished.
+    commit_at!(
+        15,
+        PIKE,
+        vec![c11.expect("commit 11 ran")],
+        "Add evening mulch reminder",
+        [Edit::Write {
+            op: Op::Add,
+            path: "plan/mulch.md",
+            content: MULCH_V1,
+            mode: Mode::Regular,
+        }]
+    );
+    let _rebase_v1 = tip; // unpublished
+    commit_at!(
+        16,
+        PIKE,
+        vec![published],
+        "Add evening mulch reminder",
+        [Edit::Write {
+            op: Op::Add,
+            path: "plan/mulch.md",
+            content: MULCH_V2,
+            mode: Mode::Regular,
+        }]
+    );
+    let _rebase_v2 = tip; // unpublished
+
+    Ok(Some(published))
 }
 
 // ------------------------------------------------------ pinned content
@@ -661,6 +736,76 @@ const ROTATION: &str = "\
 - north bed: legumes after this year's tomatoes
 - middle bed: brassicas; lettuce moves south
 - south bed: alliums, then a green manure year
+";
+
+// --- Unpublished drafts (commits 13–16): stored, never ref'd ----------
+
+const DRIP_MD: &str = "\
+# drip irrigation sketch
+
+Zones are hardcoded for now; sizing comes later.
+
+- zone 1 (north bed): 4 L/h dripline, 30 min mornings
+- zone 2 (middle bed): 2 L/h, lettuce hates wet crowns
+- zone 3 (south bed): 4 L/h, sandy side drains fast
+
+Total budget: ~120 L per watering day; tank holds 400 L.
+";
+
+/// STYLES_V2 plus the one rule draft B experiments with: muted resting
+/// beds (never published — commit 14 stays ref-less).
+const STYLES_V3: &str = "\
+:root {
+  --soil: #4a3b2a;
+  --leaf: #5a8f52;
+  --resting: #b7ad97;
+  --paper: #f7f4ec;
+}
+
+body {
+  margin: 0;
+  font-family: sans-serif;
+  background: var(--paper);
+  color: var(--soil);
+}
+
+.bed-grid {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+}
+
+.bed-cell {
+  background: var(--leaf);
+  border: 1px solid var(--soil);
+  min-height: 56px;
+}
+
+.bed-cell.resting {
+  background: var(--resting);
+}
+
+/* Pike suggested keeping only the tint; Moss wants borders gone too. */
+.bed-cell.resting {
+  border-color: transparent;
+  opacity: 0.85;
+}
+";
+
+const MULCH_V1: &str = "\
+# evening mulch reminder
+
+- check the brassica bed for drying
+- top up straw on the carrot rows before dusk
+";
+
+/// Same reminder, one trailing line added — the re-based v2 (commit 16).
+const MULCH_V2: &str = "\
+# evening mulch reminder
+
+- check the brassica bed for drying
+- top up straw on the carrot rows before dusk
+- record overnight low for the frost log
 ";
 
 const WATERING_JSON: &str = "\
