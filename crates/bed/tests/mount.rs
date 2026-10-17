@@ -194,7 +194,6 @@ async fn mount_lists_the_whole_tree() {
     let listing = mount_listing(&mountpoint);
     assert_eq!(listing, expected, "readdir must list every path");
 
-
     handle.unmount().expect("unmount succeeds");
     // The mountpoint is an ordinary directory again and removable.
     fs::remove_dir(&mountpoint).expect("mountpoint removable after unmount");

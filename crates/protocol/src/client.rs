@@ -71,13 +71,19 @@ impl GardenbedClient {
     /// Anything else fails with [`ConnectError::UnsupportedScheme`].
     pub async fn connect(endpoint: &str) -> Result<Self, ConnectError> {
         // Reject unsupported schemes up front with a clear error instead of
-        // tonic's opaque invalid-URI error.
-        let uri: Uri = endpoint
-            .parse()
-            .map_err(|_| ConnectError::UnsupportedScheme(endpoint.to_owned()))?;
-        match uri.scheme_str() {
-            Some("http" | "https" | "unix") => {}
-            _ => return Err(ConnectError::UnsupportedScheme(endpoint.to_owned())),
+        // tonic's opaque invalid-URI error. `http::Uri` cannot represent
+        // `unix:///path` (no authority component), so the scheme is checked
+        // textually for unix endpoints and by URI parse otherwise — tonic's
+        // `Endpoint` parses `unix:` natively.
+        let unix_ok = endpoint
+            .strip_prefix("unix:")
+            .is_some_and(|rest| rest.starts_with("//"));
+        let uri_ok = !unix_ok
+            && endpoint
+                .parse::<Uri>()
+                .is_ok_and(|uri| matches!(uri.scheme_str(), Some("http" | "https" | "unix")));
+        if !unix_ok && !uri_ok {
+            return Err(ConnectError::UnsupportedScheme(endpoint.to_owned()));
         }
         // tonic 0.14 handles both transports natively: `Endpoint::from_shared`
         // parses `unix:` prefixes into a UDS connector, everything else goes
