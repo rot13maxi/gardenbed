@@ -86,8 +86,39 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
 
         Command::Sparse { command } => run_sparse(cli, command).await,
 
+        Command::Sync => {
+            let report = gardenbed::queue::sync(&cli.state_dir).await?;
+            for id in &report.synced {
+                println!("synced {}", id.short());
+            }
+            match &report.failure {
+                None => {
+                    if report.synced.is_empty() {
+                        println!("nothing to sync — the queue is empty");
+                    } else {
+                        println!("synced {} commit(s), queue empty", report.synced.len());
+                    }
+                    Ok(0)
+                }
+                Some(e) => {
+                    println!("sync stopped: {e}");
+                    println!(
+                        "{} commit(s) still pending — run bed sync when online",
+                        report.remaining
+                    );
+                    Ok(1)
+                }
+            }
+        }
+
         Command::Status { full_scan } => {
             let bed = WorkingCopy::open(&cli.state_dir)?;
+            // The pending line comes first and works offline: the queue
+            // is purely local state.
+            let pending = bed.queue()?.count()?;
+            if pending > 0 {
+                println!("{pending} pending commit(s) not yet on the server — run bed sync");
+            }
             let sparse = bed.config().sparse.clone();
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");

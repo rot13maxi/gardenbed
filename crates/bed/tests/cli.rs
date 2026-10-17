@@ -257,19 +257,23 @@ fn write_path_and_blame_fail_cleanly_without_an_server() {
     assert!(stderr.contains("working copy is clean"), "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
 
-    // -- with something to commit, the (deliberately unreachable) server
-    //    connection is what fails — nothing was uploaded, no half-state.
+    // -- with something to commit and the (deliberately unreachable)
+    //    server down at connect time, the commit queues offline (v0.2
+    //    §6/D17): exit 0, the queue line first, one pending commit.
     let dir = planted_bed();
     sparse(&dir, &["src"]);
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/new.txt"), b"fresh\n").unwrap();
     let (code, stdout, stderr) = bed(&dir, &["commit", "-m", "tend the rows"]);
-    assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
     assert!(
-        stderr.contains("cannot reach the server"),
-        "stderr: {stderr}"
+        stdout.contains("queued as") && stdout.contains("1 pending — run bed sync when online"),
+        "stdout names the queue: {stdout:?}"
     );
-    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stdout.lines().next().unwrap().starts_with("queued as"),
+        "the queue line comes first: {stdout:?}"
+    );
 
     // -- rebase and publish are wired too: the connection fails before any
     //    local state is touched.

@@ -131,10 +131,11 @@ pub fn export_to_path(
         validate_ref_name(name)?;
     }
 
-    // ---- the reachable graph, parents before children.
-    let (order, cache) = topo_order(&tips, metadata.as_ref())?;
-    let cache = Arc::new(cache);
-    let blob_ids = collect_blob_ids(&order, &cache);
+    // ---- the reachable graph, parents before children. The walk keeps
+    // only ids: decoded changesets are re-fetched when the stream is
+    // written, so RAM stays O(history ids), not O(history changesets).
+    let order = topo_order(&tips, metadata.as_ref())?;
+    let blob_ids = collect_blob_ids(&order, metadata.as_ref())?;
 
     // ---- the target repository (bare sha1 when fresh).
     prepare_target(git_dir)?;
@@ -142,12 +143,12 @@ pub fn export_to_path(
     // ---- one fast-import run; the marks file is our commit→SHA channel.
     let marks_path = marks_file_path();
     let first_ref = tips.first().map(|(n, _)| n.as_str()).unwrap_or("");
-    let commit_marks = run_fast_import(
+    let (commit_marks, signed_dropped) = run_fast_import(
         git_dir,
         &marks_path,
-        objects,
+        objects.clone(),
+        metadata.clone(),
         order.clone(),
-        cache.clone(),
         blob_ids.clone(),
         first_ref,
         &tips,
@@ -182,10 +183,8 @@ pub fn export_to_path(
         )?;
     }
 
-    let signed_dropped = order
-        .iter()
-        .filter(|id| cache[id].signature.is_some())
-        .count() as u64;
+    // `signed_dropped` was counted during the emit pass (see
+    // run_fast_import) — no third walk over the history.
 
     Ok(ExportReport {
         commits_exported: order.len() as u64,
@@ -201,10 +200,12 @@ pub fn export_to_path(
 /// Depth-first post-order over every changeset reachable from `tips`,
 /// deduplicating shared ancestry and refusing cycles. Deterministic:
 /// tips in ref-name order, parents in stored order.
-fn topo_order(
-    tips: &[(String, Id)],
-    metadata: &dyn MetadataStore,
-) -> Result<(Vec<Id>, HashMap<Id, Changeset>), ExportError> {
+///
+/// The walk fetches each changeset only to read its parents and drops it
+/// immediately: the returned order is ids only, so peak memory stays
+/// proportional to the number of *ids*, never to decoded changesets —
+/// the stream writer re-fetches each one when it emits it.
+fn topo_order(tips: &[(String, Id)], metadata: &dyn MetadataStore) -> Result<Vec<Id>, ExportError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum State {
         /// On the current DFS path (an ancestor of whatever is being
@@ -220,7 +221,6 @@ fn topo_order(
     }
 
     let mut state: HashMap<Id, State> = HashMap::new();
-    let mut cache: HashMap<Id, Changeset> = HashMap::new();
     let mut order: Vec<Id> = Vec::new();
 
     for (_, tip) in tips {
@@ -239,7 +239,7 @@ fn topo_order(
                     }
                     None => {
                         state.insert(id, State::Visiting);
-                        let cs = load_changeset(metadata, id, &mut cache)?;
+                        let cs = load_changeset(metadata, id)?;
                         stack.push(Frame::Emit(id));
                         // Push in reverse so the first parent's subtree is
                         // expanded (and finished) first. A parent listed
@@ -271,33 +271,34 @@ fn topo_order(
             }
         }
     }
-    Ok((order, cache))
+    Ok(order)
 }
 
-/// Fetches a changeset into the walk cache, refusing dangling refs/parents.
-fn load_changeset<'a>(
-    metadata: &dyn MetadataStore,
-    id: Id,
-    cache: &'a mut HashMap<Id, Changeset>,
-) -> Result<&'a Changeset, ExportError> {
-    if let std::collections::hash_map::Entry::Vacant(e) = cache.entry(id) {
-        let (cs, _) = metadata
-            .get_changeset(id)?
-            .ok_or_else(|| ExportError::Changeset {
-                id: id.to_hex(),
-                detail: "missing from the metadata (dangling ref or parent)".into(),
-            })?;
-        e.insert(cs);
-    }
-    Ok(&cache[&id])
+/// Fetches one changeset, refusing dangling refs/parents. The walk cache is
+/// gone with the streaming restructure: callers re-fetch on every use
+/// (two fetches per changeset across the export) instead of holding the
+/// decoded history in RAM.
+fn load_changeset(metadata: &dyn MetadataStore, id: Id) -> Result<Changeset, ExportError> {
+    let (cs, _) = metadata
+        .get_changeset(id)?
+        .ok_or_else(|| ExportError::Changeset {
+            id: id.to_hex(),
+            detail: "missing from the metadata (dangling ref or parent)".into(),
+        })?;
+    Ok(cs)
 }
 
 /// Every blob a non-gitlink change references, sorted by id for
 /// deterministic marks (deduplicated — several paths share one blob).
-fn collect_blob_ids(order: &[Id], cache: &HashMap<Id, Changeset>) -> Vec<Id> {
+///
+/// A pre-pass over the topo order: fetches each changeset once more (the
+/// walk already fetched it once) but stores only blob *ids*, so the set
+/// scales with unique blobs rather than with decoded changesets.
+fn collect_blob_ids(order: &[Id], metadata: &dyn MetadataStore) -> Result<Vec<Id>, ExportError> {
     let mut set: HashSet<Id> = HashSet::new();
     for id in order {
-        for c in &cache[id].changes {
+        let cs = load_changeset(metadata, *id)?;
+        for c in &cs.changes {
             if let Some(blob) = c.blob
                 && c.mode != Mode::Gitlink
             {
@@ -307,7 +308,7 @@ fn collect_blob_ids(order: &[Id], cache: &HashMap<Id, Changeset>) -> Vec<Id> {
     }
     let mut ids: Vec<Id> = set.into_iter().collect();
     ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-    ids
+    Ok(ids)
 }
 
 /// Creates a bare sha1 repository when `git_dir` is missing; an existing
@@ -363,20 +364,23 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
 /// thread, then waits. The stream is built *inside* the thread so the
 /// store reads overlap with git's parsing; git's stderr is drained by its
 /// own thread so a full pipe can never deadlock the writer.
+///
+/// Returns the commit marks plus the number of signed changesets whose
+/// signature the stream had to drop (counted during the emit pass).
 // The parameters are the export's inputs (destination, stores, the staged
-// order/cache, and ref tips); bundling them into a struct would move the
+// order, and ref tips); bundling them into a struct would move the
 // complexity, not remove it.
 #[allow(clippy::too_many_arguments)]
 fn run_fast_import(
     git_dir: &Path,
     marks_path: &Path,
     objects: Arc<dyn ObjectStore>,
+    metadata: Arc<dyn MetadataStore>,
     order: Vec<Id>,
-    cache: Arc<HashMap<Id, Changeset>>,
     blob_ids: Vec<Id>,
     first_ref: &str,
     tips: &[(String, Id)],
-) -> Result<HashMap<Id, u64>, ExportError> {
+) -> Result<(HashMap<Id, u64>, u64), ExportError> {
     let mut child = git_command(git_dir)
         .args([
             "fast-import",
@@ -406,7 +410,7 @@ fn run_fast_import(
         let result = write_stream(
             &mut out,
             &order,
-            &cache,
+            metadata.as_ref(),
             &blob_ids,
             &first_ref,
             &tips,
@@ -430,27 +434,29 @@ fn run_fast_import(
 
     // A stream-generation failure is the root cause (git merely saw a
     // truncated stream); a healthy stream with a failed git is git's error.
-    let commit_marks = stream_result?;
+    let (commit_marks, signed_dropped) = stream_result?;
     if !status.success() {
         return Err(ExportError::Git(format!(
             "git fast-import failed: {}",
             stderr_text.trim()
         )));
     }
-    Ok(commit_marks)
+    Ok((commit_marks, signed_dropped))
 }
 
 /// Writes the whole fast-import stream: blobs, commits, final ref resets.
-/// Returns the mark assigned to each exported changeset.
+/// Returns the mark assigned to each exported changeset plus the number
+/// of signatures the stream necessarily dropped (fast-import has no
+/// `gpgsig`), counted as each changeset is re-fetched for emission.
 fn write_stream<W: Write>(
     out: &mut W,
     order: &[Id],
-    cache: &HashMap<Id, Changeset>,
+    metadata: &dyn MetadataStore,
     blob_ids: &[Id],
     first_ref: &str,
     tips: &[(String, Id)],
     objects: &dyn ObjectStore,
-) -> Result<HashMap<Id, u64>, ExportError> {
+) -> Result<(HashMap<Id, u64>, u64), ExportError> {
     let mut next_mark: u64 = 1;
     let bump = |next_mark: &mut u64| {
         let m = *next_mark;
@@ -472,9 +478,15 @@ fn write_stream<W: Write>(
     }
 
     // ---- commits in topological order, streamed onto the first ref.
+    // Each changeset is re-fetched here (its second and last fetch) so no
+    // decoded history is retained; `signed_dropped` is counted in passing.
     let mut commit_marks: HashMap<Id, u64> = HashMap::with_capacity(order.len());
+    let mut signed_dropped: u64 = 0;
     for id in order {
-        let cs = &cache[id];
+        let cs = load_changeset(metadata, *id)?;
+        if cs.signature.is_some() {
+            signed_dropped += 1;
+        }
         let mark = bump(&mut next_mark);
         write!(out, "commit {first_ref}\nmark :{mark}\n")?;
         write_identity(out, id, "author", &cs.author)?;
@@ -548,7 +560,7 @@ fn write_stream<W: Write>(
             })?;
         write!(out, "reset {name}\nfrom :{tip_mark}\n")?;
     }
-    Ok(commit_marks)
+    Ok((commit_marks, signed_dropped))
 }
 
 /// Writes one git ident line: `author Name <email> secs ±hhmm`. The name

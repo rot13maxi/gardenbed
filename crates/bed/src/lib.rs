@@ -16,6 +16,7 @@ pub mod error;
 pub mod heads;
 pub mod ignore;
 pub mod ops;
+pub mod queue;
 pub mod render;
 pub mod revspec;
 pub mod rpc;
