@@ -25,7 +25,7 @@ every commit records it and reviewers filter by author.
 - `bed commit -m "..."` — server-side changeset; cheap; commit early and often
 - `bed log --limit 20` — note: `--limit N`, not `-N`
 - `bed switch main` — sync to newest main (incremental fetch; warm cache is nearly free)
-- `bed diff` (no args) — today: committed diff of current changeset vs its first parent (NOT working-copy changes); `bed diff <id>` — review a changeset. Fix in flight (fix/bed-switch-prune-diffux): no-arg will diff working copy when local mods exist + header line naming the sides
+- `bed diff` (no args) — dirty working copy: working-copy changes vs current changeset (untracked excluded); clean tree: current changeset vs its first parent. One-line header names the sides. `bed diff <id>` — review a changeset
 - `bed file <path> --cs <ref|id>` — any file at any changeset, no neighbor fetch
 
 ## Multi-agent collaboration

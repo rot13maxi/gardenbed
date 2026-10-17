@@ -12,10 +12,13 @@
 //!       and `<root>/metadata.sqlite3`, created if missing.
 //!
 //! * `gardenbed-server import --from <repo> --root DIR [--limit N]
-//!   [--renames on|off] [--ref <pattern>...]` — ingests a git repository
-//!   into the same stores (git_bridge). `--from` may be a local path or a
-//!   URL; URLs are cloned/refreshed into a mirror under the Gardenbed
-//!   root first. Prints the import report on success.
+//!   [--renames on|off] [--ref <pattern>...] [--allow-rewind]` — ingests
+//!   a git repository into the same stores (git_bridge). `--from` may be
+//!   a local path or a URL; URLs are cloned/refreshed into a mirror under
+//!   the Gardenbed root first. Prints the import report on success; a
+//!   backward ref move that would lose changesets fails unless
+//!   `--allow-rewind` is given, and any backward move prints a loud
+//!   warning to stderr.
 //!
 //! * `gardenbed-server export --root DIR --into GIT-DIR [--ref <pattern>...]
 //!   [--mapping FILE]` — renders the changeset graph into a real git
@@ -85,6 +88,12 @@ enum Command {
         /// repeatable, empty means every branch.
         #[arg(long = "ref")]
         refs: Vec<String>,
+        /// Permit ref moves that would lose changesets (force-push
+        /// parity). By default such an import fails loudly instead of
+        /// silently rewinding published refs; backward moves that lose
+        /// nothing still only warn.
+        #[arg(long)]
+        allow_rewind: bool,
     },
     /// Export repository history to Git.
     Export {
@@ -122,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             limit,
             renames,
             refs,
+            allow_rewind,
         }) => {
             let detect_renames = match renames.as_str() {
                 "on" => true,
@@ -131,7 +141,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(2);
                 }
             };
-            if let Err(e) = run_import(&from, &root, detect_renames, limit, refs) {
+            if let Err(e) = run_import(&from, &root, detect_renames, limit, refs, allow_rewind) {
                 eprintln!("error: import failed: {e}");
                 std::process::exit(1);
             }
@@ -198,6 +208,7 @@ fn run_import(
     detect_renames: bool,
     limit: Option<usize>,
     refs: Vec<String>,
+    allow_rewind: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use gardenbed_git as git_bridge;
     use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
@@ -210,6 +221,7 @@ fn run_import(
         detect_renames,
         limit,
         refs,
+        allow_rewind,
     };
     let report = if from.contains("://") {
         let mirror = root.join("git-mirror.git");
@@ -217,6 +229,23 @@ fn run_import(
     } else {
         git_bridge::import_from_path(Path::new(from), objects, metadata, engine, &opts)?
     };
+    // A backward ref move is never silent: name the ref, both tips, and
+    // the changesets that fell off it. (With `allow_rewind` unset the
+    // engine already refused moves that would lose changesets, so what
+    // lands here lost nothing — but the operator still must see it.)
+    for rewind in &report.refs_rewound {
+        eprintln!(
+            "warning: import moved {name} backward: {old} -> {new} ({lost})",
+            name = rewind.name,
+            old = rewind.old_tip.short(),
+            new = rewind.new_tip.short(),
+            lost = match rewind.fell_off {
+                Some(0) => "no changesets lost".to_owned(),
+                Some(n) => format!("{n} changeset(s) may no longer be reachable from the ref"),
+                None => "changeset loss not counted (limit import)".to_owned(),
+            }
+        );
+    }
     // Machine- and human-readable one-line report on stdout.
     println!("{report}");
     Ok(())

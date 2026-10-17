@@ -25,6 +25,15 @@ pub struct ImportOptions {
     /// deliberately not dereferenced in v0.1 (and are never read at all:
     /// only `refs/heads/*` is consulted).
     pub refs: Vec<String>,
+    /// Permit ref moves that would lose changesets. The default (`false`)
+    /// still reports every backward move (see
+    /// [`ImportReport::refs_rewound`]) but fails the import with
+    /// [`ImportError::Ref`] — before any ref is touched — when a ref's
+    /// previous value would no longer be reachable from its new tip.
+    /// `true` keeps force-push parity: refs move and every rewind is
+    /// reported in the report. `--limit` imports never enforce this
+    /// (slice re-rooting breaks real ancestry; they only warn).
+    pub allow_rewind: bool,
 }
 
 impl Default for ImportOptions {
@@ -33,6 +42,7 @@ impl Default for ImportOptions {
             detect_renames: true,
             limit: None,
             refs: Vec::new(),
+            allow_rewind: false,
         }
     }
 }

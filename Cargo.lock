@@ -838,6 +838,7 @@ dependencies = [
 name = "gardenbed"
 version = "0.1.0"
 dependencies = [
+ "bstr",
  "chrono",
  "clap",
  "gardenbed-harness",
@@ -845,6 +846,7 @@ dependencies = [
  "gardenbed-protocol",
  "gardenbed-server",
  "gardenbed-store",
+ "gix-glob",
  "libc",
  "rusqlite",
  "rustix",

@@ -34,8 +34,32 @@ pub struct ImportReport {
     /// changeset id)`, sorted by name. Refs that already pointed at the
     /// same changeset are absent (an unchanged re-import reports none).
     pub refs_updated: Vec<(String, Id)>,
+    /// Refs whose new tip is NOT a descendant of the ref's previous value
+    /// (the ref moved backward, or sideways onto rewritten history):
+    /// `(full ref name, old tip, new tip, fell_off)` where `fell_off` is
+    /// the number of changesets reachable from the old tip but not the
+    /// new one (`None` when the count was not computed), i.e. the work
+    /// that fell off the ref. Sorted by name. Empty unless the previous
+    /// value existed — moving a ref that had no prior value is a fast
+    /// forward by definition.
+    pub refs_rewound: Vec<RefRewind>,
     /// Wall-clock duration of the whole import (graph walk + ingestion).
     pub elapsed: Duration,
+}
+
+/// One backward (or sideways) ref move found by an import.
+#[derive(Clone, Debug)]
+pub struct RefRewind {
+    /// The full ref name, e.g. `refs/heads/main`.
+    pub name: String,
+    /// The ref's value before this import moved it.
+    pub old_tip: Id,
+    /// The ref's value after this import moved it.
+    pub new_tip: Id,
+    /// Changesets reachable from the old tip but not the new one — the
+    /// work that fell off the ref — or `None` when counting was skipped
+    /// (limit imports, where slice re-rooting breaks real ancestry).
+    pub fell_off: Option<u64>,
 }
 
 impl ImportReport {
@@ -61,6 +85,31 @@ impl std::fmt::Display for ImportReport {
             self.refs_updated.len(),
             self.elapsed.as_secs_f64(),
             self.commits_per_second(),
-        )
+        )?;
+        if !self.refs_rewound.is_empty() {
+            write!(f, ", {} ref(s) rewound", self.refs_rewound.len())?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_includes_rewound_refs_only_when_nonzero() {
+        let mut report = ImportReport::default();
+        assert!(!report.to_string().contains("rewound"));
+        report.refs_rewound.push(RefRewind {
+            name: "refs/heads/main".into(),
+            old_tip: Id::from_bytes([1; 32]),
+            new_tip: Id::from_bytes([2; 32]),
+            fell_off: Some(3),
+        });
+        assert_eq!(
+            report.to_string(),
+            "0 commits (0 new, 0 skipped), 0 objects, 0 ref(s) moved, 0.00s (0 commits/s), 1 ref(s) rewound"
+        );
     }
 }
