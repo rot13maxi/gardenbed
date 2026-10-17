@@ -1229,7 +1229,9 @@ impl Gardenbed for GardenbedService {
             .committer
             .map(Identity::from)
             .ok_or_else(|| Status::invalid_argument("MergeReq carries no committer"))?;
-        let (id, up_to_date) = self.repo.merge(cs_id, target, &req.message, &author, &committer)?;
+        let (id, up_to_date) = self
+            .repo
+            .merge(cs_id, target, &req.message, &author, &committer)?;
         Ok(Response::new(pb::MergeResp {
             id: id_to_bytes(id),
             up_to_date,

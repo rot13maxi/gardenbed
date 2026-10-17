@@ -591,14 +591,7 @@ pub async fn merge(
         tz_min,
     };
     let (merged, up_to_date) = session
-        .merge(
-            current,
-            theirs,
-            &message,
-            &identity,
-            &identity,
-            "merge",
-        )
+        .merge(current, theirs, &message, &identity, &identity, "merge")
         .await?;
     if up_to_date {
         return Ok(format!(
