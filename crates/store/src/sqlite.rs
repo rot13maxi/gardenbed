@@ -428,6 +428,24 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .map_err(db_err)
     }
 
+    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
+        let conn = self.lock()?;
+        // Arrival order is insertion order; `rowid` is monotonic with it.
+        // Published vs. unpublished is deliberately not filtered: the
+        // point of this query is surfacing ref-less rows.
+        let mut stmt = conn
+            .prepare_cached("SELECT id FROM changesets ORDER BY rowid DESC LIMIT ?1")
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map(params![limit], |r| r.get::<_, Vec<u8>>(0))
+            .map_err(db_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(id_from_blob(&row.map_err(db_err)?)?);
+        }
+        Ok(out)
+    }
+
     fn changeset_ids_in_id_range(
         &self,
         lo: &[u8],
