@@ -164,11 +164,20 @@ Under the server root, the object store lives at `<root>/objects`, and
 <root>/objects/<2 hex>/<62 hex>
 ```
 
-- **Blobs** are stored under `SHA-256(raw content)` in the §6 envelope:
-  `"GBLO1"` magic (5 bytes) · `raw_len: u64` little-endian · one zstd
-  frame. Compression is a storage detail, never identity; on read, the
-  decompressed length and the SHA-256 are verified against the addressed
-  id — a torn or tampered object can never be handed back as wrong bytes.
+- **Blobs** are stored under `SHA-256(raw content)` in one of two
+  envelopes, chosen by size (v0.2 §7): content ≤ 1 MiB uses the §6
+  envelope (`"GBLO1"` magic (5 bytes) · `raw_len: u64` little-endian ·
+  one zstd frame); content > 1 MiB uses the chunked `"GBLO2"` envelope
+  (`magic · raw_len: u64 LE · chunk_count: u32 LE · table of
+  (chunk_raw_len, chunk_comp_len) pairs · per-chunk zstd frames`).
+  Chunk boundaries come from FastCDC (min 64 KiB / avg 256 KiB / max
+  1 MiB) — content-defined, so identical content yields an identical
+  chunk table in every process. Compression and chunking are storage
+  details, never identity; on read, the reader dispatches on the magic,
+  decodes each chunk bounded by its declared length, reassembles, and
+  verifies the SHA-256 of the whole against the addressed id — a torn
+  or tampered object (one corrupted chunk included) can never be handed
+  back as wrong bytes.
 - **Trees and changesets** are stored as their canonical payload bytes
   (their own format bytes type them; no envelope).
 - **Immutability** is load-bearing: putting an existing id with different
@@ -205,8 +214,8 @@ All local state lives under `--state-dir` (default `./.bed`):
 .bed/index.sqlite3      sqlite: files(path PK, blob_id, mode,
                     size, mtime_ns, hint) — the hint marks rows whose
                     size+mtime were hash-verified at write time
-.bed/objects/       local CAS cache — the same GBLO1 envelope and
-                    2-level sharding as object store
+.bed/objects/       local CAS cache — the same GBLO1/GBLO2 envelopes
+                    and 2-level sharding as object store
 .bed/heads          local stack tips
 ```
 
