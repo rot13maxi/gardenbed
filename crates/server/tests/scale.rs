@@ -457,7 +457,10 @@ async fn replica_correctness_grpc() {
     );
 
     // Publish through replica 2, fetch the ref + blob through replica 1.
-    let published = c2.publish(repo, id).await.expect("replica 2 publishes");
+    let published = c2
+        .publish(repo, id, None, false)
+        .await
+        .expect("replica 2 publishes");
     assert_eq!(published, id);
     assert_eq!(
         c1.get_ref(repo, "main").await.expect("replica 1 ref"),

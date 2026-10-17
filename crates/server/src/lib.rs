@@ -75,6 +75,41 @@ pub enum ServerError {
     /// Merge hit semantic conflicts; the paths are listed in the message.
     #[error("merge conflicts on: {}", .0.join(", "))]
     MergeConflict(Vec<String>),
+    /// Publish named "main" in the `ref` field: main publishes stay the
+    /// plain (ref-less) request form, gated on protocol review.
+    #[error(
+        "publish refused: ref \"main\" must use the plain form (leave the ref field unset); main publishes are review-gated"
+    )]
+    MainRefReserved,
+    /// Publish lost a lane-ref CAS (or hit a non-descendant target the
+    /// rewound form already permitted); names the ref and its current tip.
+    #[error(
+        "publish refused: ref {ref_name:?} is not fast-forwarded by the given changeset; \
+         the ref now points at {current}",
+        current = current.to_hex()
+    )]
+    LaneNotFastForward {
+        /// The ref whose CAS was lost.
+        ref_name: String,
+        /// The ref's current tip (full hex).
+        current: Id,
+    },
+    #[error(
+        "publish refused: ref {ref_name:?} would move backward from {old} to {new}, \
+         losing {fell_off} changeset(s); re-send with force set to permit this move",
+        old = old.to_hex(),
+        new = new.to_hex()
+    )]
+    PublishRewind {
+        /// The ref whose move was refused.
+        ref_name: String,
+        /// The ref's current tip (full hex).
+        old: Id,
+        /// The refused new tip (full hex).
+        new: Id,
+        /// Changesets reachable from the old tip but not the new one.
+        fell_off: u64,
+    },
 }
 
 impl ServerError {
@@ -570,33 +605,109 @@ impl Repo {
         self.create_changeset(&rebased, &BTreeMap::new())
     }
 
-    /// Fast-forwards ref `main` to `cs_id` (v0.1.md D5): asserts that the
-    /// current `main` (when one exists) is an ancestor of `cs_id`, then
-    /// compare-and-swaps `main` to it. Returns `cs_id`.
+    /// Fast-forwards a ref to `cs_id` (v0.1.md D5): asserts that the ref's
+    /// current value (when one exists) is an ancestor of `cs_id`, then
+    /// compare-and-swaps the ref to it. Returns `cs_id`.
     ///
-    /// With no `main` yet, the ancestry precondition holds trivially and the
-    /// CAS creates the ref from nothing. A CAS lost to a concurrent publish
-    /// (between the check and the swap) surfaces as
-    /// [`ServerError::NotFastForward`]; the caller retries against the new
-    /// value.
-    pub fn publish(&self, cs_id: Id) -> Result<Id, ServerError> {
+    /// `ref_name = None` is the classic main publish: with no value yet,
+    /// the ancestry precondition holds trivially and the CAS creates the
+    /// ref from nothing; a lost race surfaces as
+    /// [`ServerError::NotFastForward`], the caller retries against the new
+    /// value. A non-main ref gets the same CAS semantics plus the import
+    /// rewind guard: a move to a non-descendant (`old` not an ancestor of
+    /// `cs_id`) is refused with [`ServerError::PublishRewind`] naming the
+    /// ref, both tips, and how many changesets fall off — unless `force`
+    /// is set, the deliberate force-push escape hatch. Naming `"main"`
+    /// (or `"refs/heads/main"`) explicitly is refused
+    /// ([`ServerError::MainRefReserved`]): main publishes stay the plain
+    /// form, gated on protocol review.
+    pub fn publish(
+        &self,
+        cs_id: Id,
+        ref_name: Option<&str>,
+        force: bool,
+    ) -> Result<Id, ServerError> {
+        let name = ref_name.unwrap_or("main");
+        if let Some(ref_name) = ref_name
+            && matches!(ref_name, "main" | "refs/heads/main")
+        {
+            return Err(ServerError::MainRefReserved);
+        }
         // The published changeset must exist (a clear 404 beats a CAS that
         // would silently create a ref to nowhere).
         self.get_changeset(cs_id)?;
-        let current = self.get_ref("main")?;
-        if let Some(cur) = current {
-            let ok = self
+        // Resolve the ref the same way `cas_ref` picks its target row: the
+        // canonical `refs/heads/<name>` spelling first, then the name as
+        // given (imported histories carry full names).
+        let current = {
+            let canonical = branch_ref_name(name);
+            match self.metadata.resolve_ref(&canonical)? {
+                found @ Some(_) => found,
+                None if canonical != name => self.metadata.resolve_ref(name)?,
+                None => None,
+            }
+        };
+        if let Some(cur) = current
+            && !self
                 .engine
                 .is_ancestor(cur, cs_id)
-                .map_err(|e| ServerError::for_changeset(e, cur))?;
-            if !ok {
+                .map_err(|e| ServerError::for_changeset(e, cur))?
+        {
+            if ref_name.is_none() {
                 return Err(ServerError::NotFastForward);
             }
+            if !force {
+                return Err(ServerError::PublishRewind {
+                    ref_name: name.to_owned(),
+                    old: cur,
+                    new: cs_id,
+                    fell_off: self.count_fell_off(cur, cs_id)?,
+                });
+            }
         }
-        match self.cas_ref("main", current, cs_id)? {
+        match self.cas_ref(name, current, cs_id)? {
             RefCas::Won { .. } => Ok(cs_id),
-            RefCas::Conflict { .. } => Err(ServerError::NotFastForward),
+            RefCas::Conflict { .. } => {
+                if ref_name.is_none() {
+                    Err(ServerError::NotFastForward)
+                } else {
+                    Err(ServerError::LaneNotFastForward {
+                        ref_name: name.to_owned(),
+                        current: self
+                            .get_ref(name)?
+                            .ok_or(ServerError::RefNotFound(name.to_owned()))?,
+                    })
+                }
+            }
         }
+    }
+
+    /// How many changesets are reachable from `old` but not from `new` —
+    /// the work that falls off a rewound ref. Two plain BFS walks over the
+    /// metadata's parent edges (changeset rows only, each fetched once per
+    /// walk), mirroring the import-side counter of the same name.
+    fn count_fell_off(&self, old: Id, new: Id) -> Result<u64, ServerError> {
+        fn reachable(
+            metadata: &dyn gardenbed_store::MetadataStore,
+            start: Id,
+        ) -> Result<std::collections::HashSet<Id>, ServerError> {
+            let mut seen = std::collections::HashSet::from([start]);
+            let mut queue = vec![start];
+            while let Some(x) = queue.pop() {
+                let (cs, _) = metadata
+                    .get_changeset(x)?
+                    .ok_or(ServerError::ChangesetNotFound(x))?;
+                for p in &cs.parents {
+                    if seen.insert(*p) {
+                        queue.push(*p);
+                    }
+                }
+            }
+            Ok(seen)
+        }
+        let from_old = reachable(self.metadata.as_ref(), old)?;
+        let from_new = reachable(self.metadata.as_ref(), new)?;
+        Ok(from_old.difference(&from_new).count() as u64)
     }
 
     /// Server-side two-parent merge (v0.2.md D9-D11): merges `theirs`'
@@ -865,9 +976,11 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
-            ServerError::RebaseConflict(_) | ServerError::NotFastForward => {
-                Status::failed_precondition(e.to_string())
-            }
+            ServerError::RebaseConflict(_)
+            | ServerError::NotFastForward
+            | ServerError::LaneNotFastForward { .. }
+            | ServerError::PublishRewind { .. } => Status::failed_precondition(e.to_string()),
+            ServerError::MainRefReserved => Status::invalid_argument(e.to_string()),
             ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
         }
     }
@@ -1234,7 +1347,13 @@ impl Gardenbed for GardenbedService {
         let req = request.into_inner();
         self.repo_field(&req.repo, "Publish")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let id = self.repo.publish(cs_id)?;
+        // An absent/empty ref field is the v0.1 plain form ("main");
+        // anything else names a lane ref.
+        let ref_name = match req.r#ref.as_str() {
+            "" => None,
+            name => Some(name),
+        };
+        let id = self.repo.publish(cs_id, ref_name, req.force)?;
         Ok(Response::new(pb::PublishResp {
             id: id_to_bytes(id),
         }))

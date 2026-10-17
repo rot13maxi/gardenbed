@@ -42,6 +42,18 @@ tags, and the verification record for a release lives in
   proves read-your-writes, single-winner CAS, and idempotent creates across
   replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
 
+- `bed publish --ref <branch>` (+ `--force`): publish to a named lane ref
+  instead of `main` (dogfood finding #10 — lane agents committing
+  off-main had no way to advance their branch, so a fresh clone's
+  `bed switch <branch>` resolved the stale imported tip). The
+  `PublishReq` wire message gained an optional `ref` field and a `force`
+  flag (absent/empty `ref` = the exact v0.1 main publish; old clients
+  are unchanged), lane ref targets get the same compare-and-swap
+  semantics plus the import rewind guard (a non-descendant move is
+  refused naming the ref, both tips, and the fell-off count unless
+  `--force` is passed), and naming `main` in the `ref` field is rejected
+  (main publishes stay the plain, review-gated form).
+
 ### Fixed
 
 - `bed switch` now prunes directories its removals left empty (dogfood:
@@ -109,6 +121,27 @@ tags, and the verification record for a release lives in
   `crates/git/tests/incremental.rs::limit_import_refuses_rewind_by_default`.
 
 ### Changed
+
+
+- **`bed diff` renders renames and submodule pointer hunks** (v0.2
+  D22/D23): a pure rename renders git's `R100` form (`similarity index
+  100%` / `rename from` / `rename to`) in every diff form — the
+  changeset-scoped forms (`bed diff <cs>`, no-arg on a clean copy)
+  render from the changeset's recorded `Rename` op, and the two-sided
+  form pairs a delete with a write of the identical blob at render
+  time, the same rule `bed commit` pairs by. A moved-and-edited file
+  still renders as a delete plus a write — no similarity below 100% is
+  ever claimed (divergences §6 residual). Submodule pointers render
+  git's `Subproject commit <sha>` hunks on add, delete, and retarget,
+  with the real upstream SHA from the padded gitlink id — replacing the
+  v0.1 `Binary files … differ` line (divergences §7 residual:
+  gitlink↔regular typechanges still render mode lines only). Every
+  rendered shape reapplies with `git apply` (gitlink entries via
+  `--cached`). Verified by letter/byte parity with `git diff-tree -M`
+  and `--submodule=short` on generated rename/gitlink histories, plus
+  real-`git apply` tests (`crates/bed/tests/read_path.rs`,
+  `crates/bed/tests/render_patch.rs`). The MCP `diff` tool is
+  unchanged, keeping its `--no-renames` letter parity deliberately.
 
 - **`bed` honors `.gitignore` for untracked-file discovery**: `bed
   status` and `bed commit` now read `.gitignore` files from the working
