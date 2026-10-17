@@ -5,7 +5,6 @@ export const BASE_URL = "http://127.0.0.1:18430";
 
 export default defineConfig({
   testDir: "./tests",
-  globalSetup: "./global-setup.ts",
   timeout: 30_000,
   retries: 0,
   workers: 1,
@@ -20,6 +19,8 @@ export default defineConfig({
     command: `sh ${__dirname}/serve-e2e.sh`,
     url: `${BASE_URL}/api/refs`,
     reuseExistingServer: false,
-    timeout: 30_000,
+    // The serve script runs `cargo build` inline; a cold target dir needs
+    // minutes, not seconds.
+    timeout: 300_000,
   },
 });

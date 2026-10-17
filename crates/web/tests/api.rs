@@ -770,11 +770,11 @@ fn seed_is_deterministic_and_hides_drafts_from_main() {
     // Second run against a reffed repo is a no-op.
     assert_eq!(gardenbed_web::seed::seed(&repo_b).unwrap(), None);
 
-    // 16 changesets stored; 12 reachable from main, 4 unpublished. The
-    // four newest arrivals are the drafts, re-newest first (16, 15, 14,
-    // 13 by arrival — v2 of the rebase pair before v1).
+    // 17 changesets stored; 12 reachable from main, 5 unpublished. The
+    // five newest arrivals are the drafts, newest first (17 stress, 16
+    // rebase v2, 15 v1, 14 colors draft, 13 drip draft).
     let activity = repo_a.activity(0).unwrap();
-    assert_eq!(activity.len(), 16);
+    assert_eq!(activity.len(), 17);
     let published: Vec<Id> = repo_a
         .log(tip_a, 0)
         .unwrap()
@@ -786,34 +786,55 @@ fn seed_is_deterministic_and_hides_drafts_from_main() {
         .iter()
         .filter(|(id, _)| !published.contains(id))
         .collect();
-    assert_eq!(unpublished.len(), 4);
+    assert_eq!(unpublished.len(), 5);
     assert_eq!(
-        unpublished[0].1.message, "Add evening mulch reminder",
-        "newest arrival: rebase v2"
+        unpublished[0].1.message, "Stress fixture: rewrite garden.js wholesale",
+        "newest arrival: the stress draft"
     );
     assert_eq!(unpublished[0].1.parents, vec![tip_a]);
-    assert_eq!(unpublished[1].1.message, "Add evening mulch reminder"); // v1
+    assert_eq!(unpublished[0].1.author.name, "Moss Hale");
+    // The stress file must stay under the /api/file payload cap so the
+    // GUI fetches the full body and the diff LINE budget is what trips.
+    let stress_change = &unpublished[0].1.changes[0];
+    assert_eq!(stress_change.path, "garden.js");
+    let stress_blob = repo_a
+        .get_blob(stress_change.blob.expect("modify carries a blob"))
+        .unwrap()
+        .expect("stress blob stored");
+    let stress_text = String::from_utf8(stress_blob).unwrap();
+    assert_eq!(stress_text.lines().count(), 6000);
+    assert!(
+        stress_text.len() < 512 * 1024,
+        "must fit the file payload cap, got {} bytes",
+        stress_text.len()
+    );
+    assert_eq!(
+        unpublished[1].1.message, "Add evening mulch reminder",
+        "next newest: rebase v2"
+    );
+    assert_eq!(unpublished[1].1.parents, vec![tip_a]);
+    assert_eq!(unpublished[2].1.message, "Add evening mulch reminder"); // v1
     let c11 = published
         .iter()
         .find(|id| repo_a.get_changeset(**id).unwrap().message == "Add rotation notes for 2027")
         .copied()
         .expect("c11 reachable from main");
-    assert_eq!(unpublished[1].1.parents, vec![c11]); // v1 sat on c11
+    assert_eq!(unpublished[2].1.parents, vec![c11]); // v1 sat on c11
     assert_ne!(
-        unpublished[0].0, unpublished[1].0,
+        unpublished[1].0, unpublished[2].0,
         "rebase pair must have distinct ids"
     );
-    assert_eq!(unpublished[2].1.message, "draft: calmer empty-bed colors");
-    assert_eq!(unpublished[2].1.author.name, "Moss Hale");
+    assert_eq!(unpublished[3].1.message, "draft: calmer empty-bed colors");
+    assert_eq!(unpublished[3].1.author.name, "Moss Hale");
     assert_eq!(
-        unpublished[3].1.message,
+        unpublished[4].1.message,
         "Draft: drip irrigation sketch\n\nNot ready: zones still hardcoded.\n"
     );
-    assert_eq!(unpublished[3].1.author.name, "Pike Rowan");
-    assert_eq!(unpublished[3].1.parents, vec![tip_a]);
-    // Timestamps keep increasing across all sixteen commits.
+    assert_eq!(unpublished[4].1.author.name, "Pike Rowan");
+    assert_eq!(unpublished[4].1.parents, vec![tip_a]);
+    // Timestamps keep increasing across all seventeen commits.
     for (i, (_, cs)) in activity.iter().enumerate() {
-        let n = (16 - i) as u64;
+        let n = (17 - i) as u64;
         assert_eq!(cs.committer.time_secs, 1_751_500_000 + n * 86_400);
     }
 }

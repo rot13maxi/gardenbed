@@ -17,15 +17,36 @@ test("file finder opens on 't', fuzzy-filters, and opens the top hit", async ({ 
   await expect(page.locator("#file-header")).toContainText("beds.json");
 });
 
-test("file finder navigates with arrows and closes on Escape", async ({ page }) => {
+test("file finder arrows advance exactly one row per press", async ({ page }) => {
   await page.goto("/");
   await page.keyboard.press("t");
   await expect(page.locator("#file-finder")).toBeVisible();
   await page.keyboard.type("js");
   const rows = page.locator(".finder-row");
   await expect(rows.first()).toBeVisible();
+  // Let the debounced re-filter finish before measuring selection deltas.
+  await page.waitForTimeout(400);
+  // Arrow handling lives in the document-level keydown handler only when
+  // the finder input holds focus; under suite load autofocus can lag.
+  await expect(page.locator("#file-finder-input")).toBeFocused();
+
+  // The invariant from the review fix is the per-press DELTA, not the
+  // absolute starting index (async row refresh may move the start).
+  const selectedIndexOnce = async () => {
+    const names = await rows.evaluateAll((els) => els.map((el) => el.textContent));
+    const sel = page.locator(".finder-row.kbd-selected");
+    const cur = (await sel.count()) ? await sel.first().textContent() : null;
+    return names.findIndex((n) => n === cur);
+  };
+  const selectedIndex = async (expected: number) =>
+    expect.poll(selectedIndexOnce).toBe(expected);
+
+  await selectedIndex(0);
   await page.keyboard.press("ArrowDown");
-  await expect(page.locator(".finder-row.kbd-selected")).toHaveCount(1);
+  await selectedIndex(1);
+  await page.keyboard.press("ArrowUp");
+  await selectedIndex(0);
+
   await page.keyboard.press("Escape");
   await expect(page.locator("#file-finder")).toBeHidden();
 });
