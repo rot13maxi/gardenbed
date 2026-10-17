@@ -23,6 +23,62 @@ tags, and the verification record for a release lives in
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
 
+### Added
+
+- **Server-side two-parent merge** (v0.2.md D9–D11, M9/M10): `Repo::merge`
+  builds one changeset with `parents = [ours, theirs]` whose changes are
+  the diff `tree(ours) → merged tree`, stored through the ordinary
+  create path — no new object types. Per-file content merges with
+  `merge3` over the xdiff port (touching/overlapping regions conflict,
+  matching git's `xdl_merge`; regions both sides changed identically
+  collapse), a three-way tree walk prunes by content-addressed equality
+  before diffing (a side equal to base adopts the other wholesale —
+  O(changed), not O(tree)), and mode changes follow the same trivial
+  rules. Conflicts are one `FAILED_PRECONDITION` listing every
+  conflicting path at file granularity. `bed merge <target>` and the
+  `Merge` RPC; `up_to_date` when theirs is already an ancestor.
+  Verified against `git merge-tree --write-tree` as an oracle over
+  1,000 generated divergent pairs (plus fixture matrices, a derivation
+  invariant, determinism across wiped caches, and unchanged publish on
+  merge changesets); rename-blindness and criss-cross tie-break are
+  documented divergences (divergences.md §8, §9). `fuzz_merge3` runs 3.4
+  M+ cases clean.
+- **Local daemon** (v0.2.md D18–D19, M16): `gardenbed-daemon serve
+  --upstream <url>` is an optional per-machine caching tier between
+  `bed` and the server — a gRPC proxy on one unix socket
+  (`$XDG_RUNTIME_DIR/gardenbed/daemon.sock`; `GARDENBED_DAEMON`
+  overrides, empty disables). `GetTree`/`GetBlob` answer cache-first
+  from a shared object store at `$XDG_CACHE_HOME/gardenbed`
+  (write-through, same envelope and sharding as `.bed/objects`) so
+  working copies dedup; write RPCs are peer-uid-gated via `SO_PEERCRED`;
+  a sidecar (`Ping`/`Register`) watches working-copy roots (50 ms
+  debounce, `.bed` excluded) and bumps a generation counter that `bed
+  status` uses to reuse its cached report — any doubt runs the full
+  scan, a stale "clean" is forbidden. `bed` resolves the daemon first
+  and falls back to the embedded server endpoint (fetches retry once on
+  daemon death; writes never blindly retried). M16 acceptance 1–7 pass
+  end to end against real server + daemon + bed binaries.
+- **Virtualized checkout** (`bed mount <dir>`): the current changeset as
+  a read-only FUSE filesystem — the whole repository tree is visible and
+  readable with no sparse selection, while `.bed/objects` grows only by
+  what is actually read (lazy materialization through the ordinary
+  cache-first fetch path; listing alone fetches only trees). Every
+  mutation answers `EROFS`; metadata is deterministic (committer time,
+  true file sizes); mounting needs no root (fusermount3); SIGINT/SIGTERM
+  unmount cleanly and leave an ordinary removable directory. Snapshot
+  semantics: the mount reflects the changeset at mount time; remount to
+  switch.
+- **Generic derive framework + copy detection**: derived-data kinds are
+  now a registry (`DerivedKind`: one module plus one entry, no other
+  wiring to miss; byte-compatibility with the pre-refactor eager writes
+  proven on 3 histories), and the new `cuttings` kind records
+  per-changeset exact-blob copy/rename facts against the first parent
+  (rename = unchanged-blob move; copy = add duplicating an existing
+  blob; source = smallest matching path). The `copies` MCP tool (fifth
+  tool) answers without walking history; differential-verified against
+  `git log -M -C --find-copies-harder`. Exact blob equality only — no
+  similarity heuristic.
+
 ## [0.1.0] - 2026-10-16
 
 First tagged release. Everything below landed between the workspace

@@ -95,7 +95,9 @@ See the [quickstart](docs/quickstart.md) for a longer walkthrough and the
 | `bed commit` | Create a changeset from local changes |
 | `bed rebase` | Replay the current changeset onto a new parent |
 | `bed publish` | Fast-forward `main` to the current changeset |
-| `bed log`, `diff`, `file`, `blame` | Query repository content and history |
+| `bed merge` | Merge a changeset or ref into the current changeset |
+| `bed mount` | Mount the current changeset as a read-only FUSE filesystem |
+| `bed log`, `diff`, `file`, `blame`, `copies` | Query repository content and history |
 
 Checkout updates preserve local edits to files unchanged by the target
 and refuse updates that would overwrite local work. Concurrent publishes
@@ -104,9 +106,9 @@ replacing another worker's update.
 
 ## Agent access
 
-`gardenbed-mcp` reads the server's repository directly and exposes four
-tools: `log`, `diff`, `file`, and `blame`. It uses stdio and requires no
-working copy:
+`gardenbed-mcp` reads the server's repository directly and exposes five
+tools: `log`, `diff`, `file`, `blame`, and `copies`. It uses stdio and
+requires no working copy:
 
 ```sh
 "$BIN/gardenbed-mcp" --root /tmp/gardenbed-repo
@@ -116,22 +118,26 @@ See [MCP configuration and tool schemas](docs/mcp.md).
 
 ## Current scope
 
-Gardenbed is an early implementation at version 0.1. It supports a
-single repository per server, filesystem object storage, SQLite metadata,
-sparse working copies, server-side replay, and Git import/export.
+Gardenbed is an early implementation at version 0.1 plus the v0.2
+feature wave. It supports a single repository per server, filesystem
+object storage, SQLite metadata, sparse working copies, server-side
+replay and merge, a read-only FUSE mount of any changeset, an optional
+local caching daemon, and Git import/export.
 
 Writes require a connection to the server. There is no authentication,
-server-side merge resolution, garbage collection, or offline commit queue
-yet. Blame follows first-parent history and renames. Git roundtrips
-preserve commit IDs for supported histories; signed commits, non-UTF-8
-metadata, and other exceptions are documented in
+garbage collection, or offline commit queue yet. Blame follows
+first-parent history and renames; copy detection is exact-blob only.
+Git roundtrips preserve commit IDs for supported histories; signed
+commits, non-UTF-8 metadata, and other exceptions are documented in
 [Git interoperability limits](docs/divergences.md).
 
-Verification includes differential tests against Git, process-kill
-recovery tests, fuzz targets, benchmarks, and an end-to-end demo. A Linux
-kernel history of 1.485 million commits has been imported and sampled for
+Verification includes differential tests against Git (including
+1,000-pair merge and copy-detection oracles), process-kill recovery
+tests, fuzz targets, benchmarks, and an end-to-end demo. A Linux kernel
+history of 1.485 million commits has been imported and sampled for
 content fidelity. The [verification record](docs/release-0.1.md) and
-[corpus results](docs/corpora.md) describe what was tested and its limits.
+[corpus results](docs/corpora.md) describe what was tested and its
+limits.
 
 ## Development and documentation
 
