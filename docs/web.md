@@ -37,7 +37,7 @@ gardenbed-web --root /tmp/gardenbed-demo
 | `#/` | Overview: ref cards, request counters, activity heatmap, authors chart, recent history |
 | `#/log` | History timeline with an SVG commit-graph lane column |
 | `#/changeset/<id>` | Changeset metadata, diffstat summary, grouped change list |
-| `#/browse/<rev>/<path>` | Tree listing with breadcrumbs |
+| `#/browse/<rev>/<path>` | Tree listing with breadcrumbs; a README in the directory renders below as markdown (GitHub style) — client-side renderer, escaped end to end, relative links resolve to that revision's file views |
 | `#/file/<rev>/<path>` | File content with line numbers, blame toggle |
 | `#/compare?a=<rev>&b=<rev>` | Diff between two revspecs |
 

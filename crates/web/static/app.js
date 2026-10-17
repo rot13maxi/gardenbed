@@ -751,6 +751,291 @@ function buildAuthors(entries, top) {
   return wrap;
 }
 
+/* ---------- readme panel + minimal markdown renderer ----------
+ * Untrusted input: everything user-controlled goes through textContent or
+ * esc() (the shared highlighter escapes first); we only ever create our own
+ * whitelisted tags via createElement. */
+
+function findReadme(entries) {
+  let best = null, bestRank = -1;
+  for (const e of entries || []) {
+    if (e.kind !== "file") continue;
+    const m = /^readme(\.[\w]+)?$/i.exec(e.name);
+    if (!m) continue;
+    const ext = (m[1] || "").toLowerCase();
+    const rank = ext === ".md" ? 3 : ext === ".markdown" ? 2
+      : (ext === ".txt" || ext === "") ? 1 : 0;
+    if (rank > bestRank) { best = e; bestRank = rank; }
+  }
+  return best;
+}
+
+function isMdName(name) { return /\.(md|markdown)$/i.test(name); }
+
+/** Resolve `href` against the readme's directory; null when it escapes the repo. */
+function resolveRepoPath(href, ctx) {
+  let h = String(href || "").trim();
+  const hi = h.indexOf("#");
+  if (hi >= 0) h = h.slice(0, hi);          // in-repo routes don't carry fragments
+  if (!h) return null;
+  const wasDir = /\/$/.test(h);
+  const segs = (h.startsWith("/") ? h : (ctx.dir ? ctx.dir + "/" + h : h)).split("/");
+  const out = [];
+  for (const s of segs) {
+    if (!s || s === ".") continue;
+    if (s === "..") { if (!out.length) return null; out.pop(); continue; }
+    out.push(s);
+  }
+  if (!out.length) return null;
+  return { path: out.join("/"), isDir: wasDir };
+}
+
+/**
+ * Classify a link target:
+ *   external — https?://, mailto:
+ *   anchor   — in-panel #fragments (click intercepted for scroll, no routing)
+ *   repo     — relative/absolute paths resolved within the repo
+ *   null     — javascript:, data:, vbscript:, //... → .md-badlink
+ */
+function resolveLink(href, ctx) {
+  const h = String(href || "").trim();
+  if (!h) return null;
+  if (/^(https?:|mailto:)/i.test(h)) return { kind: "external", href: h };
+  if (h.startsWith("#")) return { kind: "anchor", href: h };
+  if (h.startsWith("//") || /^[a-z][a-z0-9+.-]*:/i.test(h)) return null;
+  const rp = resolveRepoPath(h, ctx);
+  if (!rp) return null;
+  return rp.isDir
+    ? { kind: "repo", href: browseHref(ctx.rev, rp.path) }
+    : { kind: "repo", href: fileHref(ctx.rev, rp.path) };
+}
+
+function b64encode(s) {
+  try {
+    if (typeof btoa !== "undefined") return btoa(unescape(encodeURIComponent(s)));
+  } catch (_) { /* fall through to manual */ }
+  const bin = unescape(encodeURIComponent(s));
+  const T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  let out = "";
+  for (let i = 0; i < bin.length; i += 3) {
+    const a = bin.charCodeAt(i), b = i + 1 < bin.length ? bin.charCodeAt(i + 1) : NaN, c = i + 2 < bin.length ? bin.charCodeAt(i + 2) : NaN;
+    out += T[a >> 2] + T[((a & 3) << 4) | (b >> 4 || 0)] + (isNaN(b) ? "=" : T[((b & 15) << 2) | (c >> 6 || 0)]) + (isNaN(c) ? "=" : T[c & 63]);
+  }
+  return out;
+}
+
+const MD_IMG_MIME = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+};
+
+function mdImage(alt, src, ctx) {
+  const altText = alt || src || "";
+  const bad = () => el("em", { class: "md-img-alt" }, "[img: " + altText + "]");
+  if (/^https?:\/\//i.test(src)) return el("a", { class: "md-link", href: src }, altText); // never fetch remote
+  const rp = resolveRepoPath(src, ctx);
+  const ext = rp ? (rp.path.match(/\.([a-z0-9]+)$/i) || [])[1] : null;
+  if (!rp || rp.isDir || !ext || !MD_IMG_MIME[ext.toLowerCase()]) return bad();
+  const wrap = el("span", { class: "md-img-wrap" });
+  const img = el("img", { class: "md-img", alt: altText, loading: "lazy" });
+  wrap.appendChild(img);
+  api("/api/file?" + qs({ cs: ctx.rev, path: rp.path })).then((f) => {
+    if (!f || !f.content) throw new Error("empty");
+    const b64 = f.encoding === "base64" ? f.content : b64encode(f.content);
+    img.setAttribute("src", "data:" + MD_IMG_MIME[ext.toLowerCase()] + ";base64," + b64);
+  }).catch(() => {
+    while (wrap.firstChild) wrap.removeChild(wrap.firstChild);
+    wrap.appendChild(bad());
+  });
+  return wrap;
+}
+
+function mdLink(text, href, ctx) {
+  const r = resolveLink(href, ctx);
+  const a = r
+    ? el("a", { class: "md-link", href: r.href })
+    : el("span", { class: "md-badlink" });
+  if (r && r.kind === "anchor") {
+    const frag = r.href.slice(1);
+    a.addEventListener("click", (ev) => {
+      if (ev.preventDefault) ev.preventDefault(); // scroll in-panel, never route
+      let target = null;
+      try {
+        if (ctx.body && /^[a-z0-9-]+$/i.test(frag)) target = ctx.body.querySelectorAll("#" + frag)[0] || null;
+      } catch (_) { target = null; }
+      if (target && target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+  mdInlineAppend(a, text, ctx); // bold/`code` inside link text must work
+  return a;
+}
+
+/** Inline markdown → child nodes of `sink`; only our own tags, text via textContent. */
+function mdInlineAppend(sink, text, ctx) {
+  let i = 0, buf = "";
+  const flush = () => { if (buf) { sink.appendChild(document.createTextNode(buf)); buf = ""; } };
+  while (i < text.length) {
+    let m;
+    if (text[i] === "!" && text[i + 1] === "[") {
+      m = /^!\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.exec(text.slice(i));
+      if (m) { flush(); sink.appendChild(mdImage(m[1], m[2], ctx)); i += m[0].length; continue; }
+    }
+    if (text[i] === "[") {
+      m = /^\[([^\]]*)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/.exec(text.slice(i));
+      if (m) { flush(); sink.appendChild(mdLink(m[1], m[2], ctx)); i += m[0].length; continue; }
+    }
+    const two = text.slice(i, i + 2);
+    if (two === "**" || two === "~~") {
+      const j = text.indexOf(two, i + 2);
+      if (j > i + 2) {
+        flush();
+        const node = el(two === "**" ? "strong" : "s", {});
+        mdInlineAppend(node, text.slice(i + 2, j), ctx);
+        sink.appendChild(node);
+        i = j + 2;
+        continue;
+      }
+    }
+    const c = text[i];
+    if ((c === "*" || c === "_") && (i === 0 || !/[\w]/.test(text[i - 1]))) {
+      const j = text.indexOf(c, i + 1);
+      // word-bounded: opener not after a word char (done above), closer not
+      // before whitespace and not followed by a word char (no some_file_name italics)
+      if (j > i + 1 && !/\s/.test(text[j - 1]) && (j + 1 >= text.length || !/[\w]/.test(text[j + 1]))) {
+        flush();
+        const em = el("em", {});
+        mdInlineAppend(em, text.slice(i + 1, j), ctx);
+        sink.appendChild(em);
+        i = j + 1;
+        continue;
+      }
+    }
+    if (c === "`") {
+      const j = text.indexOf("`", i + 1);
+      if (j > i + 1) { flush(); sink.appendChild(el("code", {}, text.slice(i + 1, j))); i = j + 1; continue; }
+    }
+    m = /^https?:\/\/[^\s()<>"'\]]+/.exec(text.slice(i));
+    if (m) { flush(); sink.appendChild(el("a", { class: "md-link", href: m[0] }, m[0])); i += m[0].length; continue; }
+    buf += c;
+    i++;
+  }
+  flush();
+}
+
+function mdCodeBlock(code, lang) {
+  const c = el("code", { class: "code-block" });
+  const hl = lang ? highlight(code, "fence." + lang) : null; // highlighter escapes first
+  if (hl) c.innerHTML = hl; else c.textContent = code;
+  return el("pre", {}, c);
+}
+
+function isMdBlockStart(line) {
+  return /^```/.test(line) || /^#{1,6}\s/.test(line) ||
+    /^\s*(?:-{3,}|\*{3,})\s*$/.test(line) || /^\s*>/.test(line) ||
+    /^\s*(?:[-*+]|\d+\.)\s+/.test(line);
+}
+
+function mdList(items, ctx) {
+  let pos = 0;
+  const level = (indent) => {
+    const node = el(items[pos].ordered ? "ol" : "ul", {});
+    while (pos < items.length && items[pos].indent === indent) {
+      const it = items[pos];
+      pos++;
+      const li = el("li", {});
+      mdInlineAppend(li, it.text, ctx);
+      node.appendChild(li);
+      if (pos < items.length && items[pos].indent > indent) li.appendChild(level(items[pos].indent));
+    }
+    return node;
+  };
+  return level(items.length ? items[0].indent : 0);
+}
+
+/** Markdown text → block elements; fail-safe: unknown syntax = literal paragraph text. */
+function mdBlocks(text, ctx) {
+  const lines = String(text == null ? "" : text).replace(/\r\n?/g, "\n").split("\n");
+  const usedIds = {};
+  const slug = (s) => {
+    const base = s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "section";
+    let id = base, n = 1;
+    while (usedIds[id]) id = base + "-" + (++n);
+    usedIds[id] = 1;
+    return id;
+  };
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    let m = /^```(\w*)\s*$/.exec(line);
+    if (m) {
+      const buf = [];
+      let j = i + 1;
+      while (j < lines.length && !/^```\s*$/.test(lines[j])) buf.push(lines[j++]);
+      blocks.push(mdCodeBlock(buf.join("\n"), m[1]));
+      i = j < lines.length ? j + 1 : j;
+      continue;
+    }
+    m = /^(#{1,6})\s+(.+)$/.exec(line);
+    if (m) {
+      const txt = m[2].replace(/\s*#+\s*$/, "");
+      const h = el("h" + m[1].length, { id: slug(txt) });
+      mdInlineAppend(h, txt, ctx);
+      blocks.push(h);
+      i++;
+      continue;
+    }
+    if (/^\s*(?:-{3,}|\*{3,})\s*$/.test(line)) { blocks.push(el("hr", {})); i++; continue; }
+    if (/^\s*>/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^\s*>/.test(lines[i])) buf.push(lines[i++].replace(/^\s*>\s?/, ""));
+      const bq = el("blockquote", {});
+      const p = el("p", {});
+      mdInlineAppend(p, buf.join(" "), ctx);
+      bq.appendChild(p);
+      blocks.push(bq);
+      continue;
+    }
+    if (/^\s*(?:[-*+]|\d+\.)\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length) {
+        m = /^(\s*)([-*+]|\d+)\.?\s+(.*)$/.exec(lines[i]);
+        if (!m) break;
+        items.push({ indent: m[1].length, ordered: /\d/.test(m[2][0]), text: m[3] });
+        i++;
+      }
+      blocks.push(mdList(items, ctx));
+      continue;
+    }
+    const buf = [];
+    while (i < lines.length && lines[i].trim() && !isMdBlockStart(lines[i])) buf.push(lines[i++]);
+    const p = el("p", {});
+    mdInlineAppend(p, buf.join(" "), ctx);
+    blocks.push(p);
+  }
+  return blocks;
+}
+
+function buildReadmePanel(f, rev, rpath) {
+  const name = rpath.split("/").pop();
+  const section = el("section", { id: "readme-panel", class: "panel" },
+    el("div", { class: "readme-head" },
+      el("span", { class: "readme-icon", html: ICONS.file }),
+      el("a", { class: "readme-name mono", href: fileHref(rev, rpath) }, name)));
+  let body;
+  if (f.encoding === "utf8" && isMdName(name)) {
+    const ctx = { dir: rpath.includes("/") ? rpath.slice(0, rpath.lastIndexOf("/")) : "", rev: rev, body: null };
+    body = el("div", { class: "md-body" });
+    ctx.body = body;
+    for (const b of mdBlocks(f.content, ctx)) body.appendChild(b);
+  } else {
+    body = el("pre", { class: "md-body md-plain" }, f.content || "");
+  }
+  section.appendChild(body);
+  return section;
+}
+
 /* ================= 5. views ================= */
 
 const app = () => document.getElementById("app");
@@ -1001,6 +1286,14 @@ function viewBrowse(root, rev, path) {
     scroller.appendChild(table);
     if (entries.length) panel.appendChild(scroller);
     root.appendChild(panel);
+    // README panel below the listing (GitHub layout); silent if it won't read.
+    const readme = findReadme(entries);
+    if (readme) {
+      const rpath = path ? path + "/" + readme.name : readme.name;
+      api("/api/file?" + qs({ cs: rev, path: rpath }))
+        .then((f) => root.appendChild(buildReadmePanel(f, rev, rpath)))
+        .catch(() => {});
+    }
   }).catch((err) => {
     mountError(root, err, err && err.status === 400 ? "Not a directory" : "Could not load tree");
   });

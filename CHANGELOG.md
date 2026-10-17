@@ -22,7 +22,10 @@ tags, and the verification record for a release lives in
   copyable connect-and-work prompt from `/api/server-info` plus the refs
   listing, an SVG commit-graph lane column on History, an activity
   heatmap and authors chart on Overview, and per-changeset diffstat
-  chips. See [docs/web.md](docs/web.md). Verified by in-memory router
+  chips. Browse directory pages render the directory's README
+  GitHub-style (client-side, injection-escaped markdown subset; relative
+  links and images resolve to the viewed revision's own files). See
+  [docs/web.md](docs/web.md). Verified by in-memory router
   integration tests (`crates/web/tests/api.rs`) and a Playwright
   end-to-end suite (`e2e/`) that drives a real browser through every
   page against the seeded repository.
