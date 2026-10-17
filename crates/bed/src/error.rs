@@ -163,7 +163,6 @@ pub enum ClientError {
         /// The `bed status` rendering of what is dirty.
         detail: String,
     },
-
     /// A gitlink blob id that does not follow the canonical padding
     /// convention (upstream git SHA-1 left-padded with twelve zero bytes)
     /// was asked to render as a `Subproject commit <sha>` hunk. There is
