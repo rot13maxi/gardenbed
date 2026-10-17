@@ -36,16 +36,13 @@ creator and the minio healthcheck use.
 
 The replicas publish host ports `9418-9420` (the service's internal
 port is always 9418; compose assigns one distinct host port per
-replica). Any one of them serves the whole logical repository — `bed`
-names the server per clone (`bed clone <url> <repo>`), so pick a
-published port and clone from it:
+replica). Any one of them serves the whole logical repository, so pick
+a published port and clone from it (the repository name is a
+`--repo` flag, `default` if omitted):
 
 ```sh
-bed clone http://127.0.0.1:9418 myrepo
+bed clone http://127.0.0.1:9418
 ```
-
-All replicas are interchangeable — writes through one are immediately
-visible through the others (the state is off-box).
 
 To import an existing git repository directly against the scaled
 backends (this is also the migration path from a single-machine

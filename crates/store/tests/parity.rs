@@ -624,6 +624,59 @@ fn pg_git_mapping_concurrent_idempotence() {
     assert_eq!(store.cs_for_git(&sha).unwrap(), Some(cs));
     assert_eq!(store.git_for_cs(cs).unwrap(), Some(sha));
 }
+
+#[test]
+fn pg_ingest_concurrent_idempotence() {
+    let Some((store, _s3, tag)) = live() else {
+        eprintln!("skipping parity tests: live-service env vars are not set");
+        return;
+    };
+    let store = Arc::new(store);
+    // A fresh (changeset, sha) pair per run: concurrent identical ingests
+    // all race the same changeset + git_map INSERTs inside write_changeset.
+    // validated_tree is None, so no parent-certification is involved —
+    // this isolates the ingest path's own idempotence.
+    let salt = run_salt();
+    let changeset = sample_changeset(salt, 1);
+    let canonical = changeset.canonical_bytes().unwrap();
+    let cs = changeset.id().unwrap();
+    let sha = {
+        let mut v = [0u8; 20];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = tag_bytes(&format!("{tag}ingest"))
+                .wrapping_add(salt.to_le_bytes()[i % 8])
+                .wrapping_add(i as u8);
+        }
+        hex(&v)
+    };
+    let callers = 8;
+    let barrier = Arc::new(Barrier::new(callers));
+    let handles: Vec<_> = (0..callers)
+        .map(|_| {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            let canonical = canonical.clone();
+            let sha = sha.clone();
+            thread::spawn(move || {
+                barrier.wait();
+                store.ingest_changeset(&canonical, &sha, &[])
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().expect("caller thread").expect(
+            "every concurrent identical ingest_changeset returns Ok — \
+             the mapping block in write_changeset must claim via \
+             INSERT .. ON CONFLICT, not SELECT-then-INSERT",
+        );
+    }
+    assert_eq!(
+        store.get_changeset(cs).unwrap().map(|c| c.0.id().unwrap()),
+        Some(cs)
+    );
+    assert_eq!(store.cs_for_git(&sha).unwrap(), Some(cs));
+    assert_eq!(store.git_for_cs(cs).unwrap(), Some(sha));
+}
 #[test]
 fn s3_object_parity() {
     let Some((_pg, store, _tag)) = live() else {
