@@ -769,7 +769,10 @@ async fn pure_renames_render_git_m_parity_and_byte_parity() {
         ..GenOptions::default()
     };
     let mut g = setup_with(generate(7, &opts)).await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
     let last = g.head_index();
 
@@ -916,7 +919,10 @@ async fn moved_and_edited_files_render_delete_plus_write() {
     }
     let history = history.expect("a seed with an edited rename exists");
     let mut g = setup_with(history).await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let mut edited_seen = 0usize;
@@ -996,7 +1002,10 @@ async fn gitlink_pointer_changes_render_subproject_hunks() {
     }
     let history = history.expect("a seed with a gitlink add or pointer change exists");
     let mut g = setup_with(history).await;
-    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    let (code, _, stderr) = bed(
+        &g.garden,
+        &["clone", &format!("{}/garden", g.server.http())],
+    );
     assert_eq!(code, 0, "stderr: {stderr}");
 
     let mut subproject_hunks = 0usize;
