@@ -7,10 +7,11 @@ and SQLite metadata. Derived trees, blame, and ancestry data support queries.
 Use the standard terms in [Terminology](terminology.md). Repository storage uses `objects/` and `metadata.sqlite3`.
 
 ```text
-bed ──gRPC── gardenbed-server
-               ├─ metadata: SQLite  (changesets, refs,
-               │                    git-SHA map, derived)
-               └─ objects: filesystem CAS     (blobs, trees; zstd)
+bed ──gRPC── gardenbed-server (multi-repository)
+               ├─ <root>/<repo>/metadata.sqlite3  (changesets, refs,
+               │                                 git-SHA map, derived)
+               └─ <root>/<repo>/objects/         (filesystem CAS: blobs,
+                                                  trees; zstd)
 gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 ```
 
@@ -30,8 +31,9 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 `crates/protocol/proto/gardenbed.proto` — with
 [docs/canonical-encoding.md](canonical-encoding.md), it *is* the published
 protocol (D4). The tonic service `Gardenbed` exposes 17 RPCs; every
-request carries `repo` (single-repo in v0.1, the field is wire format
-from day one, v0.1.md §1).
+request carries `repo` — the field selects the repository it applies to
+(wire format from day one, v0.1.md §1; load-bearing since multi-repo
+serving, v0.2.md §5).
 
 | group | RPCs | notes |
 |---|---|---|
@@ -47,17 +49,35 @@ enum values are the spec's op/mode bytes; timestamps stay git-native
 (epoch seconds + tz offset in minutes) — that is what makes export
 reproduce identical git SHAs.
 
-## 2. Server (`gardenbed-server`, lib `gardenbed_server::Repo`)
+## 2. Server (`gardenbed-server`, lib `gardenbed_server::RepoSet`)
 
-`Repo` wires one repository's stores (`<root>/objects` + `<root>/metadata.sqlite3`)
-and holds the semantics every surface shares — the `bed` binary's gRPC
-service and `gardenbed-mcp` call the same methods, which is why MCP and
-CLI answers agree by construction (v0.1.md §M7.1).
+The server serves any number of repositories from one root directory:
+`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3` (v0.2.md §5).
+The directory tree is the registry — a repository exists iff its
+directory holds either store; serving a new repository is a directory
+plus a request, no restart. `RepoSet` opens repositories lazily on first
+request (singleflighted), keeps per-repository stats, and caps open
+handles with `--max-repos` (LRU eviction of idle handles; a v0.1 root
+with stores at the top level serves unchanged as the repository named
+`default`). Every handler resolves its request's `repo` field through
+`RepoSet::resolve` — the one seam where authentication slots in later.
+
+`Repo` wires one repository's stores and holds the semantics every
+surface shares — the `bed` binary's gRPC service and `gardenbed-mcp` call
+the same methods, which is why MCP and CLI answers agree by construction
+(v0.1.md §M7.1).
 
 **Subcommands** (binary): `serve` (default — gRPC on `--addr`,
-default `127.0.0.1:9418`), `import`, `export` (see
-[docs/cli.md](cli.md)). The bound address is printed on stdout's first
-line (`listening on …`) — the contract scripts rely on.
+default `127.0.0.1:9418`; `--max-repos` caps open repositories),
+`import` and `export` (both take `--repo NAME`), `move` (renames a
+repository — an offline operation: it checkpoints the repository's WAL,
+carries the sidecar files, and refuses while any server holds the root's
+`gardenbed.lock`; see [docs/cli.md](cli.md)). Servers hold that lock
+*shared* for their lifetime — several servers may serve one root — while
+file-relocating offline operations (`move`, offline `gc`) take it
+exclusive, refusing while any server is live. The bound address is
+printed on stdout's first line (`listening on …`) — the contract scripts
+rely on.
 
 **Revspec resolution (`Repo::get_ref`, also served by the `GetRef`
 RPC).** One resolver funnels every id-taking surface:
