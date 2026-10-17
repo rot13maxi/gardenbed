@@ -17,11 +17,15 @@ tags, and the verification record for a release lives in
   service layer as the gRPC server and MCP, serves an embedded
   no-build-step SPA plus a same-origin JSON API
   (`/api/refs|log|changeset|tree|file|blame|diff|stats`), and ships a
-  `seed` subcommand that writes a deterministic demo history. See
-  [docs/web.md](docs/web.md). Verified by in-memory router integration
-  tests (`crates/web/tests/api.rs`) and a Playwright end-to-end suite
-  (`e2e/`) that drives a real browser through every page against the
-  seeded repository.
+  `seed` subcommand that writes a deterministic demo history. The UI
+  includes an agent hand-off dialog ("Use in agent") that generates a
+  copyable connect-and-work prompt from `/api/server-info` plus the refs
+  listing, an SVG commit-graph lane column on History, an activity
+  heatmap and authors chart on Overview, and per-changeset diffstat
+  chips. See [docs/web.md](docs/web.md). Verified by in-memory router
+  integration tests (`crates/web/tests/api.rs`) and a Playwright
+  end-to-end suite (`e2e/`) that drives a real browser through every
+  page against the seeded repository.
 
 ### Changed
 

@@ -34,12 +34,20 @@ gardenbed-web --root /tmp/gardenbed-demo
 
 | Route | Page |
 |---|---|
-| `#/` | Overview: ref cards, request counters, recent history |
-| `#/log` | History timeline from the selected ref |
-| `#/changeset/<id>` | Changeset metadata + grouped change list |
+| `#/` | Overview: ref cards, request counters, activity heatmap, authors chart, recent history |
+| `#/log` | History timeline with an SVG commit-graph lane column |
+| `#/changeset/<id>` | Changeset metadata, diffstat summary, grouped change list |
 | `#/browse/<rev>/<path>` | Tree listing with breadcrumbs |
 | `#/file/<rev>/<path>` | File content with line numbers, blame toggle |
 | `#/compare?a=<rev>&b=<rev>` | Diff between two revspecs |
+
+The **Use in agent** button (top bar) opens a dialog with a generated
+markdown prompt — repository facts (tip id, refs, root), connection
+instructions (MCP tools for read-only queries, `bed` CLI for read/write),
+and the working rules (sparse checkout, commit → publish, rebase on
+publish conflict) — ready to paste to any agent. It is assembled from
+`GET /api/server-info` (version, repository root, bound address) and the
+refs listing, so the instructions are accurate for this server.
 
 Everywhere a rev is accepted (the global ref selector, compare inputs, URL
 fragments) the shared revspec resolver applies: ref name, full 64-hex id,

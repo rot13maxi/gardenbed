@@ -100,8 +100,16 @@ async fn serve(addr: &str, root: &std::path::Path) -> ExitCode {
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let repo = Repo::open(root)?;
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        println!("listening on {}", listener.local_addr()?);
-        axum::serve(listener, gardenbed_web::router(repo)).await?;
+        let bound = listener.local_addr()?;
+        println!("listening on {bound}");
+        // Absolute, canonicalized root: the agent-connect UI prints it
+        // back into shell instructions.
+        let root_abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let info = gardenbed_web::ServerInfo {
+            root: Some(root_abs.display().to_string()),
+            addr: Some(bound.to_string()),
+        };
+        axum::serve(listener, gardenbed_web::router_with_info(repo, info)).await?;
         Ok(())
     }
     .await;

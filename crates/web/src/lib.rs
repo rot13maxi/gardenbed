@@ -21,6 +21,8 @@
 //! * `GET /api/blame?cs=<revspec>&path=<p>` — first-parent line ranges.
 //! * `GET /api/diff?a=<revspec>&b=<revspec>` — tree diff `a` → `b`.
 //! * `GET /api/stats` — the server's per-RPC counters.
+//! * `GET /api/server-info` — serving-process facts (crate version,
+//!   repository root, bound address) for connect-instructions UIs.
 //! * `GET /`, `GET /static/app.js`, `GET /static/styles.css` — the SPA.
 //!
 //! A revspec is a ref name, a full 64-hex changeset id, or an
@@ -62,16 +64,36 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_JS: &str = include_str!("../static/app.js");
 const STYLES_CSS: &str = include_str!("../static/styles.css");
 
+/// Facts about the serving process that are not derivable from the
+/// repository: the on-disk root and the address the binary bound. Served
+/// by `/api/server-info` so the UI can generate accurate
+/// connect-this-repo instructions for agents.
+#[derive(Clone, Debug, Default)]
+pub struct ServerInfo {
+    /// The `--root` the repository was opened from (absolute), when known.
+    pub root: Option<String>,
+    /// The `--addr`/bound address, when known (e.g. `"0.0.0.0:8430"`).
+    pub addr: Option<String>,
+}
+
 /// Shared handler state: one repo behind an `Arc` (every `Repo` method
-/// takes `&self`).
+/// takes `&self`), plus the [`ServerInfo`] facts.
 #[derive(Clone)]
 struct AppState {
     repo: Arc<Repo>,
+    info: Arc<ServerInfo>,
 }
 
 /// The web router over `repo`: every `/api/*` endpoint plus the embedded
 /// static assets. Mount or serve directly; the binary serves it at `/`.
 pub fn router(repo: Repo) -> Router {
+    router_with_info(repo, ServerInfo::default())
+}
+
+/// Like [`router`], but `/api/server-info` also reports the given root
+/// and bound address. The binary passes its own `--root`/`--addr`;
+/// embedded users (tests, tiers) get a `null` root/addr via [`router`].
+pub fn router_with_info(repo: Repo, info: ServerInfo) -> Router {
     Router::new()
         .route("/api/refs", get(handlers::refs))
         .route("/api/log", get(handlers::log))
@@ -81,11 +103,13 @@ pub fn router(repo: Repo) -> Router {
         .route("/api/blame", get(handlers::blame))
         .route("/api/diff", get(handlers::diff))
         .route("/api/stats", get(handlers::stats))
+        .route("/api/server-info", get(handlers::server_info))
         .route("/", get(handlers::index))
         .route("/static/app.js", get(handlers::app_js))
         .route("/static/styles.css", get(handlers::styles_css))
         .with_state(AppState {
             repo: Arc::new(repo),
+            info: Arc::new(info),
         })
 }
 
@@ -330,6 +354,18 @@ fn static_asset(content: &'static str, content_type: &'static str) -> Response {
 
 mod handlers {
     use super::*;
+
+    /// The serving-process facts for the UI's connect instructions:
+    /// crate version plus the root/addr passed to
+    /// [`router_with_info`] (`null` when unknown). No `Repo` call, so no
+    /// blocking hop.
+    pub(super) async fn server_info(State(s): State<AppState>) -> Json<Value> {
+        Json(json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "root": s.info.root,
+            "addr": s.info.addr,
+        }))
+    }
 
     pub(super) async fn refs(State(s): State<AppState>) -> Result<Json<Value>, ApiError> {
         blocking(s, |repo| {
