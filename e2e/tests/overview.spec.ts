@@ -43,7 +43,7 @@ test("clicking a ref card navigates to its changeset", async ({ page, request })
 test("document title reflects the route", async ({ page }) => {
   await page.goto("/");
   await expect(page).toHaveTitle(/gardenbed/i);
-  const tip = await (await import("./util")).mainTip(page.request);
+  const tip = await mainTip(page.request);
   const entries = await log(page.request, tip, 5);
   await page.goto(`/#/changeset/${entries[0].id}`);
   await expect(page).toHaveTitle(new RegExp(entries[0].id.slice(0, 12)));

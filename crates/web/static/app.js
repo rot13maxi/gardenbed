@@ -333,8 +333,11 @@ function skeleton(rows) {
   return wrap;
 }
 
+const EMPTY_GLYPH = '<svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v6" stroke-linecap="round"/><circle cx="12" cy="16.2" r="0.6" fill="currentColor" stroke="none"/></svg>';
+
 function emptyState(title, msg, hint) {
   const box = el("div", { class: "empty-state" },
+    el("div", { class: "empty-glyph", html: EMPTY_GLYPH }),
     el("div", { class: "empty-title" }, title),
     msg ? el("div", { class: "empty-msg" }, msg) : null);
   if (hint) box.appendChild(el("div", { class: "empty-hint" }, hint));
@@ -345,22 +348,31 @@ function mountError(root, err, title) {
   clear(root).appendChild(emptyState(title || "Something went wrong", String(err && err.message ? err.message : err)));
 }
 
+/** Clipboard write with a textarea fallback; rejects on hard failure. */
+function copyText(text) {
+  if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise((resolve, reject) => {
+    const body = document.body || document.documentElement;
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    body.appendChild(ta);
+    if (ta.select) ta.select();
+    let ok = false;
+    try { ok = document.execCommand ? document.execCommand("copy") : false; } catch (_) { ok = false; }
+    if (ta.parentNode) ta.parentNode.removeChild(ta);
+    ok ? resolve() : reject(new Error("copy command rejected"));
+  });
+}
+
 function copyButton(getText, label) {
   const btn = el("button", { class: "btn btn-sm", type: "button" }, label || "copy");
   btn.addEventListener("click", async () => {
     const orig = btn.textContent;
     try {
       const text = await Promise.resolve(typeof getText === "function" ? getText() : getText);
-      if (typeof navigator !== "undefined" && navigator.clipboard && navigator.clipboard.writeText) {
-        await navigator.clipboard.writeText(text);
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = text;
-        document.body.appendChild(ta);
-        ta.select();
-        document.execCommand("copy");
-        document.body.removeChild(ta);
-      }
+      await copyText(text);
       btn.textContent = "copied";
     } catch (_) {
       btn.textContent = "copy failed";
@@ -469,6 +481,276 @@ function revName(rev) {
   return r ? rev.replace(/^refs\/heads\//, "") : shortId(rev, 12);
 }
 
+/* ---------- agent hand-off modal ---------- */
+
+/** Only one dialog at a time; `modalClose` is set while open. */
+let modalClose = null;
+
+/** Host for clone/--addr hints: strip port; wildcards fall back to the web host. */
+function pickHost(addr) {
+  if (addr && !/^0\.0\.0\.0/.test(addr) && !/^\[::\]/.test(addr)) {
+    return String(addr).replace(/:\d+$/, "");
+  }
+  return (typeof location !== "undefined" && location.hostname) || "localhost";
+}
+
+/** The markdown prompt an operator can paste into any agent. */
+function buildAgentPrompt(info, refs) {
+  info = info || {};
+  refs = refs || [];
+  const L = [];
+  const mainRef = refs.find((r) => r.name === "refs/heads/main") || refs[0];
+  const host = pickHost(info.addr);
+  const root = info.root || "(unknown)";
+  const origin = (typeof location !== "undefined" && location.origin) || "(this web UI)";
+  L.push(
+    "# Working with this gardenbed repository", "",
+    "Gardenbed is source control built for agents: one central server owns the repository;",
+    "workers keep SPARSE working copies — you fetch only the paths you need. The unit of",
+    "work is a changeset; publishing fast-forwards main.", "",
+    "## Repository facts", "",
+    "- main tip: " + (mainRef ? mainRef.cs : "(no refs yet)"),
+    "- refs:");
+  if (!refs.length) L.push("  - (none yet)");
+  for (const r of refs) L.push("  - " + r.name + "  " + String(r.cs || "").slice(0, 12));
+  L.push(
+    "- web UI: " + origin + "; web server version " + (info.version || "(unknown)") +
+      "; repo root on the server machine: " + root, "",
+    "## Option A — MCP (queries only, no checkout)", "",
+    "If your agent host supports MCP servers, register:", "",
+    "    gardenbed-mcp --root " + (info.root || "(the repo root from your operator)"), "",
+    "Gives you log / diff / file / blame tools with zero checkout.", "",
+    "## Option B — bed CLI (full read/write)", "",
+    "Ask your operator for the gRPC endpoint (or start it on the repo machine:",
+    "`gardenbed-server --root " + root + " --addr " + host + ":9418`). Then:", "",
+    "    bed clone http://" + host + ":9418        # creates .bed, fetches nothing",
+    "    bed sparse add crates                   # materialize only what you need",
+    "    bed status",
+    "    GARDENBED_AUTHOR=\"Name <email>\" bed commit -m \"...\"",
+    "    bed publish                             # fast-forward main; if refused: bed rebase main, then publish again", "",
+    "## Rules", "",
+    "- History queries without checkout: bed log / bed diff / bed file / bed blame accept refs,",
+    "  full 64-hex ids, or unambiguous prefixes.",
+    "- publish never merges for you; on conflict rebase and republish — your changeset is kept.",
+    "- Only commit inside a sparse working copy after `bed sparse add`-ing the paths you touch.", "",
+    "Full docs: docs/quickstart.md and docs/cli.md in the gardenbed repository.");
+  return L.join("\n");
+}
+
+function openAgentModal() {
+  if (modalClose) return;
+  const trigger = document.getElementById("agent-prompt-btn");
+  if (trigger) trigger.disabled = true;
+
+  const pre = el("pre", { id: "agent-prompt-text" }, "gathering repository facts…");
+  const closeBtn = el("button", { class: "btn btn-sm modal-close", type: "button", "aria-label": "Close dialog" }, "✕");
+  const copyBtn = el("button", { id: "copy-prompt-btn", class: "btn primary", type: "button" }, "Copy prompt");
+  const modal = el("div", {
+    id: "agent-modal", role: "dialog", "aria-modal": "true",
+    "aria-labelledby": "agent-modal-title", tabindex: "-1",
+  },
+    el("div", { class: "modal-head" },
+      el("h2", { id: "agent-modal-title" }, "Hand this repo to an agent"),
+      closeBtn),
+    el("p", { class: "modal-intro" },
+      "gardenbed is source control for many agents working one repo. The prompt below tells any agent how to connect, check out only what it needs, and publish — copy it into your agent's instructions."),
+    pre,
+    el("div", { class: "modal-actions" }, copyBtn));
+  const backdrop = el("div", { class: "modal-backdrop" }, modal);
+
+  const onKey = (ev) => {
+    if (ev.key === "Escape") { if (ev.preventDefault) ev.preventDefault(); close(); }
+  };
+  const close = () => {
+    if (!modalClose) return;
+    modalClose = null;
+    if (document.removeEventListener) document.removeEventListener("keydown", onKey);
+    if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+    if (trigger) { trigger.disabled = false; if (trigger.focus) trigger.focus(); }
+  };
+  backdrop.addEventListener("click", (ev) => { if (ev.target === backdrop) close(); });
+  closeBtn.addEventListener("click", close);
+  copyBtn.addEventListener("click", async () => {
+    const orig = copyBtn.textContent;
+    try {
+      await copyText(pre.textContent || "");
+      copyBtn.textContent = "Copied ✓";
+      pre.className = "copied";
+    } catch (_) {
+      copyBtn.textContent = "Copy failed — select and copy manually";
+    }
+    setTimeout(() => { copyBtn.textContent = orig; pre.className = ""; }, 2000);
+  });
+
+  if (document.addEventListener) document.addEventListener("keydown", onKey);
+  (document.body || document.documentElement).appendChild(backdrop);
+  modalClose = close;
+  if (modal.focus) modal.focus();
+
+  const refsP = state.refs.length
+    ? Promise.resolve(state.refs)
+    : api("/api/refs").then((d) => (d && d.refs) || []).catch(() => []);
+  Promise.all([api("/api/server-info").catch(() => ({})), refsP]).then(([info, refs]) => {
+    pre.textContent = buildAgentPrompt(info, refs);
+  });
+}
+
+/* ---------- commit graph (pure SVG lanes) ---------- */
+
+const TL_ROW_H = 68;   // must match --tl-row-h in styles.css
+const GRAPH_W = 120, LANE_X0 = 14, LANE_W = 16;
+
+function laneColor(i) {
+  return i === 0 ? "#8ec07c" : "hsl(" + ((140 + i * 47) % 360) + ",40%,53%)";
+}
+
+function svgEl(tag, attrs) {
+  const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  if (attrs) for (const k in attrs) n.setAttribute(k, attrs[k]);
+  return n;
+}
+
+/**
+ * Lane assignment, newest→oldest: a commit consumes the first lane expecting
+ * it (else takes the leftmost free lane); its first parent continues that
+ * lane, extra parents open right-side lanes. Edges are drawn at consumption
+ * time from the lane's origin node; open lanes get a dangling stub.
+ */
+function buildCommitGraph(entries) {
+  const H = Math.max(entries.length * TL_ROW_H, TL_ROW_H);
+  const svg = svgEl("svg", {
+    class: "commit-graph", width: GRAPH_W, height: H,
+    viewBox: "0 0 " + GRAPH_W + " " + H, "aria-hidden": "true",
+  });
+  const X = (lane) => LANE_X0 + lane * LANE_W;
+  const Y = (row) => row * TL_ROW_H + TL_ROW_H / 2;
+  const lanes = []; // {expect, origin:{row,lane}, color}
+  const edges = [];
+  const nodes = [];
+
+  entries.forEach((e, i) => {
+    const parents = e.parents || [];
+    let li = lanes.findIndex((l) => l.expect === e.id);
+    if (li < 0) {
+      li = lanes.findIndex((l) => !l.expect);
+      if (li < 0) { li = lanes.length; lanes.push({ color: laneColor(li) }); }
+      lanes[li].origin = null;
+    }
+    const lane = lanes[li];
+    if (lane.origin) {
+      edges.push({ x1: X(lane.origin.lane), y1: Y(lane.origin.row), x2: X(li), y2: Y(i), c: lane.color });
+    }
+    nodes.push({ x: X(li), y: Y(i), c: lane.color, merge: parents.length > 1 });
+    lane.origin = { row: i, lane: li };
+    lane.expect = parents.length ? parents[0] : null;
+    for (let pi = 1; pi < parents.length; pi++) {
+      let ni = lanes.findIndex((l, idx) => idx > li && !l.expect);
+      if (ni < 0) { ni = lanes.length; lanes.push({ color: laneColor(ni) }); }
+      lanes[ni].expect = parents[pi];
+      lanes[ni].origin = { row: i, lane: li };
+    }
+  });
+  lanes.forEach((l, li) => {
+    if (l.expect && l.origin) {
+      edges.push({ x1: X(l.origin.lane), y1: Y(l.origin.row), x2: X(li), y2: H - 6, c: l.color, stub: true });
+    }
+  });
+
+  for (const g of edges) {
+    const d = g.stub && g.x1 === g.x2
+      ? "M " + g.x1 + " " + g.y1 + " L " + g.x2 + " " + g.y2
+      : g.x1 === g.x2
+        ? "M " + g.x1 + " " + g.y1 + " L " + g.x2 + " " + g.y2
+        : "M " + g.x1 + " " + g.y1 + " C " + g.x1 + " " + (g.y1 + 26) + ", " + g.x2 + " " + (g.y2 - 26) + ", " + g.x2 + " " + g.y2;
+    svg.appendChild(svgEl("path", {
+      class: "graph-edge", d: d, fill: "none", stroke: g.c,
+      "stroke-width": "2", "stroke-linecap": "round", opacity: g.stub ? "0.45" : "0.85",
+    }));
+  }
+  for (const nd of nodes) {
+    if (nd.merge) {
+      svg.appendChild(svgEl("circle", {
+        class: "merge-node", cx: nd.x, cy: nd.y, r: 8.5,
+        fill: "none", stroke: nd.c, "stroke-width": "1.6",
+      }));
+    }
+    svg.appendChild(svgEl("circle", {
+      class: "graph-node", cx: nd.x, cy: nd.y, r: 5,
+      fill: nd.c, stroke: "var(--bg-raised)", "stroke-width": "1.5",
+    }));
+  }
+  return svg;
+}
+
+/* ---------- activity heatmap & authors chart ---------- */
+
+function civilDateKey(idn) {
+  return civilTime(idn).split(" ")[0];
+}
+
+function buildHeatmap(entries) {
+  const DAY = 86400;
+  const counts = {};
+  let max = 0;
+  let newestKey = null;
+  for (const e of entries) {
+    if (!e.author) continue;
+    const k = civilDateKey(e.author);
+    if (!k) continue;
+    counts[k] = (counts[k] || 0) + 1;
+    if (counts[k] > max) max = counts[k];
+    if (!newestKey || k > newestKey) newestKey = k;
+  }
+  // Anchor the 12-week window to the newest changeset's own civil date, so a
+  // stale repo shows its real activity window; empty log falls back to today.
+  const endIdx = newestKey
+    ? Math.floor(Date.parse(newestKey + "T00:00:00Z") / (DAY * 1000))
+    : Math.floor(Math.floor(Date.now() / 1000) / DAY);
+  let start = endIdx - 83;
+  start -= new Date(start * DAY * 1000).getUTCDay(); // align first column to Sunday
+  const wrap = el("div", { id: "activity-heatmap", class: "mono" });
+  for (let d = start; d <= endIdx; d++) {
+    const key = new Date(d * DAY * 1000).toISOString().slice(0, 10);
+    const c = counts[key] || 0;
+    const level = c === 0 ? 0 : Math.min(4, Math.ceil((c / max) * 4));
+    wrap.appendChild(el("span", {
+      class: "heat-cell",
+      "data-level": String(level),
+      "data-date": key,
+      "data-count": String(c),
+      title: c + " changesets on " + key,
+    }));
+  }
+  return wrap;
+}
+
+function buildAuthors(entries, top) {
+  const counts = {};
+  for (const e of entries) {
+    const name = (e.author && e.author.name) || "unknown";
+    counts[name] = (counts[name] || 0) + 1;
+  }
+  let rows = Object.keys(counts).map((k) => [k, counts[k]]).sort((a, b) => b[1] - a[1]);
+  const rest = rows.slice(top || 8);
+  rows = rows.slice(0, top || 8);
+  if (rest.length) rows.push(["others", rest.reduce((a, r) => a + r[1], 0)]);
+  const maxN = rows.length ? rows[0][1] : 1;
+  const wrap = el("div", { id: "authors-chart" });
+  if (!rows.length) {
+    wrap.appendChild(emptyState("No authors yet", null, "changesets will attribute their authors here"));
+    return wrap;
+  }
+  for (const [name, n] of rows) {
+    const pct = Math.max(2, Math.round((n / maxN) * 100));
+    wrap.appendChild(el("div", { class: "author-row" },
+      el("span", { class: "author-name", title: name }, name),
+      el("span", { class: "author-track" },
+        el("span", { class: "author-bar", style: "width:" + pct + "%" })),
+      el("span", { class: "author-count mono" }, String(n))));
+  }
+  return wrap;
+}
+
 /* ================= 5. views ================= */
 
 const app = () => document.getElementById("app");
@@ -481,7 +763,7 @@ function viewOverview(root) {
   Promise.all([
     api("/api/refs"),
     api("/api/stats"),
-    api("/api/log?" + qs({ cs: rev, limit: 15 })),
+    api("/api/log?" + qs({ cs: rev, limit: 500 })),
   ]).then(([refs, stats, log]) => {
     clear(root);
     const counters = (stats && stats.counters) || {};
@@ -520,20 +802,33 @@ function viewOverview(root) {
     const recent = el("section", { class: "panel" },
       el("h2", { class: "panel-title" }, "Recent · " + revName(rev)));
     const recentList = el("div", { id: "recent-list" });
-    if (!log.entries || !log.entries.length) {
+    const all = log.entries || [];
+    if (!all.length) {
       recentList.appendChild(emptyState("No history yet", null, "the first seed has not landed"));
     }
-    for (const e of log.entries || []) recentList.appendChild(logRow(e));
+    for (const e of all.slice(0, 15)) recentList.appendChild(logRow(e));
     recent.appendChild(recentList);
     recent.appendChild(el("div", { style: "margin-top:10px" },
       el("a", { class: "btn btn-sm", href: "#/log?cs=" + encodeURIComponent(rev) }, "full history →")));
     twoCol.appendChild(recent);
 
+    const rightCol = el("div", { class: "stack" });
+    const authorsPanel = el("section", { class: "panel" },
+      el("h2", { class: "panel-title" }, "Authors"));
+    authorsPanel.appendChild(buildAuthors(all, 8));
+    rightCol.appendChild(authorsPanel);
+
     const statsPanel = el("section", { class: "panel" },
       el("h2", { class: "panel-title" }, "Request counters"));
     statsPanel.appendChild(statsTable(counters));
-    twoCol.appendChild(statsPanel);
+    rightCol.appendChild(statsPanel);
+    twoCol.appendChild(rightCol);
     root.appendChild(twoCol);
+
+    const activityPanel = el("section", { class: "panel" },
+      el("h2", { class: "panel-title" }, "Activity"));
+    activityPanel.appendChild(buildHeatmap(all));
+    root.appendChild(activityPanel);
   }).catch((err) => mountError(root, err, "Could not load overview"));
 }
 
@@ -570,11 +865,16 @@ function viewLog(root, query) {
       root.appendChild(el("h1", { class: "page-title" }, "History"));
       root.appendChild(el("div", { class: "page-sub" },
         revName(cs) + " · tip " + shortId(data.resolved, 12)));
-      const list = el("div", { id: "log-list", class: "panel timeline" });
-      if (!data.entries || !data.entries.length) {
+      const entries = data.entries || [];
+      const list = el("div", {
+        id: "log-list",
+        class: "panel timeline" + (entries.length ? " has-graph" : ""),
+      });
+      if (!entries.length) {
         list.appendChild(emptyState("No history", null, "this ref has no changesets"));
       }
-      for (const e of data.entries || []) list.appendChild(logRow(e));
+      for (const e of entries) list.appendChild(logRow(e));
+      if (entries.length) list.insertBefore(buildCommitGraph(entries), list.firstChild);
       root.appendChild(list);
       if (data.entries && data.entries.length === lim) {
         root.appendChild(el("button", {
@@ -616,6 +916,32 @@ function viewChangeset(root, id) {
       header.appendChild(chips);
     } else {
       header.appendChild(el("div", { class: "page-sub", style: "margin:4px 0 0" }, "root changeset — no parents"));
+    }
+    // diffstat chips + proportional bar
+    const dCounts = { add: 0, modify: 0, delete: 0, rename: 0, other: 0 };
+    for (const c of cs.changes || []) {
+      if (dCounts[c.op] !== undefined) dCounts[c.op]++; else dCounts.other++;
+    }
+    const dTotal = dCounts.add + dCounts.modify + dCounts.delete + dCounts.rename + dCounts.other;
+    if (dTotal) {
+      const SYM = { add: "+", modify: "~", delete: "−", rename: "⇒", other: "?" };
+      const LBL = { add: "added", modify: "modified", delete: "deleted", rename: "renamed", other: "changed" };
+      const dWrap = el("div", { class: "diffstat" });
+      for (const op of ["add", "modify", "delete", "rename", "other"]) {
+        if (!dCounts[op]) continue;
+        dWrap.appendChild(el("span", { class: "diff-chip mono", "data-op": op },
+          SYM[op] + dCounts[op] + " " + LBL[op]));
+      }
+      header.appendChild(dWrap);
+      const bar = el("div", { class: "diff-bar" });
+      for (const op of ["add", "modify", "delete", "rename", "other"]) {
+        if (!dCounts[op]) continue;
+        bar.appendChild(el("span", {
+          class: "diff-seg diff-seg-" + op,
+          style: "width:" + ((dCounts[op] / dTotal) * 100).toFixed(2) + "%",
+        }));
+      }
+      header.appendChild(bar);
     }
     root.appendChild(header);
 
@@ -937,6 +1263,8 @@ function route() {
 
 function boot() {
   addEventListener("hashchange", route);
+  const agentBtn = document.getElementById("agent-prompt-btn");
+  if (agentBtn) agentBtn.addEventListener("click", openAgentModal);
   // Populate the ref selector, then render (selector load is non-blocking).
   loadRefs().then(route, route);
 }

@@ -408,6 +408,31 @@ async fn stats_returns_counters() {
 }
 
 #[tokio::test]
+async fn server_info_reports_version_and_given_facts() {
+    let (repo, ..) = fixture();
+    let info = gardenbed_web::ServerInfo {
+        root: Some("/srv/repo".into()),
+        addr: Some("0.0.0.0:8430".into()),
+    };
+    let (status, json) = get_json(
+        &gardenbed_web::router_with_info(repo, info),
+        "/api/server-info",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(json["root"], "/srv/repo");
+    assert_eq!(json["addr"], "0.0.0.0:8430");
+
+    // The plain router exposes nulls for the unknown facts.
+    let (repo, ..) = fixture();
+    let (status, json) = get_json(&gardenbed_web::router(repo), "/api/server-info").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["root"], Value::Null);
+    assert_eq!(json["addr"], Value::Null);
+}
+
+#[tokio::test]
 async fn revspec_errors_map_to_statuses() {
     let (repo, ..) = fixture();
     let app = gardenbed_web::router(repo);
