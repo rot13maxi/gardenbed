@@ -13,6 +13,7 @@ name = "bed"
 path = "src/main.rs"
 
 [dependencies]
+bstr = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive"] }
 http = "1"
@@ -22,6 +23,9 @@ gardenbed-store = { path = "../store" }
 # The wire client (M4 read path): thin, runtime-only — bed never links the
 # server; tests ingest fixtures through `gardenbed-server` as a dev-dep.
 gardenbed-protocol = { path = "../protocol" }
+# .gitignore pattern matching for untracked-file discovery (status/commit).
+# Same version the `gix` dependency in crates/git already locks.
+gix-glob = "0.29.0"
 rustix = { version = "1", features = ["fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

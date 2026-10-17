@@ -48,10 +48,10 @@ Usage: bed [OPTIONS] <COMMAND>
 | `status` | show local changes under selected paths |
 | `file` | print one file's content at a changeset (or the current one) |
 | `log` | show changeset history, newest first |
-| `diff` | diff two changesets (default: current vs first parent) |
+| `diff` | diff the working copy (when dirty by modified/deleted tracked files) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
-| `publish` | fast-forward `main` to the current changeset |
+| `publish` | fast-forward a ref (default `main`) to the current changeset |
 | `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
 
@@ -126,6 +126,12 @@ bed sparse add big              # the demo: 1,021 files, byte-verified vs git sh
 bed sparse list                 # which prefixes this working copy materializes
 bed sparse remove tests/
 ```
+
+`sparse list` stays fully offline. A selected prefix that matches nothing
+at the current changeset is listed with the suffix
+`(empty at this changeset)` — selected ahead of history by design, it
+fills as the paths land in later changesets, but the marker keeps a dead
+selection from reading like live coverage.
 
 ### bed switch
 
@@ -206,13 +212,45 @@ bed log --cs master --limit 1
 Usage: bed diff [OPTIONS] [A] [B]
 ```
 
-Diffs two changesets (default: the current changeset vs its first
-parent). `A` is the older side; with `B` omitted, diffs `A` against its
-first parent. Both take a `<cs-or-ref>`.
+With no arguments, `bed diff` is context-aware: a working copy **dirty
+by modified or deleted tracked files** diffs their local bytes against
+the current changeset (untracked files are not part of it — git parity;
+a deleted file, or a tracked file replaced by a directory, renders as a
+removal to `/dev/null`; a tracked symlink's new side is its
+link-target bytes, what `commit` records, never the target's content —
+a dangling link diffs fine). A working copy clean, or dirty only by
+untracked files, diffs the current changeset against its first parent.
+With arguments, both are always changesets: `A` is the older side; with
+`B` omitted, diffs `A` against its first parent. Both take a
+`<cs-or-ref>`.
+
+Every diff prints a one-line header naming what is being diffed, so the
+modes are distinguishable at a glance — empty diffs included (identical
+sides state they are equal; a root changeset says it has no parent).
+
+Renders are git-shaped beyond the header: a pure rename (the recorded
+`Rename` op, or — between two arbitrary changesets — a delete and a
+write of the identical blob, the rule `bed commit` pairs by) renders
+git's `R100` form (`similarity index 100%`, `rename from`, `rename
+to`); a moved-and-edited file renders a delete plus a write (no
+similarity below 100% is ever claimed). A submodule pointer renders
+`Subproject commit <sha>` hunks on add, delete, and retarget — the real
+upstream SHA — and every rendered shape reapplies with `git apply`
+(gitlink entries under `git apply --cached`).
+
+The first-parent wording appears only when the older side really is the
+newer's first parent; any other pair names both sides:
 
 ```sh
-bed diff                     # current changeset vs its first parent
+bed diff                     # working copy vs current changeset (dirty),
+                             # else current changeset vs its first parent
 bed diff main master
+```
+
+```text
+diff of working copy against 57169571952de2bf
+diff of 57169571952de2bf against its first parent
+diff of 3af0c1d8e29b4a6d against 57169571952de2bf
 ```
 
 ### bed commit
@@ -259,12 +297,26 @@ bed rebase main
 Usage: bed publish [OPTIONS]
 ```
 
-Fast-forwards `main` to the current changeset (a compare-and-swap: one
+Fast-forwards a ref to the current changeset (a compare-and-swap: one
 winner per race; a loser is told the new tip).
+
+| flag | meaning |
+|---|---|
+| `--state-dir <DIR>` | local state directory (default `./.bed`) |
+| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form) |
+| `--force` | permit a non-fast-forward (rewind) move of a named ref |
+
+A named ref is the lane-agent form: agents committing off-main publish
+their branch so a fresh clone's `bed switch <branch>` resolves to the new
+tip. A lane ref gets the same rewind guard as `import`: a non-descendant
+move is refused (the error names the ref, both tips, and what falls off)
+unless `--force` is passed.
 
 ```sh
 bed publish
 # published b273e12d1c6f11ee — `main` now points to it
+bed publish --ref feat/scale-out
+# published 9d1c4b7e2a5f8d3c — `feat/scale-out` now points to it
 ```
 
 ### bed blame
@@ -298,7 +350,8 @@ Usage: gardenbed-server [OPTIONS] [COMMAND]
 |---|---|
 | `--addr <ADDR>` | listen address (`host:port`; `:0` picks an ephemeral port), default `127.0.0.1:9418` |
 | `--root <ROOT>` | the server root directory (created if missing): one subdirectory per repository (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); a v0.1 root (stores at the top level) serves unchanged as repository `default` |
-| `--max-repos <N>` | cap on simultaneously open repositories (LRU eviction above it), default 256 |
+| `--max-repos <N>` | cap on simultaneously open repositories (LRU eviction above it), default 256; local (`--root`) mode only |
+| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode. Scaled mode serves one repository; the request's `repo` name is a label, not a directory |
 
 Without a subcommand, the top-level `--addr`/`--root` flags serve the
 gRPC API — the printed address is the contract for scripts:
@@ -313,14 +366,48 @@ one-time validation of previously uncertified reachable history before moving
 refs; later restarts reuse that frontier. See [publication validation](validation.md)
 for migration behavior and certificate guarantees.
 
+### Scaled storage
+
+`serve` (and `import`/`export`, below) accept `--storage <config.toml>`
+to open off-box backends instead of the local `--root` layout — the
+horizontal scale-out tier ([docs/scale-out-design.md](scale-out-design.md)).
+The file selects one backend per storage contract:
+
+```toml
+[metadata]
+backend = "postgres"            # or "sqlite" (root = "/path/to/repo")
+url = "postgres://user:pass@host:5432/gardenbed"
+
+[objects]
+backend = "s3"                  # or "fs" (root = "/path/to/repo")
+endpoint = "http://minio:9000"
+bucket = "gardenbed"
+region = "us-east-1"
+access_key = "..."
+secret_key = "..."
+path_style = true
+```
+
+```sh
+gardenbed-server --storage config.toml serve --addr 0.0.0.0:9418
+GARDENBED_STORAGE=/etc/gardenbed/storage.toml gardenbed-server serve
+```
+
+The `sqlite`/`fs` branches point at the same `<root>/metadata.sqlite3`
+and `<root>/objects` layout that `--root` mode opens, so a config file
+can address an existing local repository. A ready-made compose stack
+(Postgres + MinIO + N replicas) lives in `tools/scale/`; see
+[tools/scale/README.md](../tools/scale/README.md).
+
 ### gardenbed-server serve
 
 ```text
 Usage: gardenbed-server serve [OPTIONS]
 ```
 
-Serves the gRPC API. Takes the same `--addr`/`--root` flags; this is the
-default when no subcommand is given.
+Serves the gRPC API. Takes the same `--addr`/`--root`/`--storage` flags
+(see [scaled storage](#scaled-storage)); this is the default when no
+subcommand is given.
 
 For its lifetime the server holds an exclusive lock on
 `<root>/gardenbed.lock`: a second server over the same root refuses to
@@ -371,6 +458,37 @@ Imports a git repository's history into the Gardenbed stores.
 | `--limit <LIMIT>` | ingest only the newest N commits (topological suffix; slice boundaries are re-rooted as full-tree root changesets) |
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
+| `--allow-rewind` | permit ref moves that would lose changesets (force-push parity) |
+| `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback). Note: URL `--from` values require local mode — scaled mode imports a local path |
+
+**Backward ref moves (rewinds).** When an incremental import moves a ref
+to a tip that is not a descendant of the ref's current value (e.g. the
+git repository's `main` is *behind* the store's published `main`, or a
+force push rewrote the tip), the import:
+
+* **fails with a non-zero exit by default** when the move would actually
+  lose changesets — the error names the ref, both tips, the number of
+  changesets that would fall off, and the escape hatch. Nothing is
+  moved: every selected ref is validated first (two-phase), so a
+  multi-ref import whose later ref would rewind does not move its
+  earlier, forward-moving refs either, and every offending ref is named
+  in the error.
+* with `--allow-rewind`, performs the move (force-push parity: old
+  objects and mapping rows remain, merely unreachable) and prints a
+  loud multi-line `warning:` to stderr naming the ref, the old and new
+  tip, and how many changesets may no longer be reachable from the ref.
+* counts the fell-off changesets exactly via a metadata-only BFS over
+  parent edges (no git or object reads). `--limit` imports cannot
+  compute the count (slice re-rooting breaks real ancestry), so they
+  refuse **every** non-descendant ref move by default — reporting the
+  loss as uncounted in the error — and, under `--allow-rewind`, report
+  the count as uncounted in the rewind entry.
+
+Forward moves (the common incremental case) are silent, exactly as
+before. Rewinds that lose nothing (a moved-back tip that is an ancestor
+of the current value is impossible by definition — the check fires on
+any non-descendant move — but sideways merges onto shared history count
+only what is actually unreachable) are permitted with just the warning.
 
 ```sh
 gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed \
@@ -397,6 +515,7 @@ report; `--mapping FILE` writes it as TSV for verification.
 | `--repo <REPO>` | repository name under the root (default `default`) |
 | `--into <INTO>` | destination git repository: created as a bare sha1 repository when missing, accepted as-is when present |
 | `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
+| `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback) |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
 
 ```sh

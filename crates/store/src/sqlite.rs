@@ -87,13 +87,27 @@ impl SqliteMetadataStore {
     /// itself untouched and the committed rows in the WAL; anything that
     /// relocates the database by renaming files (a repository move) must
     /// first fold the WAL in or the moved database is missing committed
-    /// rows. Fails when another connection holds the database (the
-    /// busy timeout applies) — which is exactly the caller's signal to
-    /// refuse the relocation.
+    /// rows.
+    ///
+    /// The PRAGMA answers even when it could not finish: its result row
+    /// is `(busy, log, checkpointed)` and `busy != 0` means another
+    /// connection is holding frames the checkpoint cannot pass (an open
+    /// read transaction, a writer mid-commit). That is exactly the
+    /// caller's signal to refuse the relocation, so it is surfaced as
+    /// [`StoreError::Db`] rather than reported as success.
     pub fn wal_checkpoint_truncate(&self) -> Result<(), StoreError> {
         let conn = self.lock()?;
-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
-            .map_err(db_err)
+        let (busy, _log, _checkpointed): (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(db_err)?;
+        if busy != 0 {
+            return Err(StoreError::Db(
+                "WAL checkpoint is blocked by another connection holding the database".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, Connection>, StoreError> {

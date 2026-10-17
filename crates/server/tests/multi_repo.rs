@@ -853,16 +853,17 @@ async fn move_after_wire_publish_serves_the_published_changeset() {
     server.shutdown().await;
 }
 
-/// A second server over a root the first server already serves refuses
-/// to start (the root's advisory lock is held), instead of silently
-/// double-serving one set of files.
+/// The root-lock contract for concurrent processes: servers hold the
+/// root's advisory lock *shared* (any number may serve one root — WAL
+/// sqlite is multi-connection safe), while offline operations that
+/// relocate repository files (move) take it *exclusive, non-blocking* and
+/// refuse while any server is live. Two servers coexisting is safe and
+/// useful (rolling restart, read fan-out); a move racing either is not.
 #[tokio::test]
-async fn second_server_over_a_live_root_refuses() {
+async fn servers_coexist_and_move_refuses_while_any_is_live() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = multi_root(dir.path(), &["garden"]);
     let first = ServerProc::spawn(&root, None).await;
-    // The spawn awaited the `listening on` line, which the server prints
-    // only after taking the root lock — so the lock is provably held.
     let client = first.client().await;
     // One real RPC against the first server exercises resolution end to
     // end (the four counters exist and read zero).
@@ -873,30 +874,236 @@ async fn second_server_over_a_live_root_refuses() {
         "no counted RPCs yet: {stats:?}"
     );
 
-    let second = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
-        .arg("--addr")
-        .arg("127.0.0.1:0")
+    // A second server over the same root takes the same shared lock and
+    // serves: coexistence is the contract (serve is a shared holder).
+    let second = ServerProc::spawn(&root, None).await;
+    let second_stats = second
+        .client()
+        .await
+        .get_stats("garden")
+        .await
+        .expect("second server answers over the same root");
+    assert_eq!(second_stats.len(), 4, "same counters on the second server");
+
+    // A move while either server is live: refused, non-zero, root
+    // untouched (an offline operation cannot take the exclusive lock).
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
         .arg("--root")
         .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
         .output()
-        .expect("second server runs");
+        .expect("move runs");
     assert!(
-        !second.status.success(),
-        "a second server over a live root must refuse"
+        !moved.status.success(),
+        "move while servers are live must fail"
     );
-    let stderr = String::from_utf8_lossy(&second.stderr);
+    let stderr = String::from_utf8_lossy(&moved.stderr);
     assert!(
-        stderr.contains("cannot lock the server root"),
-        "the refusal names the lock: {stderr}"
+        stderr.contains("stop it before moving"),
+        "the refusal explains itself: {stderr}"
     );
-    first.shutdown().await;
+    assert!(
+        root.join("garden").is_dir(),
+        "the refused move changed nothing"
+    );
 
-    // With the first gone, a new server starts cleanly.
-    let third = ServerProc::spawn(&root, None).await;
-    let client = third.client().await;
-    let err = client.get_stats("nope").await.expect_err("not found");
-    assert_eq!(err.code(), Code::NotFound);
-    third.shutdown().await;
+    // Both servers gone: the move succeeds.
+    drop(client);
+    first.shutdown().await;
+    second.shutdown().await;
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
+        .arg("--root")
+        .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
+        .output()
+        .expect("move runs");
+    assert!(
+        moved.status.success(),
+        "move after both servers stop: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    assert!(root.join("orchard").is_dir(), "the repository moved");
+}
+
+// ------------------------------------------- HIGH-1 (blocked checkpoint)
+
+/// `move` must refuse when a foreign sqlite connection pins the WAL: the
+/// checkpoint's `busy` flag is the signal (a `PRAGMA wal_checkpoint`
+/// answers even when it cannot finish). The reviewer's probe: a
+/// connection holding a read transaction on the database made the move
+/// stall out the busy timeout and then *succeed*, carrying an
+/// untruncated WAL to the new name while the code reported Ok. The fix
+/// surfaces `busy != 0`; this test pins the WAL exactly that way and
+/// asserts the refusal, with nothing renamed.
+#[tokio::test]
+async fn move_refuses_when_a_foreign_connection_pins_the_wal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["garden"]);
+
+    // Seed one changeset so the WAL actually has committed frames.
+    let server = ServerProc::spawn(&root, None).await;
+    let client = server.client().await;
+    let content = b"pin me\n";
+    let root_cs = cs(Vec::new(), vec![add("f.txt", content)], "root", 1);
+    let _id = commit(&client, "garden", &root_cs, &[content]).await;
+    server.shutdown().await;
+
+    // A foreign connection opens the database and holds a read
+    // transaction: the checkpoint cannot pass its snapshot, and the
+    // PRAGMA's busy flag says so.
+    let db_path = root.join("garden").join("metadata.sqlite3");
+    let foreign = rusqlite::Connection::open(&db_path).expect("foreign connection opens");
+    foreign
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             BEGIN; \
+             SELECT count(*) FROM changesets; \
+             -- transaction stays open for the test's duration",
+        )
+        .expect("read transaction held");
+
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
+        .arg("--root")
+        .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
+        .output()
+        .expect("move runs");
+    assert!(
+        !moved.status.success(),
+        "move must fail while a foreign connection pins the WAL: {}",
+        String::from_utf8_lossy(&moved.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&moved.stderr);
+    assert!(
+        stderr.contains("blocked by another connection"),
+        "the refusal names the blocked checkpoint: {stderr}"
+    );
+    assert!(
+        root.join("garden").join("metadata.sqlite3").is_file(),
+        "nothing was renamed"
+    );
+    assert!(
+        !root.join("orchard").exists(),
+        "no destination directory appeared"
+    );
+
+    // The foreign connection released: the move now succeeds.
+    drop(foreign);
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
+        .arg("--root")
+        .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
+        .output()
+        .expect("move runs");
+    assert!(
+        moved.status.success(),
+        "move after the foreign connection drops: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+}
+
+// ---------------------------------------- HIGH-2 (TOCTOU + in-process open)
+
+/// The resolve/rename race, exercised at its exact window: `exists()`
+/// runs lock-free, so a move (or any out-of-band rename) between it and
+/// the open gate would leave `Repo::open` creating a fresh empty
+/// repository at the vacated name. The under-lock `still_served` recheck
+/// must answer NotFound instead — and must not recreate anything.
+#[test]
+fn resolve_after_out_of_band_rename_answers_not_found_without_recreating() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["alpha", "beta"]);
+    let set = repos::RepoSet::new(&root, 16);
+
+    // The registry sees alpha (the lock-free exists() half).
+    assert!(set.exists("alpha"));
+
+    // The move window: the repository directory vanishes out-of-band
+    // between the exists() check and the open gate.
+    std::fs::rename(root.join("alpha"), dir.path().join("elsewhere")).expect("out-of-band rename");
+
+    // Resolve must answer NotFound naming the served list …
+    let err = match set.resolve("alpha") {
+        Err(e) => e,
+        Ok(_) => panic!("vacated name must resolve to NotFound"),
+    };
+    match &err {
+        repos::RepoResolveError::NotFound { name, served } => {
+            assert_eq!(name, "alpha");
+            assert!(
+                served.split(',').any(|n| n.trim() == "beta"),
+                "the served list still names beta: {served:?}"
+            );
+        }
+        other => panic!("expected NotFound, got {other:?}"),
+    }
+    // … and must not have recreated an empty repository at the vacated
+    // name (Repo::open creates missing stores — the bug this recheck
+    // closes).
+    let vacated = root.join("alpha");
+    assert!(
+        !vacated.join("metadata.sqlite3").exists() && !vacated.join("objects").exists(),
+        "no empty repository was created at the vacated name"
+    );
+    assert!(!vacated.exists(), "the vacated directory was not recreated");
+}
+
+/// The in-process half of the move contract: a repository whose handle
+/// is open in this very `RepoSet` cannot be moved (its sqlite connection
+/// holds the file). The refusal is explicit and nothing is renamed; a
+/// fresh set over the same root (the binary's own process model) moves
+/// it cleanly.
+#[test]
+fn move_refuses_while_the_repo_is_open_in_this_process() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["alpha", "beta"]);
+    let set = repos::RepoSet::new(&root, 16);
+
+    // Open a handle and keep it alive across the move attempt.
+    let guard = set.resolve("alpha").expect("alpha opens");
+    assert!(set.open_names().iter().any(|n| n == "alpha"));
+
+    let err = set
+        .move_repo("alpha", "gamma")
+        .expect_err("move must refuse an in-process open repository");
+    match &err {
+        repos::RepoResolveError::InvalidName { name, reason } => {
+            assert_eq!(name, "alpha");
+            assert!(
+                reason.contains("open in this process"),
+                "the refusal names the in-process hold: {reason}"
+            );
+        }
+        other => panic!("expected InvalidName, got {other:?}"),
+    }
+    assert!(
+        root.join("alpha").join("metadata.sqlite3").is_file(),
+        "nothing was renamed"
+    );
+    assert!(!root.join("gamma").exists(), "no destination appeared");
+    drop(guard);
+
+    // The same move from a process with no open handles (the binary's
+    // process model: `gardenbed-server move` opens nothing first).
+    let fresh = repos::RepoSet::new(&root, 16);
+    fresh.move_repo("alpha", "gamma").expect("move succeeds");
+    assert!(root.join("gamma").join("metadata.sqlite3").is_file());
 }
 
 // ------------------------------------------------ LOW-1 (stats regression)
