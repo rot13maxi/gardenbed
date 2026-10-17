@@ -487,7 +487,7 @@ struct CloneWorld {
 /// Spawns the world; `index` 0 points the ref at cs1, 1 at cs2.
 async fn clone_world(refs: &[(&str, usize)]) -> CloneWorld {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arb_root = dir.path().join("server");
+    let arb_root = dir.path().join("server").join(common::REPO);
     let (cs1, cs2) = seed_repo(&arb_root);
     {
         let repo = Repo::open(&arb_root).expect("repo opens");
@@ -743,7 +743,7 @@ fn seed_bed_shaded_repo(root: &Path) -> Id {
 /// changeset that ships `.bed/initialized.txt` and `.bed/sub/x`), one garden.
 async fn bed_shaded_world() -> CloneWorld {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arb_root = dir.path().join("server");
+    let arb_root = dir.path().join("server").join(common::REPO);
     let cs1 = seed_bed_shaded_repo(&arb_root);
     {
         let repo = Repo::open(&arb_root).expect("repo opens");

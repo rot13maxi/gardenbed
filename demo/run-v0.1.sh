@@ -238,7 +238,7 @@ step_import() {
     fi
 
     if ! timed "import" \
-        "$SERVER_BIN" import --from "$CORPUS" --root "$SERVER_ROOT" \
+        "$SERVER_BIN" import --from "$CORPUS" --root "$SERVER_ROOT" --repo garden \
         >"$W/import.log" 2>"$W/import.err"; then
         bad "gardenbed-server import failed (stderr: $(tail -2 "$W/import.err"))"
         return 1
@@ -248,7 +248,7 @@ step_import() {
     # metadata's git_map holds one row per git commit (the ingest is
     # 1:1 by construction — content-addressed ids make duplicates
     # impossible; the count proves the walk found everything).
-    GB_COMMITS=$(sqlite3 "$SERVER_ROOT/metadata.sqlite3" 'SELECT COUNT(*) FROM git_map')
+    GB_COMMITS=$(sqlite3 "$SERVER_ROOT/garden/metadata.sqlite3" 'SELECT COUNT(*) FROM git_map')
     if [[ $GB_COMMITS -eq $GIT_COMMITS ]]; then
         ok "git_map ↔ git bijection: $GB_COMMITS changesets for $GIT_COMMITS commits"
     else
@@ -294,7 +294,7 @@ step_clone() {
     log ""
     mkdir -p "$GARDEN"
     local out
-    if ! out=$(cd "$GARDEN" && timed "bed clone" "$BED_BIN" clone "$SERVER_URL" 2>&1); then
+    if ! out=$(cd "$GARDEN" && timed "bed clone" "$BED_BIN" clone "$SERVER_URL/garden" 2>&1); then
         bad "bed clone failed: $out"
         return 1
     fi
@@ -311,6 +311,38 @@ step_clone() {
         ok "zero working files outside .bed/ (nothing materialized)"
     else
         bad "clone materialized $strangers file(s) — v0.1 clone must materialize nothing"
+    fi
+
+    # Multi-repository (v0.2.md §5, M12.3): a second repository appears
+    # under the same root mid-demo, served by the same process, and a URL
+    # clone with no --repo flag addresses it by path alone.
+    if ! out=$(cd "$W" && "$SERVER_BIN" move --root "$SERVER_ROOT" \
+            --from garden --into orchard); then
+        bad "gardenbed-server move failed: $out"
+        return 1
+    fi
+    ok "repository garden moved to orchard (same server process)"
+    mkdir -p "$W/orchard-copy"
+    if ! out=$(cd "$W/orchard-copy" && "$BED_BIN" clone "$SERVER_URL/orchard" 2>&1); then
+        bad "URL clone of the renamed repository failed: $out"
+        return 1
+    fi
+    ok "URL clone of $SERVER_URL/orchard with no --repo flag"
+    mkdir -p "$W/garden-copy"
+    if out=$(cd "$W/garden-copy" && "$BED_BIN" clone "$SERVER_URL/garden" 2>&1); then
+        bad "clone of the vacated name garden unexpectedly succeeded: $out"
+        return 1
+    fi
+    if [[ $(grep -c "repository garden not found (this server serves: orchard)" \
+            <<<"$out") -ge 1 ]]; then
+        ok "the vacated name 404s naming the served repositories"
+    else
+        bad "the vacated name's error does not name the served list: $out"
+    fi
+    if ! out=$(cd "$W" && "$SERVER_BIN" move --root "$SERVER_ROOT" \
+            --from orchard --into garden); then
+        bad "moving the repository back failed: $out"
+        return 1
     fi
     log ""
     return 0
@@ -442,7 +474,7 @@ step_export() {
     log "## 6. export — back to git (fsck + push --dry-run + SHA roundtrip)"
     log ""
     if ! timed "export" \
-        "$SERVER_BIN" export --root "$SERVER_ROOT" --into "$W/export.git" \
+        "$SERVER_BIN" export --root "$SERVER_ROOT" --repo garden --into "$W/export.git" \
         --mapping "$W/mapping.tsv" >"$W/export.log" 2>"$W/export.err"; then
         bad "gardenbed-server export failed: $(tail -2 "$W/export.err")"
         return 1
