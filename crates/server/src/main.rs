@@ -154,6 +154,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(2);
                 }
             };
+            // Refuse before any directory is created: with neither
+            // --root, --storage, nor GARDENBED_STORAGE, resolve_storage
+            // would fall back to an empty root and the import would
+            // scatter objects/ into the CWD before failing.
+            if storage.is_none() && root.is_none() && env_storage().is_none() {
+                eprintln!(
+                    "error: import requires either --root (local mode) or \
+                     --storage (scaled mode)"
+                );
+                std::process::exit(2);
+            }
             let selection = resolve_storage(storage.as_deref(), root.as_deref());
             if let Err(e) = run_import(&from, selection, detect_renames, limit, refs) {
                 eprintln!("error: import failed: {e}");
@@ -173,6 +184,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             refs,
             mapping,
         }) => {
+            // Same pre-open refusal as import: no stores, no side effects.
+            if storage.is_none() && root.is_none() && env_storage().is_none() {
+                eprintln!(
+                    "error: export requires either --root (local mode) or \
+                     --storage (scaled mode)"
+                );
+                std::process::exit(2);
+            }
             let selection = resolve_storage(storage.as_deref(), root.as_deref());
             if let Err(e) = run_export(selection, &into, refs, mapping) {
                 eprintln!("error: export failed: {e}");
@@ -196,6 +215,14 @@ enum StorageSelection {
     Root(PathBuf),
 }
 
+/// The `GARDENBED_STORAGE` env fallback, when set to a non-empty path.
+fn env_storage() -> Option<PathBuf> {
+    std::env::var("GARDENBED_STORAGE")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+}
+
 /// Resolves the storage selection: an explicit `--storage` flag first,
 /// then the `GARDENBED_STORAGE` env var (a path to the same TOML file),
 /// then local `--root` mode.
@@ -203,10 +230,8 @@ fn resolve_storage(storage_flag: Option<&Path>, root: Option<&Path>) -> StorageS
     if let Some(p) = storage_flag {
         return StorageSelection::Config(p.to_path_buf());
     }
-    if let Ok(p) = std::env::var("GARDENBED_STORAGE")
-        && !p.is_empty()
-    {
-        return StorageSelection::Config(PathBuf::from(p));
+    if let Some(p) = env_storage() {
+        return StorageSelection::Config(p);
     }
     StorageSelection::Root(root.unwrap_or(Path::new("")).to_path_buf())
 }

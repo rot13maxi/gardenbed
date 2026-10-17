@@ -2,9 +2,9 @@
 # Build context is the workspace root (see compose.yaml) so the full
 # workspace — protocol, model, store, derive, git — is in the image.
 #
-# Two stages: cargo build --release in a rust image, then copy the single
-# static-ish binary into a distroless cc runtime (glibc + CA certs, no
-# shell) to keep the runtime layer small.
+# Two stages: cargo build --release in a rust image, then a slim debian
+# runtime. The runtime carries `git` (the import path shells out to
+# `git diff-tree`) and CA certs; the server itself stays stateless.
 
 FROM rust:1-bookworm AS build
 WORKDIR /build
@@ -14,8 +14,17 @@ COPY crates crates
 COPY docs docs
 RUN cargo build --release -p gardenbed-server
 
-FROM gcr.io/distroless/cc-debian12:nonroot
+# The runtime needs `git` on PATH: the import path shells out to
+# `git diff-tree` (docs/architecture.md §7). debian:bookworm-slim keeps
+# the runtime layer small while providing it (distroless has no shell,
+# and the binary is glibc-linked, so the debian runtime matches).
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/gardenbed-server /usr/local/bin/gardenbed-server
+# Non-root, matching the distroless default this replaces.
+USER nobody
 # Stateless: no volumes, no writable state; all storage is off-box
 # (Postgres + S3 via /etc/gardenbed/storage.toml, mounted by compose).
 ENTRYPOINT ["/usr/local/bin/gardenbed-server"]

@@ -83,15 +83,16 @@ impl S3ObjectStore {
                 .map_err(|e| StoreError::Invalid(format!("s3 client: {e}")))?,
         );
         let driver = Driver::new("gardenbed-s3-driver");
-        // Fail fast: HEAD a probe key. A missing key is the healthy case
-        // (NotFound); an unreachable endpoint or missing bucket surfaces
-        // here, at open, not at the first put.
+        // Fail fast on an unreachable endpoint or a missing bucket: a
+        // one-page list at the bucket root is a signed round trip whose
+        // failure modes are exactly those two (a plain HEAD of a probe
+        // key cannot see a missing bucket — MinIO answers 404 "object
+        // not found" either way). An existing empty bucket lists zero
+        // objects, which is the healthy case.
         let probe = Arc::clone(&inner);
         driver.block_on(async move {
-            match probe.head(&Path::from("gardenbed-open-probe")).await {
-                Ok(_) => {}
-                Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => return Err(StoreError::Db(format!("s3 bucket unreachable: {e}"))),
+            if let Err(e) = probe.list_with_delimiter(None).await {
+                return Err(StoreError::Db(format!("s3 bucket unreachable: {e}")));
             }
             Ok::<(), StoreError>(())
         })?;
