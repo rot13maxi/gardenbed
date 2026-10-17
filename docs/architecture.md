@@ -146,14 +146,18 @@ lost CAS race is a clean conflict result, not an error.
   (`crates/derive/src/lib.rs`) — the registry drives both eager paths
   (`on_changeset_created` per-kind hooks; `derived_rows_for_validated_tree`
   per-kind rows for batched import), so a new kind is one module plus one
-  registry entry:
+  registry entry. A kind whose derivation cost scales with the parent
+  tree size (not just the changeset's own changes) registers as
+  **lazy-only** (no hooks) and computes on first query — the M5
+  size-independence budget forbids write-path work that grows with
+  repository size:
 
 | kind | what it is | what it buys |
 |---|---|---|
 | `tree` | the changeset's derived root tree id (the tree object itself lives in the object store) | clone/sparse/export resolve trees immediately (D3 eager materialization); recompute is a cache miss, never a wrong answer |
 | `skiplist` | segmented ancestry changelog over mainline (roots and merges are segment heads) | fast `MergeBase`/`IsAncestor` and blame segment skips |
 | `pathsummary` | per-changeset bounded touched-path set + cumulative per-segment Bloom filter | blame skips a whole linear segment with **one** derived read when the summary proves the path untouched (a false positive costs a step, never a wrong answer) |
-| `cuttings` | per-changeset exact-blob copy/rename facts against the first parent (rename = unchanged-blob move; copy = add duplicating an existing blob, source = lexicographically smallest matching path) | the `copies` MCP tool answers without walking history; exact blob equality only — no similarity heuristic |
+| `cuttings` | per-changeset exact-blob copy/rename facts against the first parent (rename = unchanged-blob move; copy = add duplicating an existing blob, source = lexicographically smallest matching path) — **lazy-only**: computed and cached on first `copies` query | the `copies` MCP tool answers without walking history; exact blob equality only — no similarity heuristic. Lazy because the fact walk flattens the whole parent tree, which would make commit latency grow with repository size |
 
 Everything derived is a **cache**: wipe + rebuild must converge to
 identical state (verified in M6 and re-verified after every chaos kill).
