@@ -115,6 +115,20 @@ pub enum ClientError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
+    /// `bed mount` cannot run on this host: no usable FUSE.
+    #[error(
+        "this host cannot mount a virtualized checkout — /dev/fuse or fusermount3 \
+         is missing; install fuse3, or read files with `bed file` instead"
+    )]
+    MountUnavailable,
+
+    /// The virtualized checkout could not be unmounted cleanly.
+    #[error("unmounting the virtualized checkout failed: {source}")]
+    MountUnmount {
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
     // ------------------------------------------------- server (M4 read path)
     /// The server could not be reached. Validation and connection both
     /// happen before any local state is written, so local state is unchanged.

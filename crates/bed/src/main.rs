@@ -207,6 +207,11 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             }
             Ok(0)
         }
+
+        Command::Mount { mountpoint } => {
+            gardenbed::ops::mount(&cli.state_dir, mountpoint).await?;
+            Ok(0)
+        }
     }
 }
 

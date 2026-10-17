@@ -578,3 +578,72 @@ async fn mount_unmount_external_and_removal() {
     fs::remove_dir(&mountpoint2).expect("mountpoint removable after explicit unmount");
     g.server.shutdown().await;
 }
+
+/// `bed mount <dir>` end to end: the real binary mounts the current
+/// changeset, serves reads while it stays in the foreground, and exits
+/// 0 after SIGINT — leaving an ordinary, removable directory behind.
+#[tokio::test]
+async fn bed_mount_command_serves_reads_and_exits_on_sigint() {
+    require_fuse!();
+    let mut g = setup().await;
+    let mountpoint = g.garden.join("cli-mnt");
+    fs::create_dir(&mountpoint).unwrap();
+
+    let mut child = common::bed_async(&g.garden, &["mount", "cli-mnt"]);
+    // The command announces itself on stderr once the mount is live.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bed mount did not come up"
+        );
+        let mut expected: Vec<String> = g.expected_files().keys().cloned().collect();
+        expected.sort();
+        if mount_listing(&mountpoint) == expected {
+            break;
+        }
+        assert!(
+            child.try_wait().expect("child is pollable").is_none(),
+            "bed mount exited early"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Every file reads with exact bytes through the CLI mount — the
+    // same fidelity the library-level tests assert, now through the
+    // binary's foreground serving loop.
+    let expected = g.expected_files();
+    for (path, (bytes, mode)) in &expected {
+        let got = match mode {
+            // An opaque upstream pointer: surfaces as an empty
+            // read-only file, never a stored object.
+            Mode::Gitlink => continue,
+            // The link's target text is its content; the target path
+            // itself need not exist.
+            Mode::Symlink => fs::read_link(mountpoint.join(path))
+                .expect("readlink through CLI mount")
+                .to_string_lossy()
+                .as_bytes()
+                .to_vec(),
+            _ => fs::read(mountpoint.join(path)).expect("read through CLI mount"),
+        };
+        assert_eq!(&got, bytes, "byte fidelity through bed mount: {path}");
+    }
+    // SIGINT ends the command cleanly: exit 0, mount gone, directory
+    // removable.
+    kill(child.id().expect("pid"), libc::SIGINT);
+    let out = child.wait_with_output().await.expect("child reaped");
+    assert_eq!(out.status.code(), Some(0), "bed mount exits 0 on SIGINT");
+    assert!(
+        mount_listing(&mountpoint).is_empty(),
+        "mountpoint is an ordinary empty directory again"
+    );
+    fs::remove_dir(&mountpoint).expect("mountpoint removable after bed mount");
+    g.server.shutdown().await;
+}
+
+/// Sends `signal` to `pid` (test-only sugar over `libc::kill`).
+fn kill(pid: u32, signal: i32) {
+    let r = unsafe { libc::kill(pid as libc::pid_t, signal) };
+    assert_eq!(r, 0, "kill({pid}, {signal}) failed");
+}

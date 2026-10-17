@@ -51,8 +51,9 @@ Usage: bed [OPTIONS] <COMMAND>
 | `diff` | diff two changesets (default: current vs first parent) |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
+| `merge` | merge a changeset or ref into the current changeset (server-side two-parent merge) |
 | `publish` | fast-forward `main` to the current changeset |
-| `blame` | show first-parent line attribution, following renames |
+| `mount` | mount the current changeset as a read-only FUSE filesystem |
 | `help` | print help for any subcommand |
 
 ### bed clone
@@ -315,6 +316,34 @@ each line renders `<16-hex id> (<author> <date> <lineno>) <content>`.
 ```sh
 bed blame src/main.rs
 bed blame --cs master Makefile
+```
+
+
+### bed mount
+
+```text
+Usage: bed mount [OPTIONS] <MOUNTPOINT>
+```
+
+Mounts the current changeset as a read-only FUSE filesystem — the
+**virtualized checkout**: the whole repository tree is visible and
+readable at `<MOUNTPOINT>` with no sparse selection, while `.bed/objects`
+grows only by what is actually read (a file's blob materializes on first
+`stat`, a symlink's on first `lstat`; listing alone fetches only trees).
+Every mutating operation fails with `EROFS`. Snapshot semantics: the
+mount reflects the current changeset at mount time and does not track
+later ref movement — unmount and mount again to switch.
+
+The command stays in the foreground serving the filesystem; `Ctrl-C`
+(SIGINT or SIGTERM) unmounts cleanly and exits 0, leaving an ordinary
+removable directory behind. No root privileges are needed (mounting
+goes through `fusermount3`); hosts without `/dev/fuse` refuse with
+`this host cannot mount a virtualized checkout`.
+
+```sh
+bed mount /tmp/view
+# mounted b273e12d1c6f11ee read-only at /tmp/view — Ctrl-C to unmount
+cat /tmp/view/src/main.rs      # fetched exactly this blob, cache-first
 ```
 
 ## gardenbed-server

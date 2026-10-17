@@ -38,6 +38,8 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "process",
     "io-util",
+    # `bed mount`'s foreground loop waits on SIGINT/SIGTERM.
+    "signal",
 ] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "channel"] }

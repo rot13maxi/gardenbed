@@ -14,6 +14,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
+use std::str::FromStr as _;
 
 use gardenbed_model::codec::validate_path;
 use gardenbed_model::{Id, Mode, TreeKind};
@@ -974,4 +975,53 @@ fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, ClientError
                 r.cs_id.len()
             ))
         })
+}
+
+/// `bed mount <mountpoint>` — mount the current changeset read-only.
+///
+/// The mount is a *snapshot*: it reflects `current_cs` at mount time and
+/// does not track later ref movement. This command stays in the
+/// foreground serving the filesystem; Ctrl-C (SIGINT/SIGTERM) unmounts
+/// cleanly and leaves an ordinary directory behind. All fetches flow
+/// through the same cache-first path every other command uses, so
+/// `.bed/objects` stays bounded by what the mount actually read.
+pub async fn mount(state_dir: &Path, mountpoint: &Path) -> Result<(), ClientError> {
+    let bed = WorkingCopy::open(state_dir)?;
+    require_current_cs(&bed)?;
+    if !crate::mount::fuse_available() {
+        return Err(ClientError::MountUnavailable);
+    }
+    let handle = crate::mount::mount(&bed, mountpoint).await?;
+    let cs = Id::from_str(bed.config().current_cs.as_deref().expect("checked"))
+        .map_err(|_| ClientError::NoCurrentCs)?;
+    eprintln!(
+        "mounted {} read-only at {} — Ctrl-C to unmount",
+        cs.short(),
+        mountpoint.display()
+    );
+    wait_for_shutdown().await;
+    handle
+        .unmount()
+        .map_err(|e| ClientError::MountUnmount { source: e })?;
+    Ok(())
+}
+
+/// Blocks until SIGINT or SIGTERM arrives (the mount's foreground loop).
+async fn wait_for_shutdown() {
+    let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let (mut sigint, mut sigterm) = match (sigint, sigterm) {
+        (Ok(i), Ok(t)) => (i, t),
+        _ => {
+            // No signal API on this platform: park until killed. The
+            // MountHandle's Drop still unmounts when the process dies
+            // via the kernel's connection teardown.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+    }
 }

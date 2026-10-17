@@ -3,7 +3,8 @@
 //!
 //! All commands are wired: the read path (`clone`, `sparse add`, `switch`,
 //! `file`, `log`, `diff`, `blame`), the write path (`commit`, `rebase`,
-//! `publish`), and the fully offline ones (`status`, `sparse list/remove`).
+//! `publish`, `merge`), the FUSE view (`mount`), and the fully offline
+//! ones (`status`, `sparse list/remove`).
 
 use std::path::PathBuf;
 
@@ -144,6 +145,16 @@ pub enum Command {
         /// Changeset id or ref to blame at (default: the current one).
         #[arg(long = "cs", value_name = "ID-OR-REF")]
         cs: Option<String>,
+    },
+
+    /// Mount the current changeset as a read-only FUSE filesystem
+    /// (virtualized checkout). The whole repository tree is visible and
+    /// readable; each read materializes exactly the blob it needs.
+    /// Stays in the foreground; unmount with Ctrl-C.
+    Mount {
+        /// The directory to mount over. Created when missing; an ordinary
+        /// removable directory is left behind after unmount.
+        mountpoint: PathBuf,
     },
 }
 
@@ -388,6 +399,18 @@ mod tests {
         assert!(Cli::try_parse_from(["bed", "commit"]).is_err());
         // `--author` takes exactly one value.
         assert!(Cli::try_parse_from(["bed", "commit", "-m", "x", "--author"]).is_err());
+    }
+
+    #[test]
+    fn mount_parses_mountpoint() {
+        match parsed(&["mount", "/tmp/view"]).command {
+            Command::Mount { mountpoint } => {
+                assert_eq!(mountpoint, PathBuf::from("/tmp/view"));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+        // The mountpoint is required.
+        assert!(Cli::try_parse_from(["bed", "mount"]).is_err());
     }
 
     #[test]
