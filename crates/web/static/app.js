@@ -55,8 +55,11 @@ function currentRev() {
 /* session caches: files by (rev,path), changesets by id */
 const FILE_CACHE = {};
 function fetchFileCached(rev, path) {
-  const k = rev + "" + path;
-  if (!FILE_CACHE[k]) FILE_CACHE[k] = api("/api/file?" + qs({ cs: rev, path: path }));
+  const k = rev + " " + path;
+  if (!FILE_CACHE[k]) {
+    FILE_CACHE[k] = api("/api/file?" + qs({ cs: rev, path: path }));
+    FILE_CACHE[k].catch(() => { delete FILE_CACHE[k]; }); // failures never stick — retry must recover
+  }
   return FILE_CACHE[k];
 }
 const CS_CACHE = {};
@@ -456,10 +459,11 @@ function changeList(changes, newRev, oldRev) {
         }, "▸");
         const block = el("div", { class: "diff-block", hidden: "" });
         const metaEl = el("span", { class: "diff-meta mono" });
-        job = { exp: exp, block: block, meta: metaEl, change: c, loaded: false, loading: null, open: false, wantOpen: false };
+        job = { exp: exp, block: block, meta: metaEl, change: c, loaded: false, loading: null, open: false, rendered: false, ops: null };
         exp.addEventListener("click", () => {
           if (job.loaded) setDiffOpen(job, !job.open);
-          else loadDiff(job, ctx, false); // force-open after load
+          else if (job.loading) job.loading.then(() => setDiffOpen(job, true)); // user intent wins over auto
+          else loadDiff(job, ctx, false); // retry allowed: loadDiff only marks loaded on success
         });
         row.appendChild(exp);
       }
@@ -844,13 +848,15 @@ function buildAuthors(entries, top) {
 /* ---------- unified diff (myers, no deps) ---------- */
 
 const DIFF_AUTO_MAX = 80; // auto-expand diffs with at most this many lines
+const DIFF_LINE_BUDGET = 3000; // beyond this we note-and-skip: no trace, no DOM
 
-/** Classic Myers diff over line arrays → [{type:'ctx'|'add'|'del', text}]. */
-function diffLines(aStr, bStr) {
-  const a = aStr ? String(aStr).split("\n") : [];
-  const b = bStr ? String(bStr).split("\n") : [];
+/** Classic Myers over the middle of the arrays; prefix/suffix are trimmed by
+ *  diffLines (identical tails dominate real-world edits). */
+function myersCore(a, b) {
   const N = a.length, M = b.length;
   if (!N && !M) return [];
+  if (!N) return b.map((t) => ({ type: "add", text: t }));
+  if (!M) return a.map((t) => ({ type: "del", text: t }));
   const max = N + M, OFF = max;
   let v = new Int32Array(2 * max + 1);
   const trace = [];
@@ -881,6 +887,19 @@ function diffLines(aStr, bStr) {
   return ops;
 }
 
+function diffLines(aStr, bStr) {
+  const a = aStr ? String(aStr).split("\n") : [];
+  const b = bStr ? String(bStr).split("\n") : [];
+  // classic edge trim: strip the common prefix/suffix before the O(ND) core
+  let lo = 0;
+  while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo++;
+  let hiA = a.length, hiB = b.length;
+  while (hiA > lo && hiB > lo && a[hiA - 1] === b[hiB - 1]) { hiA--; hiB--; }
+  const pre = a.slice(0, lo).map((t) => ({ type: "ctx", text: t }));
+  const post = a.slice(hiA).map((t) => ({ type: "ctx", text: t }));
+  return pre.concat(myersCore(a.slice(lo, hiA), b.slice(lo, hiB)), post);
+}
+
 /** Group ops into hunks with up to 3 context lines; longer runs collapse away. */
 function buildHunks(ops) {
   const CTX = 3;
@@ -893,18 +912,13 @@ function buildHunks(ops) {
   });
   const hunks = [];
   let on = 1, nn = 1, cur = null;
-  let ri = 0; // counts of kept items in current run
   ops.forEach((op, i) => {
     if (keep[i] && (i === 0 || !keep[i - 1])) {
       cur = { oldStart: on, newStart: nn, oldLines: 0, newLines: 0, items: [] };
       hunks.push(cur);
-      ri = 0;
     }
     if (keep[i] && cur) {
       cur.items.push({ type: op.type, text: op.text, oldNo: op.type !== "add" ? on : 0, newNo: op.type !== "del" ? nn : 0 });
-      ri++;
-    }
-    if (keep[i] && cur) {
       if (op.type !== "add") cur.oldLines++;
       if (op.type !== "del") cur.newLines++;
     }
@@ -920,11 +934,20 @@ function buildHunks(ops) {
 
 /* diff job plumbing: one per change row */
 function setDiffOpen(job, open) {
+  if (open) ensureDiffRendered(job); // DOM for collapsed blocks is built lazily
   job.open = open;
   job.exp.setAttribute("aria-expanded", String(open));
   job.exp.textContent = open ? "▾" : "▸";
   if (open) job.block.removeAttribute("hidden");
   else job.block.setAttribute("hidden", "");
+}
+
+/** Build hunk DOM only on first open; ops are computed eagerly for the count. */
+function ensureDiffRendered(job) {
+  if (!job.rendered && job.ops) {
+    renderDiffHunks(job, buildHunks(job.ops));
+    job.rendered = true;
+  }
 }
 
 function renderDiffNote(job, text) {
@@ -949,7 +972,7 @@ function renderDiffHunks(job, hunks) {
 }
 
 async function loadDiff(job, ctx, auto) {
-  if (job.loading) { job.wantOpen = true; return job.loading; }
+  if (job.loading) return job.loading;
   if (job.loaded) { if (!auto) setDiffOpen(job, !job.open); return Promise.resolve(); }
   const c = job.change;
   job.meta.textContent = "loading…";
@@ -970,21 +993,27 @@ async function loadDiff(job, ctx, auto) {
         if (c.op === "rename" && a === b) {
           renderDiffNote(job, "content unchanged — path only");
         } else {
-          const ops = diffLines(a, b);
-          renderDiffHunks(job, buildHunks(ops));
-          job.lineCount = ops.length;
-          job.meta.textContent = job.lineCount + " line" + (job.lineCount === 1 ? "" : "s");
+          const lines = (s) => (s === "" ? 0 : String(s).split("\n").length);
+          const mx = Math.max(lines(a), lines(b));
+          if (mx > DIFF_LINE_BUDGET) {
+            // budget bail: a full trace + thousands of DOM rows is not worth it
+            renderDiffNote(job, "too many lines to diff (" + mx + " > " + DIFF_LINE_BUDGET + ")");
+          } else {
+            job.ops = diffLines(a, b); // DOM deferred to first open
+            job.lineCount = job.ops.length;
+            job.meta.textContent = job.lineCount + " line" + (job.lineCount === 1 ? "" : "s");
+          }
         }
       }
       job.loaded = true;
       const wantsOpen = auto
         ? (job.lineCount === undefined ? true : job.lineCount <= DIFF_AUTO_MAX)
-        : !job.open;
+        : true;
       setDiffOpen(job, wantsOpen);
       if (job.lineCount === undefined) job.meta.textContent = "";
     } catch (err) {
+      // note only — job.loaded stays false so the next click retries the fetch
       renderDiffNote(job, "could not load diff: " + (err && err.message ? err.message : err));
-      job.loaded = true;
       job.meta.textContent = "";
       setDiffOpen(job, true);
     } finally {
@@ -1226,7 +1255,8 @@ function openFileFinder() {
       if (a) { ev.preventDefault && ev.preventDefault(); location.hash = a.getAttribute("href"); close(); }
     }
   };
-  input.addEventListener("keydown", onKey);
+  // Arrows/Enter/Escape handled in EXACTLY one place: the document-level
+  // listener (input-level would double-fire via bubbling).
   if (document.addEventListener) document.addEventListener("keydown", onKey);
   input.addEventListener("input", () => {
     if (finderFiles.paths && finderFiles.rev === rev) render(finderFiles.paths, input.value.trim());
@@ -1238,7 +1268,7 @@ function openFileFinder() {
 
   const ensure = finderFiles.rev === rev && finderFiles.paths
     ? Promise.resolve(finderFiles.paths)
-    : api("/api/files?" + qs({ cs: rev, limit: 2000 })).then((d) => {
+    : api("/api/files?" + qs({ cs: rev })).then((d) => {
         finderFiles = { rev: rev, paths: (d && d.paths) || [] };
         return finderFiles.paths;
       });

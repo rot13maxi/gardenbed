@@ -26,7 +26,10 @@ tags, and the verification record for a release lives in
   GitHub-style (client-side, injection-escaped markdown subset; relative
   links and images resolve to the viewed revision's own files).
   Changeset and compare rows expand into real unified diffs (in-page
-  Myers diff over both sides fetched at their revisions); the UI polls
+  Myers over both sides fetched at their revisions, with common
+  prefix/suffix trimming, a 3000-line budget that renders a
+  "too many lines to diff" note instead of freezing the page, and DOM
+  built lazily only for expanded blocks); the UI polls
   `/api/refs` and toasts when the selected ref moves; blame gutters
   shade by relative age. New endpoints `/api/files` (path listing) and
   `/api/search` (case-insensitive content grep) back the `t` file

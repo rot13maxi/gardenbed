@@ -27,9 +27,12 @@ gardenbed-web --root /tmp/gardenbed-demo
 # → prints `seeded tip <64-hex>`
 ```
 
-`seed` writes the same twelve-changeset "garden planner" history every
-time (exec file, rename, delete, a side branch merged back with two
-parents, three authors), then fast-forwards `main`.
+`seed` writes the same seventeen-changeset "garden planner" history
+every time: twelve published on `main` (exec file, rename, delete, a
+side branch merged back with two parents, three authors) plus five
+unpublished drafts — a two-author work-in-progress set, a rebase pair,
+and one wholesale-rewrite stress file (6000 lines) the diff renderer
+must decline with its budget note.
 
 ## Pages
 

@@ -33,7 +33,7 @@ const ROSA: (&str, &str) = ("Rosa Bloom", "rosa@example.com");
 const KEN: (&str, &str) = ("Ken Furrow", "ken@example.com");
 /// Author "C": commits 4, 8.
 const ADA: (&str, &str) = ("Ada Trellis", "ada@example.com");
-/// Unpublished-only authors: the draft commits 13–16.
+/// Unpublished-only authors: the draft commits 13–17.
 const PIKE: (&str, &str) = ("Pike Rowan", "pike@example.com");
 const MOSS: (&str, &str) = ("Moss Hale", "moss@example.com");
 
@@ -384,7 +384,43 @@ pub fn seed(repo: &Repo) -> Result<Option<Id>, ServerError> {
     );
     let _rebase_v2 = tip; // unpublished
 
+    // Stress fixture (keeps the GUI's diff budget honest): Moss rewrote
+    // garden.js wholesale — 6000 lines, none matching the old side, so a
+    // naive Myers trace would explode. The web UI must render its
+    // 'too many lines to diff' note instead of ~12000 hidden rows.
+    // Edit::Write wants &'static content; the stress body is generated,
+    // so leak it — seed() runs once per process.
+    let stress: &'static str = Box::leak(stress_garden_js().into_boxed_str());
+    commit_at!(
+        17,
+        MOSS,
+        vec![published],
+        "Stress fixture: rewrite garden.js wholesale",
+        [Edit::Write {
+            op: Op::Modify,
+            path: "garden.js",
+            content: stress,
+            mode: Mode::Regular,
+        }]
+    );
+    let _stress_draft = tip; // unpublished
+
     Ok(Some(published))
+}
+
+/// A deterministic 6000-line replacement for garden.js: no line matches
+/// the current content, so diffing against the published revision is the
+/// worst case (full rewrite, no shared anchors except none).
+fn stress_garden_js() -> String {
+    let mut out = String::with_capacity(360_000);
+    for i in 0..6000u32 {
+        out.push_str(&format!(
+            "const bed_{i:04} = mkBed({i:?}, {spacing}, '{crop}'); // stress line {i}\n",
+            spacing = 30 + (i % 7),
+            crop = ["carrot", "lettuce", "tomato", "pea"][usize::try_from(i % 4).unwrap()],
+        ));
+    }
+    out
 }
 
 // ------------------------------------------------------ pinned content
@@ -738,7 +774,7 @@ const ROTATION: &str = "\
 - south bed: alliums, then a green manure year
 ";
 
-// --- Unpublished drafts (commits 13–16): stored, never ref'd ----------
+// --- Unpublished drafts (commits 13–17): stored, never ref'd ----------
 
 const DRIP_MD: &str = "\
 # drip irrigation sketch
