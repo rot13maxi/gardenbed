@@ -309,12 +309,23 @@ message RebaseResp {
   bytes id = 1;
 }
 
-// Fast-forwards ref "main" to `cs_id`: asserts IsAncestor(current main,
-// cs_id), then CAS-moves "main" (v0.1.md D5). Violating the ancestry
+// Fast-forwards a ref to `cs_id`: asserts IsAncestor(current ref value,
+// cs_id), then CAS-moves the ref (v0.1.md D5). Violating the ancestry
 // precondition fails with FAILED_PRECONDITION.
+//
+// Absent/empty `ref` means "main" — exactly the v0.1 behavior, so old
+// clients are wire-compatible. Naming "main" explicitly in `ref` is
+// rejected (invalid_argument): main publishes stay the plain form, gated
+// on protocol review. A non-main ref additionally gets the import rewind
+// guard: a non-descendant move (force-push shape) is refused unless
+// `force` is true.
 message PublishReq {
   string repo = 1;
   bytes cs_id = 2;
+  // The ref to move (e.g. "feature"); absent/empty = "main".
+  string ref = 3;
+  // Permits a non-descendant (rewind) move of a non-main ref.
+  bool force = 4;
 }
 
 // The changeset "main" now points at (== the published cs_id).
@@ -402,7 +413,7 @@ service Gardenbed {
   // FAILED_PRECONDITION errors, not results).
   rpc Rebase(RebaseReq) returns (RebaseResp);
 
-  // Fast-forward CAS of ref "main" to the given changeset.
+  // Fast-forward CAS of a ref to the given changeset (absent ref = "main").
   rpc Publish(PublishReq) returns (PublishResp);
 
   // Per-repo request counters (debug/test infrastructure).

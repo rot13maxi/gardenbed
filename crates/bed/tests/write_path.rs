@@ -1081,3 +1081,73 @@ async fn no_arg_diff_names_working_copy_when_dirty_and_changesets_when_clean() {
 
     w.server.shutdown().await;
 }
+
+/// The dogfood #10 repro: a lane agent commits off-main and publishes with
+/// `bed publish --ref <branch>`; a FRESH clone's `bed switch <branch>` must
+/// then resolve the branch to the committed tip, not the stale imported one
+/// the ref carried before the publish.
+#[tokio::test]
+async fn publish_ref_advances_lane_and_fresh_switch_sees_it() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // The stale imported lane ref: the branch exists on the server, pointing
+    // at the history the working copy cloned from (the dogfood's
+    // `feat/scale-out` resolving to the imported tip).
+    let lane = "feat/scale-out";
+    w.repo
+        .cas_ref(lane, None, w.head)
+        .expect("lane ref imported");
+
+    // The lane agent commits off-main.
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n lane work\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "lane work"]);
+    assert_eq!(code, 0, "commit: {stderr}\n{out}");
+    let committed = current_cs(&w.garden);
+
+    // `bed publish --ref <branch>` advances the lane ref.
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane]);
+    assert_eq!(code, 0, "publish --ref: {stderr}\n{out}");
+    assert!(
+        out.contains(&format!("`{lane}` now points to it")),
+        "the output names the lane ref: {out}"
+    );
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(committed),
+        "the lane ref advanced to the committed tip"
+    );
+    // main is untouched by a lane publish.
+    assert_eq!(w.repo.get_ref("main").expect("get_ref"), Some(w.head));
+
+    // The fresh clone: `bed switch <branch>` must land on the committed tip.
+    let fresh = w._dir.path().join("garden-fresh");
+    fs::create_dir_all(&fresh).unwrap();
+    let (code, _, stderr) = bed(&fresh, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "fresh clone: {stderr}");
+    let (code, out, stderr) = bed(&fresh, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "fresh sparse add: {stderr}\n{out}");
+    let (code, out, stderr) = bed(&fresh, &["switch", lane]);
+    assert_eq!(code, 0, "fresh switch: {stderr}\n{out}");
+    assert_eq!(
+        current_cs(&fresh),
+        committed,
+        "switch resolves the lane ref to the published tip, not the stale imported one"
+    );
+    // The materialized file is the lane agent's edit.
+    assert_eq!(
+        fs::read(fresh.join("docs/readme.md")).unwrap(),
+        b"# hello\n\n lane work\n",
+        "the fresh switch materialized the committed content"
+    );
+
+    // `--ref main` is reserved: main publishes stay the plain form.
+    let (code, _, stderr) = bed(&w.garden, &["publish", "--ref", "main"]);
+    assert_eq!(code, 1, "--ref main must be rejected: {stderr}");
+    assert!(
+        stderr.contains("plain form"),
+        "the reserved error names the plain form: {stderr}"
+    );
+
+    w.server.shutdown().await;
+}

@@ -243,16 +243,19 @@ pub enum ClientError {
     #[error("{0:?} keeps changing while committing — rerun `bed commit`")]
     FileChanged(String),
 
-    /// `publish` was refused because `main` is no longer where this working copy's
-    /// changeset grew from — a fast-forward CAS lost to a moved ref.
+    /// `publish` was refused because the target ref is no longer where this
+    /// working copy's changeset grew from — a fast-forward CAS lost to a
+    /// moved ref.
     #[error(
-        "cannot publish {cs}: it does not fast-forward `main`{tip}\n  \
-         rebase this changeset onto the new main (`bed rebase main`) and publish again"
+        "cannot publish {cs}: it does not fast-forward `{ref}`{tip}\n  \
+         rebase this changeset onto the new {ref} (`bed rebase {ref}`) and publish again"
     )]
     PublishNotFastForward {
         /// The changeset that was being published (short form).
         cs: String,
-        /// `main`'s current tip (short form), when the server said.
+        /// The ref that was being published to.
+        r#ref: String,
+        /// The ref's current tip (short form), when the server said.
         tip: String,
     },
 }

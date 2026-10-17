@@ -30,6 +30,18 @@ tags, and the verification record for a release lives in
   end-to-end suite (`e2e/`) that drives a real browser through every
   page against the seeded repository.
 
+- `bed publish --ref <branch>` (+ `--force`): publish to a named lane ref
+  instead of `main` (dogfood finding #10 — lane agents committing
+  off-main had no way to advance their branch, so a fresh clone's
+  `bed switch <branch>` resolved the stale imported tip). The
+  `PublishReq` wire message gained an optional `ref` field and a `force`
+  flag (absent/empty `ref` = the exact v0.1 main publish; old clients
+  are unchanged), lane ref targets get the same compare-and-swap
+  semantics plus the import rewind guard (a non-descendant move is
+  refused naming the ref, both tips, and the fell-off count unless
+  `--force` is passed), and naming `main` in the `ref` field is rejected
+  (main publishes stay the plain, review-gated form).
+
 ### Fixed
 
 - `bed switch` now prunes directories its removals left empty (dogfood:

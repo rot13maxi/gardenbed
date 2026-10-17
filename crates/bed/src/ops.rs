@@ -550,27 +550,38 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     ))
 }
 
-/// `bed publish` — fast-forward `main` to the working copy's current changeset.
+/// `bed publish` — fast-forward a ref to the working copy's current changeset.
 ///
-/// The server enforces the ancestry precondition with a
-/// compare-and-swap: exactly one publisher wins a race, everyone else
-/// receives [`ClientError::PublishNotFastForward`] with the fix spelled out.
-/// Success appends the published changeset to the heads stack; the working copy
-/// stays where it is — publishing publishes, it does not move.
-pub async fn publish(state_dir: &Path) -> Result<String, ClientError> {
+/// `ref_name = None` publishes `main` (the classic form). A named ref is the
+/// lane-agent form: same compare-and-swap semantics — exactly one publisher
+/// wins a race, everyone else receives [`ClientError::PublishNotFastForward`]
+/// with the fix spelled out — plus the server's rewind guard: a
+/// non-descendant move is refused unless `force` is set. Success appends the
+/// published changeset to the heads stack; the working copy stays where it
+/// is — publishing publishes, it does not move.
+pub async fn publish(
+    state_dir: &Path,
+    ref_name: Option<&str>,
+    force: bool,
+) -> Result<String, ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "publish").await?;
+    let target = ref_name.unwrap_or(DEFAULT_REF);
 
-    match session.client.publish(&repo, current).await {
-        // The returned tip is `main`'s value after the fast-forward —
+    match session
+        .client
+        .publish(&repo, current, ref_name, force)
+        .await
+    {
+        // The returned tip is the ref's value after the fast-forward —
         // the changeset itself for a conforming server.
         Ok(_tip) => {
             bed.heads().append(current)?;
             Ok(format!(
-                "published {} — `main` now points to it\n",
-                current.short()
+                "published {current} — `{target}` now points to it\n",
+                current = current.short()
             ))
         }
         Err(status) if status.code() == Code::FailedPrecondition => {
@@ -579,7 +590,7 @@ pub async fn publish(state_dir: &Path) -> Result<String, ClientError> {
             // will say it, so the fix is one command away.
             let tip = session
                 .client
-                .get_ref(&repo, DEFAULT_REF)
+                .get_ref(&repo, target)
                 .await
                 .ok()
                 .flatten()
@@ -587,6 +598,7 @@ pub async fn publish(state_dir: &Path) -> Result<String, ClientError> {
                 .unwrap_or_default();
             Err(ClientError::PublishNotFastForward {
                 cs: current.short(),
+                r#ref: target.to_owned(),
                 tip,
             })
         }
