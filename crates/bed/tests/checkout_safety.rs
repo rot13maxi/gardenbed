@@ -64,7 +64,7 @@ async fn world_with_external_state(
     if let Some(external) = external {
         std::os::unix::fs::symlink(external, garden.join(state_name)).unwrap();
     }
-    let store_root = root.path().join("server");
+    let store_root = root.path().join("server").join(REPO);
     let repo = Repo::open(&store_root).unwrap();
     let mut files = vec![
         ("a", Op::Add, b"base".as_slice()),
@@ -82,7 +82,7 @@ async fn world_with_external_state(
         &[("a", Op::Modify, b"target"), ("z", Op::Modify, b"target")],
     );
     repo.cas_ref("main", None, local).unwrap();
-    let server = Server::spawn(&store_root).await;
+    let server = Server::spawn(store_root.parent().unwrap()).await;
     let (code, _, err) = bed(
         &garden,
         &[
@@ -242,7 +242,7 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
         .current_cs
         .clone()
         .unwrap();
-    let repo = Repo::open(&w._root.path().join("server")).unwrap();
+    let repo = Repo::open(&w._root.path().join("server").join(REPO)).unwrap();
     let cs = repo.get_changeset(current.parse().unwrap()).unwrap();
     assert_eq!(
         cs.changes
