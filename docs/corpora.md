@@ -46,3 +46,4 @@ commit as the perf work (a wrong-root run silently verified a store it
 had built itself — the sampler now also picks revs uniformly from
 `git_map` by rowid poke and paths by random tree descent, since a full
 flatten is millions of tree reads at kernel scale).
+touched by w2
