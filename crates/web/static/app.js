@@ -1045,10 +1045,17 @@ function viewOverview(root) {
   setNav("overview");
   clear(root).appendChild(skeleton(8));
   const rev = currentRev();
+  // Refs/stats are independent of history: on an unseeded repo the log
+  // fetch 404s ("no ref or changeset matching main") and must not discard
+  // the rest of the overview. A non-404 log error still fails the page.
+  const logP = api("/api/log?" + qs({ cs: rev, limit: 500 })).catch((err) => {
+    if (err && err.status === 404) return { entries: [] };
+    throw err;
+  });
   Promise.all([
     api("/api/refs"),
     api("/api/stats"),
-    api("/api/log?" + qs({ cs: rev, limit: 500 })),
+    logP,
   ]).then(([refs, stats, log]) => {
     clear(root);
     const counters = (stats && stats.counters) || {};
@@ -1066,10 +1073,15 @@ function viewOverview(root) {
         el("div", { class: "chip-value" }, String((refs.refs || []).length))),
       el("div", { class: "chip" },
         el("div", { class: "chip-label" }, "tip · " + revName(rev)),
-        el("div", { class: "chip-value" }, tip ? shortId(tip.cs, 12) : "—")),
-      el("div", { class: "chip" },
-        el("div", { class: "chip-label" }, "requests served"),
+        el("div", { class: "chip-value" }, tip ? shortId(tip.cs, 12) : "—")));
+    // Repo stats counters bump only inside gRPC handlers, so in a
+    // gardenbed-web-only process they read 0 forever; show the chip only
+    // when there is something to report (and label the source honestly).
+    if (totalReq > 0) {
+      chips.appendChild(el("div", { class: "chip" },
+        el("div", { class: "chip-label" }, "grpc requests served"),
         el("div", { class: "chip-value" }, String(totalReq))));
+    }
     hero.appendChild(chips);
     root.appendChild(hero);
 
