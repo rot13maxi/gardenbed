@@ -463,11 +463,14 @@ pub struct MergeTreeOutcome {
 /// same mainline commit). Exit code 1 = conflict; anything other than
 /// 0/1 is an error. `--name-only` lists the conflicted paths.
 pub fn git_merge_tree(repo: &Path, ours: &str, theirs: &str) -> std::io::Result<MergeTreeOutcome> {
-    let out = git_cmd(repo, &["merge-tree", "--write-tree", "--name-only", ours, theirs])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
+    let out = git_cmd(
+        repo,
+        &["merge-tree", "--write-tree", "--name-only", ours, theirs],
+    )
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .output()?;
     match out.status.code() {
         Some(0) | Some(1) => {}
         other => {
@@ -475,7 +478,7 @@ pub fn git_merge_tree(repo: &Path, ours: &str, theirs: &str) -> std::io::Result<
                 "git merge-tree failed (exit {:?}): {}",
                 other,
                 String::from_utf8_lossy(&out.stderr).trim_end()
-            )))
+            )));
         }
     }
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
