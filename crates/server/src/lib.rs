@@ -13,9 +13,10 @@
 //! optional fields); errors are reserved for genuinely absent objects
 //! (`not_found`), bad input (`invalid_argument`), and semantic precondition
 //! violations (`failed_precondition`).
+pub mod repos;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use crate::repos::RepoSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,8 +27,9 @@ use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
 
+pub mod repos;
+
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
-/// must be uploaded with `PutBlob` first (v0.1.md §5).
 pub const MAX_INLINE_BLOB_LEN: usize = 1 << 20;
 
 /// Errors from [`Repo`] and the gRPC layer.
@@ -158,6 +160,33 @@ impl Repo {
             engine,
             stats: Stats::default(),
         }
+    }
+
+    /// Opens a repository over explicit stores — the scale-out entry point
+    /// (docs/scale-out-design.md): `gardenbed_store::StorageConfig::open`
+    /// produces the `(objects, metadata)` pair and this builds the same
+    /// service over them that [`Repo::open`] builds over a local root.
+    /// Identical to [`Repo::new`]; the distinct name says "explicit stores
+    /// are a first-class way to open, not a test hook".
+    pub fn open_stores(objects: Arc<dyn ObjectStore>, metadata: Arc<dyn MetadataStore>) -> Self {
+        Self::new(objects, metadata)
+    }
+
+    /// The object store this repo was opened over — for callers that drive
+    /// store-level APIs alongside the repo (e.g. git import/export).
+    pub fn objects_handle(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.objects)
+    }
+
+    /// The metadata store this repo was opened over.
+    pub fn metadata_handle(&self) -> Arc<dyn MetadataStore> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// The derived-data engine this repo runs (git import takes it to keep
+    /// its derivation on the same engine instance as the repo).
+    pub fn engine_handle(&self) -> Engine {
+        self.engine.clone()
     }
 
     // -------------------------------------------------------- write path
@@ -790,29 +819,38 @@ impl From<ServerError> for Status {
     }
 }
 
-/// The tonic adapter over one [`Repo`]: implements the generated
-/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5).
+/// The tonic adapter over a [`RepoSet`]: implements the generated
+/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5) over N repositories.
+///
+/// Every handler resolves its request's `repo` field through
+/// [`RepoSet::resolve`] — the one seam where authentication lands (v0.3).
 pub struct GardenbedService {
-    repo: Arc<Repo>,
+    set: Arc<RepoSet>,
 }
 
 impl GardenbedService {
-    /// A service over `repo` (shared behind an `Arc`).
-    pub fn new(repo: Arc<Repo>) -> Self {
-        GardenbedService { repo }
+    /// A service over the repositories under `set`'s root.
+    pub fn new(set: Arc<RepoSet>) -> Self {
+        GardenbedService { set }
     }
 
-    /// The request's `repo` field: validated non-empty and logged. Every
-    /// request carries it (v0.1.md §5); v0.1 serves a single repo, so the
-    /// name is accepted as-is once non-empty.
-    fn repo_field<'a>(&self, repo: &'a str, rpc: &'static str) -> Result<&'a str, Status> {
-        if repo.is_empty() {
-            return Err(Status::invalid_argument(
-                "request carries no repo name (the `repo` field is mandatory)",
-            ));
-        }
+    /// The serving set (tests, the binary's logging).
+    pub fn set(&self) -> &RepoSet {
+        &self.set
+    }
+
+    /// Resolves the request's `repo` field to an in-use repository. The
+    /// name rules and errors are [`RepoSet::resolve`]'s: illegal names
+    /// (empty, bad characters, reserved) → `invalid_argument`; legal but
+    /// unserved → `not_found` listing the served names; a store that will
+    /// not open → `internal` naming the repository.
+    fn repo_guard(&self, repo: &str, rpc: &'static str) -> Result<repos::RepoGuard<'_>, Status> {
         log::debug!("request rpc={rpc} repo={repo}");
-        Ok(repo)
+        self.set.resolve(repo).map_err(|e| match e {
+            repos::RepoResolveError::InvalidName { .. } => Status::invalid_argument(e.to_string()),
+            repos::RepoResolveError::NotFound { .. } => Status::not_found(e.to_string()),
+            repos::RepoResolveError::Open { .. } => Status::internal(e.to_string()),
+        })
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -825,9 +863,10 @@ impl GardenbedService {
         })
     }
 
-    /// Bumps one of the counted RPC counters (no-op for uncounted names).
-    fn bump(&self, name: &str) {
-        if let Some(c) = self.repo.counter(name) {
+    /// Bumps one of the counted RPC counters on `repo` (no-op for
+    /// uncounted names).
+    fn bump(repo: &Repo, name: &str) {
+        if let Some(c) = repo.counter(name) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
