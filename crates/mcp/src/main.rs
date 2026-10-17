@@ -1,5 +1,7 @@
 //! `gardenbed-mcp` — the binary. Parses `--root` (the server's data
-//! dir) and the accepted `--repo` name (single-repo in v0.1), opens the
+//! dir), the accepted `--repo` name (single-repo in v0.1), and the
+//! accepted `--token` (forward compatibility; repository access is in
+//! process, so no token is needed today), opens the
 //! server's [`gardenbed_server::Repo`] in process, and serves the MCP
 //! stdio protocol: one JSON-RPC message per stdin line, one response per
 //! request, stdout for nothing but the protocol.
@@ -31,6 +33,13 @@ struct Args {
     /// from day one, docs/v0.1.md §1).
     #[arg(long, value_name = "NAME")]
     repo: Option<String>,
+
+    /// Auth token; accepted and validated for forward compatibility
+    /// (the MCP server talks to the repository in process, so no token
+    /// is needed today; a future RPC mode will send it as the bearer
+    /// token).
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
 }
 
 fn main() {
@@ -43,6 +52,16 @@ fn main() {
         }
         None => "default".to_owned(),
     };
+    if let Some(token) = &args.token {
+        if token.trim().is_empty() {
+            eprintln!("gardenbed-mcp: --token must not be empty");
+            std::process::exit(1);
+        }
+        eprintln!(
+            "gardenbed-mcp: --token accepted for forward compatibility; \
+             repository access is in process and needs no token today"
+        );
+    }
     let repo = match Repo::open(&args.root) {
         Ok(repo) => repo,
         Err(e) => {

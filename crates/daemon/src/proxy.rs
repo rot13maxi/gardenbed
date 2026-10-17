@@ -31,6 +31,27 @@ use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+/// The `authorization` metadata value of an incoming request, forwarded
+/// verbatim to the upstream. The daemon never interprets credentials —
+/// an authed upstream makes the call.
+type AuthValue = Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>;
+
+/// Captures `request`'s `authorization` metadata (before `into_inner`).
+fn auth_of<T>(request: &Request<T>) -> AuthValue {
+    request.metadata().get("authorization").cloned()
+}
+
+/// Re-wraps `request`'s message in an upstream request carrying the
+/// caller's `authorization` metadata.
+fn forward<T>(request: Request<T>) -> tonic::Request<T> {
+    let value = request.metadata().get("authorization").cloned();
+    let mut out = tonic::Request::new(request.into_inner());
+    if let Some(value) = value {
+        out.metadata_mut().insert("authorization", value);
+    }
+    out
+}
+
 /// The daemon's upstream connection, re-established on demand.
 struct Upstream {
     endpoint: String,
@@ -129,7 +150,12 @@ impl ProxyService {
     /// Cache-first tree lookup: shared store, then one upstream `GetTree`,
     /// write-through. Concurrent requests for the same id collapse into a
     /// single fetch.
-    async fn tree_from_cache(&self, repo: &str, id: Id) -> Result<pb::TreeResp, Status> {
+    async fn tree_from_cache(
+        &self,
+        repo: &str,
+        id: Id,
+        auth: AuthValue,
+    ) -> Result<pb::TreeResp, Status> {
         if let Some(bytes) = self
             .cache
             .get_tree(id)
@@ -161,7 +187,7 @@ impl ProxyService {
             return pb::TreeResp::try_from(&tree)
                 .map_err(|_| Status::internal("cached tree cannot be re-encoded"));
         }
-        let client = self.upstream.get().await?;
+        let client = self.upstream.get().await?.with_auth_value(auth);
         let tree = match client.get_tree(repo, id).await {
             Ok(tree) => tree,
             Err(status) => {
@@ -184,7 +210,12 @@ impl ProxyService {
     /// Cache-first blob lookup: shared store, else one streamed upstream
     /// `GetBlob`, reassembled, hash-verified, write-through, then streamed
     /// back to the caller in chunks.
-    async fn blob_stream(self, repo: String, id: Id) -> Result<BoxStream<pb::BlobChunk>, Status> {
+    async fn blob_stream(
+        self,
+        repo: String,
+        id: Id,
+        auth: AuthValue,
+    ) -> Result<BoxStream<pb::BlobChunk>, Status> {
         if let Some(content) = self
             .cache
             .get_blob(id)
@@ -194,7 +225,7 @@ impl ProxyService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(chunked(content));
         }
-        let client = self.upstream.get().await?;
+        let client = self.upstream.get().await?.with_auth_value(auth);
         let mut stream = match client.get_blob(&repo, id).await {
             Ok(stream) => stream,
             Err(status) => {
@@ -299,7 +330,7 @@ impl Gardenbed for ProxyService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::RootTreeResp>, Status> {
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().root_tree(request.into_inner()).await?;
+        let resp = client.raw().clone().root_tree(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -307,9 +338,10 @@ impl Gardenbed for ProxyService {
         &self,
         request: Request<pb::GetTreeReq>,
     ) -> Result<Response<pb::TreeResp>, Status> {
+        let auth = auth_of(&request);
         let req = request.into_inner();
         let id = Self::id(&req.id, "id")?;
-        let tree = self.tree_from_cache(&req.repo, id).await?;
+        let tree = self.tree_from_cache(&req.repo, id, auth).await?;
         Ok(Response::new(tree))
     }
 
@@ -317,9 +349,10 @@ impl Gardenbed for ProxyService {
         &self,
         request: Request<pb::GetBlobReq>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
+        let auth = auth_of(&request);
         let req = request.into_inner();
         let id = Self::id(&req.id, "id")?;
-        let stream = self.clone().blob_stream(req.repo, id).await?;
+        let stream = self.clone().blob_stream(req.repo, id, auth).await?;
         Ok(Response::new(stream))
     }
 
@@ -327,10 +360,15 @@ impl Gardenbed for ProxyService {
         &self,
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::ChangesetMsg>, Status> {
+        let auth = auth_of(&request);
         let client = self.upstream.get().await?;
         let req = request.into_inner();
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let cs = match client.get_changeset(&req.repo, cs_id).await {
+        let cs = match client
+            .with_auth_value(auth)
+            .get_changeset(&req.repo, cs_id)
+            .await
+        {
             Ok(cs) => cs,
             Err(status) => {
                 if transport_dead(&status) {
@@ -349,6 +387,7 @@ impl Gardenbed for ProxyService {
         request: Request<Streaming<pb::PutBlobChunk>>,
     ) -> Result<Response<pb::PutBlobResp>, Status> {
         peer_uid_ok(&request)?;
+        let auth = auth_of(&request);
         // Drain the client stream, then forward through the typed wrapper
         // (the header names the repo; body chunks ride in order).
         let mut stream = request.into_inner();
@@ -362,6 +401,7 @@ impl Gardenbed for ProxyService {
         });
         let client = self.upstream.get().await?;
         let id = client
+            .with_auth_value(auth)
             .put_blob(
                 &repo.unwrap_or_default(),
                 tokio_stream::iter(
@@ -389,7 +429,7 @@ impl Gardenbed for ProxyService {
         let id = client
             .raw()
             .clone()
-            .create_changeset(request.into_inner())
+            .create_changeset(forward(request))
             .await?
             .into_inner()
             .id;
@@ -401,11 +441,7 @@ impl Gardenbed for ProxyService {
         request: Request<pb::MergeBaseReq>,
     ) -> Result<Response<pb::MergeBaseResp>, Status> {
         let client = self.upstream.get().await?;
-        let resp = client
-            .raw()
-            .clone()
-            .merge_base(request.into_inner())
-            .await?;
+        let resp = client.raw().clone().merge_base(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -414,11 +450,7 @@ impl Gardenbed for ProxyService {
         request: Request<pb::IsAncestorReq>,
     ) -> Result<Response<pb::IsAncestorResp>, Status> {
         let client = self.upstream.get().await?;
-        let resp = client
-            .raw()
-            .clone()
-            .is_ancestor(request.into_inner())
-            .await?;
+        let resp = client.raw().clone().is_ancestor(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -430,7 +462,7 @@ impl Gardenbed for ProxyService {
         let mut stream = client
             .raw()
             .clone()
-            .diff(request.into_inner())
+            .diff(forward(request))
             .await?
             .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -453,7 +485,7 @@ impl Gardenbed for ProxyService {
         let mut stream = client
             .raw()
             .clone()
-            .log(request.into_inner())
+            .log(forward(request))
             .await?
             .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -476,7 +508,7 @@ impl Gardenbed for ProxyService {
         let mut stream = client
             .raw()
             .clone()
-            .blame(request.into_inner())
+            .blame(forward(request))
             .await?
             .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -499,7 +531,7 @@ impl Gardenbed for ProxyService {
         let mut stream = client
             .raw()
             .clone()
-            .list_refs(request.into_inner())
+            .list_refs(forward(request))
             .await?
             .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
@@ -518,9 +550,13 @@ impl Gardenbed for ProxyService {
         &self,
         request: Request<pb::GetRefReq>,
     ) -> Result<Response<pb::GetRefResp>, Status> {
+        let auth = auth_of(&request);
         let client = self.upstream.get().await?;
         let req = request.into_inner();
-        let value = client.get_ref(&req.repo, &req.name).await?;
+        let value = client
+            .with_auth_value(auth)
+            .get_ref(&req.repo, &req.name)
+            .await?;
         Ok(Response::new(pb::GetRefResp {
             cs_id: value.map(id_to_bytes),
         }))
@@ -532,7 +568,7 @@ impl Gardenbed for ProxyService {
     ) -> Result<Response<pb::CasResp>, Status> {
         peer_uid_ok(&request)?;
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().cas_ref(request.into_inner()).await?;
+        let resp = client.raw().clone().cas_ref(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -542,7 +578,7 @@ impl Gardenbed for ProxyService {
     ) -> Result<Response<pb::RebaseResp>, Status> {
         peer_uid_ok(&request)?;
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().rebase(request.into_inner()).await?;
+        let resp = client.raw().clone().rebase(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -552,7 +588,7 @@ impl Gardenbed for ProxyService {
     ) -> Result<Response<pb::PublishResp>, Status> {
         peer_uid_ok(&request)?;
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().publish(request.into_inner()).await?;
+        let resp = client.raw().clone().publish(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -562,7 +598,7 @@ impl Gardenbed for ProxyService {
     ) -> Result<Response<pb::MergeResp>, Status> {
         peer_uid_ok(&request)?;
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().merge(request.into_inner()).await?;
+        let resp = client.raw().clone().merge(forward(request)).await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -577,7 +613,7 @@ impl Gardenbed for ProxyService {
             client
                 .raw()
                 .clone()
-                .get_stats(request.into_inner())
+                .get_stats(forward(request))
                 .await?
                 .into_inner()
         };
