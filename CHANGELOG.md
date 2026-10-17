@@ -58,7 +58,28 @@ tags, and the verification record for a release lives in
   offline from the treestate's materialized rows — a dead selection no
   longer reads like live coverage. Recording empty selections ahead of
   history is unchanged by design.
-
+- **No-argument `bed diff` now reads the working copy with the scanner's
+  metadata discipline** (`symlink_metadata`, never following): a
+  retargeted tracked symlink's new side is its link-target bytes — the
+  same bytes `commit` records, not the target file's content — so a
+  dangling link and a tracked file replaced by a directory both render
+  (the latter as a deletion, matching `status`) instead of exiting 1
+  ('No such file or directory' / 'Is a directory'). Also: a working
+  copy dirty only by untracked files no longer prints a header-only
+  empty working-copy diff — untracked files were never part of it, so
+  the diff falls back to the committed current-vs-parent diff (git
+  parity, `docs/cli.md`); empty diffs (identical sides, a root
+  changeset with no parent) now print their header too, stating the
+  fact (`— both sides are equal` / `— a root changeset has no parent`)
+  instead of printing nothing; and the two-argument header claims
+  "against its first parent" only when the older side really is the
+  newer's first parent — any other pair reads `diff of <older> against
+  <newer>` (regression tests in `crates/bed/tests/write_path.rs`:
+  `diff_retargeted_symlink_shows_link_target_bytes_not_target_content`,
+  `diff_dangling_symlink_renders_instead_of_failing`,
+  `diff_tracked_file_replaced_by_directory_renders_as_deletion`,
+  `diff_two_arg_header_names_both_sides_for_non_parent_pair`,
+  `diff_untracked_only_dirt_falls_back_to_committed_diff`).
 - **`gardenbed-server import` no longer silently rewinds refs** when an
   incremental import moves a ref to a tip that is not a descendant of
   the ref's current value (e.g. re-importing a git repository whose
@@ -106,13 +127,16 @@ tags, and the verification record for a release lives in
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
 - No-argument `bed diff` is context-aware and always self-describing: a
-  dirty working copy diffs local bytes against the current changeset
-  (untracked files excluded, git parity; deleted files render as removal
-  to `/dev/null`), while a clean one keeps the current-changeset-vs-
-  first-parent diff. Both modes print a one-line header naming what is
+  working copy dirty by modified or deleted tracked files diffs local
+  bytes against the current changeset (untracked files excluded, git
+  parity, so untracked-only dirt falls back to the committed diff;
+  deleted files render as removal to `/dev/null`), while an otherwise
+  clean one keeps the current-changeset-vs-first-parent diff. Every
+  diff — empty ones included — prints a one-line header naming what is
   being diffed (`diff of working copy against <cs>` /
-  `diff of <cs> against its first parent`); explicit `bed diff A [B]`
-  still means changesets, now with the same header line.
+  `diff of <cs> against its first parent` / `diff of <a> against <b>`
+  for non-parent pairs); explicit `bed diff A [B]` still means
+  changesets, now with the same header line.
 
 
 ## [0.1.0] - 2026-10-16

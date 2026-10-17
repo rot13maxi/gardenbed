@@ -48,7 +48,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `status` | show local changes under selected paths |
 | `file` | print one file's content at a changeset (or the current one) |
 | `log` | show changeset history, newest first |
-| `diff` | diff the working copy (when dirty) or two changesets; every diff prints a header naming its sides |
+| `diff` | diff the working copy (when dirty by modified/deleted tracked files) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
 | `publish` | fast-forward `main` to the current changeset |
@@ -210,17 +210,23 @@ bed log --cs master --limit 1
 Usage: bed diff [OPTIONS] [A] [B]
 ```
 
-With no arguments, `bed diff` is context-aware: a **dirty** working copy
-diffs the local bytes of every modified or deleted tracked file under
-the sparse selection against the current changeset (untracked files are
-not part of it — git parity; a deleted file renders as a removal to
-`/dev/null`); a **clean** working copy diffs the current changeset
-against its first parent. With arguments, both are always changesets:
-`A` is the older side; with `B` omitted, diffs `A` against its first
-parent. Both take a `<cs-or-ref>`.
+With no arguments, `bed diff` is context-aware: a working copy **dirty
+by modified or deleted tracked files** diffs their local bytes against
+the current changeset (untracked files are not part of it — git parity;
+a deleted file, or a tracked file replaced by a directory, renders as a
+removal to `/dev/null`; a tracked symlink's new side is its
+link-target bytes, what `commit` records, never the target's content —
+a dangling link diffs fine). A working copy clean, or dirty only by
+untracked files, diffs the current changeset against its first parent.
+With arguments, both are always changesets: `A` is the older side; with
+`B` omitted, diffs `A` against its first parent. Both take a
+`<cs-or-ref>`.
 
 Every diff prints a one-line header naming what is being diffed, so the
-two modes are distinguishable at a glance:
+modes are distinguishable at a glance — empty diffs included (identical
+sides state they are equal; a root changeset says it has no parent).
+The first-parent wording appears only when the older side really is the
+newer's first parent; any other pair names both sides:
 
 ```sh
 bed diff                     # working copy vs current changeset (dirty),
@@ -231,6 +237,7 @@ bed diff main master
 ```text
 diff of working copy against 57169571952de2bf
 diff of 57169571952de2bf against its first parent
+diff of 3af0c1d8e29b4a6d against 57169571952de2bf
 ```
 
 ### bed commit

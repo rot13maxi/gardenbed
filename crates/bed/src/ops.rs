@@ -660,18 +660,22 @@ fn log_entry_of(summary: &ChangesetSummary) -> LogEntry {
 }
 
 /// `bed diff [<a> [<b>]]` — rendered git-diff-like, always under a
-/// one-line header naming what is being diffed.
+/// one-line header naming what is being diffed (empty diffs included).
 ///
 /// * **No arguments, dirty working copy** — every modified or deleted
 ///   tracked file under the sparse selection, diffed against the current
 ///   changeset (local bytes vs the blob at `current_cs`); the header
 ///   names the working copy and the changeset. Untracked files are not
-///   part of a working-copy diff (git parity).
-/// * **No arguments, clean working copy** — the current changeset
-///   against its first parent; the header names both changesets.
-/// * **One argument** — that changeset against its first parent.
+///   part of a working-copy diff (git parity), so a copy dirty only by
+///   untracked files falls back to the committed diff below.
+/// * **No arguments, otherwise clean working copy** — the current
+///   changeset against its first parent; the header names both changesets.
+/// * **One argument** — that changeset against its first parent. A root
+///   changeset has no parent: the header says so, with an empty body.
 /// * **Two arguments** — `a → b`. Changeset arguments always mean
-///   changesets, in every form.
+///   changesets, in every form. The header claims "first parent" only
+///   when the older side really is the newer's parent; otherwise it
+///   names both sides. Identical sides state that and render nothing.
 pub async fn diff(
     state_dir: &Path,
     a: Option<&str>,
@@ -702,24 +706,26 @@ pub async fn diff(
     let session = Session::open(&bed).await?;
 
     // Resolve sides; fill in first parents client-side as needed.
-    let (older, newer) = match (a, b) {
+    // `first_parent_wording` is true only when the older side really is
+    // the newer's first parent — the header must not lie about ancestry.
+    let (older, newer, first_parent_wording) = match (a, b) {
         (Some(a), Some(b)) => {
             let pa = crate::revspec::CsOrRef::parse(a)?;
             let pb = crate::revspec::CsOrRef::parse(b)?;
-            (
-                session.resolve(&pa, "diff").await?,
-                session.resolve(&pb, "diff").await?,
-            )
+            let older = session.resolve(&pa, "diff").await?;
+            let newer = session.resolve(&pb, "diff").await?;
+            let first_parent_wording = session.first_parent(newer, "diff").await? == Some(older);
+            (older, newer, first_parent_wording)
         }
         (Some(a), None) => {
             // One side: that changeset against its first parent. A root
-            // changeset has no parent — nothing to diff, empty output.
+            // changeset has no parent — the header says so, body empty.
             let newer = session
                 .resolve(&crate::revspec::CsOrRef::parse(a)?, "diff")
                 .await?;
             match session.first_parent(newer, "diff").await? {
-                Some(older) => (older, newer),
-                None => return Ok(String::new()),
+                Some(older) => (older, newer, true),
+                None => return Ok(root_header(newer)),
             }
         }
         (None, Some(_)) => {
@@ -732,13 +738,19 @@ pub async fn diff(
         (None, None) => {
             let newer = session.resolve_current_cs(&bed, "diff").await?;
             match session.first_parent(newer, "diff").await? {
-                Some(older) => (older, newer),
-                None => return Ok(String::new()), // a root: nothing to diff
+                Some(older) => (older, newer, true),
+                None => return Ok(root_header(newer)), // a root: nothing to diff
             }
         }
     };
     if older == newer {
-        return Ok(String::new());
+        // An empty diff still prints its header: it names both sides and
+        // states the fact that they are equal.
+        return Ok(format!(
+            "diff of {} against {} — both sides are equal\n",
+            older.short(),
+            newer.short()
+        ));
     }
 
     let changes = session.diff(older, newer, "diff").await?;
@@ -754,22 +766,32 @@ pub async fn diff(
             .ok_or(ClientError::BlobHashMismatch(id))
     };
     let body = render::render_diff(&entries, &content_of)?;
-    Ok(format!(
-        "diff of {} against its first parent\n{body}",
-        newer.short()
-    ))
+    let header = if first_parent_wording {
+        format!("diff of {} against its first parent", newer.short())
+    } else {
+        format!("diff of {} against {}", older.short(), newer.short())
+    };
+    Ok(format!("{header}\n{body}"))
+}
+
+/// The self-describing header of a root changeset's diff: no parent to
+/// diff against, so the body is empty but the header still prints.
+fn root_header(cs: Id) -> String {
+    format!("diff of {} — a root changeset has no parent\n", cs.short())
 }
 
 /// The working-copy half of the no-argument `bed diff`: local bytes vs
 /// the current changeset, for every modified or deleted tracked file
-/// under the sparse selection. `Ok(None)` means the working copy is
-/// clean — the caller falls back to the committed diff.
+/// under the sparse selection. `Ok(None)` means the working copy has
+/// nothing diffable — clean, or dirty only by untracked files (the
+/// renderer covers modified/deleted paths only, git parity) — and the
+/// caller falls back to the committed diff.
 async fn working_copy_diff(bed: &WorkingCopy, current: Id) -> Result<Option<String>, ClientError> {
     let sparse = bed.config().sparse.clone();
     let treestate = bed.treestate()?;
     let root = bed.workspace_root();
     let report = crate::status::scan_status(&root, &sparse, &treestate, false)?;
-    if report.is_clean() {
+    if report.modified.is_empty() && report.deleted.is_empty() {
         return Ok(None);
     }
 
@@ -786,24 +808,17 @@ async fn working_copy_diff(bed: &WorkingCopy, current: Id) -> Result<Option<Stri
             mode: crate::commit::mode_code_to_mode(row.mode),
         };
         wanted.insert(row.blob_id);
-        let on_disk = root.join(path);
-        let new_side = match fs::read(&on_disk) {
-            Ok(bytes) => {
+        let new_side = match observe_working_bytes(&root, path)? {
+            Some((bytes, mode)) => {
                 let blob = gardenbed_model::blob_id(&bytes);
-                let mode = observed_mode(&on_disk)?;
                 // Cache the local bytes so the renderer's cache-first
                 // content lookup finds them.
                 bed.objects()?.put_blob(&bytes)?;
                 Some(render::DiffSide { blob, mode })
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if report.deleted.contains(path) {
-                    None // a local deletion renders as removal to /dev/null
-                } else {
-                    return Err(ClientError::from(error));
-                }
-            }
-            Err(error) => return Err(ClientError::from(error)),
+            // Gone, or replaced by a directory: a local deletion renders
+            // as a removal to /dev/null.
+            None => None,
         };
         entries.push(DiffEntry {
             path: path.clone(),
@@ -826,17 +841,35 @@ async fn working_copy_diff(bed: &WorkingCopy, current: Id) -> Result<Option<Stri
     )))
 }
 
-/// The §4 mode of the working file at `path`, as a diff side needs it.
-fn observed_mode(path: &Path) -> Result<Mode, ClientError> {
-    let meta = fs::symlink_metadata(path)?;
-    use std::os::unix::fs::PermissionsExt as _;
-    if meta.file_type().is_symlink() {
-        Ok(Mode::Symlink)
-    } else if meta.permissions().mode() & 0o111 != 0 {
-        Ok(Mode::Exec)
-    } else {
-        Ok(Mode::Regular)
+/// Reads the new side of a working-copy diff at `root/rel`, with the
+/// scanner's metadata discipline (`status::observe`, `commit`'s
+/// `read_working`): `symlink_metadata` first, never following — a
+/// symlink's content is its link-target bytes (what `commit` records, so
+/// a dangling target is still a faithful symlink), and only regular
+/// files are read. `Ok(None)` when the path is gone or was replaced by
+/// a directory — both render as deletions.
+fn observe_working_bytes(root: &Path, rel: &str) -> Result<Option<(Vec<u8>, Mode)>, ClientError> {
+    let on_disk = root.join(rel);
+    let meta = match fs::symlink_metadata(&on_disk) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.is_dir() {
+        return Ok(None); // replaced by a directory: a deletion
     }
+    use std::os::unix::ffi::OsStrExt as _;
+    if meta.file_type().is_symlink() {
+        let bytes = fs::read_link(&on_disk)?.as_os_str().as_bytes().to_vec();
+        return Ok(Some((bytes, Mode::Symlink)));
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let mode = if meta.permissions().mode() & 0o111 != 0 {
+        Mode::Exec
+    } else {
+        Mode::Regular
+    };
+    Ok(Some((fs::read(&on_disk)?, mode)))
 }
 
 /// Converts wire `ChangeMsg`s into render entries. The wire carries only
