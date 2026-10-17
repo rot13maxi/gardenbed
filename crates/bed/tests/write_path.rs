@@ -1351,7 +1351,7 @@ async fn publish_ref_advances_lane_and_fresh_switch_sees_it() {
     // The fresh clone: `bed switch <branch>` must land on the committed tip.
     let fresh = w._dir.path().join("garden-fresh");
     fs::create_dir_all(&fresh).unwrap();
-    let (code, _, stderr) = bed(&fresh, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(&fresh, &["clone", &format!("{}/garden", w.server.http())]);
     assert_eq!(code, 0, "fresh clone: {stderr}");
     let (code, out, stderr) = bed(&fresh, &["sparse", "add", "."]);
     assert_eq!(code, 0, "fresh sparse add: {stderr}\n{out}");
