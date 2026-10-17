@@ -108,19 +108,34 @@ impl Session {
 
     /// Connects to `endpoint`, caching objects into `objects` on behalf of
     /// `repo`, with at most `concurrency` fetches in flight.
+    ///
+    /// The TCP+HTTP/2 handshake is bounded (`Endpoint::connect_timeout`,
+    /// 5s): a hung server (SIGSTOPped, or a black-holed address) fails
+    /// as a `ClientError::Connect` within the deadline instead of
+    /// blocking indefinitely — which is what lets the offline queue
+    /// treat unreachable as queueable.
     pub async fn connect(
         repo: &str,
         objects: gardenbed_store::FsObjectStore,
         endpoint: &str,
         concurrency: usize,
     ) -> Result<Self, ClientError> {
-        let client =
-            GardenbedClient::connect(endpoint)
-                .await
-                .map_err(|e| ClientError::Connect {
-                    server: endpoint.to_owned(),
-                    message: e.to_string(),
-                })?;
+        let server = endpoint.to_owned();
+        let endpoint = tonic::transport::Endpoint::from_shared(server.clone()).map_err(|e| {
+            ClientError::Connect {
+                server: server.clone(),
+                message: format!("invalid endpoint: {e}"),
+            }
+        })?;
+        let channel = endpoint
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .connect()
+            .await
+            .map_err(|e| ClientError::Connect {
+                server,
+                message: e.to_string(),
+            })?;
+        let client = GardenbedClient::from_channel(channel);
         let fetcher = Arc::new(Fetcher::new(client.clone(), repo, objects, concurrency));
         Ok(Session {
             client,

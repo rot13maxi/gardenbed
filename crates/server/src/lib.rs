@@ -30,6 +30,16 @@ use gardenbed_store::{
 /// must be uploaded with `PutBlob` first (v0.1.md §5).
 pub const MAX_INLINE_BLOB_LEN: usize = 1 << 20;
 
+/// Aggregate cap on all inline blobs in one `CreateChangeset` (2 MiB):
+/// per-blob limits alone still admit N×1 MiB in a single request, and
+/// the request is fully buffered before validation.
+pub const MAX_INLINE_TOTAL_LEN: usize = 2 << 20;
+
+/// Largest blob accepted by `PutBlob` (1 GiB). The stream is checked
+/// chunk-by-chunk against this bound, so an oversized upload is refused
+/// after its first frames — never by growing an unbounded buffer first.
+pub const MAX_PUT_BLOB_LEN: usize = 1 << 30;
+
 /// Errors from [`Repo`] and the gRPC layer.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -359,16 +369,26 @@ impl Repo {
         } else {
             limit as usize
         };
+        // One get_changeset per node: every heap entry is pushed with its
+        // decoded changeset (the push needs committer.time_secs anyway),
+        // and popped entries hand theirs back — the head seeds the cache
+        // and every node is fetched exactly once, versus the old pop-time
+        // re-fetch that walked every changeset twice.
+        let mut cache: HashMap<Id, Changeset> = HashMap::new();
+        cache.insert(cs_id, head);
         let mut out: Vec<(Id, Changeset)> = Vec::with_capacity(cap.min(64));
         while let Some((_, _, id_bytes)) = heap.pop() {
             let id = Id::from_bytes(id_bytes);
             // Insert the parents on pop (git inserts parents when a commit
             // is taken off its date-sorted list), each with a fresh seq.
-            let cs = self.get_changeset(id)?;
+            let cs = cache
+                .remove(&id)
+                .ok_or(ServerError::ChangesetNotFound(id))?;
             for p in &cs.parents {
                 if seen.insert(*p) {
                     let parent = self.get_changeset(*p)?;
                     heap.push((parent.committer.time_secs, Reverse(seq), *p.as_bytes()));
+                    cache.insert(*p, parent);
                     seq += 1;
                 }
             }
@@ -528,12 +548,17 @@ impl Repo {
                 .collect(),
             None => BTreeMap::new(),
         };
+        // Precompute once: the paths that differ between the new parent
+        // and the pre-image (the whole lockstep diff, sorted). Every
+        // check below is then membership tests and binary searches over
+        // this slice, instead of re-diffing subtrees per change.
+        let changed = changed_paths(&files, &pre);
 
         let mut conflicts: Vec<String> = Vec::new();
         for c in &cs.changes {
             match c.op {
                 gardenbed_model::Op::Add | gardenbed_model::Op::Modify => {
-                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(&files, &c.path, c.blob, c.mode, &changed, &mut conflicts);
                 }
                 gardenbed_model::Op::Delete => {
                     check_removal(&files, &pre, &c.path, &mut conflicts);
@@ -544,7 +569,7 @@ impl Repo {
                         continue;
                     };
                     check_removal(&files, &pre, src, &mut conflicts);
-                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(&files, &c.path, c.blob, c.mode, &changed, &mut conflicts);
                 }
             }
         }
@@ -736,10 +761,10 @@ fn check_removal(
 
 fn check_write(
     files: &BTreeMap<String, (Mode, Id)>,
-    pre: &BTreeMap<String, (Mode, Id)>,
     path: &str,
     blob: Option<Id>,
     mode: Mode,
+    changed: &[&str],
     conflicts: &mut Vec<String>,
 ) {
     let Some(blob) = blob else {
@@ -750,30 +775,86 @@ fn check_write(
     if existing == Some(&(mode, blob)) {
         return; // Exact desired result: no path or subtree is overwritten.
     }
-    if existing != pre.get(path) {
+    // Paths whose (mode, blob) differs between the new parent and the
+    // pre-image, precomputed once per rebase call (sorted; binary-searched).
+    if changed.binary_search(&path).is_ok() {
         conflicts.push(format!("{path:?} was changed or deleted"));
     }
     let mut ancestor = path;
     while let Some((parent, _)) = ancestor.rsplit_once('/') {
-        if let Some(value) = files.get(parent)
-            && pre.get(parent) != Some(value)
-        {
+        // Only a file that still exists on the new parent can have been
+        // changed under; a parent absent from `files` was removed, not
+        // changed (the removed subtree is checked by the removal paths).
+        if files.contains_key(parent) && changed.binary_search(&parent).is_ok() {
             conflicts.push(format!("{path:?} sits under a concurrently changed file"));
         }
         ancestor = parent;
     }
     // Replacing a directory must not erase concurrent additions, edits,
-    // mode changes, or deletions anywhere in the swallowed subtree.
+    // mode changes, or deletions anywhere in the swallowed subtree. The
+    // first differing path sorted after "path/" is inside that subtree iff
+    // any differing path is: every non-descendant greater than "path/"
+    // (e.g. "dir0" for path "dir") sorts after every descendant.
     let prefix = format!("{path}/");
-    let descendants = |map: &BTreeMap<String, (Mode, Id)>| {
-        map.range(prefix.clone()..)
-            .take_while(|(p, _)| p.starts_with(&prefix))
-            .map(|(p, value)| (p.clone(), *value))
-            .collect::<BTreeMap<_, _>>()
-    };
-    if descendants(files) != descendants(pre) {
+    let i = changed
+        .binary_search_by(|p| p.as_bytes().cmp(prefix.as_bytes()))
+        .unwrap_err();
+    if i < changed.len() && changed[i].starts_with(&prefix) {
         conflicts.push(format!("directory {path:?} was changed"));
     }
+}
+
+/// The sorted list of paths whose `(mode, blob)` differs between two flat
+/// trees — one lockstep walk over both maps, `O(files + pre)` total,
+/// replacing the per-change subtree diffs that made rebase quadratic in
+/// the number of changes.
+fn changed_paths<'a>(
+    files: &'a BTreeMap<String, (Mode, Id)>,
+    pre: &'a BTreeMap<String, (Mode, Id)>,
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut fi = files.iter();
+    let mut pi = pre.iter();
+    let (mut f, mut p) = (fi.next(), pi.next());
+    loop {
+        match (f, p) {
+            (None, None) => return out,
+            (Some((fk, _fv)), None) => {
+                out.push(fk.as_str());
+                f = fi.next();
+            }
+            (None, Some((pk, _))) => {
+                out.push(pk.as_str());
+                p = pi.next();
+            }
+            (Some((fk, fv)), Some((pk, pv))) => match fk.cmp(pk) {
+                std::cmp::Ordering::Less => {
+                    out.push(fk.as_str());
+                    f = fi.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(pk.as_str());
+                    p = pi.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if fv != pv {
+                        out.push(fk.as_str());
+                    }
+                    f = fi.next();
+                    p = pi.next();
+                }
+            },
+        }
+    }
+}
+
+/// Would appending `incoming` bytes to a buffer already at `len` stay
+/// within `cap`? Checked before every `PutBlob` frame extends the body,
+/// so the buffer never exceeds the cap by more than one frame — and a
+/// stream of any size is refused after its first frames, not buffered
+/// first.
+fn chunk_fits(len: usize, incoming: usize, cap: usize) -> bool {
+    len <= cap && incoming <= cap - len
 }
 
 // --------------------------------------------------------------- gRPC layer
@@ -963,7 +1044,19 @@ impl Gardenbed for GardenbedService {
         let mut body = Vec::new();
         while let Some(chunk) = stream.message().await? {
             match chunk.frame {
-                Some(pb::put_blob_chunk::Frame::Data(d)) => body.extend_from_slice(&d),
+                Some(pb::put_blob_chunk::Frame::Data(d)) => {
+                    // Checked per chunk, before extending: the buffer never
+                    // grows past the cap by more than one frame, so an
+                    // oversized upload is refused as soon as it is detected.
+                    if !chunk_fits(body.len(), d.len(), MAX_PUT_BLOB_LEN) {
+                        return Err(Status::resource_exhausted(format!(
+                            "PutBlob body exceeds {} bytes (refused at {} bytes received)",
+                            MAX_PUT_BLOB_LEN,
+                            body.len() + d.len()
+                        )));
+                    }
+                    body.extend_from_slice(&d);
+                }
                 Some(pb::put_blob_chunk::Frame::Header(_)) => {
                     return Err(Status::invalid_argument(
                         "duplicate header frame in a PutBlob stream",
@@ -1008,6 +1101,17 @@ impl Gardenbed for GardenbedService {
             .into_iter()
             .map(|(key, content)| (key, content.to_vec()))
             .collect();
+        // Aggregate cap: per-blob limits alone still admit many blobs in
+        // one request; the map is already fully buffered here, so refuse
+        // before any store write.
+        let total: usize = inline.values().map(Vec::len).sum();
+        if total > MAX_INLINE_TOTAL_LEN {
+            return Err(Status::resource_exhausted(format!(
+                "inline_blobs total {} bytes exceeds the {} byte aggregate cap; \
+                 upload larger sets via PutBlob first",
+                total, MAX_INLINE_TOTAL_LEN
+            )));
+        }
         let id = self.repo.create_changeset(&cs, &inline)?;
         self.bump("create_changeset");
         Ok(Response::new(pb::CreateChangesetResp {
@@ -1527,6 +1631,56 @@ mod ref_normalization_tests {
         assert_eq!(
             repo.list_refs().expect("refs"),
             vec![("main".to_owned(), r2)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::*;
+
+    /// The PutBlob per-chunk gate: exactly at the cap fits, one byte past
+    /// refuses — checked before the buffer ever grows past the cap.
+    #[test]
+    fn chunk_fits_boundary() {
+        assert!(chunk_fits(0, 5, 5));
+        assert!(chunk_fits(4, 1, 5));
+        assert!(
+            chunk_fits(5, 0, 5),
+            "exactly at the cap with nothing incoming fits"
+        );
+        assert!(!chunk_fits(4, 2, 5));
+        assert!(
+            !chunk_fits(6, 0, 5),
+            "an already-oversized buffer never fits"
+        );
+    }
+
+    /// The lockstep diff behind rebase's precomputed `changed` set: sorted
+    /// output, symmetric treatment of add/delete/modify, value equality
+    /// (not key presence) decides.
+    #[test]
+    fn changed_paths_is_the_sorted_diff() {
+        let mode = Mode::Regular;
+        let id = Id::from_bytes([0u8; 32]);
+        let id2 = Id::from_bytes([1u8; 32]);
+        let files: BTreeMap<String, (Mode, Id)> = [
+            ("a".to_owned(), (mode, id)),
+            ("b".to_owned(), (mode, id)),
+            ("d/e".to_owned(), (mode, id)),
+        ]
+        .into_iter()
+        .collect();
+        let pre: BTreeMap<String, (Mode, Id)> = [
+            ("b".to_owned(), (mode, id2)),  // value changed
+            ("c".to_owned(), (mode, id)),   // deleted in files
+            ("d/f".to_owned(), (mode, id)), // deleted in files
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            changed_paths(&files, &pre),
+            vec!["a", "b", "c", "d/e", "d/f"]
         );
     }
 }

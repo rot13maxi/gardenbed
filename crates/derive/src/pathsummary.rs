@@ -289,19 +289,22 @@ fn bloom_maybe(bits: &[u8], path: &str) -> bool {
 
 /// The touched paths of a changeset: every change's `path` plus every
 /// rename's `src_path`, deduplicated, ascending by raw bytes.
+///
+/// Change paths are unique (codec validation), but a rename's `src_path`
+/// may collide with another change's destination, so a plain
+/// `extend`+`sort` is not enough — `dedup` after the sort removes the
+/// collisions. Sort-then-dedup is O(n log n) versus the previous
+/// O(n²) containment scan, with identical output.
 fn touched_paths(cs: &gardenbed_model::Changeset) -> Vec<String> {
     let mut set: Vec<String> = Vec::with_capacity(cs.changes.len() * 2);
     for c in &cs.changes {
-        if !set.iter().any(|p| p == &c.path) {
-            set.push(c.path.clone());
-        }
-        if let Some(src) = &c.src_path
-            && !set.iter().any(|p| p == src)
-        {
+        set.push(c.path.clone());
+        if let Some(src) = &c.src_path {
             set.push(src.clone());
         }
     }
     set.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    set.dedup();
     set
 }
 

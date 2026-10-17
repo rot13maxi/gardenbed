@@ -122,6 +122,9 @@ pub enum Command {
     /// Publish the current changeset by fast-forwarding `main`.
     Publish,
 
+    /// Upload queued offline commits to the server.
+    Sync,
+
     /// Show first-parent line attribution, following renames.
     Blame {
         /// The file's repo-relative path.
@@ -355,6 +358,12 @@ mod tests {
             Command::Publish => {}
             other => panic!("expected Publish, got {other:?}"),
         }
+        match parsed(&["sync"]).command {
+            Command::Sync => {}
+            other => panic!("expected Sync, got {other:?}"),
+        }
+        // `sync` takes no arguments.
+        assert!(Cli::try_parse_from(["bed", "sync", "extra"]).is_err());
         match parsed(&["blame", "src/lib.rs"]).command {
             Command::Blame { path, cs } => {
                 assert_eq!(path, "src/lib.rs");
