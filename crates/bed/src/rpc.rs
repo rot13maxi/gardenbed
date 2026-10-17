@@ -233,6 +233,21 @@ impl Session {
             Err(status) if status.code() == tonic::Code::NotFound => {
                 Err(ClientError::MissingCs(cs))
             }
+            // The conflict contract (v0.2.md D11): FAILED_PRECONDITION
+            // whose message is "merge conflicts on: <paths>" — mapped to
+            // the error that carries the resolution hint.
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && status.message().starts_with("merge conflicts on:") =>
+            {
+                Err(ClientError::MergeConflict {
+                    paths: status
+                        .message()
+                        .trim_start_matches("merge conflicts on:")
+                        .trim()
+                        .to_owned(),
+                })
+            }
             Err(status) => Err(ClientError::Rpc {
                 command,
                 code: status.code(),
