@@ -294,7 +294,48 @@ keyed by `(changeset, path)`. Attribution is anchored per-line to
 divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
 §5).
 
-## 9. Durability
+## 9. Merge (M9/M10, v0.2.md D9-D11)
+
+Merge is **server-side and changeset-only**: `Repo::merge` builds one
+changeset with `parents = [ours, theirs]` whose `changes` are the diff
+`tree(ours) -> merged tree`, stored through the ordinary
+`create_changeset` path — no new object types, no direct metadata writes
+for the merge itself. Merged blobs written during a failed (conflicting)
+merge are unreferenced and harmless.
+
+**Content merge (`merge3`)** runs per file over the xdiff port: each
+side's edits become regions in base coordinates; regions both sides
+changed identically collapse to one application; overlapping or touching
+(adjacent) regions from the two sides conflict — matching git's
+`xdl_merge`, which also refuses adjacent single-line changes from
+different sides. Blobs past the xdiff line cap conflict rather than
+mis-merge. Files with no merge base (added on both sides with different
+content) conflict.
+
+**The three-way tree walk** prunes by content-addressed equality before
+diffing: a side equal to the base adopts the other side wholesale (a
+subtree diff, paths rewritten to the root frame); the trivial rules keep
+a merge O(changed), not O(tree). Mode changes follow the same trivial
+rules (one side flips the exec bit, the other edits content: both
+survive); symlinks and gitlinks are atomic (any both-changed difference
+conflicts). Deletions are symmetric: mutual deletes are clean,
+delete-vs-modify conflicts.
+
+**The conflict contract**: `FAILED_PRECONDITION` listing every
+conflicting path at file granularity — the shape `git merge-tree
+--write-tree` reports (a directory-level conflict names the files inside;
+git's `~branch`-renamed counterparts are not listed). The engine is
+verified differentially against that oracle over 1,000 generated
+divergent pairs, plus fixture matrices, a derivation invariant
+(`apply(changes, tree(ours))` equals the engine-derived tree of the stored
+merge), determinism across runs and wiped caches, and the unchanged
+publish path on top of merge changesets.
+
+**Up to date**: when theirs is already an ancestor of ours the RPC
+answers `up_to_date = true` with `id = ours` and stores nothing.
+Unrelated histories (no merge base) fail naming the operation.
+
+## 10. Durability
 
 - **Object writes are fully durable by default**: payload fsynced to a
   unique tmp file in the destination shard, directory fsynced, atomic
