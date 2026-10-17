@@ -47,6 +47,20 @@ tags, and the verification record for a release lives in
   longer reads like live coverage. Recording empty selections ahead of
   history is unchanged by design.
 
+- **`gardenbed-server import` no longer silently rewinds refs** when an
+  incremental import moves a ref to a tip that is not a descendant of
+  the ref's current value (e.g. re-importing a git repository whose
+  `main` is behind the store's published `main` — the dogfood incident:
+  published work fell off `main` with exit 0 and no output). Such an
+  import now fails non-zero before any ref is touched when the move
+  would lose changesets, naming the ref, both tips, and the count;
+  `--allow-rewind` opts in (force-push parity) and the move is reported
+  in the import report (`refs_rewound`) plus a loud stderr warning.
+  Fell-off changesets are counted exactly via a metadata-only BFS.
+  Forward moves are unchanged (silent). Tests:
+  `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
+  `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
+
 ### Changed
 
 - **`bed` honors `.gitignore` for untracked-file discovery**: `bed
@@ -88,21 +102,6 @@ tags, and the verification record for a release lives in
   `diff of <cs> against its first parent`); explicit `bed diff A [B]`
   still means changesets, now with the same header line.
 
-### Fixed
-
-- **`gardenbed-server import` no longer silently rewinds refs** when an
-  incremental import moves a ref to a tip that is not a descendant of
-  the ref's current value (e.g. re-importing a git repository whose
-  `main` is behind the store's published `main` — the dogfood incident:
-  published work fell off `main` with exit 0 and no output). Such an
-  import now fails non-zero before any ref is touched when the move
-  would lose changesets, naming the ref, both tips, and the count;
-  `--allow-rewind` opts in (force-push parity) and the move is reported
-  in the import report (`refs_rewound`) plus a loud stderr warning.
-  Fell-off changesets are counted exactly via a metadata-only BFS.
-  Forward moves are unchanged (silent). Tests:
-  `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
-  `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
 
 ## [0.1.0] - 2026-10-16
 
