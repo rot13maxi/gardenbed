@@ -506,9 +506,11 @@ corpus (`$CORPUS` → `$SERVER_ROOT`).
 Usage: gardenbed-server export [OPTIONS] --root <ROOT> --into <INTO>
 ```
 
-Exports the changeset graph into a real git repository (one
-`git fast-import` stream). The changeset→git mapping rides in the
-report; `--mapping FILE` writes it as TSV for verification.
+Exports the changeset graph into a real git repository (a native
+SHA-1 pack + `.idx`, written directly — no git subprocess). Every
+computed commit SHA is asserted against the store's git-mapping row.
+The changeset→git mapping rides in the report; `--mapping FILE` writes
+it as TSV for verification.
 
 | flag | meaning |
 |---|---|

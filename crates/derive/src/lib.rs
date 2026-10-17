@@ -242,7 +242,7 @@ impl Engine {
             }
             let root = self.validated_tree_for_new(&cs)?;
             self.metadata
-                .put_validated_changeset(&cs, root, &[], None)?;
+                .put_validated_changeset(&cs, root, &[], None, None)?;
         }
         Ok(())
     }
@@ -388,6 +388,18 @@ impl Engine {
     /// that do not touch it), so a bounded cache turns most loads into
     /// cache hits. Content addressing makes the entry immortal — the same
     /// id always decodes to the same entries.
+    ///
+    /// The public twin of [`Engine::tree`] for hot paths: same content,
+    /// shared `Arc` instead of a fresh clone, and served from the cache
+    /// (the export's per-commit tree rendering hits the same stable ids
+    /// thousands of times in a row). A missing object surfaces as the
+    /// store's `Corrupt` error — a referenced tree id that is absent is
+    /// corruption, not an absence to report — so no existence probe runs
+    /// first: one store roundtrip per uncached id.
+    pub fn cached_tree_arc(&self, id: Id) -> Result<Option<Arc<Tree>>, StoreError> {
+        Ok(Some(self.decoded_tree(id)?))
+    }
+
     fn decoded_tree(&self, id: Id) -> Result<Arc<Tree>, StoreError> {
         if let Some(tree) = self.lock_trees().get(&id) {
             return Ok(tree);

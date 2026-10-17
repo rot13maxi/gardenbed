@@ -102,6 +102,19 @@ pub trait MetadataStore: Send + Sync {
     /// The git SHA recorded for a changeset id, if any.
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError>;
 
+    /// The verbatim bytes of the original git commit object for a
+    /// changeset, if captured at import (v0.2 D21). Only commits whose
+    /// bytes the model cannot reconstruct (signatures, unmodeled
+    /// headers, non-UTF-8 identity bytes) carry a row; everything else
+    /// is reconstructed. Rows land in the same ingest transaction as the
+    /// changeset itself, so a raw row never names a missing changeset.
+    /// Raw bytes are identity/export truth only — never parsed on the
+    /// display path.
+    fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+        let _ = cs;
+        Ok(None)
+    }
+
     /// Ids of stored changesets whose 32-byte id sorts in the half-open
     /// byte range `[lo, hi_exclusive)` — the storage primitive behind
     /// truncated-id (hex prefix) resolution.
@@ -161,18 +174,26 @@ pub trait MetadataStore: Send + Sync {
     }
 
     /// Trusted validator write: atomically store canonical changeset, immutable
-    /// v1 certificate, optional Git mapping, and derived rows. All parents must
-    /// already be certified. The caller MUST validate shape and blobs and replay
-    /// against the first parent's certified tree without trusting derived caches
-    /// (see Engine::validated_tree_for_new). Generic put/ingest/derived_put never
+    /// v1 certificate, optional Git mapping, raw commit bytes (v0.2 D21),
+    /// and derived rows. All parents must already be certified. The caller
+    /// MUST validate shape and blobs and replay against the first parent's
+    /// certified tree without trusting derived caches (see
+    /// Engine::validated_tree_for_new). Generic put/ingest/derived_put never
     /// grant certificates. Re-certifying with a different root is an error.
     /// Backends without certificate support must refuse this operation.
+    ///
+    /// `raw_commit` carries the verbatim git object bytes when the original
+    /// commit is not reconstructable from the model (sparse capture);
+    /// `None` stores no raw row (a previously captured row is kept —
+    /// re-certification is idempotent, and dropping bytes on a re-put would
+    /// silently regress fidelity).
     fn put_validated_changeset(
         &self,
         _cs: &Changeset,
         _root_tree: Option<Id>,
         _derived: &[DerivedRow],
         _git_sha_hex: Option<&str>,
+        _raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         Err(StoreError::Db(
             "validation certificates are unsupported by this metadata store".into(),

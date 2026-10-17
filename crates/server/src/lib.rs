@@ -312,7 +312,7 @@ impl Repo {
             .engine
             .derived_rows_for_validated_tree(cs_id, cs, root)?;
         self.metadata
-            .put_validated_changeset(cs, root, &rows, None)?;
+            .put_validated_changeset(cs, root, &rows, None, None)?;
         Ok(cs_id)
     }
 
@@ -1454,8 +1454,9 @@ mod revspec_tests {
             root: Option<Id>,
             rows: &[gardenbed_store::DerivedRow],
             git: Option<&str>,
+            raw: Option<&[u8]>,
         ) -> Result<Id, StoreError> {
-            self.inner.put_validated_changeset(cs, root, rows, git)
+            self.inner.put_validated_changeset(cs, root, rows, git, raw)
         }
         fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
             self.inner.recent_changesets(limit)

@@ -219,6 +219,50 @@ tags, and the verification record for a release lives in
 
 ### Changed
 
+- **Export is native (v0.2 M17, D20/D21)**: `gardenbed-server export`
+  and `export_to_path` write the pack + idx directly (new
+  `crates/git/src/pack.rs`: full objects, no deltas, SHA-1, zlib level 1,
+  per-entry CRC-32, v2 idx with fanout / sorted ids / large-offset
+  table) instead of spawning `git fast-import`. Object names are
+  computed, not observed: every commit SHA the export produces is
+  asserted against the git-mapping row, and drift is a hard error that
+  names the changeset — never a silent divergence. Marks and
+  `ExportReport::marks_path` retire; `pack_path` lands in the report.
+  The pack is written atomically (tmp + rename + fsync) as
+  `objects/pack/pack-<sha>.{pack,idx}`; re-exports are idempotent
+  (same content ⇒ same name, skipped when present). The reader side
+  (`read_pack`/`read_idx`) is a full structural validator used as the
+  decode oracle and the fuzz target (`fuzz_pack_reader`; 1.12M runs, 0
+  crashes). The pack streams to disk as objects are produced (bounded
+  memory, ~285 MB peak on the 50k-commit demo corpus vs multi-GB
+  buffered), with blob hashing, tree decoding and zlib compression
+  spread over all cores; demo-corpus export wall-clock is **12.5 s**
+  (50,100 commits, 106,694 blobs; 16-core tmpfs, load-averaged box),
+  recorded as the new CI baseline against the 14.4 s fast-import
+  predecessor — the ≤17.3 s M17.2 budget (1.2×) holds with margin.
+
+- **Imported history exports verbatim (v0.2 M18, D21)**: commits whose
+  bytes are not provably reconstructable from the model — signatures,
+  `encoding`/`mergetag`/`gpgsig-sha256` headers, non-UTF-8 identity
+  bytes, header-order drift — are captured raw at import into a sparse
+  `git_raw_commit` side table (same ingest transaction), and the export
+  emits those bytes as-is: signed and extra-header commits roundtrip
+  SHA-exact, `signed_dropped == 0` for post-M18 imports. Two loud
+  failure modes replace silent divergence: a raw commit whose tree
+  header disagrees with the derived tree (pre-canonical `100664`,
+  non-UTF-8 paths — raw-tree capture stays gated on the kernel
+  throughput gate), and a raw commit naming parents outside the export
+  (limit-slice boundaries refuse rather than emit a dangling pack).
+  `docs/divergences.md` §1/§3 retired, §2 narrowed to path names, §4's
+  export half retired. v0.1 stores refuse loudly at export for signed
+  commits (the SHA assertion fires before anything ships; re-import
+  retires, ids stable). Kernel capture exercised on
+  1,000/5,000-commit segments (19% of commits captured, 951 raw rows
+  on the 5k segment). The pinned full kernel corpus (a v0.1 store) is
+  verified to refuse loudly at its first pre-canonical `100664` tree
+  entry (`include/asm-mips/vr41xx/pci.h`, commit `5dfa9c1b`) after a
+  clean 35 GB blob phase — never silently diverging;
+  `kernel_export_spot_check` pins that refusal.
 
 - **`bed diff` renders renames and submodule pointer hunks** (v0.2
   D22/D23): a pure rename renders git's `R100` form (`similarity index

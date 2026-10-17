@@ -97,7 +97,8 @@ impl Arena {
             let sha_hex = oid.to_hex();
             let existing = metadata.cs_for_git(&sha_hex)?;
             let is_mapped = existing.is_some();
-            let raw = read_commit(repo, oid, &sha_hex)?;
+            let (raw, raw_bytes) = read_commit(repo, oid, &sha_hex)?;
+            let _ = &raw_bytes; // captured later per-node by the ingest loop
             index.insert(oid, oids.len() as u32);
             oids.push(oid);
             trees.push(raw.tree);
@@ -218,13 +219,14 @@ impl Arena {
     }
 }
 
-/// Reads a commit object and parses its header fields.
+/// Reads a commit object, parses its header fields, and returns the
+/// verbatim object bytes alongside (the importer's raw-capture input).
 pub(crate) fn read_commit(
     repo: &gix::Repository,
     oid: GitOid,
     sha_hex: &str,
-) -> Result<RawCommit, ImportError> {
-    let obj = repo
+) -> Result<(RawCommit, Vec<u8>), ImportError> {
+    let mut obj = repo
         .find_object(gix_id(oid))
         .map_err(|e| ImportError::Object {
             oid: sha_hex.to_owned(),
@@ -236,10 +238,11 @@ pub(crate) fn read_commit(
             detail: format!("expected a commit object, found {:?}", obj.kind),
         });
     }
-    parse_commit(&obj.data).map_err(|detail| ImportError::Commit {
+    let parsed = parse_commit(&obj.data).map_err(|detail| ImportError::Commit {
         sha: sha_hex.to_owned(),
         detail,
-    })
+    })?;
+    Ok((parsed, std::mem::take(&mut obj.data)))
 }
 
 /// Converts a raw git id into gix's `ObjectId`.
