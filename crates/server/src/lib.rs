@@ -160,6 +160,33 @@ impl Repo {
         }
     }
 
+    /// Opens a repository over explicit stores — the scale-out entry point
+    /// (docs/scale-out-design.md): `gardenbed_store::StorageConfig::open`
+    /// produces the `(objects, metadata)` pair and this builds the same
+    /// service over them that [`Repo::open`] builds over a local root.
+    /// Identical to [`Repo::new`]; the distinct name says "explicit stores
+    /// are a first-class way to open, not a test hook".
+    pub fn open_stores(objects: Arc<dyn ObjectStore>, metadata: Arc<dyn MetadataStore>) -> Self {
+        Self::new(objects, metadata)
+    }
+
+    /// The object store this repo was opened over — for callers that drive
+    /// store-level APIs alongside the repo (e.g. git import/export).
+    pub fn objects_handle(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.objects)
+    }
+
+    /// The metadata store this repo was opened over.
+    pub fn metadata_handle(&self) -> Arc<dyn MetadataStore> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// The derived-data engine this repo runs (git import takes it to keep
+    /// its derivation on the same engine instance as the repo).
+    pub fn engine_handle(&self) -> Engine {
+        self.engine.clone()
+    }
+
     // -------------------------------------------------------- write path
 
     /// Commits a changeset: validates parents and blob references, stores any

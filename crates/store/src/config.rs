@@ -89,6 +89,10 @@ pub struct StorageConfig {
     pub objects: ObjectsConfig,
 }
 
+/// One opened pair of repository stores: the object store plus the
+/// metadata store, both behind their trait objects.
+pub type Stores = (Arc<dyn ObjectStore>, Arc<dyn MetadataStore>);
+
 impl StorageConfig {
     /// Parses a storage TOML file (schema in the module docs).
     pub fn from_path(p: &Path) -> Result<Self, StoreError> {
@@ -116,7 +120,7 @@ impl StorageConfig {
             other => {
                 return Err(StoreError::Invalid(format!(
                     "metadata backend {other:?} is not one of \"sqlite\", \"postgres\""
-                )))
+                )));
             }
         };
 
@@ -136,7 +140,7 @@ impl StorageConfig {
                     Some(_) => {
                         return Err(StoreError::Invalid(
                             "objects.path_style must be a boolean".into(),
-                        ))
+                        ));
                     }
                 },
             }),
@@ -146,7 +150,7 @@ impl StorageConfig {
             other => {
                 return Err(StoreError::Invalid(format!(
                     "objects backend {other:?} is not one of \"fs\", \"s3\""
-                )))
+                )));
             }
         };
 
@@ -155,11 +159,9 @@ impl StorageConfig {
 
     /// Opens both backends. The object store opens first so a bad S3
     /// endpoint fails before any metadata schema is created.
-    pub fn open(&self) -> Result<(Arc<dyn ObjectStore>, Arc<dyn MetadataStore>), StoreError> {
+    pub fn open(&self) -> Result<Stores, StoreError> {
         let objects: Arc<dyn ObjectStore> = match &self.objects {
-            ObjectsConfig::Fs { root } => {
-                Arc::new(FsObjectStore::open(root)?)
-            }
+            ObjectsConfig::Fs { root } => Arc::new(FsObjectStore::open(root)?),
             ObjectsConfig::S3(s3) => Arc::new(S3ObjectStore::open(
                 &s3.endpoint,
                 &s3.bucket,
@@ -170,9 +172,9 @@ impl StorageConfig {
             )?),
         };
         let metadata: Arc<dyn MetadataStore> = match &self.metadata {
-            MetadataConfig::Sqlite { root } => Arc::new(SqliteMetadataStore::open(
-                &root.join("metadata.sqlite3"),
-            )?),
+            MetadataConfig::Sqlite { root } => {
+                Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?)
+            }
             MetadataConfig::Postgres { url } => Arc::new(PostgresMetadataStore::open(url)?),
         };
         Ok((objects, metadata))
@@ -190,9 +192,7 @@ fn str_field<'a>(
         Some(_) => Err(StoreError::Invalid(format!(
             "{section}.{field} must be a string"
         ))),
-        None => Err(StoreError::Invalid(format!(
-            "{section}.{field} is missing"
-        ))),
+        None => Err(StoreError::Invalid(format!("{section}.{field} is missing"))),
     }
 }
 
