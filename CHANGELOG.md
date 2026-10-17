@@ -72,6 +72,20 @@ tags, and the verification record for a release lives in
 
 ### Fixed
 
+
+- **Rename pairing now guards destination and entry kind** (retroactive
+  review of the M19 landing): `bed diff`'s render-time pairing, the
+  scoped forms' recorded-`Rename` rendering, and `bed commit`'s
+  `Op::Rename` recording all pair a delete with a write of the identical
+  blob only when the destination was absent on the old side and the
+  entry kinds match. Pre-fix, a delete paired with a *rewrite of a
+  pre-existing path* or a *cross-kind write* (e.g. a regular file
+  replaced by a symlink whose target equals its content) rendered an
+  `R100` block git apply refuses ("already exists in working directory"
+  / "new mode does not match"); those corners now render git's own
+  `D`+`M` / `D`+`A` shape, which applies. Verified by new unit tests and
+  a real-`git apply` regression pair
+  (`crates/bed/tests/render_patch.rs::guarded_corners_render_delete_plus_write_and_apply`).
 - `bed switch` now prunes directories its removals left empty (dogfood:
   switching off a changeset that introduced `crates/web` left the empty
   `crates/web/{src,static,tests}` behind, so a workspace glob `crates/*`
@@ -145,7 +159,9 @@ tags, and the verification record for a release lives in
   changeset-scoped forms (`bed diff <cs>`, no-arg on a clean copy)
   render from the changeset's recorded `Rename` op, and the two-sided
   form pairs a delete with a write of the identical blob at render
-  time, the same rule `bed commit` pairs by. A moved-and-edited file
+  time — the same rule `bed commit` records one by: same entry kind,
+  destination absent on the old side (git apply refuses anything else).
+  A moved-and-edited file
   still renders as a delete plus a write — no similarity below 100% is
   ever claimed (divergences §6 residual). Submodule pointers render
   git's `Subproject commit <sha>` hunks on add, delete, and retarget,
