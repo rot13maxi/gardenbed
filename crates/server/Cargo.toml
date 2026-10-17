@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "gardenbed-server"
 path = "src/main.rs"
 
+[build-dependencies]
+# The build fingerprint's digest (dogfood finding #12 hardening).
+sha2 = "0.10"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"

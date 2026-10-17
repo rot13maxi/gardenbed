@@ -43,6 +43,20 @@ every commit records it and reviewers filter by author.
   `crates/server`, rebuild first (`cargo build -p gardenbed-server`) or a stale
   binary will fail protocol-dependent tests in ways that look like code
   regressions (same class as the e2e-vs-cli binary mismatch).
+- **Dogfood #13 — protocol skew across server/client generations:** an
+  OLD server binary (pre-`fd29b3d`, when `PublishReq` gained `ref`/`force`)
+  plus a NEW `bed` makes `bed publish --ref <lane>` silently publish to
+  `refs/heads/main`: proto3 unknown-field skipping means the old server
+  ignores the new tag-3 `ref` field, treats the publish as the plain
+  main form, and the CLIENT still prints the lane name (it echoes its
+  own argv, never the server's ref choice). Reproduced: dc079f8-era
+  server + fd29b3d-era client on a throwaway root — `refs/heads/main`
+  moved to the published tip, no lane row. Wire-compat tests covered
+  old-client/new-server only. **Upgrade note: restart servers before
+  using `--ref`.** The test harness's server_bin() digest guard now
+  refuses a binary built from different tree state, but a deliberately
+  deployed old server is outside its reach — coordinate restarts with
+  wG:p9 when protocol messages change.
 - Before publishing: `cargo fmt --all && cargo clippy -p <pkg> --all-targets -- -D warnings`
 - Hit a bed bug or papercut? Report to wG:p9 (`herdr agent prompt wG:p9 "..."`) with the
   exact command + error. Fixing bed is the point of this dogfood. Don't silently work around.

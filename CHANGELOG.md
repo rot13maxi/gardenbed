@@ -72,6 +72,27 @@ tags, and the verification record for a release lives in
 
 ### Fixed
 
+- **Test harness refuses a stale `gardenbed-server` binary** (dogfood
+  findings #12 and #13): `crates/bed/tests/common/mod.rs::server_bin()`
+  panics with the fix command (`cargo build -p gardenbed-server`) when
+  the workspace binary fails either staleness oracle — older mtime than
+  the newest `crates/server/src` source, or (the #12 core) an embedded
+  build fingerprint (`gardenbed_server::SRC_DIGEST`, SHA-256 over
+  `src/**` computed by the new `crates/server/build.rs`) that does not
+  match the digest of the working copy's current sources, catching a
+  binary built from different tree state even when mtimes look fresh
+  (`bed switch` materializes sources with commit-time mtimes). A stale
+  binary otherwise fails protocol-dependent tests in ways that look like
+  code regressions — and, per dogfood #13, a pre-protocol-change server
+  silently turns `bed publish --ref <lane>` into a main publish
+  (proto3 unknown-field skipping; see docs/DOGFOOD.md #13 — restart
+  servers before using `--ref`). `BED_SERVER_BIN` overrides are trusted
+  as-is. Regression proofs in `crates/bed/tests/server_bin_guard.rs`
+  (refusal names the fix command; the tree-state probe holds mtime
+  constant so only the digest can catch it; touches are net-zero). The
+  publish `--ref` ref-row outcomes — new-lane row created + main
+  untouched, force+non-ancestor lane move + main untouched — are pinned
+  in `crates/bed/tests/write_path.rs`.
 
 - **Rename pairing now guards destination and entry kind** (retroactive
   review of the M19 landing): `bed diff`'s render-time pairing, the

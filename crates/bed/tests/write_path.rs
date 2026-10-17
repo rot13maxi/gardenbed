@@ -1376,3 +1376,131 @@ async fn publish_ref_advances_lane_and_fresh_switch_sees_it() {
 
     w.server.shutdown().await;
 }
+
+/// Dogfood #12's freeze-verification bar: `bed publish --ref` to a lane
+/// that does NOT exist yet must CREATE the lane ref row and must NOT
+/// touch `refs/heads/main` — a server-side ref-name drop would move main
+/// while the client still prints the lane's name (exactly the reported
+/// regression signature). Asserts on the ref rows themselves (the
+/// in-process `Repo` reads the same table the sqlite probe would), not on
+/// output text alone.
+#[tokio::test]
+async fn publish_ref_to_new_lane_creates_row_and_never_moves_main() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = "feat/fresh-lane";
+    // No seeded lane ref — this lane has never existed on the server.
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        None,
+        "the lane starts nonexistent"
+    );
+    let main_before = w.repo.get_ref("main").expect("get_ref main");
+
+    // The lane agent commits off-main and publishes to the new lane.
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n fresh lane\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "fresh lane work"]);
+    assert_eq!(code, 0, "commit: {stderr}\n{out}");
+    let committed = current_cs(&w.garden);
+    assert_ne!(
+        committed, w.head,
+        "the lane work is a new changeset, not the imported tip"
+    );
+
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane]);
+    assert_eq!(code, 0, "publish --ref to a new lane: {stderr}\n{out}");
+    assert!(
+        out.contains(&format!("`{lane}` now points to it")),
+        "the output names the lane ref: {out}"
+    );
+    // (a) The lane row was created at the committed tip.
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(committed),
+        "the lane row was created at the published tip"
+    );
+    // (b) main did NOT move — the ref-drop regression would have moved it.
+    assert_eq!(
+        w.repo.get_ref("main").expect("get_ref main"),
+        main_before,
+        "main is untouched by a lane publish"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The force+lane shape the freeze bar requires: `bed publish --ref
+/// <lane> --force` on a PRE-EXISTING NON-ANCESTOR lane row must (a) move
+/// the lane row to the new tip and (b) leave `refs/heads/main` alone.
+/// Also pins the rewind refusal without `--force` (the lane names the
+/// fix) — the path p6's landing will exercise.
+#[tokio::test]
+async fn publish_ref_force_moves_lane_not_main_on_non_ancestor() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = "feat/merge";
+    // A pre-existing lane row at a NON-ANCESTOR tip: commit divergent work
+    // directly through the server (not a child of main's tip), so the
+    // lane publish below is a rewind move, not a fast-forward.
+    let (c, b) = add("docs/divergent.md", b"divergent lane work\n", Mode::Regular);
+    let cs = cs(
+        vec![w.head],
+        vec![c.clone()],
+        "divergent lane work",
+        1_700_000_200,
+    );
+    let mut inline = std::collections::BTreeMap::new();
+    inline.insert(c.blob.unwrap().to_hex(), b);
+    let divergent = w
+        .repo
+        .create_changeset(&cs, &inline)
+        .expect("divergent ingests");
+    w.repo.cas_ref(lane, None, divergent).expect("lane seeded");
+    let main_before = w.repo.get_ref("main").expect("get_ref main");
+
+    // Commit NEW main-side work off main's tip (a sibling of the lane's
+    // divergent commit — same parent, different changeset).
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n main side\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "main-side work"]);
+    assert_eq!(code, 0, "commit: {stderr}\n{out}");
+    let main_side = current_cs(&w.garden);
+
+    // Without --force the rewind is refused, naming the lane and the fix.
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane]);
+    assert_eq!(
+        code, 1,
+        "non-ancestor lane publish must refuse: {out}{stderr}"
+    );
+    assert!(
+        stderr.contains(lane),
+        "the refusal names the lane ref: {stderr}"
+    );
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(divergent),
+        "the refused publish did not move the lane"
+    );
+
+    // With --force the lane row moves to the new tip...
+    let (code, out, stderr) = bed(&w.garden, &["publish", "--ref", lane, "--force"]);
+    assert_eq!(code, 0, "publish --ref --force: {stderr}\n{out}");
+    assert!(
+        out.contains(&format!("`{lane}` now points to it")),
+        "the output names the lane ref: {out}"
+    );
+    assert_eq!(
+        w.repo.get_ref(lane).expect("get_ref"),
+        Some(main_side),
+        "(a) the lane row moved to the forced tip"
+    );
+    // ...and (b) main still did not move.
+    assert_eq!(
+        w.repo.get_ref("main").expect("get_ref main"),
+        main_before,
+        "(b) main is untouched even by a forced lane publish"
+    );
+
+    w.server.shutdown().await;
+}
