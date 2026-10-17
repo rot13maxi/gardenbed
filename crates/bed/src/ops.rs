@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::str::FromStr;
 use tokio_stream::StreamExt as _;
 use tonic::Code;
 
@@ -430,6 +431,7 @@ fn bed_state_note(skipped: &[String]) -> String {
 /// an interrupted refresh is repaired by simply running switch again.
 pub async fn switch(state_dir: &Path, spec: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "switch")?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;
     let session = Session::open(&bed).await?;
     let cs = session.resolve(&parsed, "switch").await?;
@@ -544,6 +546,7 @@ pub async fn file(
 /// to the rebased one.
 pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
     let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
     let session = Session::open(&bed).await?;
     let current = session.resolve_current_cs(&bed, "rebase").await?;
@@ -703,6 +706,116 @@ pub async fn merge(
     ))
 }
 
+/// `bed rebase --stack <new-parent>` — replay the whole first-parent
+/// chain from the merge base of (current, new parent) up to the current
+/// changeset, oldest first, onto the new parent.
+///
+/// The stack is walked with one `GetChangeset` per link and replayed via
+/// the same `Rebase` RPC the single form uses, so each step gets the
+/// server's conflict check against the tree it is applied to. A conflict
+/// anywhere aborts the entire stack: the RPC fails before the working
+/// copy moves, and the server has created nothing the chain depends on
+/// (each replay names its predecessor as parent, and the first failure
+/// stops the sequence before any later link exists). The working-copy
+/// move is the plain `rebase` move at the final tip.
+pub async fn rebase_stack(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
+    let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
+    let session = Session::open(&bed).await?;
+    let current = session.resolve_current_cs(&bed, "rebase --stack").await?;
+    let parent = session.resolve(&parsed, "rebase --stack").await?;
+    let repo = bed.config().repo.clone();
+
+    // The chain current → base, exclusive, oldest first. A missing merge
+    // base (unrelated histories) refuses before anything is replayed.
+    let base = session
+        .client
+        .merge_base(&repo, current, parent)
+        .await
+        .map_err(|status| ClientError::Rpc {
+            command: "rebase --stack",
+            code: status.code(),
+            message: status.message().to_owned(),
+        })?
+        .ok_or(ClientError::ConfigInvalid(
+            "the current changeset and the new parent share no history — \
+             a stack rebase needs a merge base"
+                .into(),
+        ))?;
+    let mut chain: Vec<Id> = Vec::new();
+    let mut walk = current;
+    while walk != base {
+        chain.push(walk);
+        let cs = session.get_changeset(walk, "rebase --stack").await?;
+        let Some(next) = cs.parents.first().copied() else {
+            return Err(ClientError::ConfigInvalid(
+                "the merge base is not on the current changeset's first-parent \
+                 chain — a stack rebase replays first-parent history only"
+                    .into(),
+            ));
+        };
+        walk = next;
+    }
+    chain.reverse(); // oldest first: replay applies each link onto the last
+
+    // Replay. Each step's parent is the previous step's result; the first
+    // step replays onto the requested new parent. `Rebase` is atomic per
+    // changeset, and a failure at step i means steps i+1.. were never
+    // created — but steps 1..i-1 WERE. That is the abort contract: the
+    // working copy never moves (still at `current`), and the partially
+    // replayed prefix is ordinary server content no ref points at, not a
+    // divergence.
+    let mut replayed = Vec::with_capacity(chain.len());
+    let mut onto = parent;
+    for &cs_id in &chain {
+        let rebased = session
+            .client
+            .rebase(&repo, cs_id, onto)
+            .await
+            .map_err(|status| ClientError::Rpc {
+                command: "rebase --stack",
+                code: status.code(),
+                message: status.message().to_owned(),
+            })?;
+        replayed.push(rebased);
+        onto = rebased;
+    }
+    let tip = replayed[replayed.len() - 1];
+
+    // The working-copy move, exactly the single-rebase one, at the tip.
+    let root = session.root_tree(tip, "rebase --stack").await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
+    let (plan, bed_state) = exclude_bed_state(plan);
+    let treestate = bed.treestate()?;
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
+        &prefixes,
+        plan,
+        session.fetcher(),
+        &treestate,
+    )
+    .await?;
+    bed.config_mut().current_cs = Some(tip.to_hex());
+    bed.save_config()?;
+    bed.heads().repoint(current, tip)?;
+
+    let links: Vec<String> = replayed.iter().map(|id| id.short()).collect();
+    Ok(format!(
+        "rebased {} change(s) onto {} as {}\n  {}\n\
+         fetched {} tree(s), {} blob(s)\n{}{}\n",
+        chain.len(),
+        parent.short(),
+        tip.short(),
+        links.join(" -> "),
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        bed_state_note(&bed_state),
+        outcome.summarize(),
+    ))
+}
+
 /// `bed publish` — fast-forward a ref to the working copy's current changeset.
 ///
 /// `ref_name = None` publishes `main` (the classic form). A named ref is the
@@ -718,6 +831,7 @@ pub async fn publish(
     force: bool,
 ) -> Result<String, ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "publish")?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "publish").await?;
@@ -775,6 +889,47 @@ fn require_current_cs(bed: &WorkingCopy) -> Result<(), ClientError> {
         .ok_or(ClientError::NoCurrentCs)
 }
 
+/// Refuses a mutating ref/head command while offline commits are queued:
+/// moving the working copy's base before the queue drains would strand
+/// the pending chain off the new history. Works offline (queue state is
+/// local). A clean queue is a no-op.
+fn refuse_pending(bed: &WorkingCopy, command: &'static str) -> Result<(), ClientError> {
+    let pending = bed.queue()?.count()?;
+    if pending > 0 {
+        return Err(ClientError::PendingCommits { command, pending });
+    }
+    Ok(())
+}
+
+/// Refuses a read command whose target changeset is a pending tip: the
+/// changeset itself is local, but its parents may only exist on the
+/// server, and these commands answer from the server's walk. With no
+/// explicit target the working copy's current changeset is the check.
+fn refuse_pending_target(bed: &WorkingCopy, cs: Option<&str>) -> Result<(), ClientError> {
+    let queue = bed.queue()?;
+    let pending = queue.count()?;
+    if pending == 0 {
+        return Ok(());
+    }
+    let target = match cs {
+        Some(spec) => crate::revspec::CsOrRef::parse(spec)?.as_id(),
+        None => bed
+            .config()
+            .current_cs
+            .as_deref()
+            .and_then(|hex| Id::from_str(hex).ok()),
+    };
+    if let Some(id) = target
+        && queue.contains(id)?
+    {
+        return Err(ClientError::PendingCs {
+            cs: id.short(),
+            pending,
+        });
+    }
+    Ok(())
+}
+
 /// Resolves the changeset a read command should answer at: an explicit
 /// `<cs-or-ref>` when given, else the working copy's current changeset.
 async fn resolve_target(
@@ -804,8 +959,12 @@ pub async fn log(
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending tip's parents may only exist on the server; log answers
+    // from the server's walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, cs)?;
     let session = Session::open(&bed).await?;
     let cs_id = resolve_target(&session, &bed, cs, "log").await?;
+
     let summaries = session.log(cs_id, limit.unwrap_or(0), "log").await?;
     let entries: Vec<LogEntry> = summaries.iter().map(log_entry_of).collect();
     Ok(render::render_log(&entries))
@@ -858,6 +1017,10 @@ pub async fn diff(
     if a.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending side's tree may only exist on the server; diff answers
+    // from the server's tree walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, a)?;
+    refuse_pending_target(&bed, b)?;
 
     // The no-argument form is context-aware: local modifications beat the
     // committed-diff fallback. Explicit arguments never consult the

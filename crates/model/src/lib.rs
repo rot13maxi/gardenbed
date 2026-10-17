@@ -31,12 +31,20 @@ impl Id {
     }
 
     /// Lowercase hex encoding, 64 characters.
+    ///
+    /// Hot path (every object's `path_for`), so the digits come from one
+    /// table lookup per byte into a stack buffer — no per-byte formatting.
     pub fn to_hex(&self) -> String {
-        let mut s = String::with_capacity(64);
-        for b in self.0 {
-            s.push_str(&format!("{:02x}", b));
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = [0u8; 64];
+        for (i, b) in self.0.iter().enumerate() {
+            out[i * 2] = HEX[(b >> 4) as usize];
+            out[i * 2 + 1] = HEX[(b & 0x0f) as usize];
         }
-        s
+        // Every byte of `out` is an ASCII hex digit, so this is infallible.
+        std::str::from_utf8(&out)
+            .expect("hex digits are ASCII")
+            .to_owned()
     }
 
     /// Short display form (first 16 hex characters).

@@ -10,7 +10,7 @@
 //! cleanly (exit 0); a repo that will not open (unknown name included)
 //! exits 1 with the reason before the loop starts.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use clap::Parser;
 
@@ -90,14 +90,33 @@ fn main() {
     let mut writer = stdout.lock();
     let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return, // EOF: the client is done
-            Ok(_) => {}
+        // A line is capped at 1 MiB: protocol messages are tiny, and a
+        // hostile client's "line" must not be buffered without bound.
+        // An oversized line is answered with -32600 and skipped, then
+        // serving continues.
+        let in_cap = match gardenbed_mcp::protocol::read_capped_line(&mut reader, &mut line) {
+            Ok(None) => return, // EOF: the client is done
+            Ok(Some(true)) => true,
+            Ok(Some(false)) => false,
             Err(e) => {
                 eprintln!("gardenbed-mcp: stdin failed: {e}");
                 std::process::exit(1);
             }
+        };
+        if !in_cap {
+            let response = gardenbed_mcp::protocol::error_line(
+                &serde_json::Value::Null,
+                gardenbed_mcp::protocol::INVALID_REQUEST,
+                format!(
+                    "request line exceeds the {}-byte limit and was skipped",
+                    gardenbed_mcp::protocol::MAX_LINE_LEN
+                ),
+            );
+            if writeln!(writer, "{response}").is_err() {
+                return; // stdout closed: the client hung up; end cleanly
+            }
+            let _ = writer.flush();
+            continue;
         }
         let trimmed = line.trim_end_matches(['\n', '\r']);
         if trimmed.is_empty() {

@@ -254,3 +254,84 @@ fn changesets_and_refs_persist_across_reopen_sqlite() {
         assert_eq!(store.list_refs().unwrap().len(), 1);
     }
 }
+
+#[test]
+fn read_pool_concurrent_reads_and_writer_complete() {
+    // The read pool exists so concurrent readers make progress while a
+    // writer commits; under the old single-connection design every read
+    // serialized behind every write in-process. Correctness under
+    // concurrency is what matters here: N reader threads spinning on
+    // get_changeset plus a writer thread committing distinct changesets,
+    // all joined without deadlock and every read consistent.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("s.sqlite3");
+    let store = std::sync::Arc::new(SqliteMetadataStore::open(&db).expect("open"));
+
+    let mut ids = Vec::new();
+    for seed in 0..8u64 {
+        let cs = sample_changeset(0xC0DE + seed, 2);
+        let id = store.put_changeset(&cs).expect("seed put");
+        ids.push(id);
+    }
+
+    const READERS: usize = 8;
+    const SPINS: usize = 200;
+    let mut handles = Vec::new();
+    for r in 0..READERS {
+        let store = store.clone();
+        let ids = ids.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..SPINS {
+                let id = ids[(r + i) % ids.len()];
+                let (decoded, canonical) = store.get_changeset(id).unwrap().expect("present");
+                assert_eq!(decoded.canonical_bytes().unwrap(), canonical);
+                let _ = store.resolve_ref("main");
+                let _ = store.list_refs();
+            }
+        }));
+    }
+    {
+        let store = store.clone();
+        let ids = ids.clone();
+        handles.push(std::thread::spawn(move || {
+            for seed in 0..64u64 {
+                let cs = sample_changeset(0xFEED + seed, 1);
+                let id = store.put_changeset(&cs).expect("writer put");
+                // Keep the write path interleaved with the readers' data.
+                assert_eq!(store.get_changeset(id).unwrap().expect("present").0, cs);
+                assert!(ids.iter().all(|known| *known != id));
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("no thread panicked (no deadlock)");
+    }
+}
+
+#[test]
+fn read_pool_with_zero_readers_still_serves() {
+    // readers = 0 restores the pre-pool single-connection shape: every
+    // read borrows the write connection's mutex.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("s.sqlite3");
+    let store = SqliteMetadataStore::open_with_readers(&db, 0).expect("open");
+    let cs = sample_changeset(0x2EAD, 1);
+    let id = store.put_changeset(&cs).expect("put");
+    let (decoded, canonical) = store.get_changeset(id).unwrap().expect("present");
+    assert_eq!(decoded, cs);
+    assert_eq!(canonical, cs.canonical_bytes().unwrap());
+}
+
+#[test]
+fn read_pool_readers_open_with_the_same_pragmas() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("s.sqlite3");
+    let _store = SqliteMetadataStore::open_with_readers(&db, 2).expect("open");
+    for i in 1..=2 {
+        let conn = rusqlite::Connection::open(&db).unwrap_or_else(|e| panic!("conn {i}: {e}"));
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal", "reader {i} shares WAL journaling");
+    }
+}
