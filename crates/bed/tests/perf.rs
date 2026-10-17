@@ -126,7 +126,10 @@ async fn sparse_add_of_1k_files_under_5s() {
         ..GenOptions::default()
     })
     .await;
-    let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(
+        &w.garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
 
     let files = w.head_files.len();
@@ -222,7 +225,10 @@ async fn cold_file_p95_under_50ms() {
         ..GenOptions::default()
     })
     .await;
-    let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(
+        &w.garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
     let (code, _, stderr) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "sparse add: {stderr}");
@@ -381,21 +387,25 @@ async fn commit_p50_is_size_independent_10k_vs_1m() {
     // One untimed warm-up per size (page cache, code paths), then the
     // measured reps.
     let _ = commit_once(
-        &small_server.http(),
+        &format!("{}/garden", small_server.http()),
         &dir.path().join("garden-warm-10k"),
         100,
     );
-    let _ = commit_once(&big_server.http(), &dir.path().join("garden-warm-1m"), 100);
+    let _ = commit_once(
+        &format!("{}/garden", big_server.http()),
+        &dir.path().join("garden-warm-1m"),
+        100,
+    );
     let mut small_samples = Vec::new();
     let mut big_samples = Vec::new();
     for rep in 0..REPS {
         small_samples.push(commit_once(
-            &small_server.http(),
+            &format!("{}/garden", small_server.http()),
             &dir.path().join(format!("garden-10k-{rep}")),
             rep,
         ));
         big_samples.push(commit_once(
-            &big_server.http(),
+            &format!("{}/garden", big_server.http()),
             &dir.path().join(format!("garden-1m-{rep}")),
             rep,
         ));
