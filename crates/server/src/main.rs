@@ -89,9 +89,11 @@ enum Command {
         #[arg(long = "ref")]
         refs: Vec<String>,
         /// Permit ref moves that would lose changesets (force-push
-        /// parity). By default such an import fails loudly instead of
-        /// silently rewinding published refs; backward moves that lose
-        /// nothing still only warn.
+        /// parity). By default such an import fails loudly — before any
+        /// ref is touched — instead of silently rewinding published
+        /// refs; backward moves that lose nothing still only warn.
+        /// `--limit` imports cannot compute the loss, so they refuse
+        /// every non-descendant ref move by default.
         #[arg(long)]
         allow_rewind: bool,
     },

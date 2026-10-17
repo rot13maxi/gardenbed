@@ -364,14 +364,20 @@ force push rewrote the tip), the import:
 * **fails with a non-zero exit by default** when the move would actually
   lose changesets — the error names the ref, both tips, the number of
   changesets that would fall off, and the escape hatch. Nothing is
-  moved: the refusal happens before any ref is touched.
+  moved: every selected ref is validated first (two-phase), so a
+  multi-ref import whose later ref would rewind does not move its
+  earlier, forward-moving refs either, and every offending ref is named
+  in the error.
 * with `--allow-rewind`, performs the move (force-push parity: old
   objects and mapping rows remain, merely unreachable) and prints a
   loud multi-line `warning:` to stderr naming the ref, the old and new
   tip, and how many changesets may no longer be reachable from the ref.
 * counts the fell-off changesets exactly via a metadata-only BFS over
-  parent edges (no git or object reads); `--limit` imports report the
-  count as uncounted, because slice re-rooting breaks real ancestry.
+  parent edges (no git or object reads). `--limit` imports cannot
+  compute the count (slice re-rooting breaks real ancestry), so they
+  refuse **every** non-descendant ref move by default — reporting the
+  loss as uncounted in the error — and, under `--allow-rewind`, report
+  the count as uncounted in the rewind entry.
 
 Forward moves (the common incremental case) are silent, exactly as
 before. Rewinds that lose nothing (a moved-back tip that is an ancestor

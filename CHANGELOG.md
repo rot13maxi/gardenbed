@@ -61,6 +61,20 @@ tags, and the verification record for a release lives in
   `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
   `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
 
+- **`gardenbed-server import` no longer partially moves refs on a
+  refused rewind**, and `--limit` no longer bypasses the rewind guard.
+  The refusal is now decided for every selected ref before any ref is
+  touched (two-phase): a multi-ref import where one ref would move
+  forward and another would rewind fails without moving the forward
+  ref either, and every offending ref is named in the single error.
+  Under `--limit` a non-descendant ref move is refused by default too —
+  the fell-off count is not computable there (slice re-rooting breaks
+  real ancestry), so the loss is reported as uncounted;
+  `--allow-rewind` still permits the move, reported in the import
+  report (`refs_rewound`) plus a loud stderr warning. Tests:
+  `crates/git/tests/incremental.rs::rewind_refusal_moves_no_refs_in_multi_ref_import`,
+  `crates/git/tests/incremental.rs::limit_import_refuses_rewind_by_default`.
+
 ### Changed
 
 - **`bed` honors `.gitignore` for untracked-file discovery**: `bed
