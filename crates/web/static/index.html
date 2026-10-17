@@ -18,6 +18,8 @@
     <a href="#/browse" data-nav="browse">Browse</a>
     <a href="#/compare" data-nav="compare">Compare</a>
   </nav>
+  <input id="global-search" class="input" type="search" placeholder="grep…"
+    aria-label="Search file contents" title="grep file contents (press /)">
   <div class="refsel">
     <button id="agent-prompt-btn" class="btn btn-sm" type="button"
       title="Copy a setup prompt for an AI agent">🌱 Use in agent</button>
@@ -29,7 +31,8 @@
 </header>
 <main id="app" class="app" aria-live="polite"></main>
 <footer class="footer">
-  <span>gardenbed · agents share one repo · read-only view</span>
+  <span>gardenbed · agents share one repo</span>
+  <span id="readonly-note">read-only view · writes via the bed CLI</span>
 </footer>
 <script src="/static/app.js"></script>
 </body>

@@ -24,8 +24,24 @@ tags, and the verification record for a release lives in
   heatmap and authors chart on Overview, and per-changeset diffstat
   chips. Browse directory pages render the directory's README
   GitHub-style (client-side, injection-escaped markdown subset; relative
-  links and images resolve to the viewed revision's own files). See
-  [docs/web.md](docs/web.md). Verified by in-memory router
+  links and images resolve to the viewed revision's own files).
+  Changeset and compare rows expand into real unified diffs (in-page
+  Myers over both sides fetched at their revisions, with common
+  prefix/suffix trimming, a 3000-line budget that renders a
+  "too many lines to diff" note instead of freezing the page, and DOM
+  built lazily only for expanded blocks); the UI polls
+  `/api/refs` and toasts when the selected ref moves; blame gutters
+  shade by relative age. New endpoints `/api/files` (path listing) and
+  `/api/search` (case-insensitive content grep) back the `t` file
+  finder, the topbar grep box (`#/search` route), and `j`/`k` keyboard
+  navigation with a `?` help overlay. Multi-worker visibility: the
+  Overview gains a Workers panel (per-author unpublished drafts,
+  watchlist), an Events feed (publishes, rebases, landings), and a
+  `#/review/<id>` route with the full diff and read-only land commands;
+  backed by `MetadataStore::recent_changesets`, `Repo::activity`, and
+  `GET /api/activity` (arrival order, unpublished included). See
+  [docs/web.md](docs/web.md).
+  Verified by in-memory router
   integration tests (`crates/web/tests/api.rs`) and a Playwright
   end-to-end suite (`e2e/`) that drives a real browser through every
   page against the seeded repository.
