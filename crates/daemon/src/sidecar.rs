@@ -102,17 +102,27 @@ impl SidecarService {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let state_dir_for_watcher = state_dir.clone();
         // The watcher thread: notify events → filtered → debounce → bump.
+        // Fail OPEN: an error from the watcher (or an event with no
+        // paths — inotify's queue-overflow arrives as EventKind::Other
+        // with empty paths) cannot be attributed to machinery alone, so
+        // it bumps the generation. A stale "clean" over modified files
+        // is the one outcome this module must never produce
+        // (status.rs: the stale-clean-forbidden invariant); a spurious
+        // rescan is merely slow.
         let watcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if res.is_err() {
-                    return; // a lost event is a generation non-bump; the client
-                    // falls back to scanning when in doubt via other signals.
-                }
-                let Ok(event) = res else { return };
-                let touched = event
-                    .paths
-                    .iter()
-                    .any(|p| !SidecarService::is_machinery(&state_dir_for_watcher, p));
+                let event = match res {
+                    Ok(event) => event,
+                    Err(_) => {
+                        let _ = tx.send(());
+                        return;
+                    }
+                };
+                let touched = event.paths.is_empty()
+                    || event
+                        .paths
+                        .iter()
+                        .any(|p| !SidecarService::is_machinery(&state_dir_for_watcher, p));
                 if touched {
                     let _ = tx.send(());
                 }

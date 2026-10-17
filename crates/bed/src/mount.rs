@@ -494,18 +494,66 @@ struct SyncFs {
 
 impl SyncFs {
     /// Ships a reply-filling future to the bridge runtime.
-    fn reply_with<F>(&self, fut: F)
+    ///
+    /// `fut` builds the future from the reply value. If the bridge is
+    /// already gone — teardown raced a kernel request: `unmount()` ran
+    /// `fusermount -u`, then shut the bridge down while the serving
+    /// thread was mid-callback — the kernel gets `EIO` instead of a
+    /// panic: a panic here kills the serving thread, whose death then
+    /// cascades through `teardown()`'s join and takes `unmount()` with
+    /// it. (The closed-then-send race below is benign: a request that
+    /// loses it belongs to a session fusermount has already detached.)
+    fn reply_with<R, F, Fut>(&self, reply: R, fut: F)
     where
-        F: Future<Output = ()> + Send + 'static,
+        R: ReplyErr + Send + 'static,
+        F: FnOnce(R) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
-        self.tx
+        if self.tx.is_closed() {
+            reply.error(Errno::EIO);
+            return;
+        }
+        if self
+            .tx
             .send(Box::new(move || {
-                tokio::task::spawn(fut);
+                tokio::task::spawn(fut(reply));
             }))
-            .map_err(|_| ())
-            .expect("bridge thread outlives the mount");
+            .is_err()
+        {
+            // Lost the race above: the bridge closed between the check
+            // and the send, so the job is dropped unread. The mount is
+            // being torn down; the kernel is not waiting on it.
+        }
     }
 }
+
+/// The one fuser reply operation the EIO fallback needs: answer the
+/// kernel with an errno. Every `Reply*` in fuser 0.18 implements it
+/// (as an inherent method; this local trait re-exports that shape so
+/// `reply_with` can be generic over the reply type).
+trait ReplyErr {
+    fn error(self, err: Errno);
+}
+
+macro_rules! impl_reply_err {
+    ($($t:ty),* $(,)?) => {
+        $(impl ReplyErr for $t {
+            fn error(self, err: Errno) {
+                // Inherent method on the fuser reply type.
+                self.error(err)
+            }
+        })*
+    };
+}
+
+impl_reply_err!(
+    ReplyEntry,
+    ReplyAttr,
+    ReplyData,
+    ReplyOpen,
+    ReplyDirectory,
+    ReplyEmpty
+);
 
 fn join_path(parent: &str, name: &OsStr) -> String {
     if parent.is_empty() {
@@ -523,7 +571,7 @@ impl Filesystem for SyncFs {
         };
         let child = join_path(&parent_path, name);
         let state = self.state.clone();
-        self.reply_with(async move {
+        self.reply_with(reply, move |reply| async move {
             match state.resolve(&child).await {
                 Ok(Resolved::Missing) => reply.error(Errno::ENOENT),
                 Ok(Resolved::File { entry, ino }) => {
@@ -551,7 +599,7 @@ impl Filesystem for SyncFs {
             return;
         };
         let state = self.state.clone();
-        self.reply_with(async move {
+        self.reply_with(reply, move |reply| async move {
             match state.attr(&path).await {
                 Ok(Some(attr)) => reply.attr(&ATTR_TTL, &attr),
                 Ok(None) => reply.error(Errno::ENOENT),
@@ -566,7 +614,7 @@ impl Filesystem for SyncFs {
             return;
         };
         let state = self.state.clone();
-        self.reply_with(async move {
+        self.reply_with(reply, move |reply| async move {
             match state.resolve(&path).await {
                 Ok(Resolved::File { entry, .. }) if entry.mode == Mode::Symlink => {
                     let blob = entry.blob.expect("file entries carry a blob id");
@@ -600,7 +648,7 @@ impl Filesystem for SyncFs {
             return;
         };
         let state = self.state.clone();
-        self.reply_with(async move {
+        self.reply_with(reply, move |reply| async move {
             match state.resolve(&path).await {
                 Ok(Resolved::File { entry, .. }) => {
                     if entry.mode == Mode::Symlink {
@@ -640,10 +688,9 @@ impl Filesystem for SyncFs {
             return;
         };
         let state = self.state.clone();
-        self.reply_with(async move {
+        self.reply_with(reply, move |mut reply| async move {
             match state.resolve(&path).await {
                 Ok(Resolved::Dir { tree, ino }) => {
-                    let mut reply = reply;
                     fill_dir(&state, &tree, ino, &path, offset, &mut reply);
                     reply.ok();
                 }
@@ -885,8 +932,20 @@ pub async fn mount(bed: &WorkingCopy, mountpoint: &Path) -> io::Result<MountHand
     // mounted inside `Session::new`; this probe stats *through* the
     // mount (blocking until the serving thread replies), so a mount
     // whose bridge cannot answer fails here instead of hanging the
-    // caller's first read.
-    wait_until_ready(mountpoint).await?;
+    // caller's first read. A failed probe must not leak the live mount
+    // + serving thread: the two earlier failure paths (Session::new,
+    // thread spawn) both clean up; this one joins them.
+    if let Err(e) = wait_until_ready(mountpoint).await {
+        let _ = fusermount_unmount(&mountpoint_owned);
+        bridge.shutdown();
+        // The serving thread exits when fusermount tears the session
+        // down; join it so the thread is reclaimed, not abandoned. Its
+        // result is secondary to the probe failure (a probe that timed
+        // out may have left the loop mid-request; a join error there is
+        // still just the probe failure).
+        let _ = serve.join();
+        return Err(e);
+    }
 
     Ok(MountHandle {
         mountpoint: mountpoint_owned,
