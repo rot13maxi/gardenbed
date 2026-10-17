@@ -644,7 +644,9 @@ impl Engine {
     /// derived data.
     pub fn on_changeset_created(&self, cs_id: Id) -> Result<(), StoreError> {
         for kind in crate::DERIVED_KINDS {
-            (kind.eager)(self, cs_id)?;
+            if let Some(eager) = kind.eager {
+                eager(self, cs_id)?;
+            }
         }
         Ok(())
     }

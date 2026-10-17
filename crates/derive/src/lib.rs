@@ -61,18 +61,24 @@ pub const DERIVED_CUTTINGS: &str = "cuttings";
 /// hook in order, and [`Engine::derived_rows_for_validated_tree`] runs
 /// each `for_new` hook. Adding a kind is one module plus one entry in
 /// [`DERIVED_KINDS`]; no other wiring exists to miss.
+///
+/// A kind whose derivation cost scales with the **parent tree size**
+/// (not just the changeset's own changes) must not run on the write
+/// path — the M5 size-independence budget forbids commit latency that
+/// grows with repository size. Such a kind registers as lazy: no eager
+/// hook, no `for_new` row; its lazy getter computes and persists on
+/// first query instead. `cuttings` is the current lazy kind.
 pub struct DerivedKind {
     /// The kind tag persisted in the `derived` table.
     pub name: &'static str,
     /// Eagerly computes and persists this kind's entry for an
     /// already-stored changeset (idempotent; the kind's lazy getter's
     /// compute-and-write half doubles as this hook).
-    pub(crate) eager: fn(&Engine, Id) -> Result<(), StoreError>,
+    pub(crate) eager: Option<fn(&Engine, Id) -> Result<(), StoreError>>,
     /// Contributes this kind's rows for a not-yet-stored changeset to the
-    /// shared [`DerivedFlow`] (batched import), in registry order.
-    pub(crate) for_new: fn(&Engine, &mut DerivedFlow<'_>) -> Result<(), StoreError>,
+    /// shared [`DerivedFlow`]` (batched import), in registry order.
+    pub(crate) for_new: Option<fn(&Engine, &mut DerivedFlow<'_>) -> Result<(), StoreError>>,
 }
-
 // ---------------------------------------------------------- kind hooks
 
 /// Tree eager hook: derive (or restore from a certificate) and cache.
@@ -119,18 +125,11 @@ fn pathsummary_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<()
     Ok(())
 }
 
-/// Cuttings eager hook: the lazy getter computes and persists.
-fn cuttings_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
-    engine.cuttings_entry(cs_id).map(|_| ())
-}
-
-/// Cuttings batched hook: flat compute from the changeset + first parent's
-/// tree; always contributes a row (empty facts included).
-fn cuttings_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
-    let entry = cuttings::build_cuttings(engine, flow.cs)?;
-    flow.push(DERIVED_CUTTINGS, entry.encode());
-    Ok(())
-}
+/// Cuttings is **lazy-only**: `build_cuttings` flattens the whole first
+/// parent's tree (O(changes + parent size)), which is fine for a query
+/// but is exactly what the M5 size-independence budget forbids on the
+/// commit path. The eager and batched hooks stay `None`; the lazy getter
+/// [`Engine::cuttings_entry`] computes and persists on first query.
 
 /// The derived-data kind registry, in eager-write and row order: tree,
 /// skiplist, pathsummary, cuttings. The order is part of the
@@ -140,23 +139,23 @@ fn cuttings_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), S
 static DERIVED_KINDS: &[DerivedKind] = &[
     DerivedKind {
         name: DERIVED_TREE,
-        eager: tree_eager,
-        for_new: tree_for_new,
+        eager: Some(tree_eager),
+        for_new: Some(tree_for_new),
     },
     DerivedKind {
         name: DERIVED_SKIPLIST,
-        eager: skiplist_eager,
-        for_new: skiplist_for_new,
+        eager: Some(skiplist_eager),
+        for_new: Some(skiplist_for_new),
     },
     DerivedKind {
         name: DERIVED_PATHSUMMARY,
-        eager: pathsummary_eager,
-        for_new: pathsummary_for_new,
+        eager: Some(pathsummary_eager),
+        for_new: Some(pathsummary_for_new),
     },
     DerivedKind {
         name: DERIVED_CUTTINGS,
-        eager: cuttings_eager,
-        for_new: cuttings_for_new,
+        eager: None,
+        for_new: None,
     },
 ];
 
@@ -686,7 +685,9 @@ impl Engine {
             segment: None,
         };
         for kind in DERIVED_KINDS {
-            (kind.for_new)(self, &mut flow)?;
+            if let Some(for_new) = kind.for_new {
+                for_new(self, &mut flow)?;
+            }
         }
         Ok(flow.rows)
     }
