@@ -34,7 +34,10 @@ mod common;
 use common::{id_of, sample_changeset, sample_tree};
 use gardenbed_model::Id;
 use gardenbed_model::blob_id;
-use gardenbed_store::{DerivedRow, MetadataStore, ObjectStore, PostgresMetadataStore, RefCas, S3ObjectStore, StoreError};
+use gardenbed_store::{
+    DerivedRow, MetadataStore, ObjectStore, PostgresMetadataStore, RefCas, S3ObjectStore,
+    StoreError,
+};
 use std::sync::Arc;
 use std::sync::Barrier;
 use std::thread;
@@ -52,10 +55,16 @@ fn live() -> Option<(PostgresMetadataStore, S3ObjectStore, String)> {
     let path_style = std::env::var("GARDENBED_TEST_S3_PATH_STYLE")
         .map(|v| v != "false" && v != "0")
         .unwrap_or(true);
-    let pg = PostgresMetadataStore::open(&pg_url)
-        .expect("connect to GARDENBED_TEST_PG_URL");
-    let s3 = S3ObjectStore::open(&endpoint, &bucket, &region, &access_key, &secret_key, path_style)
-        .expect("connect to GARDENBED_TEST_S3_ENDPOINT");
+    let pg = PostgresMetadataStore::open(&pg_url).expect("connect to GARDENBED_TEST_PG_URL");
+    let s3 = S3ObjectStore::open(
+        &endpoint,
+        &bucket,
+        &region,
+        &access_key,
+        &secret_key,
+        path_style,
+    )
+    .expect("connect to GARDENBED_TEST_S3_ENDPOINT");
     // Per-run tag: unique ref names and changesets so parallel runs
     // against one shared database/bucket coexist.
     let tag = format!("p{}", std::process::id());
@@ -146,9 +155,7 @@ fn git_mapping_checks(store: &dyn MetadataStore, tag: &str) {
     ));
 
     // Recording the exact same pair again is idempotent.
-    store
-        .record_git_mapping(&sha_a, cs1)
-        .expect("idempotent");
+    store.record_git_mapping(&sha_a, cs1).expect("idempotent");
     store
         .record_git_mapping(&sha_a.to_uppercase(), cs1)
         .expect("idempotent with different case");
@@ -156,14 +163,14 @@ fn git_mapping_checks(store: &dyn MetadataStore, tag: &str) {
     // A second independent pair coexists.
     store.record_git_mapping(&sha_b, cs2).expect("record");
     assert_eq!(store.cs_for_git(&sha_b).unwrap(), Some(cs2));
-    assert_eq!(
-        store.git_for_cs(cs2).unwrap(),
-        Some(sha_b.to_lowercase())
-    );
+    assert_eq!(store.git_for_cs(cs2).unwrap(), Some(sha_b.to_lowercase()));
 
     // Absent lookups are None.
     assert_eq!(store.cs_for_git(&hex(&[9; 20])).unwrap(), None);
-    assert_eq!(store.git_for_cs(id_of(0xFFFF ^ hash_tag(tag))).unwrap(), None);
+    assert_eq!(
+        store.git_for_cs(id_of(0xFFFF ^ hash_tag(tag))).unwrap(),
+        None
+    );
 }
 
 fn ref_listing_checks(store: &dyn MetadataStore, tag: &str) {
@@ -428,10 +435,7 @@ fn tree_roundtrip(store: &dyn ObjectStore) {
     store.put_tree(tree_id, &canonical).expect("put_tree");
     let got = store.get_tree(tree_id).expect("get_tree");
     assert_eq!(got.as_deref(), Some(canonical.as_slice()));
-    assert_eq!(
-        gardenbed_model::Tree::decode(&got.unwrap()).unwrap(),
-        tree
-    );
+    assert_eq!(gardenbed_model::Tree::decode(&got.unwrap()).unwrap(), tree);
     assert!(store.has(tree_id).unwrap());
     // Re-put of identical bytes is idempotent.
     store.put_tree(tree_id, &canonical).expect("re-put");
@@ -450,8 +454,7 @@ fn tree_hash_mismatch_rejected(store: &dyn ObjectStore) {
 }
 
 fn absent_ids_read_as_none(store: &dyn ObjectStore) {
-    let ghost =
-        Id::from_bytes([0xDE; 32]);
+    let ghost = Id::from_bytes([0xDE; 32]);
     assert_eq!(store.get_blob(ghost).unwrap(), None);
     assert_eq!(store.get_tree(ghost).unwrap(), None);
     assert!(!store.has(ghost).unwrap());
@@ -536,7 +539,11 @@ fn pg_cas_race_from_existing_base() {
         store.cas_ref(&name, None, base).expect("seed ref"),
         RefCas::Won { current: base }
     );
-    race_from_base(Arc::clone(&store) as Arc<dyn MetadataStore>, Some(base), &name);
+    race_from_base(
+        Arc::clone(&store) as Arc<dyn MetadataStore>,
+        Some(base),
+        &name,
+    );
 }
 
 #[test]

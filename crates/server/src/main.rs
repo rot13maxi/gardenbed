@@ -81,8 +81,10 @@ enum Command {
         #[arg(long)]
         from: String,
         /// Gardenbed repository directory (created if missing).
+        /// Required in local mode; omitted when `--storage` selects the
+        /// scaled backends (or a URL import, which is local-only).
         #[arg(long)]
-        root: PathBuf,
+        root: Option<PathBuf>,
         /// Storage configuration file (TOML) for the scaled backends
         /// (Postgres metadata + S3 objects); takes precedence over
         /// `--root`. `GARDENBED_STORAGE` is the env fallback.
@@ -106,7 +108,7 @@ enum Command {
         /// Gardenbed repository directory (holds `objects/` and
         /// `metadata.sqlite3`).
         #[arg(long)]
-        root: PathBuf,
+        root: Option<PathBuf>,
         /// Storage configuration file (TOML) for the scaled backends
         /// (Postgres metadata + S3 objects); takes precedence over
         /// `--root`. `GARDENBED_STORAGE` is the env fallback.
@@ -152,16 +154,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(2);
                 }
             };
-            let selection = resolve_storage(storage.as_deref(), Some(&root));
+            let selection = resolve_storage(storage.as_deref(), root.as_deref());
             if let Err(e) = run_import(&from, selection, detect_renames, limit, refs) {
                 eprintln!("error: import failed: {e}");
                 std::process::exit(1);
             }
             Ok(())
         }
-        Some(Command::Serve { addr, root, storage }) => {
-            serve(addr, root, storage).await
-        }
+        Some(Command::Serve {
+            addr,
+            root,
+            storage,
+        }) => serve(addr, root, storage).await,
         Some(Command::Export {
             root,
             storage,
@@ -169,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             refs,
             mapping,
         }) => {
-            let selection = resolve_storage(storage.as_deref(), Some(&root));
+            let selection = resolve_storage(storage.as_deref(), root.as_deref());
             if let Err(e) = run_export(selection, &into, refs, mapping) {
                 eprintln!("error: export failed: {e}");
                 std::process::exit(1);

@@ -36,10 +36,10 @@ use crate::fs::encode_envelope;
 use gardenbed_model::Id;
 use gardenbed_model::blob_id;
 use object_store::ObjectStore as _;
-use object_store::path::Path;
 use object_store::PutMode;
 use object_store::PutOptions;
 use object_store::PutPayload;
+use object_store::path::Path;
 use sha2::Digest;
 use sha2::Sha256;
 use std::sync::Arc;
@@ -91,9 +91,7 @@ impl S3ObjectStore {
             match probe.head(&Path::from("gardenbed-open-probe")).await {
                 Ok(_) => {}
                 Err(object_store::Error::NotFound { .. }) => {}
-                Err(e) => {
-                    return Err(StoreError::Db(format!("s3 bucket unreachable: {e}")))
-                }
+                Err(e) => return Err(StoreError::Db(format!("s3 bucket unreachable: {e}"))),
             }
             Ok::<(), StoreError>(())
         })?;
@@ -116,9 +114,7 @@ impl S3ObjectStore {
         let key = key.clone();
         self.driver.block_on(async move {
             let opts = PutOptions::from(PutMode::Create);
-            let result = inner
-                .put_opts(&key, PutPayload::from(payload), opts)
-                .await;
+            let result = inner.put_opts(&key, PutPayload::from(payload), opts).await;
             match result {
                 Ok(_) => Ok(true),
                 Err(object_store::Error::Precondition { .. })
@@ -170,8 +166,7 @@ impl S3ObjectStore {
             false => {
                 let existing = self
                     .get_raw(&key)?
-                    .ok_or_else(|| StoreError::Db("object vanished between put and read"
-                        .into()))?;
+                    .ok_or_else(|| StoreError::Db("object vanished between put and read".into()))?;
                 if same_content(&existing) {
                     return Ok(()); // idempotent no-op
                 }
@@ -211,10 +206,7 @@ impl crate::traits::ObjectStore for S3ObjectStore {
         self.conditional_put(
             id,
             &envelope,
-            |existing| {
-                crate::fs::parse_envelope(existing)
-                    .is_ok_and(|decoded| decoded == content)
-            },
+            |existing| crate::fs::parse_envelope(existing).is_ok_and(|decoded| decoded == content),
             true,
         )?;
         Ok(id)
@@ -236,9 +228,12 @@ impl crate::traits::ObjectStore for S3ObjectStore {
                 "tree canonical bytes hash to {actual}, not {id}"
             )));
         }
-        self.conditional_put(id, canonical_bytes, |existing| {
-            existing == canonical_bytes
-        }, false)
+        self.conditional_put(
+            id,
+            canonical_bytes,
+            |existing| existing == canonical_bytes,
+            false,
+        )
     }
 
     fn get_tree(&self, id: Id) -> Result<Option<Vec<u8>>, StoreError> {

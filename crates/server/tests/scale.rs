@@ -1,11 +1,13 @@
 //! Scale-out verification (docs/scale-out-design.md, §Verification 2):
-//! N independent handles over the SAME off-box stores (Postgres metadata
-//! + S3 objects) behave as one logical repository — read-your-writes
-//! across handles, exactly-one-winner CAS races, idempotent identical
-//! creates, and cross-handle object fetches. The second half repeats the
-//! create+publish+fetch cycle split across two real `gardenbed-server`
-//! processes spawned with `--storage`, proving the server wiring (flag
-//! parsing, `StorageConfig::open`, `Repo::open_stores`) end to end.
+//! N independent handles over the SAME off-box stores (Postgres
+//! metadata and S3 objects) behave as one logical repository —
+//! read-your-writes across handles, exactly-one-winner CAS races,
+//! idempotent identical creates, and cross-handle object fetches.
+//!
+//! The second half repeats the create+publish+fetch cycle split across
+//! two real `gardenbed-server` processes spawned with `--storage`,
+//! proving the server wiring (flag parsing, `StorageConfig::open`,
+//! `Repo::open_stores`) end to end.
 //!
 //! Gated on live services (no developer without Docker pays for it):
 //! set `GARDENBED_SCALE_TEST=1` plus `GARDENBED_TEST_PG_URL` and the
@@ -102,8 +104,7 @@ fn s3_env() -> Option<S3Config> {
     Some(S3Config {
         endpoint,
         bucket,
-        region: std::env::var("GARDENBED_TEST_S3_REGION")
-            .unwrap_or_else(|_| "us-east-1".into()),
+        region: std::env::var("GARDENBED_TEST_S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
         access_key,
         secret_key,
         path_style: std::env::var("GARDENBED_TEST_S3_PATH_STYLE")
@@ -138,13 +139,67 @@ fn live_config(test: &str) -> Option<(StorageConfig, String)> {
         return None;
     }
     let tag = run_tag(test);
+    // A fresh Postgres database per run: publish moves the shared
+    // `main` ref, so a shared database would collide with whatever else
+    // lives there (the demo imports into `gardenbed`, for instance).
+    // The bucket stays shared — object puts are content-addressed and
+    // idempotent, so cross-run objects are harmless.
+    let url = create_run_database(&url.expect("checked above"), &tag);
     let config = StorageConfig {
-        metadata: gardenbed_store::MetadataConfig::Postgres {
-            url: url.expect("checked above"),
-        },
+        metadata: gardenbed_store::MetadataConfig::Postgres { url },
         objects: gardenbed_store::ObjectsConfig::S3(s3.expect("checked above")),
     };
     Some((config, tag))
+}
+
+/// Creates a per-run database and returns its URL. Connects to the
+/// maintenance database named by `url` (whatever it points at must allow
+/// `CREATE DATABASE`), runs one `CREATE DATABASE ... TEMPLATE template0`,
+/// and rewrites the URL's path to the new database. The database is left
+/// behind: tests are hermetic by fresh name, and a shared test server
+/// accumulates runs like any CI database.
+fn create_run_database(base_url: &str, tag: &str) -> String {
+    // The async client must not block a tokio test thread
+    // (`Cannot start a runtime from within a runtime`); run the
+    // maintenance connection on a dedicated thread, the same
+    // spawn-and-park shape the store backends' driver uses.
+    let base_url = base_url.to_owned();
+    let tag = tag.to_owned();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("maintenance runtime builds");
+        rt.block_on(async move {
+            // `postgres://.../gardenbed` → connect to `.../postgres`
+            // for maintenance, then create the run database.
+            let maintenance = rewrite_db(&base_url, "postgres");
+            let (client, connection) = tokio_postgres::connect(&maintenance, tokio_postgres::NoTls)
+                .await
+                .expect("maintenance connection");
+            let conn_handle = tokio::spawn(connection);
+            let name = format!("gbd_{}", tag.replace('-', "_"));
+            let statement = format!(
+                "CREATE DATABASE \"{}\" TEMPLATE template0",
+                name.replace('"', "\"\"")
+            );
+            client
+                .batch_execute(&statement)
+                .await
+                .expect("CREATE DATABASE");
+            drop(client);
+            let _ = conn_handle.await;
+            rewrite_db(&base_url, &name)
+        })
+    })
+    .join()
+    .expect("database-creation thread joins")
+}
+
+/// Rewrites the database name in a postgres URL.
+fn rewrite_db(url: &str, db: &str) -> String {
+    let (prefix, _) = url.rsplit_once('/').expect("url with a path");
+    format!("{prefix}/{db}")
 }
 
 /// Writes the config to a temp file and opens it through the public
@@ -204,7 +259,9 @@ fn render_config_toml(config: &StorageConfig) -> String {
 /// (the seam, without port management).
 #[test]
 fn replica_correctness_in_process() {
-    let Some((config, tag)) = live_config("inproc") else { return };
+    let Some((config, tag)) = live_config("inproc") else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("tempdir");
 
     // Two handles, two independent open() calls over the same backing
@@ -254,8 +311,8 @@ fn replica_correctness_in_process() {
     });
     let out_a = handle_a.join().expect("A thread");
     let out_b = handle_b.join().expect("B thread");
-    let wins = matches!(out_a, RefCas::Won { .. }) as u32
-        + matches!(out_b, RefCas::Won { .. }) as u32;
+    let wins =
+        matches!(out_a, RefCas::Won { .. }) as u32 + matches!(out_b, RefCas::Won { .. }) as u32;
     assert_eq!(wins, 1, "exactly one CAS won (a={out_a:?}, b={out_b:?})");
     // Whoever lost reported the winner's value as the blocking current.
     let current = match (&out_a, &out_b) {
@@ -274,8 +331,7 @@ fn replica_correctness_in_process() {
     let blob3 = b"raced blob\n".to_vec();
     let cs_race = cs(vec![id_a], vec![add("r.txt", &blob3)], "race", 3);
     let expected = cs_race.id().expect("id derives");
-    let inline: BTreeMap<String, Vec<u8>> =
-        [(blob_id(&blob3).to_hex(), blob3.clone())].into();
+    let inline: BTreeMap<String, Vec<u8>> = [(blob_id(&blob3).to_hex(), blob3.clone())].into();
     let a_create = Arc::clone(&a);
     let cs_a = cs_race.clone();
     let inline_a = inline.clone();
@@ -297,7 +353,10 @@ fn replica_correctness_in_process() {
         "the raced changeset is the one both sides computed"
     );
 
-    println!("scale: in-process replica correctness ok (tag={})", run_tag("inproc"));
+    println!(
+        "scale: in-process replica correctness ok (tag={})",
+        run_tag("inproc")
+    );
 }
 
 /// One running server: the spawned child plus its bound address.
@@ -366,7 +425,9 @@ async fn read_blob(client: &GardenbedClient, repo: &str, id: Id) -> Vec<u8> {
 /// replica 1 again (a round trip that must cross the off-box stores).
 #[tokio::test]
 async fn replica_correctness_grpc() {
-    let Some((config, tag)) = live_config("grpc") else { return };
+    let Some((config, tag)) = live_config("grpc") else {
+        return;
+    };
     let dir = tempfile::tempdir().expect("tempdir");
     let path: PathBuf = dir.path().join("storage.toml");
     std::fs::write(&path, render_config_toml(&config)).expect("write storage.toml");
@@ -386,11 +447,7 @@ async fn replica_correctness_grpc() {
     let blob = b"grpc scale blob\n".to_vec();
     let cs_root = cs(vec![], vec![add("f.txt", &blob)], "root", 1);
     let id = c1
-        .create_changeset(
-            repo,
-            &cs_root,
-            [(blob_id(&blob), blob.clone())],
-        )
+        .create_changeset(repo, &cs_root, [(blob_id(&blob), blob.clone())])
         .await
         .expect("replica 1 creates");
     // Visible through replica 2 (read-your-writes across processes).
