@@ -9,33 +9,57 @@ tags, and the verification record for a release lives in
 
 ### Added
 
-- Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
-  and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
-  `gardenbed-store` `StorageConfig` (TOML) to select them.
-- `gardenbed-server --storage <config.toml>` (plus `GARDENBED_STORAGE` env
-  fallback) for `serve`, `import`, and `export`: stateless replicas over
-  off-box Postgres + S3 instead of local `--root` mode, which stays the
-  default.
-- `tools/scale/compose.yaml`: a Postgres + MinIO (`pgsty/minio`) + N-replica
-  server deployment (see `tools/scale/README.md`); `crates/server/tests/scale.rs`
-  proves read-your-writes, single-winner CAS, and idempotent creates across
-  replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
-
-### Added
-
-- Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
-  and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
-  `gardenbed-store` `StorageConfig` (TOML) to select them.
-- `gardenbed-server --storage <config.toml>` (plus `GARDENBED_STORAGE` env
-  fallback) for `serve`, `import`, and `export`: stateless replicas over
-  off-box Postgres + S3 instead of local `--root` mode, which stays the
-  default.
-- `tools/scale/compose.yaml`: a Postgres + MinIO (`pgsty/minio`) + N-replica
-  server deployment (see `tools/scale/README.md`); `crates/server/tests/scale.rs`
-  proves read-your-writes, single-winner CAS, and idempotent creates across
-  replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
+- **Multi-repository serving** (v0.2.md §5, M11): one server process
+  serves any number of repositories from a root directory
+  (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); the
+  directory tree is the registry. Repositories open lazily on first
+  request (singleflighted), `--max-repos` (default 256) caps open handles
+  with LRU eviction of idle ones, and per-repository request counters
+  stay per-repository. Unknown repository names fail `not_found` listing
+  the served names; illegal and reserved names fail `invalid_argument`.
+- `gardenbed-server import --repo` and `export --repo` target a named
+  repository; per-repository git mirrors live at
+  `<root>/<repo>/git-mirror.git`.
+- `gardenbed-server move --from NAME --into NEW-NAME` renames a
+  repository under the root; history is byte-identical after the move.
+  The move is an **offline operation**: it refuses (non-zero exit,
+  nothing changed) while a server is serving the root, and it checkpoints
+  the repository's WAL and carries `metadata.sqlite3-wal`/`-shm` with the
+  database, so committed rows are never stranded at the old path.
+- `bed clone http://host:port/<repo>` (M12): an http(s) URL's path names
+  the repository; `--repo` wins on conflict. URL-clone and `--repo`-flag
+  clone produce identical working-copy configs.
+- `gardenbed-mcp --repo` is load-bearing: the named repository is the
+  only one the session answers from; an unknown name exits 1 listing
+  what the root serves.
 
 ### Changed
+
+- `gardenbed-server --root` takes the server root (one subdirectory per
+  repository) rather than a single repository directory. A root laid out
+  the v0.1 way (stores at the top level) keeps serving unchanged as the
+  repository named `default`, so existing roots need no migration; use
+  `gardenbed-server move --from default --into NAME` to adopt the
+  per-directory layout. Servers hold an advisory lock on
+  `<root>/gardenbed.lock` **shared** for their lifetime (several servers
+  may serve one root), while file-relocating offline operations —
+  `gardenbed-server move`, offline `gc` — take it **exclusive** and
+  refuse while any server is live. This is the unified root-lock
+  contract shared with the GC lane's `repo.lock` design: one lockfile,
+  reader/writer semantics. **Deployment note:** until every deployed
+  binary speaks this contract, an old binary locking a different file
+  has no mutual exclusion with a new one — rebuild `gardenbed-server`
+  everywhere (including `~/.local/bin` and the systemd unit) before
+  running `gc` or `move` against a served root. Repository resolution
+  rechecks the directory under the open gate so a concurrent move cannot
+  recreate an empty repository at a vacated name.
+- Per-repository request counters are cumulative per name for the
+  server's lifetime: LRU eviction closes idle repositories, and a reopen
+  keeps counting where the evicted epoch left off (`get_stats` no longer
+  resets after churn).
+- `bed clone` refuses an http(s) URL whose path has more than one
+  segment (`http://host:port/a/b` — it cannot name a repository) instead
+  of silently cloning `default`.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
