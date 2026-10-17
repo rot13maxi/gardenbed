@@ -22,7 +22,10 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "gardenbed-daemon", about = "gardenbed local daemon (shared cache + watchers)")]
+#[command(
+    name = "gardenbed-daemon",
+    about = "gardenbed local daemon (shared cache + watchers)"
+)]
 struct Args {
     #[command(subcommand)]
     command: Command,

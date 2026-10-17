@@ -21,7 +21,11 @@ use std::path::PathBuf;
 /// Returns `None` only for the empty-`GARDENBED_DAEMON` case.
 pub fn socket_path() -> Option<PathBuf> {
     if let Ok(value) = std::env::var("GARDENBED_DAEMON") {
-        return if value.is_empty() { None } else { Some(PathBuf::from(value)) };
+        return if value.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(value))
+        };
     }
     Some(default_socket_path())
 }

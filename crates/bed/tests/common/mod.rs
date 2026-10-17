@@ -295,3 +295,139 @@ pub fn cached_count(state_dir: &Path, ids: &HashSet<Id>) -> usize {
     use gardenbed_store::ObjectStore as _;
     ids.iter().filter(|id| store.has(**id).unwrap()).count()
 }
+
+/// One running gardenbed-daemon: the spawned process, its socket path,
+/// and its isolated shared-cache root.
+pub struct Daemon {
+    pub child: tokio::process::Child,
+    /// The unix socket the daemon announced.
+    pub socket: PathBuf,
+    /// The isolated XDG_CACHE_HOME root (per-daemon, under the tempdir).
+    pub cache_home: PathBuf,
+    /// The temp root keeping the socket and cache alive.
+    pub root: PathBuf,
+}
+
+/// Locates the built `gardenbed-daemon` binary. Order: the
+/// `BED_DAEMON_BIN` override, then the workspace `target/{debug,release}`
+/// directory. Panics with actionable advice when absent.
+pub fn daemon_bin() -> PathBuf {
+    if let Ok(path) = std::env::var("BED_DAEMON_BIN") {
+        let path = PathBuf::from(path);
+        assert!(
+            path.is_file(),
+            "BED_DAEMON_BIN points at {path:?}, not a file"
+        );
+        return path;
+    }
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // crates/bed
+    let workspace_target = std::env::var("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| manifest.join("..").join("..").join("target"));
+    let profiles: &[&str] = if cfg!(debug_assertions) {
+        &["debug", "release"]
+    } else {
+        &["release", "debug"]
+    };
+    for profile in profiles {
+        let candidate = workspace_target.join(profile).join("gardenbed-daemon");
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    panic!(
+        "gardenbed-daemon binary not found under {} — run \
+         `cargo build --workspace` first (or set BED_DAEMON_BIN)",
+        workspace_target.display()
+    )
+}
+
+impl Daemon {
+    /// Spawns the daemon proxying `upstream`, with an isolated socket and
+    /// shared cache under `root`. Waits (≤ 30 s) for the
+    /// `listening on <path>` stdout line.
+    pub async fn spawn(root: &Path, upstream: &str) -> Self {
+        let socket = root.join("daemon.sock");
+        let cache_home = root.join("xdg-cache");
+        std::fs::create_dir_all(root).expect("daemon root created");
+        let mut child = tokio::process::Command::new(daemon_bin())
+            .arg("serve")
+            .arg("--upstream")
+            .arg(upstream)
+            .arg("--socket")
+            .arg(&socket)
+            .arg("--cache")
+            .arg(cache_home.join("gardenbed"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("gardenbed-daemon binary spawns");
+        let stdout = child.stdout.take().expect("daemon stdout piped");
+        let line = timeout(Duration::from_secs(30), async {
+            let mut lines = BufReader::new(stdout).lines();
+            loop {
+                let line = lines
+                    .next_line()
+                    .await
+                    .expect("daemon stdout open")
+                    .expect("daemon prints a line");
+                if let Some(path) = line.strip_prefix("listening on ") {
+                    return path.to_owned();
+                }
+                // Banner lines before the announcement are skipped.
+            }
+        })
+        .await
+        .expect("daemon announces itself within 30s");
+        Daemon {
+            child,
+            socket: PathBuf::from(line),
+            cache_home,
+            root: root.to_path_buf(),
+        }
+    }
+
+    /// Kills the daemon without cleanup (SIGKILL semantics for the
+    /// crash-fallback tests).
+    pub async fn kill(&mut self) {
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+}
+
+/// Runs the real `bed` binary in `dir` **through the daemon**: sets
+/// `GARDENBED_DAEMON` to the daemon's socket and isolates
+/// `XDG_CACHE_HOME`. Returns (exit code, stdout, stderr).
+pub fn bed_via_daemon(daemon: &Daemon, dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bed"))
+        .current_dir(dir)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("GARDENBED_DAEMON", &daemon.socket)
+        .env("XDG_CACHE_HOME", &daemon.cache_home)
+        .output()
+        .expect("bed binary spawns");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Runs the real `bed` binary in `dir` with the daemon **disabled**
+/// (GARDENBED_DAEMON=""), for direct-vs-daemon output comparisons.
+pub fn bed_direct(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bed"))
+        .current_dir(dir)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env("GARDENBED_DAEMON", "")
+        .output()
+        .expect("bed binary spawns");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}

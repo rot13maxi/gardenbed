@@ -62,8 +62,7 @@ mod tests {
         // The wire names are part of the daemon's published surface; these
         // are the strings `grpcurl`-style tools and tests address.
         let fds = std::fs::read(concat!(env!("OUT_DIR"), "/daemon.fds.bin")).unwrap();
-        let set =
-            prost_types::FileDescriptorSet::decode(fds.as_slice()).expect("fds decode");
+        let set = prost_types::FileDescriptorSet::decode(fds.as_slice()).expect("fds decode");
         let file = set.file.first().expect("one compiled file");
         let svc = file
             .service

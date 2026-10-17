@@ -55,7 +55,9 @@ impl SidecarService {
 
     /// The registration key: the canonicalized state directory.
     fn key(state_dir: &Path) -> PathBuf {
-        state_dir.canonicalize().unwrap_or_else(|_| state_dir.to_path_buf())
+        state_dir
+            .canonicalize()
+            .unwrap_or_else(|_| state_dir.to_path_buf())
     }
 
     /// True when an event path belongs to the working copy's own
@@ -100,20 +102,22 @@ impl SidecarService {
         let (tx, mut rx) = mpsc::unbounded_channel::<()>();
         let state_dir_for_watcher = state_dir.clone();
         // The watcher thread: notify events → filtered → debounce → bump.
-        let watcher = notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-            if res.is_err() {
-                return; // a lost event is a generation non-bump; the client
-                // falls back to scanning when in doubt via other signals.
-            }
-            let Ok(event) = res else { return };
-            let touched = event.paths.iter().any(|p| {
-                !SidecarService::is_machinery(&state_dir_for_watcher, p)
-            });
-            if touched {
-                let _ = tx.send(());
-            }
-        })
-        .map_err(|e| Status::internal(format!("cannot start a filesystem watcher: {e}")))?;
+        let watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
+                if res.is_err() {
+                    return; // a lost event is a generation non-bump; the client
+                    // falls back to scanning when in doubt via other signals.
+                }
+                let Ok(event) = res else { return };
+                let touched = event
+                    .paths
+                    .iter()
+                    .any(|p| !SidecarService::is_machinery(&state_dir_for_watcher, p));
+                if touched {
+                    let _ = tx.send(());
+                }
+            })
+            .map_err(|e| Status::internal(format!("cannot start a filesystem watcher: {e}")))?;
 
         // watch the root recursively
         let mut watcher = watcher;
@@ -133,10 +137,7 @@ impl SidecarService {
         let generation = {
             let regs = self.registrations.lock().expect("registration map");
             regs.get(&key)
-                .map(|r| {
-                    r.generation
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                })
+                .map(|r| r.generation.load(std::sync::atomic::Ordering::Relaxed))
                 .unwrap_or(0)
         };
         let registration = Arc::new(Registration {
@@ -165,7 +166,8 @@ impl SidecarService {
                     }
                 }
                 if let Some(reg) = weak.upgrade() {
-                    reg.generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reg.generation
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else {
                     break; // replaced; the new registration runs its own loop
                 }
@@ -180,10 +182,8 @@ impl SidecarService {
     pub fn generation(&self, state_dir: &Path) -> Option<u64> {
         let key = Self::key(state_dir);
         let regs = self.registrations.lock().expect("registration map");
-        regs.get(&key).map(|r| {
-            r.generation
-                .load(std::sync::atomic::Ordering::Relaxed)
-        })
+        regs.get(&key)
+            .map(|r| r.generation.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -195,7 +195,10 @@ impl Default for SidecarService {
 
 #[tonic::async_trait]
 impl DaemonSidecar for SidecarService {
-    async fn ping(&self, _request: Request<crate::pb::PingReq>) -> Result<Response<crate::pb::PingResp>, Status> {
+    async fn ping(
+        &self,
+        _request: Request<crate::pb::PingReq>,
+    ) -> Result<Response<crate::pb::PingResp>, Status> {
         Ok(Response::new(crate::pb::PingResp {
             pid: std::process::id() as u64,
         }))

@@ -69,8 +69,7 @@ fn set_private_mode(dir: &Path) -> std::io::Result<()> {
 /// True when something answers a `Ping` on the socket at `path`.
 async fn is_live_daemon(path: &Path) -> bool {
     let endpoint = format!("unix://{}", path.display());
-    let Ok(mut client) =
-        crate::daemon_sidecar_client::DaemonSidecarClient::connect(endpoint).await
+    let Ok(mut client) = crate::daemon_sidecar_client::DaemonSidecarClient::connect(endpoint).await
     else {
         return false;
     };
@@ -86,9 +85,8 @@ async fn shutdown_signal() {
     let ctrl_c = tokio::signal::ctrl_c();
     #[cfg(unix)]
     {
-        let mut term =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("SIGTERM handler installs");
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler installs");
         tokio::select! {
             _ = ctrl_c => {},
             _ = term.recv() => {},

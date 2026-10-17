@@ -27,8 +27,8 @@ use gardenbed_protocol::convert::{id_from_bytes, id_to_bytes};
 use gardenbed_protocol::gardenbed_server::Gardenbed;
 use gardenbed_protocol::pb;
 use gardenbed_store::{FsObjectStore, ObjectStore as _};
-use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::Stream;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 /// The daemon's upstream connection, re-established on demand.
@@ -139,8 +139,8 @@ impl ProxyService {
                 .map_err(|_| Status::internal("shared cache holds an undecodable tree"))?;
             self.cache_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(pb::TreeResp::try_from(&tree)
-                .map_err(|_| Status::internal("cached tree cannot be re-encoded"))?);
+            return pb::TreeResp::try_from(&tree)
+                .map_err(|_| Status::internal("cached tree cannot be re-encoded"));
         }
         // Singleflight per id: the winner fetches and writes through, the
         // latecomer re-checks the cache under the lock.
@@ -158,8 +158,8 @@ impl ProxyService {
                 .map_err(|_| Status::internal("shared cache holds an undecodable tree"))?;
             self.cache_hits
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok(pb::TreeResp::try_from(&tree)
-                .map_err(|_| Status::internal("cached tree cannot be re-encoded"))?);
+            return pb::TreeResp::try_from(&tree)
+                .map_err(|_| Status::internal("cached tree cannot be re-encoded"));
         }
         let client = self.upstream.get().await?;
         let tree = match client.get_tree(repo, id).await {
@@ -177,18 +177,14 @@ impl ProxyService {
         self.cache
             .put_tree(id, &bytes)
             .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
-        Ok(pb::TreeResp::try_from(&tree)
-            .map_err(|_| Status::internal("upstream tree cannot be re-encoded"))?)
+        pb::TreeResp::try_from(&tree)
+            .map_err(|_| Status::internal("upstream tree cannot be re-encoded"))
     }
 
     /// Cache-first blob lookup: shared store, else one streamed upstream
     /// `GetBlob`, reassembled, hash-verified, write-through, then streamed
     /// back to the caller in chunks.
-    async fn blob_stream(
-        self,
-        repo: String,
-        id: Id,
-    ) -> Result<BoxStream<pb::BlobChunk>, Status> {
+    async fn blob_stream(self, repo: String, id: Id) -> Result<BoxStream<pb::BlobChunk>, Status> {
         if let Some(content) = self
             .cache
             .get_blob(id)
@@ -405,7 +401,11 @@ impl Gardenbed for ProxyService {
         request: Request<pb::MergeBaseReq>,
     ) -> Result<Response<pb::MergeBaseResp>, Status> {
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().merge_base(request.into_inner()).await?;
+        let resp = client
+            .raw()
+            .clone()
+            .merge_base(request.into_inner())
+            .await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -414,7 +414,11 @@ impl Gardenbed for ProxyService {
         request: Request<pb::IsAncestorReq>,
     ) -> Result<Response<pb::IsAncestorResp>, Status> {
         let client = self.upstream.get().await?;
-        let resp = client.raw().clone().is_ancestor(request.into_inner()).await?;
+        let resp = client
+            .raw()
+            .clone()
+            .is_ancestor(request.into_inner())
+            .await?;
         Ok(Response::new(resp.into_inner()))
     }
 
@@ -423,7 +427,12 @@ impl Gardenbed for ProxyService {
         request: Request<pb::DiffReq>,
     ) -> Result<Response<Self::DiffStream>, Status> {
         let client = self.upstream.get().await?;
-        let mut stream = client.raw().clone().diff(request.into_inner()).await?.into_inner();
+        let mut stream = client
+            .raw()
+            .clone()
+            .diff(request.into_inner())
+            .await?
+            .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         let upstream = self.upstream.clone();
         tokio::spawn(async move {
@@ -439,12 +448,14 @@ impl Gardenbed for ProxyService {
         Ok(Response::new(Box::pin(ReceiverStream::new(rx))))
     }
 
-    async fn log(
-        &self,
-        request: Request<pb::LogReq>,
-    ) -> Result<Response<Self::LogStream>, Status> {
+    async fn log(&self, request: Request<pb::LogReq>) -> Result<Response<Self::LogStream>, Status> {
         let client = self.upstream.get().await?;
-        let mut stream = client.raw().clone().log(request.into_inner()).await?.into_inner();
+        let mut stream = client
+            .raw()
+            .clone()
+            .log(request.into_inner())
+            .await?
+            .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
             use tokio_stream::StreamExt as _;
@@ -462,7 +473,12 @@ impl Gardenbed for ProxyService {
         request: Request<pb::BlameReq>,
     ) -> Result<Response<Self::BlameStream>, Status> {
         let client = self.upstream.get().await?;
-        let mut stream = client.raw().clone().blame(request.into_inner()).await?.into_inner();
+        let mut stream = client
+            .raw()
+            .clone()
+            .blame(request.into_inner())
+            .await?
+            .into_inner();
         let (tx, rx) = tokio::sync::mpsc::channel(32);
         tokio::spawn(async move {
             use tokio_stream::StreamExt as _;
@@ -555,10 +571,8 @@ impl Gardenbed for ProxyService {
                 .await?
                 .into_inner()
         };
-        resp.counters.insert(
-            "daemon.cache_hits".to_owned(),
-            self.cache_hits(),
-        );
+        resp.counters
+            .insert("daemon.cache_hits".to_owned(), self.cache_hits());
         Ok(Response::new(resp))
     }
 }
@@ -619,7 +633,7 @@ mod tests {
         assert!(message.contains("was refused"), "{message}");
         assert!(message.contains(&format!("uid {other}")), "{message}");
     }
-
+    #[tokio::test]
     async fn peer_uid_check_over_a_real_socket() {
         // SO_PEERCRED over a real unix socket: a connected peer's
         // credentials (what tonic's `Connected` impl reads to build
