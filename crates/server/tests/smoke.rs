@@ -150,6 +150,9 @@ where
 #[tokio::test]
 async fn server_smoke_end_to_end() {
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it.
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
 
@@ -296,7 +299,10 @@ async fn server_smoke_end_to_end() {
     assert_eq!(refs[0].name, "refs/heads/feature");
 
     // Publish fast-forwards "main"; a non-descendant is refused.
-    let published = client.publish(repo, id_child).await.expect("publish");
+    let published = client
+        .publish(repo, id_child, None, false)
+        .await
+        .expect("publish");
     assert_eq!(published, id_child);
     assert_eq!(
         client.get_ref(repo, "main").await.expect("main"),
@@ -518,6 +524,9 @@ async fn revspec_prefix_resolution_end_to_end() {
     use tonic::Code;
 
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it.
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
     let client = server.client().await;
@@ -539,7 +548,10 @@ async fn revspec_prefix_resolution_end_to_end() {
         20,
     );
     let id_child = commit(&client, repo, &cs_child, &[&a2]).await;
-    client.publish(repo, id_child).await.expect("publish");
+    client
+        .publish(repo, id_child, None, false)
+        .await
+        .expect("publish");
 
     let hex_root = id_root.to_hex();
 
@@ -649,8 +661,8 @@ async fn revspec_prefix_resolution_end_to_end() {
     // first 8 hex chars (hash-prefixed ids cannot be engineered, so the
     // twin is written beside a real row in the test's own metadata — the
     // same offline surgery the chaos suite practices).
-    let metadata =
-        rusqlite::Connection::open(dir.path().join("metadata.sqlite3")).expect("metadata opens");
+    let metadata = rusqlite::Connection::open(dir.path().join("garden").join("metadata.sqlite3"))
+        .expect("metadata opens");
     metadata
         .busy_timeout(std::time::Duration::from_secs(5))
         .ok();
@@ -690,6 +702,9 @@ async fn rebase_three_way_edge_cases() {
     use tonic::Code;
 
     let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it.
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
     let server = ServerProc::spawn(dir.path()).await;
     let repo = "garden";
     let client = server.client().await;
@@ -1011,4 +1026,169 @@ fn expected_rebase_id(cs: &Changeset, new_parent: gardenbed_model::Id) -> garden
     };
     let canonical = replayed.canonical_bytes().expect("canonical encodes");
     Id::from_bytes(Sha256::digest(&canonical).into())
+}
+
+/// Publish with a named ref: the lane-ref form. Covers the CAS race
+/// (exactly one winner; the loser is told the new tip), the rewind
+/// refusal with the `force` escape hatch, the reserved-`main` rejection,
+/// and the absent-field wire compatibility (an old-style request with no
+/// ref behaves exactly like a plain main publish).
+#[tokio::test]
+async fn publish_ref_lane_cas_rewind_and_wire_compat() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // One repository under the root: `garden`, opened in-process so the
+    // directory (the registry entry) exists before the server sees it
+    // (the directory tree is the registry — D12).
+    gardenbed_server::Repo::open(&dir.path().join("garden")).expect("repo opens");
+    let server = ServerProc::spawn(dir.path()).await;
+    let repo = "garden";
+    let client = server.client().await;
+
+    // A root and two children (the lane's forks).
+    let a = b"lane base\n".to_vec();
+    let cs_root = cs(vec![], vec![add("a.txt", &a)], "root", 10);
+    let id_root = commit(&client, repo, &cs_root, &[&a]).await;
+    let b = b"lane left\n".to_vec();
+    let cs_left = cs(vec![id_root], vec![add("left.txt", &b)], "left", 20);
+    let id_left = commit(&client, repo, &cs_left, &[&b]).await;
+    let c = b"lane right\n".to_vec();
+    let cs_right = cs(vec![id_root], vec![add("right.txt", &c)], "right", 30);
+    let id_right = commit(&client, repo, &cs_right, &[&c]).await;
+
+    // ---------------------------------------------- (a) CAS race on a lane ref
+    // Two concurrent publishers of two descendants of the same base: both
+    // pass the ancestry check against the absent ref, exactly one CAS
+    // wins, and the loser's error names the ref and its new tip. The
+    // winner is forced deterministically by racing the SECOND descendant
+    // against a ref the first already moved — a genuine CAS loss is
+    // provoked below with two parallel requests.
+    client
+        .publish(repo, id_left, Some("lane"), false)
+        .await
+        .expect("first lane publish creates the ref");
+    // Two descendants of id_left race for the same CAS position: one wins,
+    // the other loses the CAS (not the ancestry check).
+    let e = b"lane fwd-1\n".to_vec();
+    let cs_f1 = cs(vec![id_left], vec![add("fwd1.txt", &e)], "fwd1", 50);
+    let id_f1 = commit(&client, repo, &cs_f1, &[&e]).await;
+    let f = b"lane fwd-2\n".to_vec();
+    let cs_f2 = cs(vec![id_left], vec![add("fwd2.txt", &f)], "fwd2", 60);
+    let id_f2 = commit(&client, repo, &cs_f2, &[&f]).await;
+    let (r1, r2) = tokio::join!(
+        client.publish(repo, id_f1, Some("lane"), false),
+        client.publish(repo, id_f2, Some("lane"), false),
+    );
+    let (winner, loser) = match (r1, r2) {
+        (Ok(_), Err(err)) => (id_f1, err),
+        (Err(err), Ok(_)) => (id_f2, err),
+        (Ok(_), Ok(_)) => panic!("two concurrent lane publishes cannot both win"),
+        (Err(e1), Err(e2)) => panic!("at least one lane publish must win: {e1}\n{e2}"),
+    };
+    assert_eq!(
+        loser.code(),
+        tonic::Code::FailedPrecondition,
+        "the lost race: {loser}"
+    );
+    assert!(
+        loser.message().contains("lane"),
+        "the lost race names the ref: {loser}"
+    );
+    assert!(
+        loser.message().contains(&winner.to_hex()),
+        "the lost race names the current tip: {loser}"
+    );
+    assert_eq!(
+        client.get_ref(repo, "lane").await.expect("get_ref"),
+        Some(winner),
+        "the ref holds the winner's changeset"
+    );
+
+    // A further descendant publish (of whichever won the race)
+    // fast-forwards the lane ref.
+    let g = b"lane forward\n".to_vec();
+    let cs_fwd = cs(vec![winner], vec![add("fwd.txt", &g)], "forward", 70);
+    let id_fwd = commit(&client, repo, &cs_fwd, &[&g]).await;
+    client
+        .publish(repo, id_fwd, Some("lane"), false)
+        .await
+        .expect("descendant publish fast-forwards");
+    assert_eq!(
+        client.get_ref(repo, "lane").await.expect("get_ref"),
+        Some(id_fwd)
+    );
+
+    // ------------------------------------------- (b) rewind refusal + force hatch
+    // Moving the lane ref back onto `id_right` (a sibling of history the
+    // ref points at) is a rewind: refused without force, naming the ref,
+    // both tips, and the fell-off count; permitted with force.
+    let err = client
+        .publish(repo, id_right, Some("lane"), false)
+        .await
+        .expect_err("rewind must be refused without force");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+    let msg = err.message();
+    assert!(msg.contains("lane"), "names the ref: {msg}");
+    assert!(
+        msg.contains(&id_fwd.to_hex()),
+        "names the current tip: {msg}"
+    );
+    assert!(msg.contains(&id_right.to_hex()), "names the new tip: {msg}");
+    assert!(
+        msg.contains("losing 3 changeset(s)"),
+        "counts what falls off (id_fwd + the race winner + id_left): {msg}"
+    );
+    assert!(msg.contains("force"), "spells the escape hatch: {msg}");
+    assert_eq!(
+        client.get_ref(repo, "lane").await.expect("get_ref"),
+        Some(id_fwd),
+        "the refusal moved nothing"
+    );
+    client
+        .publish(repo, id_right, Some("lane"), true)
+        .await
+        .expect("force permits the rewind");
+    assert_eq!(
+        client.get_ref(repo, "lane").await.expect("get_ref"),
+        Some(id_right),
+        "the ref moved under force"
+    );
+
+    // --------------------------------------------- (4) `main` via --ref is reserved
+    for name in ["main", "refs/heads/main"] {
+        let err = client
+            .publish(repo, id_fwd, Some(name), false)
+            .await
+            .expect_err("naming main in the ref field is reserved");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err}");
+        assert!(
+            err.message().contains("plain form"),
+            "the reserved error says main stays the plain form: {err}"
+        );
+    }
+
+    // ------------------------------------ (c) absent-field wire compatibility
+    // An old-style request (no ref, no force) publishes main exactly as
+    // before: the ref-less form is the main publish.
+    client
+        .publish(repo, id_fwd, None, false)
+        .await
+        .expect("ref-less publish fast-forwards main");
+    assert_eq!(
+        client.get_ref(repo, "main").await.expect("get_ref"),
+        Some(id_fwd),
+        "the ref-less publish moved main"
+    );
+    // And it is still the only way to move main: a ref-less publish of a
+    // non-descendant is the classic main refusal.
+    let err = client
+        .publish(repo, id_root, None, false)
+        .await
+        .expect_err("main keeps its classic refusal");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err}");
+    assert!(
+        err.message().contains("\"main\" is not an ancestor"),
+        "the classic main error text is unchanged: {err}"
+    );
+
+    server.shutdown().await;
 }

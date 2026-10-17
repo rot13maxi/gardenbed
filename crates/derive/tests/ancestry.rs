@@ -272,3 +272,90 @@ fn ancestry_differential_seed77_lazy() {
 fn ancestry_differential_seed555_eager() {
     run_history(555, 50, true);
 }
+
+// ------------------------------------------------ error propagation
+
+/// A metadata wrapper whose `get_changeset` fails with `StoreError::Db`
+/// once armed: exercises that genuine store errors propagate out of
+/// `is_ancestor` instead of silently degrading to the naive walk.
+struct FailingMetadata {
+    inner: MemoryStore,
+    fail: std::sync::atomic::AtomicBool,
+}
+
+impl MetadataStore for FailingMetadata {
+    fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
+        self.inner.put_changeset(cs)
+    }
+    fn get_changeset(&self, id: Id) -> Result<Option<(Changeset, Vec<u8>)>, StoreError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(StoreError::Db("injected failure".into()));
+        }
+        self.inner.get_changeset(id)
+    }
+    fn resolve_ref(&self, name: &str) -> Result<Option<Id>, StoreError> {
+        self.inner.resolve_ref(name)
+    }
+    fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError> {
+        self.inner.list_refs()
+    }
+    fn cas_ref(
+        &self,
+        name: &str,
+        expected: Option<Id>,
+        new: Id,
+    ) -> Result<gardenbed_store::RefCas, StoreError> {
+        self.inner.cas_ref(name, expected, new)
+    }
+    fn record_git_mapping(&self, git_sha_hex: &str, cs: Id) -> Result<(), StoreError> {
+        self.inner.record_git_mapping(git_sha_hex, cs)
+    }
+    fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
+        self.inner.cs_for_git(git_sha_hex)
+    }
+    fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
+        self.inner.git_for_cs(cs)
+    }
+    fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
+        self.inner.derived_put(kind, cs, bytes)
+    }
+    fn derived_get(&self, kind: &str, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+        self.inner.derived_get(kind, cs)
+    }
+    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
+        self.inner.recent_changesets(limit)
+    }
+}
+
+/// The same check with real data: ingest normally, then arm the failure
+/// and verify every public entry point errors with `Db`.
+#[test]
+fn is_ancestor_propagates_db_errors_with_data() {
+    let h = history(4321, 12);
+    let shared = Arc::new(MemoryStore::new());
+    let objects: Arc<dyn gardenbed_store::ObjectStore> = shared.clone();
+
+    // Ingest into the wrapper's inner store first (fail disarmed).
+    let wrapped = Arc::new(FailingMetadata {
+        inner: MemoryStore::new(),
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    {
+        let inner_meta: Arc<dyn MetadataStore> = wrapped.clone();
+        common::ingest(&objects, &inner_meta, &h, true);
+    }
+
+    let engine = Engine::new(objects, wrapped.clone());
+    let a = h.changesets[0].id().expect("encodes");
+    let b = h.changesets.last().unwrap().id().expect("encodes");
+
+    // Sanity: healthy store answers fine through the wrapper.
+    engine.is_ancestor(a, b).expect("healthy is_ancestor");
+
+    // Arm the failure: every path must surface the Db error.
+    wrapped
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(engine.is_ancestor(a, b), Err(StoreError::Db(_))));
+    assert!(matches!(engine.merge_base(a, b), Err(StoreError::Db(_))));
+}

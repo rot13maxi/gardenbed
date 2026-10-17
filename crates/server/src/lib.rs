@@ -5,8 +5,10 @@
 //! [`Engine`] into the Task-B service layer: changeset creation with blob
 //! validation and eager derivation, object access, the ancestry queries,
 //! refs with compare-and-swap, server-side rebase (linearized rebase), and
-//! the publish fast-forward. [`GardenbedService`] adapts [`Repo`] to the
-//! generated tonic `Gardenbed` trait (v0.1.md §5).
+//! the publish fast-forward. A server process serves N repositories
+//! through a [`repos::RepoSet`]; [`GardenbedService`] resolves each
+//! request's `repo` field through it and adapts [`Repo`] to the generated
+//! tonic `Gardenbed` trait (v0.1.md §5, v0.2.md §5).
 //!
 //! Error philosophy: a conforming client never sees an error for a *result*
 //! (ref CAS conflicts come back in `CasResp`, empty answers as absent
@@ -18,6 +20,9 @@ pub mod auth;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+use crate::repos::RepoSet;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,9 +33,28 @@ use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
 
+pub mod repos;
+/// The build fingerprint: a SHA-256 over `crates/server/src/**` file
+/// contents at build time (`build.rs`). The test harness compares it
+/// against the same digest computed over the *current* sources to catch a
+/// binary built from different tree state — mtime checks are blind to
+/// that (`bed switch` materializes sources with commit-time mtimes;
+/// dogfood finding #12's core).
+pub const SRC_DIGEST: &str = env!("GARDENBED_SERVER_SRC_DIGEST");
+
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
 /// must be uploaded with `PutBlob` first (v0.1.md §5).
 pub const MAX_INLINE_BLOB_LEN: usize = 1 << 20;
+
+/// Aggregate cap on all inline blobs in one `CreateChangeset` (2 MiB):
+/// per-blob limits alone still admit N×1 MiB in a single request, and
+/// the request is fully buffered before validation.
+pub const MAX_INLINE_TOTAL_LEN: usize = 2 << 20;
+
+/// Largest blob accepted by `PutBlob` (1 GiB). The stream is checked
+/// chunk-by-chunk against this bound, so an oversized upload is refused
+/// after its first frames — never by growing an unbounded buffer first.
+pub const MAX_PUT_BLOB_LEN: usize = 1 << 30;
 
 /// Errors from [`Repo`] and the gRPC layer.
 #[derive(Debug, thiserror::Error)]
@@ -77,6 +101,42 @@ pub enum ServerError {
     /// Merge hit semantic conflicts; the paths are listed in the message.
     #[error("merge conflicts on: {}", .0.join(", "))]
     MergeConflict(Vec<String>),
+
+    /// Publish named "main" in the `ref` field: main publishes stay the
+    /// plain (ref-less) request form, gated on protocol review.
+    #[error(
+        "publish refused: ref \"main\" must use the plain form (leave the ref field unset); main publishes are review-gated"
+    )]
+    MainRefReserved,
+    /// Publish lost a lane-ref CAS (or hit a non-descendant target the
+    /// rewound form already permitted); names the ref and its current tip.
+    #[error(
+        "publish refused: ref {ref_name:?} is not fast-forwarded by the given changeset; \
+         the ref now points at {current}",
+        current = current.to_hex()
+    )]
+    LaneNotFastForward {
+        /// The ref whose CAS was lost.
+        ref_name: String,
+        /// The ref's current tip (full hex).
+        current: Id,
+    },
+    #[error(
+        "publish refused: ref {ref_name:?} would move backward from {old} to {new}, \
+         losing {fell_off} changeset(s); re-send with force set to permit this move",
+        old = old.to_hex(),
+        new = new.to_hex()
+    )]
+    PublishRewind {
+        /// The ref whose move was refused.
+        ref_name: String,
+        /// The ref's current tip (full hex).
+        old: Id,
+        /// The refused new tip (full hex).
+        new: Id,
+        /// Changesets reachable from the old tip but not the new one.
+        fell_off: u64,
+    },
 }
 
 impl ServerError {
@@ -94,6 +154,11 @@ impl ServerError {
 /// Per-repo request counters (debug/test infrastructure). Bumped by the gRPC
 /// handlers for the four counted RPCs only — never by internal [`Repo`]
 /// calls, so a test can prove an RPC really crossed the wire.
+///
+/// Shared by `Arc` between the [`Repo`] and its [`crate::repos::RepoHandle`]:
+/// LRU eviction closes and may later reopen a repository, and the counters
+/// are cumulative for the *name*, not the open epoch — a reopen must keep
+/// counting where the previous epoch left off.
 #[derive(Debug, Default)]
 struct Stats {
     get_tree: AtomicU64,
@@ -118,13 +183,13 @@ impl Stats {
 /// The repository service: stores + derived data engine + counters.
 ///
 /// Cheap to share: every method takes `&self`, both stores live behind
-/// `Arc`, and all counters are atomics. One `Repo` per process in v0.1
-/// (single-repo servers).
+/// `Arc`, and all counters are atomics. One `Repo` per repository; a
+/// server holds them in a [`repos::RepoSet`].
 pub struct Repo {
     objects: Arc<dyn ObjectStore>,
     metadata: Arc<dyn MetadataStore>,
     engine: Engine,
-    stats: Stats,
+    stats: Arc<Stats>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -161,8 +226,35 @@ impl Repo {
             objects,
             metadata,
             engine,
-            stats: Stats::default(),
+            stats: Arc::new(Stats::default()),
         }
+    }
+
+    /// Opens a repository over explicit stores — the scale-out entry point
+    /// (docs/scale-out-design.md): `gardenbed_store::StorageConfig::open`
+    /// produces the `(objects, metadata)` pair and this builds the same
+    /// service over them that [`Repo::open`] builds over a local root.
+    /// Identical to [`Repo::new`]; the distinct name says "explicit stores
+    /// are a first-class way to open, not a test hook".
+    pub fn open_stores(objects: Arc<dyn ObjectStore>, metadata: Arc<dyn MetadataStore>) -> Self {
+        Self::new(objects, metadata)
+    }
+
+    /// The object store this repo was opened over — for callers that drive
+    /// store-level APIs alongside the repo (e.g. git import/export).
+    pub fn objects_handle(&self) -> Arc<dyn ObjectStore> {
+        Arc::clone(&self.objects)
+    }
+
+    /// The metadata store this repo was opened over.
+    pub fn metadata_handle(&self) -> Arc<dyn MetadataStore> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// The derived-data engine this repo runs (git import takes it to keep
+    /// its derivation on the same engine instance as the repo).
+    pub fn engine_handle(&self) -> Engine {
+        self.engine.clone()
     }
 
     // -------------------------------------------------------- write path
@@ -236,7 +328,7 @@ impl Repo {
             .engine
             .derived_rows_for_validated_tree(cs_id, cs, root)?;
         self.metadata
-            .put_validated_changeset(cs, root, &rows, None)?;
+            .put_validated_changeset(cs, root, &rows, None, None)?;
         Ok(cs_id)
     }
 
@@ -337,16 +429,26 @@ impl Repo {
         } else {
             limit as usize
         };
+        // One get_changeset per node: every heap entry is pushed with its
+        // decoded changeset (the push needs committer.time_secs anyway),
+        // and popped entries hand theirs back — the head seeds the cache
+        // and every node is fetched exactly once, versus the old pop-time
+        // re-fetch that walked every changeset twice.
+        let mut cache: HashMap<Id, Changeset> = HashMap::new();
+        cache.insert(cs_id, head);
         let mut out: Vec<(Id, Changeset)> = Vec::with_capacity(cap.min(64));
         while let Some((_, _, id_bytes)) = heap.pop() {
             let id = Id::from_bytes(id_bytes);
             // Insert the parents on pop (git inserts parents when a commit
             // is taken off its date-sorted list), each with a fresh seq.
-            let cs = self.get_changeset(id)?;
+            let cs = cache
+                .remove(&id)
+                .ok_or(ServerError::ChangesetNotFound(id))?;
             for p in &cs.parents {
                 if seen.insert(*p) {
                     let parent = self.get_changeset(*p)?;
                     heap.push((parent.committer.time_secs, Reverse(seq), *p.as_bytes()));
+                    cache.insert(*p, parent);
                     seq += 1;
                 }
             }
@@ -390,6 +492,24 @@ impl Repo {
     /// All refs as `(name, id)`, sorted by name.
     pub fn list_refs(&self) -> Result<Vec<(String, Id)>, ServerError> {
         Ok(self.metadata.list_refs()?)
+    }
+
+    /// The most recently *stored* changesets, newest arrival first, as
+    /// `(changeset id, changeset)` pairs, capped at `limit` (`0` =
+    /// unlimited — the whole arrival log).
+    ///
+    /// Unlike [`Repo::log`] this has no graph semantics: **unpublished
+    /// changesets are included** (working copies commit directly to the
+    /// server, so a changeset no ref can reach is the normal shape of
+    /// agent work-in-progress, not corruption). Arrival order, not commit
+    /// dates: see [`MetadataStore::recent_changesets`].
+    pub fn activity(&self, limit: u32) -> Result<Vec<(Id, Changeset)>, ServerError> {
+        let ids = self
+            .metadata
+            .recent_changesets(if limit == 0 { u32::MAX } else { limit })?;
+        ids.into_iter()
+            .map(|id| Ok((id, self.get_changeset(id)?)))
+            .collect()
     }
 
     /// Resolves a client-facing `<cs-or-ref>` argument: a ref's current
@@ -514,12 +634,17 @@ impl Repo {
                 .collect(),
             None => BTreeMap::new(),
         };
+        // Precompute once: the paths that differ between the new parent
+        // and the pre-image (the whole lockstep diff, sorted). Every
+        // check below is then membership tests and binary searches over
+        // this slice, instead of re-diffing subtrees per change.
+        let changed = changed_paths(&files, &pre);
 
         let mut conflicts: Vec<String> = Vec::new();
         for c in &cs.changes {
             match c.op {
                 gardenbed_model::Op::Add | gardenbed_model::Op::Modify => {
-                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(&files, &c.path, c.blob, c.mode, &changed, &mut conflicts);
                 }
                 gardenbed_model::Op::Delete => {
                     check_removal(&files, &pre, &c.path, &mut conflicts);
@@ -530,7 +655,7 @@ impl Repo {
                         continue;
                     };
                     check_removal(&files, &pre, src, &mut conflicts);
-                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(&files, &c.path, c.blob, c.mode, &changed, &mut conflicts);
                 }
             }
         }
@@ -553,35 +678,110 @@ impl Repo {
         self.create_changeset(&rebased, &BTreeMap::new())
     }
 
-    /// Fast-forwards ref `main` to `cs_id` (v0.1.md D5): asserts that the
-    /// current `main` (when one exists) is an ancestor of `cs_id`, then
-    /// compare-and-swaps `main` to it. Returns `cs_id`.
+    /// Fast-forwards a ref to `cs_id` (v0.1.md D5): asserts that the ref's
+    /// current value (when one exists) is an ancestor of `cs_id`, then
+    /// compare-and-swaps the ref to it. Returns `cs_id`.
     ///
-    /// With no `main` yet, the ancestry precondition holds trivially and the
-    /// CAS creates the ref from nothing. A CAS lost to a concurrent publish
-    /// (between the check and the swap) surfaces as
-    /// [`ServerError::NotFastForward`]; the caller retries against the new
-    /// value.
-    pub fn publish(&self, cs_id: Id) -> Result<Id, ServerError> {
+    /// `ref_name = None` is the classic main publish: with no value yet,
+    /// the ancestry precondition holds trivially and the CAS creates the
+    /// ref from nothing; a lost race surfaces as
+    /// [`ServerError::NotFastForward`], the caller retries against the new
+    /// value. A non-main ref gets the same CAS semantics plus the import
+    /// rewind guard: a move to a non-descendant (`old` not an ancestor of
+    /// `cs_id`) is refused with [`ServerError::PublishRewind`] naming the
+    /// ref, both tips, and how many changesets fall off — unless `force`
+    /// is set, the deliberate force-push escape hatch. Naming `"main"`
+    /// (or `"refs/heads/main"`) explicitly is refused
+    /// ([`ServerError::MainRefReserved`]): main publishes stay the plain
+    /// form, gated on protocol review.
+    pub fn publish(
+        &self,
+        cs_id: Id,
+        ref_name: Option<&str>,
+        force: bool,
+    ) -> Result<Id, ServerError> {
+        let name = ref_name.unwrap_or("main");
+        if let Some(ref_name) = ref_name
+            && matches!(ref_name, "main" | "refs/heads/main")
+        {
+            return Err(ServerError::MainRefReserved);
+        }
         // The published changeset must exist (a clear 404 beats a CAS that
         // would silently create a ref to nowhere).
         self.get_changeset(cs_id)?;
-        let current = self.get_ref("main")?;
-        if let Some(cur) = current {
-            let ok = self
+        // Resolve the ref the same way `cas_ref` picks its target row: the
+        // canonical `refs/heads/<name>` spelling first, then the name as
+        // given (imported histories carry full names).
+        let current = {
+            let canonical = branch_ref_name(name);
+            match self.metadata.resolve_ref(&canonical)? {
+                found @ Some(_) => found,
+                None if canonical != name => self.metadata.resolve_ref(name)?,
+                None => None,
+            }
+        };
+        if let Some(cur) = current
+            && !self
                 .engine
                 .is_ancestor(cur, cs_id)
-                .map_err(|e| ServerError::for_changeset(e, cur))?;
-            if !ok {
+                .map_err(|e| ServerError::for_changeset(e, cur))?
+        {
+            if ref_name.is_none() {
                 return Err(ServerError::NotFastForward);
             }
+            if !force {
+                return Err(ServerError::PublishRewind {
+                    ref_name: name.to_owned(),
+                    old: cur,
+                    new: cs_id,
+                    fell_off: self.count_fell_off(cur, cs_id)?,
+                });
+            }
         }
-        match self.cas_ref("main", current, cs_id)? {
+        match self.cas_ref(name, current, cs_id)? {
             RefCas::Won { .. } => Ok(cs_id),
-            RefCas::Conflict { .. } => Err(ServerError::NotFastForward),
+            RefCas::Conflict { .. } => {
+                if ref_name.is_none() {
+                    Err(ServerError::NotFastForward)
+                } else {
+                    Err(ServerError::LaneNotFastForward {
+                        ref_name: name.to_owned(),
+                        current: self
+                            .get_ref(name)?
+                            .ok_or(ServerError::RefNotFound(name.to_owned()))?,
+                    })
+                }
+            }
         }
     }
 
+    /// How many changesets are reachable from `old` but not from `new` —
+    /// the work that falls off a rewound ref. Two plain BFS walks over the
+    /// metadata's parent edges (changeset rows only, each fetched once per
+    /// walk), mirroring the import-side counter of the same name.
+    fn count_fell_off(&self, old: Id, new: Id) -> Result<u64, ServerError> {
+        fn reachable(
+            metadata: &dyn gardenbed_store::MetadataStore,
+            start: Id,
+        ) -> Result<std::collections::HashSet<Id>, ServerError> {
+            let mut seen = std::collections::HashSet::from([start]);
+            let mut queue = vec![start];
+            while let Some(x) = queue.pop() {
+                let (cs, _) = metadata
+                    .get_changeset(x)?
+                    .ok_or(ServerError::ChangesetNotFound(x))?;
+                for p in &cs.parents {
+                    if seen.insert(*p) {
+                        queue.push(*p);
+                    }
+                }
+            }
+            Ok(seen)
+        }
+        let from_old = reachable(self.metadata.as_ref(), old)?;
+        let from_new = reachable(self.metadata.as_ref(), new)?;
+        Ok(from_old.difference(&from_new).count() as u64)
+    }
     /// Server-side two-parent merge (v0.2.md D9-D11): merges `theirs`'
     /// tree into `ours`' over their merge base and stores one changeset
     /// `parents = [ours, theirs]` whose changes are the diff
@@ -637,6 +837,18 @@ impl Repo {
     /// A snapshot of the request counters, sorted by name.
     pub fn stats(&self) -> BTreeMap<String, u64> {
         self.stats.snapshot()
+    }
+    /// The shared counters behind [`Repo::stats`] — shared with the
+    /// owning [`crate::repos::RepoHandle`] so eviction cannot reset them.
+    pub(crate) fn counters(&self) -> &Arc<Stats> {
+        &self.stats
+    }
+
+    /// Swaps in an earlier epoch's counters (an eviction reopen keeping
+    /// the name's counts cumulative). No effect on already-served
+    /// snapshots.
+    pub(crate) fn adopt_counters(&mut self, stats: &Arc<Stats>) {
+        self.stats = stats.clone();
     }
 
     /// The stats counters (bumped by the gRPC handlers only).
@@ -774,10 +986,10 @@ fn check_removal(
 
 fn check_write(
     files: &BTreeMap<String, (Mode, Id)>,
-    pre: &BTreeMap<String, (Mode, Id)>,
     path: &str,
     blob: Option<Id>,
     mode: Mode,
+    changed: &[&str],
     conflicts: &mut Vec<String>,
 ) {
     let Some(blob) = blob else {
@@ -788,30 +1000,86 @@ fn check_write(
     if existing == Some(&(mode, blob)) {
         return; // Exact desired result: no path or subtree is overwritten.
     }
-    if existing != pre.get(path) {
+    // Paths whose (mode, blob) differs between the new parent and the
+    // pre-image, precomputed once per rebase call (sorted; binary-searched).
+    if changed.binary_search(&path).is_ok() {
         conflicts.push(format!("{path:?} was changed or deleted"));
     }
     let mut ancestor = path;
     while let Some((parent, _)) = ancestor.rsplit_once('/') {
-        if let Some(value) = files.get(parent)
-            && pre.get(parent) != Some(value)
-        {
+        // Only a file that still exists on the new parent can have been
+        // changed under; a parent absent from `files` was removed, not
+        // changed (the removed subtree is checked by the removal paths).
+        if files.contains_key(parent) && changed.binary_search(&parent).is_ok() {
             conflicts.push(format!("{path:?} sits under a concurrently changed file"));
         }
         ancestor = parent;
     }
     // Replacing a directory must not erase concurrent additions, edits,
-    // mode changes, or deletions anywhere in the swallowed subtree.
+    // mode changes, or deletions anywhere in the swallowed subtree. The
+    // first differing path sorted after "path/" is inside that subtree iff
+    // any differing path is: every non-descendant greater than "path/"
+    // (e.g. "dir0" for path "dir") sorts after every descendant.
     let prefix = format!("{path}/");
-    let descendants = |map: &BTreeMap<String, (Mode, Id)>| {
-        map.range(prefix.clone()..)
-            .take_while(|(p, _)| p.starts_with(&prefix))
-            .map(|(p, value)| (p.clone(), *value))
-            .collect::<BTreeMap<_, _>>()
-    };
-    if descendants(files) != descendants(pre) {
+    let i = changed
+        .binary_search_by(|p| p.as_bytes().cmp(prefix.as_bytes()))
+        .unwrap_err();
+    if i < changed.len() && changed[i].starts_with(&prefix) {
         conflicts.push(format!("directory {path:?} was changed"));
     }
+}
+
+/// The sorted list of paths whose `(mode, blob)` differs between two flat
+/// trees — one lockstep walk over both maps, `O(files + pre)` total,
+/// replacing the per-change subtree diffs that made rebase quadratic in
+/// the number of changes.
+fn changed_paths<'a>(
+    files: &'a BTreeMap<String, (Mode, Id)>,
+    pre: &'a BTreeMap<String, (Mode, Id)>,
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut fi = files.iter();
+    let mut pi = pre.iter();
+    let (mut f, mut p) = (fi.next(), pi.next());
+    loop {
+        match (f, p) {
+            (None, None) => return out,
+            (Some((fk, _fv)), None) => {
+                out.push(fk.as_str());
+                f = fi.next();
+            }
+            (None, Some((pk, _))) => {
+                out.push(pk.as_str());
+                p = pi.next();
+            }
+            (Some((fk, fv)), Some((pk, pv))) => match fk.cmp(pk) {
+                std::cmp::Ordering::Less => {
+                    out.push(fk.as_str());
+                    f = fi.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(pk.as_str());
+                    p = pi.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if fv != pv {
+                        out.push(fk.as_str());
+                    }
+                    f = fi.next();
+                    p = pi.next();
+                }
+            },
+        }
+    }
+}
+
+/// Would appending `incoming` bytes to a buffer already at `len` stay
+/// within `cap`? Checked before every `PutBlob` frame extends the body,
+/// so the buffer never exceeds the cap by more than one frame — and a
+/// stream of any size is refused after its first frames, not buffered
+/// first.
+fn chunk_fits(len: usize, incoming: usize, cap: usize) -> bool {
+    len <= cap && incoming <= cap - len
 }
 
 // --------------------------------------------------------------- gRPC layer
@@ -848,47 +1116,58 @@ impl From<ServerError> for Status {
             | ServerError::ObjectNotFound(_)
             | ServerError::RefNotFound(_)
             | ServerError::RevspecNotFound(_) => Status::not_found(e.to_string()),
-            ServerError::RebaseConflict(_) | ServerError::NotFastForward => {
-                Status::failed_precondition(e.to_string())
-            }
+            ServerError::RebaseConflict(_)
+            | ServerError::NotFastForward
+            | ServerError::LaneNotFastForward { .. }
+            | ServerError::PublishRewind { .. } => Status::failed_precondition(e.to_string()),
+            ServerError::MainRefReserved => Status::invalid_argument(e.to_string()),
             ServerError::MergeConflict(_) => Status::failed_precondition(e.to_string()),
         }
     }
 }
 
-/// The tonic adapter over one [`Repo`]: implements the generated
-/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5).
+/// The tonic adapter over a [`RepoSet`]: implements the generated
+/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5) over N repositories.
+///
+/// Every handler resolves its request's `repo` field through
+/// [`RepoSet::resolve`] — the one seam where authentication lands (v0.3).
 pub struct GardenbedService {
-    repo: Arc<Repo>,
+    set: Arc<RepoSet>,
     auth: Option<Arc<auth::AuthPolicy>>,
 }
 
 impl GardenbedService {
-    /// A service over `repo` (shared behind an `Arc`).
-    pub fn new(repo: Arc<Repo>) -> Self {
-        GardenbedService { repo, auth: None }
+    /// A service over the repositories under `set`'s root (open server).
+    pub fn new(set: Arc<RepoSet>) -> Self {
+        GardenbedService { set, auth: None }
     }
 
-    /// A service over `repo` that authenticates bearer tokens against
+    /// A service over `set` that authenticates bearer tokens against
     /// `policy` (see [`auth`]); `None` auth means an open server.
-    pub fn with_auth(repo: Arc<Repo>, policy: auth::AuthPolicy) -> Self {
+    pub fn with_auth(set: Arc<RepoSet>, policy: auth::AuthPolicy) -> Self {
         GardenbedService {
-            repo,
+            set,
             auth: Some(Arc::new(policy)),
         }
     }
 
-    /// The request's `repo` field: validated non-empty and logged. Every
-    /// request carries it (v0.1.md §5); v0.1 serves a single repo, so the
-    /// name is accepted as-is once non-empty.
-    fn repo_field<'a>(&self, repo: &'a str, rpc: &'static str) -> Result<&'a str, Status> {
-        if repo.is_empty() {
-            return Err(Status::invalid_argument(
-                "request carries no repo name (the `repo` field is mandatory)",
-            ));
-        }
+    /// The serving set (tests, the binary's logging).
+    pub fn set(&self) -> &RepoSet {
+        &self.set
+    }
+
+    /// Resolves the request's `repo` field to an in-use repository. The
+    /// name rules and errors are [`RepoSet::resolve`]'s: illegal names
+    /// (empty, bad characters, reserved) → `invalid_argument`; legal but
+    /// unserved → `not_found` listing the served names; a store that will
+    /// not open → `internal` naming the repository.
+    fn repo_guard(&self, repo: &str, rpc: &'static str) -> Result<repos::RepoGuard<'_>, Status> {
         log::debug!("request rpc={rpc} repo={repo}");
-        Ok(repo)
+        self.set.resolve(repo).map_err(|e| match e {
+            repos::RepoResolveError::InvalidName { .. } => Status::invalid_argument(e.to_string()),
+            repos::RepoResolveError::NotFound { .. } => Status::not_found(e.to_string()),
+            repos::RepoResolveError::Open { .. } => Status::internal(e.to_string()),
+        })
     }
 
     /// Enforces the token policy for `repo` before any store is touched.
@@ -918,9 +1197,10 @@ impl GardenbedService {
         })
     }
 
-    /// Bumps one of the counted RPC counters (no-op for uncounted names).
-    fn bump(&self, name: &str) {
-        if let Some(c) = self.repo.counter(name) {
+    /// Bumps one of the counted RPC counters on `repo` (no-op for
+    /// uncounted names).
+    fn bump(repo: &Repo, name: &str) {
+        if let Some(c) = repo.counter(name) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -953,10 +1233,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::RootTreeResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "RootTree")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "RootTree")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let tree = self.repo.root_tree(cs_id)?;
+        let tree = repo.root_tree(cs_id)?;
         Ok(Response::new(pb::RootTreeResp {
             tree_id: tree.map(id_to_bytes),
         }))
@@ -967,11 +1247,11 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetTreeReq>,
     ) -> Result<Response<pb::TreeResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "GetTree")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
-        self.bump("get_tree");
+        let repo = self.repo_guard(&req.repo, "GetTree")?;
+        Self::bump(&repo, "get_tree");
         let id = Self::id(&req.id, "id")?;
-        let Some(tree) = self.repo.get_tree(id)? else {
+        let Some(tree) = repo.get_tree(id)? else {
             return Err(Status::not_found(format!("tree {id} not found")));
         };
         let resp = pb::TreeResp::try_from(&tree)
@@ -984,11 +1264,11 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetBlobReq>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "GetBlob")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
-        self.bump("get_blob");
+        let repo = self.repo_guard(&req.repo, "GetBlob")?;
+        Self::bump(&repo, "get_blob");
         let id = Self::id(&req.id, "id")?;
-        let Some(content) = self.repo.get_blob(id)? else {
+        let Some(content) = repo.get_blob(id)? else {
             return Err(Status::not_found(format!("blob {id} not found")));
         };
         // Own the chunks up front: the stream must be 'static and the blob
@@ -1003,10 +1283,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::ChangesetMsg>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "GetChangeset")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "GetChangeset")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let cs = self.repo.get_changeset(cs_id)?;
+        let cs = repo.get_changeset(cs_id)?;
         let msg = pb::ChangesetMsg::try_from(&cs).map_err(|e| {
             Status::internal(format!("stored changeset {cs_id} has no wire form: {e}"))
         })?;
@@ -1036,13 +1316,25 @@ impl Gardenbed for GardenbedService {
                 ));
             }
         };
-        self.repo_field(&repo_name, "PutBlob")?;
         self.authorize(Self::token(&meta), &repo_name, auth::Role::Write)?;
+        let repo = self.repo_guard(&repo_name, "PutBlob")?;
 
         let mut body = Vec::new();
         while let Some(chunk) = stream.message().await? {
             match chunk.frame {
-                Some(pb::put_blob_chunk::Frame::Data(d)) => body.extend_from_slice(&d),
+                Some(pb::put_blob_chunk::Frame::Data(d)) => {
+                    // Checked per chunk, before extending: the buffer never
+                    // grows past the cap by more than one frame, so an
+                    // oversized upload is refused as soon as it is detected.
+                    if !chunk_fits(body.len(), d.len(), MAX_PUT_BLOB_LEN) {
+                        return Err(Status::resource_exhausted(format!(
+                            "PutBlob body exceeds {} bytes (refused at {} bytes received)",
+                            MAX_PUT_BLOB_LEN,
+                            body.len() + d.len()
+                        )));
+                    }
+                    body.extend_from_slice(&d);
+                }
                 Some(pb::put_blob_chunk::Frame::Header(_)) => {
                     return Err(Status::invalid_argument(
                         "duplicate header frame in a PutBlob stream",
@@ -1055,8 +1347,8 @@ impl Gardenbed for GardenbedService {
                 }
             }
         }
-        let id = self.repo.put_blob(&body)?;
-        self.bump("put_blob");
+        let id = repo.put_blob(&body)?;
+        Self::bump(&repo, "put_blob");
         Ok(Response::new(pb::PutBlobResp {
             id: id_to_bytes(id),
         }))
@@ -1067,8 +1359,8 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::CreateChangesetReq>,
     ) -> Result<Response<pb::CreateChangesetResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "CreateChangeset")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
+        let repo = self.repo_guard(&req.repo, "CreateChangeset")?;
         let msg = req
             .cs
             .ok_or_else(|| Status::invalid_argument("CreateChangesetReq carries no changeset"))?;
@@ -1088,8 +1380,8 @@ impl Gardenbed for GardenbedService {
             .into_iter()
             .map(|(key, content)| (key, content.to_vec()))
             .collect();
-        let id = self.repo.create_changeset(&cs, &inline)?;
-        self.bump("create_changeset");
+        let id = repo.create_changeset(&cs, &inline)?;
+        Self::bump(&repo, "create_changeset");
         Ok(Response::new(pb::CreateChangesetResp {
             id: id_to_bytes(id),
         }))
@@ -1100,11 +1392,11 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::MergeBaseReq>,
     ) -> Result<Response<pb::MergeBaseResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "MergeBase")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "MergeBase")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let base = self.repo.merge_base(a, b)?;
+        let base = repo.merge_base(a, b)?;
         Ok(Response::new(pb::MergeBaseResp {
             id: base.map(id_to_bytes),
         }))
@@ -1115,11 +1407,11 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::IsAncestorReq>,
     ) -> Result<Response<pb::IsAncestorResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "IsAncestor")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "IsAncestor")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let is_ancestor = self.repo.is_ancestor(a, b)?;
+        let is_ancestor = repo.is_ancestor(a, b)?;
         Ok(Response::new(pb::IsAncestorResp { is_ancestor }))
     }
 
@@ -1128,11 +1420,11 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::DiffReq>,
     ) -> Result<Response<Self::DiffStream>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "Diff")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "Diff")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let changes = self.repo.diff(a, b)?;
+        let changes = repo.diff(a, b)?;
         let items = changes.into_iter().map(|c| {
             pb::ChangeMsg::try_from(&c)
                 .map_err(|e| Status::internal(format!("change has no wire form: {e}")))
@@ -1142,10 +1434,10 @@ impl Gardenbed for GardenbedService {
 
     async fn log(&self, request: Request<pb::LogReq>) -> Result<Response<Self::LogStream>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "Log")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "Log")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let entries = self.repo.log(cs_id, req.limit)?;
+        let entries = repo.log(cs_id, req.limit)?;
         let items = entries.into_iter().map(|(id, cs)| {
             Ok(pb::ChangesetSummary {
                 cs_id: id_to_bytes(id),
@@ -1163,10 +1455,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::BlameReq>,
     ) -> Result<Response<Self::BlameStream>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "Blame")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "Blame")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let ranges = self.repo.blame(cs_id, &req.path)?;
+        let ranges = repo.blame(cs_id, &req.path)?;
         let items = ranges.into_iter().map(|(lo, hi, cs)| {
             Ok(pb::BlameRange {
                 lo,
@@ -1182,9 +1474,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::ListRefsReq>,
     ) -> Result<Response<Self::ListRefsStream>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "ListRefs")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
-        let refs = self.repo.list_refs()?;
+        let repo = self.repo_guard(&req.repo, "ListRefs")?;
+        let refs = repo.list_refs()?;
         let items = refs.into_iter().map(|(name, cs_id)| {
             Ok(pb::RefEntry {
                 name,
@@ -1207,12 +1499,12 @@ impl Gardenbed for GardenbedService {
         // 64-hex token stays a ref name here — clients parse those as ids
         // before any lookup.
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "GetRef")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "GetRef")?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
-        let cs_id = self.repo.get_ref(&req.name)?;
+        let cs_id = repo.get_ref(&req.name)?;
         Ok(Response::new(pb::GetRefResp {
             cs_id: cs_id.map(id_to_bytes),
         }))
@@ -1223,8 +1515,8 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::CasRefReq>,
     ) -> Result<Response<pb::CasResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "CasRef")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
+        let repo = self.repo_guard(&req.repo, "CasRef")?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
@@ -1233,7 +1525,7 @@ impl Gardenbed for GardenbedService {
             None => None,
         };
         let new = Self::id(&req.new, "new")?;
-        let outcome = self.repo.cas_ref(&req.name, expected, new)?;
+        let outcome = repo.cas_ref(&req.name, expected, new)?;
         let result = match outcome {
             RefCas::Won { .. } => pb::cas_resp::Result::Won(true),
             RefCas::Conflict { current } => {
@@ -1250,11 +1542,11 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::RebaseReq>,
     ) -> Result<Response<pb::RebaseResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "Rebase")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
+        let repo = self.repo_guard(&req.repo, "Rebase")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let new_parent = Self::id(&req.new_parent, "new_parent")?;
-        let id = self.repo.rebase(cs_id, new_parent)?;
+        let id = repo.rebase(cs_id, new_parent)?;
         Ok(Response::new(pb::RebaseResp {
             id: id_to_bytes(id),
         }))
@@ -1265,10 +1557,16 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::PublishReq>,
     ) -> Result<Response<pb::PublishResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "Publish")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
+        let repo = self.repo_guard(&req.repo, "Publish")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let id = self.repo.publish(cs_id)?;
+        // An absent/empty ref field is the v0.1 plain form ("main");
+        // anything else names a lane ref.
+        let ref_name = match req.r#ref.as_str() {
+            "" => None,
+            name => Some(name),
+        };
+        let id = repo.publish(cs_id, ref_name, req.force)?;
         Ok(Response::new(pb::PublishResp {
             id: id_to_bytes(id),
         }))
@@ -1279,8 +1577,8 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::MergeReq>,
     ) -> Result<Response<pb::MergeResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "Merge")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
+        let repo = self.repo_guard(&req.repo, "Merge")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let target = Self::id(&req.target, "target")?;
         let author = req
@@ -1291,9 +1589,7 @@ impl Gardenbed for GardenbedService {
             .committer
             .map(Identity::from)
             .ok_or_else(|| Status::invalid_argument("MergeReq carries no committer"))?;
-        let (id, up_to_date) = self
-            .repo
-            .merge(cs_id, target, &req.message, &author, &committer)?;
+        let (id, up_to_date) = repo.merge(cs_id, target, &req.message, &author, &committer)?;
         Ok(Response::new(pb::MergeResp {
             id: id_to_bytes(id),
             up_to_date,
@@ -1305,10 +1601,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetStatsReq>,
     ) -> Result<Response<pb::StatsResp>, Status> {
         let (meta, _, req) = request.into_parts();
-        self.repo_field(&req.repo, "GetStats")?;
         self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "GetStats")?;
         Ok(Response::new(pb::StatsResp {
-            counters: self.repo.stats().into_iter().collect(),
+            counters: repo.stats().into_iter().collect(),
         }))
     }
 }
@@ -1393,8 +1689,12 @@ mod revspec_tests {
             root: Option<Id>,
             rows: &[gardenbed_store::DerivedRow],
             git: Option<&str>,
+            raw: Option<&[u8]>,
         ) -> Result<Id, StoreError> {
-            self.inner.put_validated_changeset(cs, root, rows, git)
+            self.inner.put_validated_changeset(cs, root, rows, git, raw)
+        }
+        fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
+            self.inner.recent_changesets(limit)
         }
         fn changeset_ids_in_id_range(
             &self,
@@ -1644,6 +1944,56 @@ mod ref_normalization_tests {
         assert_eq!(
             repo.list_refs().expect("refs"),
             vec![("main".to_owned(), r2)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod robustness_tests {
+    use super::*;
+
+    /// The PutBlob per-chunk gate: exactly at the cap fits, one byte past
+    /// refuses — checked before the buffer ever grows past the cap.
+    #[test]
+    fn chunk_fits_boundary() {
+        assert!(chunk_fits(0, 5, 5));
+        assert!(chunk_fits(4, 1, 5));
+        assert!(
+            chunk_fits(5, 0, 5),
+            "exactly at the cap with nothing incoming fits"
+        );
+        assert!(!chunk_fits(4, 2, 5));
+        assert!(
+            !chunk_fits(6, 0, 5),
+            "an already-oversized buffer never fits"
+        );
+    }
+
+    /// The lockstep diff behind rebase's precomputed `changed` set: sorted
+    /// output, symmetric treatment of add/delete/modify, value equality
+    /// (not key presence) decides.
+    #[test]
+    fn changed_paths_is_the_sorted_diff() {
+        let mode = Mode::Regular;
+        let id = Id::from_bytes([0u8; 32]);
+        let id2 = Id::from_bytes([1u8; 32]);
+        let files: BTreeMap<String, (Mode, Id)> = [
+            ("a".to_owned(), (mode, id)),
+            ("b".to_owned(), (mode, id)),
+            ("d/e".to_owned(), (mode, id)),
+        ]
+        .into_iter()
+        .collect();
+        let pre: BTreeMap<String, (Mode, Id)> = [
+            ("b".to_owned(), (mode, id2)),  // value changed
+            ("c".to_owned(), (mode, id)),   // deleted in files
+            ("d/f".to_owned(), (mode, id)), // deleted in files
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            changed_paths(&files, &pre),
+            vec!["a", "b", "c", "d/e", "d/f"]
         );
     }
 }

@@ -13,8 +13,9 @@ gardenbed-model = { path = "../crates/model" }
 gardenbed-derive = { path = "../crates/derive" }
 gardenbed-store = { path = "../crates/store" }
 gardenbed-server = { path = "../crates/server" }
-gardenbed-mcp = { path = "../crates/mcp" }
 gardenbed-git = { path = "../crates/git" }
+gardenbed-mcp = { path = "../crates/mcp" }
+sha1 = "0.10"
 
 [[bin]]
 name = "decode_changeset"
@@ -60,6 +61,13 @@ doc = false
 [[bin]]
 name = "fuzz_merge3"
 path = "fuzz_targets/fuzz_merge3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pack_reader"
+path = "fuzz_targets/fuzz_pack_reader.rs"
 test = false
 doc = false
 bench = false

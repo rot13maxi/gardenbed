@@ -110,9 +110,9 @@ async fn setup() -> Garden {
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir created");
     let history = qualifying_history();
-    common::ingest(&history, &server_root);
+    common::ingest(&history, &server_root.join(common::REPO));
     let server = Server::spawn(&server_root).await;
-    let (code, out, stderr) = common::bed(&garden, &["clone", &server.http()]);
+    let (code, out, stderr) = common::bed(&garden, &["clone", &server.http_garden()]);
     assert_eq!(code, 0, "clone failed: {stderr}\n{out}");
     // The clone selected no sparse paths and materialized nothing: the
     // mount must show EVERYTHING even though the working copy selected

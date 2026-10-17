@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="gardenbed — read-only observability surface for a many-agent source-control repo.">
+<title>gardenbed</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' rx='4' fill='%231b1a14'/><text x='8' y='12' font-size='11' text-anchor='middle'>🌱</text></svg>">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="wordmark" href="#/">gardenbed&nbsp;<span class="sprout" aria-hidden="true">🌱</span></a>
+  <nav class="nav" aria-label="Primary">
+    <a href="#/" data-nav="overview">Overview</a>
+    <a href="#/log" data-nav="history">History</a>
+    <a href="#/browse" data-nav="browse">Browse</a>
+    <a href="#/compare" data-nav="compare">Compare</a>
+  </nav>
+  <input id="global-search" class="input" type="search" placeholder="grep…"
+    aria-label="Search file contents" title="grep file contents (press /)">
+  <div class="refsel">
+    <button id="agent-prompt-btn" class="btn btn-sm" type="button"
+      title="Copy a setup prompt for an AI agent">🌱 Use in agent</button>
+    <label for="ref-select" class="refsel-label">ref</label>
+    <select id="ref-select" disabled aria-label="Default ref">
+      <option>loading…</option>
+    </select>
+  </div>
+</header>
+<main id="app" class="app" aria-live="polite"></main>
+<footer class="footer">
+  <span>gardenbed · agents share one repo</span>
+  <span id="readonly-note">read-only view · writes via the bed CLI</span>
+</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>

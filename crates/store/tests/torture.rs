@@ -34,13 +34,27 @@ use std::time::Instant;
 
 /// Deterministic blob content for (iteration, blob index); parent and child
 /// compute identical bytes from these seeds alone.
+///
+/// Every 4th index is a **multi-chunk** (> 1 MiB) blob (M14): 2–5 MiB,
+/// alternating incompressible / compressible, so the torn-write torture
+/// kills land inside GBLO2 envelope construction and chunk compression.
 fn torture_blob_content(iter: u64, idx: usize) -> Vec<u8> {
     let seed = iter
         .wrapping_mul(1_000_003)
         .wrapping_add(idx as u64)
         .wrapping_add(0x0709_17B0);
-    let len = 1024 + (xorshift64(seed) % 4096) as usize;
-    random_bytes(seed, len)
+    if idx.is_multiple_of(4) {
+        // 2–5 MiB: 2 MiB + (seed % 3 MiB), alternating random/compressible.
+        let len = (2 << 20) + ((xorshift64(seed) % (3 << 20)) as usize);
+        if idx.is_multiple_of(8) {
+            random_bytes(seed, len)
+        } else {
+            common::compressible_bytes(seed, len)
+        }
+    } else {
+        let len = 1024 + (xorshift64(seed) % 4096) as usize;
+        random_bytes(seed, len)
+    }
 }
 
 /// Deterministic changeset for (iteration, changeset index).
@@ -188,6 +202,15 @@ fn verify_everything(
                 "blob iter={iter} idx={idx} id={id} must read back byte-exact"
             ),
             None => absent += 1,
+        }
+        // M14: present multi-chunk blobs must sit in the GBLO2 envelope
+        // with a multi-chunk table — the chunked class survives kills
+        // intact, never as a damaged hybrid.
+        if expected.len() > (1 << 20) && present_expected {
+            let raw = std::fs::read(common::shard_path(root, *id)).expect("read envelope");
+            assert_eq!(&raw[..5], b"GBLO2", "iter={iter} idx={idx} is GBLO2");
+            let count = u32::from_le_bytes(raw[13..17].try_into().unwrap()) as usize;
+            assert!(count >= 2, "iter={iter} idx={idx} spans several chunks");
         }
         match store.has(*id) {
             Ok(present) => assert_eq!(

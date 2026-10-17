@@ -708,7 +708,7 @@ mod prefix_tests {
         let child_id = repo
             .create_changeset(&child, &inline(&[a2]))
             .expect("child commits");
-        repo.publish(child_id).expect("main published");
+        repo.publish(child_id, None, false).expect("main published");
         (dir, repo, root_id, child_id)
     }
 

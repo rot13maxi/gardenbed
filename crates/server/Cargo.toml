@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "gardenbed-server"
 path = "src/main.rs"
 
+[build-dependencies]
+# The build fingerprint's digest (dogfood finding #12 hardening).
+sha2 = "0.10"
+
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
@@ -42,6 +46,9 @@ tonic = { version = "0.14.6", default-features = false, features = [
     "channel",
 ] }
 toml = "1"
+# The root advisory lock (repos::ROOT_LOCK): flock via rustix, the same
+# primitive the working-copy staging journal uses.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
@@ -51,4 +58,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 tempfile = "3"
 tokio-stream = "0.1"
+tokio-postgres = "0.7"
 zstd = "0.13"

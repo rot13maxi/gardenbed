@@ -319,11 +319,10 @@ const BLOB_CHUNK_LEN: usize = 1 << 16;
 /// Wraps `content` as a ready-made `BlobChunk` stream in `BLOB_CHUNK_LEN`
 /// pieces — the same shape the server streams.
 fn chunked(content: Vec<u8>) -> BoxStream<pb::BlobChunk> {
-    let chunks: Vec<Vec<u8>> = content
-        .chunks(BLOB_CHUNK_LEN)
-        .map(<[u8]>::to_vec)
-        .collect();
-    Box::pin(tokio_stream::iter(chunks.into_iter().map(|data| Ok(pb::BlobChunk { data }))))
+    let chunks: Vec<Vec<u8>> = content.chunks(BLOB_CHUNK_LEN).map(<[u8]>::to_vec).collect();
+    Box::pin(tokio_stream::iter(
+        chunks.into_iter().map(|data| Ok(pb::BlobChunk { data })),
+    ))
 }
 
 /// True when a tonic status means the daemon's cached upstream channel is
