@@ -91,11 +91,10 @@ pub enum Command {
         cs: Option<String>,
     },
 
-    /// Diff the working copy against the current changeset (when dirty),
-    /// or two changesets (default: the current one vs its first parent).
-    /// Every diff prints a header naming what is being diffed.
+    /// Diff two changesets (default: the current changeset vs its first
+    /// parent).
     Diff {
-        /// The older side: changeset id or ref. With `b` omitted, diffs
+        /// The older side: changeset id or ref. With `b` omitted: diffs
         /// against this changeset's first parent.
         a: Option<String>,
         /// The newer side: changeset id or ref.
@@ -121,6 +120,9 @@ pub enum Command {
 
     /// Publish the current changeset by fast-forwarding `main`.
     Publish,
+
+    /// Upload queued offline commits to the server.
+    Sync,
 
     /// Show first-parent line attribution, following renames.
     Blame {
@@ -355,6 +357,12 @@ mod tests {
             Command::Publish => {}
             other => panic!("expected Publish, got {other:?}"),
         }
+        match parsed(&["sync"]).command {
+            Command::Sync => {}
+            other => panic!("expected Sync, got {other:?}"),
+        }
+        // `sync` takes no arguments.
+        assert!(Cli::try_parse_from(["bed", "sync", "extra"]).is_err());
         match parsed(&["blame", "src/lib.rs"]).command {
             Command::Blame { path, cs } => {
                 assert_eq!(path, "src/lib.rs");

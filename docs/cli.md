@@ -48,7 +48,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `status` | show local changes under selected paths |
 | `file` | print one file's content at a changeset (or the current one) |
 | `log` | show changeset history, newest first |
-| `diff` | diff the working copy (when dirty) or two changesets; every diff prints a header naming its sides |
+| `diff` | diff two changesets (default: current vs first parent) |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
 | `publish` | fast-forward `main` to the current changeset |
@@ -124,12 +124,6 @@ bed sparse add big              # the demo: 1,021 files, byte-verified vs git sh
 bed sparse list                 # which prefixes this working copy materializes
 bed sparse remove tests/
 ```
-
-`sparse list` stays fully offline. A selected prefix that matches nothing
-at the current changeset is listed with the suffix
-`(empty at this changeset)` — selected ahead of history by design, it
-fills as the paths land in later changesets, but the marker keeps a dead
-selection from reading like live coverage.
 
 ### bed switch
 
@@ -210,27 +204,13 @@ bed log --cs master --limit 1
 Usage: bed diff [OPTIONS] [A] [B]
 ```
 
-With no arguments, `bed diff` is context-aware: a **dirty** working copy
-diffs the local bytes of every modified or deleted tracked file under
-the sparse selection against the current changeset (untracked files are
-not part of it — git parity; a deleted file renders as a removal to
-`/dev/null`); a **clean** working copy diffs the current changeset
-against its first parent. With arguments, both are always changesets:
-`A` is the older side; with `B` omitted, diffs `A` against its first
-parent. Both take a `<cs-or-ref>`.
-
-Every diff prints a one-line header naming what is being diffed, so the
-two modes are distinguishable at a glance:
+Diffs two changesets (default: the current changeset vs its first
+parent). `A` is the older side; with `B` omitted, diffs `A` against its
+first parent. Both take a `<cs-or-ref>`.
 
 ```sh
-bed diff                     # working copy vs current changeset (dirty),
-                             # else current changeset vs its first parent
+bed diff                     # current changeset vs its first parent
 bed diff main master
-```
-
-```text
-diff of working copy against 57169571952de2bf
-diff of 57169571952de2bf against its first parent
 ```
 
 ### bed commit
@@ -316,7 +296,6 @@ Usage: gardenbed-server [OPTIONS] [COMMAND]
 |---|---|
 | `--addr <ADDR>` | listen address (`host:port`; `:0` picks an ephemeral port), default `127.0.0.1:9418` |
 | `--root <ROOT>` | repository directory; must be a non-empty path (created if missing) — holds `<root>/objects` and `<root>/metadata.sqlite3` |
-| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode |
 
 Without a subcommand, the top-level `--addr`/`--root` flags serve the
 gRPC API — the printed address is the contract for scripts:
@@ -331,48 +310,14 @@ one-time validation of previously uncertified reachable history before moving
 refs; later restarts reuse that frontier. See [publication validation](validation.md)
 for migration behavior and certificate guarantees.
 
-### Scaled storage
-
-`serve` (and `import`/`export`, below) accept `--storage <config.toml>`
-to open off-box backends instead of the local `--root` layout — the
-horizontal scale-out tier ([docs/scale-out-design.md](scale-out-design.md)).
-The file selects one backend per storage contract:
-
-```toml
-[metadata]
-backend = "postgres"            # or "sqlite" (root = "/path/to/repo")
-url = "postgres://user:pass@host:5432/gardenbed"
-
-[objects]
-backend = "s3"                  # or "fs" (root = "/path/to/repo")
-endpoint = "http://minio:9000"
-bucket = "gardenbed"
-region = "us-east-1"
-access_key = "..."
-secret_key = "..."
-path_style = true
-```
-
-```sh
-gardenbed-server --storage config.toml serve --addr 0.0.0.0:9418
-GARDENBED_STORAGE=/etc/gardenbed/storage.toml gardenbed-server serve
-```
-
-The `sqlite`/`fs` branches point at the same `<root>/metadata.sqlite3`
-and `<root>/objects` layout that `--root` mode opens, so a config file
-can address an existing local repository. A ready-made compose stack
-(Postgres + MinIO + N replicas) lives in `tools/scale/`; see
-[tools/scale/README.md](../tools/scale/README.md).
-
 ### gardenbed-server serve
 
 ```text
 Usage: gardenbed-server serve [OPTIONS]
 ```
 
-Serves the gRPC API. Takes the same `--addr`/`--root`/`--storage` flags
-(see [scaled storage](#scaled-storage)); this is the default when no
-subcommand is given.
+Serves the gRPC API. Takes the same `--addr`/`--root` flags; this is the
+default when no subcommand is given.
 
 ### gardenbed-server import
 
@@ -389,31 +334,6 @@ Imports a git repository's history into the Gardenbed stores.
 | `--limit <LIMIT>` | ingest only the newest N commits (topological suffix; slice boundaries are re-rooted as full-tree root changesets) |
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
-| `--allow-rewind` | permit ref moves that would lose changesets (force-push parity) |
-| `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback). Note: URL `--from` values require local mode — scaled mode imports a local path |
-
-**Backward ref moves (rewinds).** When an incremental import moves a ref
-to a tip that is not a descendant of the ref's current value (e.g. the
-git repository's `main` is *behind* the store's published `main`, or a
-force push rewrote the tip), the import:
-
-* **fails with a non-zero exit by default** when the move would actually
-  lose changesets — the error names the ref, both tips, the number of
-  changesets that would fall off, and the escape hatch. Nothing is
-  moved: the refusal happens before any ref is touched.
-* with `--allow-rewind`, performs the move (force-push parity: old
-  objects and mapping rows remain, merely unreachable) and prints a
-  loud multi-line `warning:` to stderr naming the ref, the old and new
-  tip, and how many changesets may no longer be reachable from the ref.
-* counts the fell-off changesets exactly via a metadata-only BFS over
-  parent edges (no git or object reads); `--limit` imports report the
-  count as uncounted, because slice re-rooting breaks real ancestry.
-
-Forward moves (the common incremental case) are silent, exactly as
-before. Rewinds that lose nothing (a moved-back tip that is an ancestor
-of the current value is impossible by definition — the check fires on
-any non-descendant move — but sideways merges onto shared history count
-only what is actually unreachable) are permitted with just the warning.
 
 ```sh
 gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed-repo \
@@ -439,7 +359,6 @@ report; `--mapping FILE` writes it as TSV for verification.
 | `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
 | `--into <INTO>` | destination git repository: created as a bare sha1 repository when missing, accepted as-is when present |
 | `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
-| `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback) |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
 
 ```sh

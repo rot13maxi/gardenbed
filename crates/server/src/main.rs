@@ -12,13 +12,10 @@
 //!       and `<root>/metadata.sqlite3`, created if missing.
 //!
 //! * `gardenbed-server import --from <repo> --root DIR [--limit N]
-//!   [--renames on|off] [--ref <pattern>...] [--allow-rewind]` — ingests
-//!   a git repository into the same stores (git_bridge). `--from` may be
-//!   a local path or a URL; URLs are cloned/refreshed into a mirror under
-//!   the Gardenbed root first. Prints the import report on success; a
-//!   backward ref move that would lose changesets fails unless
-//!   `--allow-rewind` is given, and any backward move prints a loud
-//!   warning to stderr.
+//!   [--renames on|off] [--ref <pattern>...]` — ingests a git repository
+//!   into the same stores (git_bridge). `--from` may be a local path or a
+//!   URL; URLs are cloned/refreshed into a mirror under the Gardenbed
+//!   root first. Prints the import report on success.
 //!
 //! * `gardenbed-server export --root DIR --into GIT-DIR [--ref <pattern>...]
 //!   [--mapping FILE]` — renders the changeset graph into a real git
@@ -49,11 +46,6 @@ struct Args {
     /// Repository directory; must be a non-empty path.
     #[arg(long)]
     root: Option<PathBuf>,
-    /// Storage configuration file (TOML) for the scaled backends
-    /// (Postgres metadata + S3 objects); takes precedence over `--root`.
-    /// `GARDENBED_STORAGE` is the env fallback.
-    #[arg(long)]
-    storage: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -70,11 +62,6 @@ enum Command {
         /// `<root>/metadata.sqlite3`.
         #[arg(long)]
         root: Option<PathBuf>,
-        /// Storage configuration file (TOML) for the scaled backends
-        /// (Postgres metadata + S3 objects); takes precedence over
-        /// `--root`. `GARDENBED_STORAGE` is the env fallback.
-        #[arg(long)]
-        storage: Option<PathBuf>,
     },
     /// Import Git history into a repository.
     Import {
@@ -84,15 +71,8 @@ enum Command {
         #[arg(long)]
         from: String,
         /// Gardenbed repository directory (created if missing).
-        /// Required in local mode; omitted when `--storage` selects the
-        /// scaled backends (or a URL import, which is local-only).
         #[arg(long)]
-        root: Option<PathBuf>,
-        /// Storage configuration file (TOML) for the scaled backends
-        /// (Postgres metadata + S3 objects); takes precedence over
-        /// `--root`. `GARDENBED_STORAGE` is the env fallback.
-        #[arg(long)]
-        storage: Option<PathBuf>,
+        root: PathBuf,
         /// Ingest only the newest N commits (topological suffix; slice
         /// boundaries are re-rooted as full-tree root changesets).
         #[arg(long)]
@@ -105,25 +85,13 @@ enum Command {
         /// repeatable, empty means every branch.
         #[arg(long = "ref")]
         refs: Vec<String>,
-        /// Permit ref moves that would lose changesets (force-push
-        /// parity). By default such an import fails loudly instead of
-        /// silently rewinding published refs; backward moves that lose
-        /// nothing still only warn.
-        #[arg(long)]
-        allow_rewind: bool,
     },
     /// Export repository history to Git.
     Export {
         /// Gardenbed repository directory (holds `objects/` and
-        /// `metadata.sqlite3`); required in local mode, omitted when
-        /// `--storage` selects the scaled backends.
+        /// `metadata.sqlite3`).
         #[arg(long)]
-        root: Option<PathBuf>,
-        /// Storage configuration file (TOML) for the scaled backends
-        /// (Postgres metadata + S3 objects); takes precedence over
-        /// `--root`. `GARDENBED_STORAGE` is the env fallback.
-        #[arg(long)]
-        storage: Option<PathBuf>,
+        root: PathBuf,
         /// Destination git repository: created as a bare sha1 repository
         /// when missing, accepted as-is when present.
         #[arg(long)]
@@ -151,11 +119,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Command::Import {
             from,
             root,
-            storage,
             limit,
             renames,
             refs,
-            allow_rewind,
         }) => {
             let detect_renames = match renames.as_str() {
                 "on" => true,
@@ -165,114 +131,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(2);
                 }
             };
-            // Refuse before any directory is created: with neither
-            // --root, --storage, nor GARDENBED_STORAGE, resolve_storage
-            // would fall back to an empty root and the import would
-            // scatter objects/ into the CWD before failing.
-            if storage.is_none() && root.is_none() && env_storage().is_none() {
-                eprintln!(
-                    "error: import requires either --root (local mode) or \
-                     --storage (scaled mode)"
-                );
-                std::process::exit(2);
-            }
-            let selection = resolve_storage(storage.as_deref(), root.as_deref());
-            if let Err(e) = run_import(&from, selection, detect_renames, limit, refs, allow_rewind)
-            {
+            if let Err(e) = run_import(&from, &root, detect_renames, limit, refs) {
                 eprintln!("error: import failed: {e}");
                 std::process::exit(1);
             }
             Ok(())
         }
-        Some(Command::Serve {
-            addr,
-            root,
-            storage,
-        }) => serve(addr, root, storage).await,
+        Some(Command::Serve { addr, root }) => serve(addr, root).await,
         Some(Command::Export {
             root,
-            storage,
             into,
             refs,
             mapping,
         }) => {
-            // Same pre-open refusal as import: no stores, no side effects.
-            if storage.is_none() && root.is_none() && env_storage().is_none() {
-                eprintln!(
-                    "error: export requires either --root (local mode) or \
-                     --storage (scaled mode)"
-                );
-                std::process::exit(2);
-            }
-            let selection = resolve_storage(storage.as_deref(), root.as_deref());
-            if let Err(e) = run_export(selection, &into, refs, mapping) {
+            if let Err(e) = run_export(&root, &into, refs, mapping) {
                 eprintln!("error: export failed: {e}");
                 std::process::exit(1);
             }
             Ok(())
         }
-        None => serve(args.addr, args.root, args.storage).await,
+        None => serve(args.addr, args.root).await,
     }
 }
 
-/// Which backing stores a subcommand runs against: either a
-/// [`gardenbed_store::StorageConfig`] file (scaled mode) or a local
-/// repository `--root` (the default, unchanged).
-#[derive(Debug)]
-enum StorageSelection {
-    /// A storage configuration file path (from `--storage` or
-    /// `GARDENBED_STORAGE`).
-    Config(PathBuf),
-    /// Local mode: the `--root` repository directory.
-    Root(PathBuf),
-}
-
-/// The `GARDENBED_STORAGE` env fallback, when set to a non-empty path.
-fn env_storage() -> Option<PathBuf> {
-    std::env::var("GARDENBED_STORAGE")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .map(PathBuf::from)
-}
-
-/// Resolves the storage selection: an explicit `--storage` flag first,
-/// then the `GARDENBED_STORAGE` env var (a path to the same TOML file),
-/// then local `--root` mode.
-fn resolve_storage(storage_flag: Option<&Path>, root: Option<&Path>) -> StorageSelection {
-    if let Some(p) = storage_flag {
-        return StorageSelection::Config(p.to_path_buf());
-    }
-    if let Some(p) = env_storage() {
-        return StorageSelection::Config(p);
-    }
-    StorageSelection::Root(root.unwrap_or(Path::new("")).to_path_buf())
-}
-
-/// Opens the repository named by the selection: local mode via
-/// [`Repo::open`] (layout validation + fs/sqlite stores, unchanged), scaled
-/// mode via [`gardenbed_store::StorageConfig`] and [`Repo::open_stores`].
-fn open_repo(selection: &StorageSelection) -> Result<Repo, Box<dyn std::error::Error>> {
-    match selection {
-        StorageSelection::Root(root) => Ok(Repo::open(root)?),
-        StorageSelection::Config(path) => {
-            let (objects, metadata) = gardenbed_store::StorageConfig::from_path(path)?.open()?;
-            Ok(Repo::open_stores(objects, metadata))
-        }
-    }
-}
-
-/// One-shot git export from the stores behind `selection` into the git
+/// One-shot git export from the stores under `root` into the git
 /// repository at `into` (git_bridge's `git fast-import` writer). Prints the
 /// report; optionally writes the changeset→git-SHA mapping as TSV.
 fn run_export(
-    selection: StorageSelection,
+    root: &Path,
     into: &Path,
     refs: Vec<String>,
     mapping: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = open_repo(&selection)?;
-    let objects = repo.objects_handle();
-    let metadata = repo.metadata_handle();
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
+
+    Repo::validate_layout(root)?;
+    let objects = Arc::new(FsObjectStore::open(root)?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?);
     let opts = gardenbed_git::ExportOptions { refs };
     let report = gardenbed_git::export_to_path(into, objects, metadata, &opts)?;
     if let Some(path) = mapping {
@@ -296,83 +191,51 @@ fn run_export(
     Ok(())
 }
 
-/// One-shot git import into the stores behind `selection`.
+/// One-shot git import into the stores under `root`.
 fn run_import(
     from: &str,
-    selection: StorageSelection,
+    root: &Path,
     detect_renames: bool,
     limit: Option<usize>,
     refs: Vec<String>,
-    allow_rewind: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use gardenbed_git as git_bridge;
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
 
-    let repo = open_repo(&selection)?;
-    let objects = repo.objects_handle();
-    let metadata = repo.metadata_handle();
-    let engine = repo.engine_handle();
+    Repo::validate_layout(root)?;
+    let objects = Arc::new(FsObjectStore::open(root)?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?);
+    let engine = gardenbed_derive::Engine::new(objects.clone(), metadata.clone());
     let opts = git_bridge::ImportOptions {
         detect_renames,
         limit,
         refs,
-        allow_rewind,
     };
-    // URL imports clone into a mirror under the local repository root;
-    // scaled mode has no root, so URLs must be cloned locally first.
     let report = if from.contains("://") {
-        let StorageSelection::Root(root) = &selection else {
-            return Err("URL import requires local mode (--root); clone the \
-                         repository locally and import the path with --storage"
-                .into());
-        };
         let mirror = root.join("git-mirror.git");
         git_bridge::import_from_url(from, &mirror, objects, metadata, engine, &opts)?
     } else {
         git_bridge::import_from_path(Path::new(from), objects, metadata, engine, &opts)?
     };
-    // A backward ref move is never silent: name the ref, both tips, and
-    // the changesets that fell off it. (With `allow_rewind` unset the
-    // engine already refused moves that would lose changesets, so what
-    // lands here lost nothing — but the operator still must see it.)
-    for rewind in &report.refs_rewound {
-        eprintln!(
-            "warning: import moved {name} backward: {old} -> {new} ({lost})",
-            name = rewind.name,
-            old = rewind.old_tip.short(),
-            new = rewind.new_tip.short(),
-            lost = match rewind.fell_off {
-                Some(0) => "no changesets lost".to_owned(),
-                Some(n) => format!("{n} changeset(s) may no longer be reachable from the ref"),
-                None => "changeset loss not counted (limit import)".to_owned(),
-            }
-        );
-    }
     // Machine- and human-readable one-line report on stdout.
     println!("{report}");
     Ok(())
 }
+
 async fn serve(
     addr_arg: String,
     root_arg: Option<PathBuf>,
-    storage_arg: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Local mode keeps the historical "explicit non-empty --root" check.
-    let selection = match resolve_storage(storage_arg.as_deref(), root_arg.as_deref()) {
-        StorageSelection::Config(p) => StorageSelection::Config(p),
-        StorageSelection::Root(root) => {
-            if root.as_os_str().is_empty() {
-                eprintln!("error: --root is required (the repository directory)");
-                std::process::exit(2);
-            }
-            StorageSelection::Root(root)
-        }
+    let Some(root) = root_arg.filter(|p| !p.as_os_str().is_empty()) else {
+        eprintln!("error: --root is required (the repository directory)");
+        std::process::exit(2);
     };
 
-    let repo = Arc::new(open_repo(&selection).map_err(|e| {
-        eprintln!("error: cannot open repository: {e}");
+    let repo = Arc::new(Repo::open(&root).map_err(|e| {
+        eprintln!("error: cannot open repository at {}: {e}", root.display());
         e
     })?);
-    log::info!("repository opened storage={selection:?}");
+    log::info!("repository opened root={}", root.display());
 
     let addr: SocketAddr = addr_arg
         .parse()
