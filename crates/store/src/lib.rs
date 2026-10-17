@@ -22,6 +22,7 @@
 //! pure-local store with only fs/sqlite/memory).
 
 mod error;
+mod fastcdc;
 mod fs;
 mod memory;
 mod sqlite;

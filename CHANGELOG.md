@@ -9,6 +9,32 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+
+- **Blob chunking (GBLO2)** (v0.2.md §7, M14): blobs above 1 MiB are
+  stored in a new content-defined chunked envelope — `"GBLO2"` magic ·
+  `raw_len: u64` LE · `chunk_count: u32` LE · per-chunk
+  `(raw_len, comp_len)` table · per-chunk zstd frames — with FastCDC
+  boundaries (min 64 KiB / avg 256 KiB / max 1 MiB, Gear hash).
+  Content-defined boundaries make the chunk table deterministic for
+  identical content and stable under one-byte tail appends; identical
+  prefix content shares chunks. Blobs ≤ 1 MiB keep the GBLO1 envelope
+  byte-identically. Chunking is invisible above the store: no trait,
+  wire-protocol, `Repo`, client fetch, or export changes — the bed
+  client cache and `git` export reassembly are envelope-blind
+  (wire-invariance + SHA-exact roundtrip tests). Torn or tampered
+  objects remain whole-blob SHA-256 gated: one corrupted chunk is
+  `Corrupt`, never partial bytes (six damage classes tested). M14
+  put/get benches (release, fsync on, shared box): 1 MiB GBLO1 put
+  26 ms / get 3 ms; 8 MiB GBLO2 put 34–55 ms / get 6–16 ms; 64 MiB
+  GBLO2 put 163–277 ms / get 104–151 ms. No ≤ 1 MiB regression: the
+  GBLO1 encode/decode path is byte-identical pre/post change — dispatch
+  adds one length check and a 5-byte magic compare. Mixed-version
+  note: rebuild server and bed together — an older bed reading a newer
+  working copy's cache fails cleanly on a GBLO2 entry
+  (`corrupt object: bad envelope magic`, rc=1); deleting the cached
+  entry under `.bed/objects/` recovers it (refetch over the wire,
+  re-cache). See `docs/canonical-encoding.md` §6.
+
 - **Multi-repository serving** (v0.2.md §5, M11): one server process
   serves any number of repositories from a root directory
   (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); the

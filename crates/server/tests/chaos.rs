@@ -9,8 +9,9 @@
 //!    by construction (one-row CAS in one immediate transaction).
 //! 2. **Loam checksum sweep.** Every object file under `<root>/objects/` is
 //!    walked and verified against its content address: blob envelopes are
-//!    zstd-decoded and SHA-256-checked (`GBLO1` envelope, canonical
-//!    encoding §6); trees are decoded from canonical bytes and hashed.
+//!    zstd-decoded and SHA-256-checked (`GBLO1`/`GBLO2` envelopes,
+//!    canonical encoding §6 + v0.2.md §7 — chunked files reassemble and
+//!    hash-verify); trees are decoded from canonical bytes and hashed.
 //! 3. **`PRAGMA integrity_check` ok** on the metadata after WAL recovery.
 //! 4. **Derived-data rebuild determinism.** All derived kinds (`tree`,
 //!    `skiplist`, `pathsummary`) are wiped, recomputed from the changeset
@@ -880,6 +881,56 @@ fn sweep_objects(root: &Path) -> u64 {
                     "blob {id} envelope length lies (torn write observed)"
                 );
                 assert_eq!(blob_id(&content), id, "blob {id} fails its checksum");
+            } else if bytes.starts_with(b"GBLO2") {
+                // M14: chunked envelope. Reassemble per the §7 table —
+                // every chunk decodes to its declared raw length, the
+                // frames region is exactly the comp lengths, the raw
+                // lengths sum to raw_len — then hash-verify the whole.
+                assert!(bytes.len() >= 17, "GBLO2 blob {id} has no complete header");
+                let raw_len = u64::from_le_bytes(bytes[5..13].try_into().expect("raw_len"));
+                let count =
+                    u32::from_le_bytes(bytes[13..17].try_into().expect("chunk count")) as usize;
+                let table_end = 17 + count * 8;
+                assert!(
+                    bytes.len() >= table_end,
+                    "GBLO2 blob {id} chunk table is torn"
+                );
+                let mut content = Vec::with_capacity(raw_len as usize);
+                let mut off = table_end;
+                for i in 0..count {
+                    let e = 17 + i * 8;
+                    let chunk_raw =
+                        u32::from_le_bytes(bytes[e..e + 4].try_into().expect("raw")) as usize;
+                    let chunk_comp =
+                        u32::from_le_bytes(bytes[e + 4..e + 8].try_into().expect("comp")) as usize;
+                    assert!(
+                        off + chunk_comp <= bytes.len(),
+                        "GBLO2 blob {id} chunk {i} frame is torn"
+                    );
+                    let chunk =
+                        zstd::stream::decode_all(Cursor::new(&bytes[off..off + chunk_comp]))
+                            .unwrap_or_else(|e| {
+                                panic!("GBLO2 blob {id} chunk {i} does not decode: {e}")
+                            });
+                    assert_eq!(
+                        chunk.len(),
+                        chunk_raw,
+                        "GBLO2 blob {id} chunk {i} length lies (torn write observed)"
+                    );
+                    content.extend_from_slice(&chunk);
+                    off += chunk_comp;
+                }
+                assert_eq!(
+                    off,
+                    bytes.len(),
+                    "GBLO2 blob {id} has trailing bytes after the last frame"
+                );
+                assert_eq!(
+                    content.len() as u64,
+                    raw_len,
+                    "GBLO2 blob {id} chunks do not sum to raw_len"
+                );
+                assert_eq!(blob_id(&content), id, "GBLO2 blob {id} fails its checksum");
             } else {
                 assert_eq!(
                     bytes.first().copied(),

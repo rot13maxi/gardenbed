@@ -5,7 +5,8 @@
 //! .bed/config.toml    WorkingCopyConfig
 //! .bed/index.sqlite3      Treestate (sqlite, WAL)
 //! .bed/objects/       gardenbed_store::FsObjectStore — the local CAS cache,
-//!                     same GBLO1 envelope and 2-level sharding as objects
+//!                     same GBLO1/GBLO2 envelopes and 2-level sharding
+//!                     as objects
 //! .bed/heads          Heads — local stack tips
 //! ```
 //!

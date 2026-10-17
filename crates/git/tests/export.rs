@@ -1233,3 +1233,108 @@ fn a_corrupted_raw_commit_row_fails_loudly() {
 fn zstd_compress(data: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(data, 3).expect("zstd compress")
 }
+
+/// M14 (v0.2.md §9 M14.4): import→export at ≥ 2 MiB blobs. The big blobs
+/// land GBLO2 (chunked) in the store; export must reproduce the exact
+/// same git SHAs — identity never sees the envelope — and the exported
+/// repository passes `git fsck --strict`.
+#[test]
+fn export_roundtrips_multi_mib_chunked_blobs_sha_exact() {
+    let fx = Fixture::generate(
+        20260217,
+        &GenOptions {
+            commits: 40,
+            big_blob_bytes: Some((5 << 20) / 2 + 123), // 2.5 MiB > 1 MiB: GBLO2
+            ..GenOptions::default()
+        },
+    );
+    import_fixture(&fx);
+
+    let (objects, metadata, _engine) = open_stores(&fx.garden);
+
+    // The big blobs really are multi-chunk GBLO2 objects in the store.
+    let mut chunked = 0usize;
+    for cs in &fx.history.changesets {
+        for change in &cs.changes {
+            let Some(blob) = change.blob else { continue };
+            if change.mode == Mode::Gitlink {
+                continue;
+            }
+            let Some(content) = fx.history.blob(&blob) else {
+                continue;
+            };
+            if content.len() > (1 << 20) {
+                let hex = blob.to_hex();
+                let raw = std::fs::read(fx.garden.join("objects").join(&hex[..2]).join(&hex[2..]))
+                    .expect("envelope on disk");
+                assert_eq!(&raw[..5], b"GBLO2", "blob > 1 MiB stores GBLO2");
+                let count = u32::from_le_bytes(raw[13..17].try_into().unwrap()) as usize;
+                assert!(count >= 2, "2.5 MiB blob spans several chunks");
+                chunked += 1;
+            }
+        }
+    }
+    assert!(
+        chunked >= 3,
+        "the fixture exercises the chunked path (found {chunked} big blobs)"
+    );
+
+    let target = fx.dir.path().join("export.git");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
+
+    assert_eq!(
+        report.commits_exported,
+        fx.mapping.len() as u64,
+        "one commit per imported changeset"
+    );
+    assert_eq!(report.signed_dropped, 0, "unsigned history");
+    let mut exported: Vec<&str> = report.commits.iter().map(|(_, s)| s.as_str()).collect();
+    let mut fixture: Vec<&str> = fx.mapping.iter().map(|(_, s)| s.as_str()).collect();
+    exported.sort_unstable();
+    fixture.sort_unstable();
+    assert_eq!(
+        exported, fixture,
+        "identical git SHAs through GBLO2 storage"
+    );
+
+    git_fsck(&target).expect("fsck --strict clean on chunked-blob export");
+
+    // Re-import the exported repository into a fresh store: the changeset
+    // ids and blob contents survive a second full cycle (blob bytes
+    // byte-exact through GBLO2 → git → GBLO2).
+    let garden2 = fx.dir.path().join("garden2");
+    let (objects2, metadata2, engine2) = open_stores(&garden2);
+    let report2 = import_from_path(
+        &target,
+        objects2,
+        metadata2,
+        engine2,
+        &ImportOptions::default(),
+    )
+    .expect("re-import succeeds");
+    assert_eq!(
+        report2.commits_new,
+        fx.mapping.len() as u64,
+        "the exported history re-imports whole"
+    );
+    for cs in &fx.history.changesets {
+        for change in &cs.changes {
+            let Some(blob) = change.blob else { continue };
+            if change.mode == Mode::Gitlink {
+                continue;
+            }
+            let Some(content) = fx.history.blob(&blob) else {
+                continue;
+            };
+            if content.len() > (1 << 20) {
+                let (objects2, ..) = open_stores(&garden2);
+                assert_eq!(
+                    objects2.get_blob(blob).expect("get").expect("present"),
+                    content,
+                    "big blob byte-exact through the full cycle"
+                );
+            }
+        }
+    }
+}

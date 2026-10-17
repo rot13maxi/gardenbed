@@ -28,6 +28,7 @@
 //! A crash therefore leaves the object either absent or byte-complete.
 
 use crate::StoreError;
+use crate::fastcdc;
 use gardenbed_model::Id;
 use gardenbed_model::blob_id;
 use sha2::Digest;
@@ -43,16 +44,26 @@ use std::sync::atomic::Ordering;
 
 /// Envelope magic (`docs/canonical-encoding.md` §6).
 const MAGIC: &[u8; 5] = b"GBLO1";
+/// GBLO2 magic (`docs/v0.2.md` §7): content-defined chunked storage for
+/// blobs above [`CHUNK_THRESHOLD`].
+const MAGIC2: &[u8; 5] = b"GBLO2";
 /// Magic + `u64` raw length.
 const HEADER_LEN: usize = MAGIC.len() + 8;
+/// GBLO2 fixed header: magic + `raw_len: u64` + `chunk_count: u32`.
+const HEADER2_LEN: usize = MAGIC2.len() + 8 + 4;
+/// Per-chunk table entry: `raw_len: u32` + `comp_len: u32`.
+const CHUNK_ENTRY_LEN: usize = 8;
+/// Blobs strictly larger than this store GBLO2 (FastCDC-chunked); blobs at
+/// or below it stay GBLO1 byte-identically (docs/v0.2.md §7, D15).
+const CHUNK_THRESHOLD: usize = 1 << 20;
 /// Sanity bound on decompressed blob size (4 GiB). Far above anything v0.1
 /// stores, while capping the damage of a hostile or corrupt envelope
 /// claiming an enormous `raw_len`. Part of reading defensively, not part of
 /// the storage contract.
 const MAX_BLOB_LEN: u64 = 4 << 30;
 /// Bound on the on-disk object file itself (envelope overhead slack on top
-/// of [`MAX_BLOB_LEN`]).
-const MAX_ENVELOPE_LEN: u64 = MAX_BLOB_LEN + (1 << 20);
+/// of [`MAX_BLOB_LEN`]; GBLO2's chunk table is ≤ ~786 KiB at the cap).
+const MAX_ENVELOPE_LEN: u64 = MAX_BLOB_LEN + (1 << 21);
 /// zstd compression level. Storage detail; never part of identity.
 const ZSTD_LEVEL: i32 = 3;
 
@@ -256,8 +267,22 @@ impl crate::traits::ObjectStore for FsObjectStore {
     }
 }
 
-/// Encodes the §6 envelope: `"GBLO1"` + `u64` LE raw length + one zstd frame.
+/// Encodes the on-disk envelope: GBLO1 for content at or below
+/// [`CHUNK_THRESHOLD`], GBLO2 (FastCDC-chunked, docs/v0.2.md §7) above it.
+///
+/// The choice is a pure function of `content.len()` — every writer in every
+/// process stores the same bytes under the same id.
 pub(crate) fn encode_envelope(content: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if content.len() > CHUNK_THRESHOLD {
+        encode_envelope_chunked(content)
+    } else {
+        encode_envelope_whole(content)
+    }
+}
+
+/// Encodes the §6 GBLO1 envelope: `"GBLO1"` + `u64` LE raw length + one
+/// zstd frame.
+fn encode_envelope_whole(content: &[u8]) -> Result<Vec<u8>, StoreError> {
     let mut out = Vec::with_capacity(HEADER_LEN + content.len() / 2 + 64);
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(content.len() as u64).to_le_bytes());
@@ -266,7 +291,41 @@ pub(crate) fn encode_envelope(content: &[u8]) -> Result<Vec<u8>, StoreError> {
     Ok(out)
 }
 
-/// Decodes and fully verifies a §6 envelope against the addressed id.
+/// Encodes the §7 GBLO2 envelope:
+/// `"GBLO2" | raw_len: u64 LE | chunk_count: u32 LE | chunk_count ×
+/// {raw_len: u32 LE, comp_len: u32 LE} | chunk_count zstd frames`.
+///
+/// Chunk boundaries come from FastCDC (content-defined, deterministic for
+/// identical content); each chunk is one zstd frame. Boundaries are part of
+/// the on-disk format; frame bytes are not (identity hashes the
+/// reassembled raw bytes only).
+fn encode_envelope_chunked(content: &[u8]) -> Result<Vec<u8>, StoreError> {
+    let lengths = crate::fastcdc::chunk_lengths(content);
+    let count = lengths.len();
+    let mut out = Vec::with_capacity(HEADER2_LEN + count * CHUNK_ENTRY_LEN + content.len() / 2);
+    out.extend_from_slice(MAGIC2);
+    out.extend_from_slice(&(content.len() as u64).to_le_bytes());
+    out.extend_from_slice(&(count as u32).to_le_bytes());
+    // One pass: compress each chunk, hold the frames, and write the table
+    // first (the frames region follows the table in file order).
+    let mut frames: Vec<Vec<u8>> = Vec::with_capacity(count);
+    let mut offset = 0usize;
+    for &len in &lengths {
+        let chunk = &content[offset..offset + len as usize];
+        let frame = zstd::bulk::compress(chunk, ZSTD_LEVEL).map_err(io_err)?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        frames.push(frame);
+        offset += len as usize;
+    }
+    for frame in frames {
+        out.extend_from_slice(&frame);
+    }
+    Ok(out)
+}
+
+/// Decodes and fully verifies an envelope (either magic) against the
+/// addressed id.
 ///
 /// Returns [`StoreError::Corrupt`] on any mismatch — bad magic, truncated
 /// envelope, decompressed length differing from `raw_len`, or content whose
@@ -282,11 +341,14 @@ pub(crate) fn decode_envelope(raw: &[u8], id: Id) -> Result<Vec<u8>, StoreError>
     Ok(content)
 }
 
-/// Parses a §6 envelope (magic, declared length, one zstd frame) without the
-/// final SHA-256-vs-id check. Used by `put_blob`'s existence check, which
-/// must distinguish "envelope of *different* content" (immutability
-/// violation) from "structurally corrupt file" (healable).
+/// Parses an envelope (either magic) without the final SHA-256-vs-id check.
+/// Used by `put_blob`'s existence check, which must distinguish "envelope
+/// of *different* content" (immutability violation) from "structurally
+/// corrupt file" (healable).
 pub(crate) fn parse_envelope(raw: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if raw.len() >= MAGIC2.len() && &raw[..MAGIC2.len()] == MAGIC2 {
+        return parse_envelope_chunked(raw);
+    }
     if raw.len() < HEADER_LEN {
         return Err(StoreError::Corrupt(format!(
             "envelope is {} bytes, need at least {HEADER_LEN}",
@@ -310,6 +372,92 @@ pub(crate) fn parse_envelope(raw: &[u8]) -> Result<Vec<u8>, StoreError> {
         return Err(StoreError::Corrupt(format!(
             "decompressed to {} bytes, envelope declares {raw_len}",
             content.len()
+        )));
+    }
+    Ok(content)
+}
+
+/// Parses a GBLO2 envelope: fixed header, bounds-checked chunk table, one
+/// bounded zstd decode per chunk, reassembled in order. Any structural
+/// fault — truncated file, table/frame length disagreement, chunk raw
+/// lengths not summing to `raw_len` — is [`StoreError::Corrupt`].
+fn parse_envelope_chunked(raw: &[u8]) -> Result<Vec<u8>, StoreError> {
+    if raw.len() < HEADER2_LEN {
+        return Err(StoreError::Corrupt(format!(
+            "GBLO2 envelope is {} bytes, need at least {HEADER2_LEN}",
+            raw.len()
+        )));
+    }
+    let raw_len = u64::from_le_bytes(raw[5..13].try_into().expect("8 raw_len bytes"));
+    let count = u32::from_le_bytes(raw[13..17].try_into().expect("4 count bytes")) as usize;
+    if raw_len > MAX_BLOB_LEN {
+        return Err(StoreError::Corrupt(format!(
+            "declared raw_len {raw_len} exceeds the {MAX_BLOB_LEN}-byte limit"
+        )));
+    }
+    let table_end = HEADER2_LEN
+        + count
+            .checked_mul(CHUNK_ENTRY_LEN)
+            .ok_or_else(|| StoreError::Corrupt("chunk table overflows".into()))?;
+    if raw.len() < table_end {
+        return Err(StoreError::Corrupt(format!(
+            "GBLO2 envelope is {} bytes, chunk table needs {table_end}",
+            raw.len()
+        )));
+    }
+    // The frames region is exactly the remaining bytes; every comp_len
+    // must slice it without slack (a torn or tampered file fails here).
+    let frames = &raw[table_end..];
+    let mut frame_offset = 0usize;
+    let mut total_raw = 0u64;
+    let mut content = Vec::with_capacity(raw_len as usize);
+    for i in 0..count {
+        let entry = HEADER2_LEN + i * CHUNK_ENTRY_LEN;
+        let chunk_raw =
+            u32::from_le_bytes(raw[entry..entry + 4].try_into().expect("4 raw bytes")) as usize;
+        let chunk_comp =
+            u32::from_le_bytes(raw[entry + 4..entry + 8].try_into().expect("4 comp bytes"))
+                as usize;
+        if chunk_raw == 0 {
+            return Err(StoreError::Corrupt(format!(
+                "chunk {i} declares zero raw length"
+            )));
+        }
+        if chunk_raw > fastcdc::MAX {
+            return Err(StoreError::Corrupt(format!(
+                "chunk {i} declares {chunk_raw} bytes, above the {}-byte FastCDC max",
+                fastcdc::MAX
+            )));
+        }
+        if frame_offset + chunk_comp > frames.len() {
+            return Err(StoreError::Corrupt(format!(
+                "chunk {i} frame of {chunk_comp} bytes runs past the {}-byte frames region",
+                frames.len()
+            )));
+        }
+        let frame = &frames[frame_offset..frame_offset + chunk_comp];
+        frame_offset += chunk_comp;
+        let chunk = zstd_decode_bounded(frame, chunk_raw)?;
+        if chunk.len() != chunk_raw {
+            return Err(StoreError::Corrupt(format!(
+                "chunk {i} decompressed to {} bytes, table declares {chunk_raw}",
+                chunk.len()
+            )));
+        }
+        total_raw = total_raw
+            .checked_add(chunk_raw as u64)
+            .ok_or_else(|| StoreError::Corrupt("chunk lengths overflow".into()))?;
+        content.extend_from_slice(&chunk);
+    }
+    if frame_offset != frames.len() {
+        return Err(StoreError::Corrupt(format!(
+            "frames region has {} trailing bytes after {count} chunks",
+            frames.len() - frame_offset
+        )));
+    }
+    if total_raw != raw_len {
+        return Err(StoreError::Corrupt(format!(
+            "chunks reassemble to {total_raw} bytes, envelope declares {raw_len}"
         )));
     }
     Ok(content)

@@ -28,7 +28,7 @@ use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 use gardenbed_server::Repo;
 use tempfile::TempDir;
 
-use common::{REPO, Server, bed, bed_async};
+use common::{REPO, Server, bed, bed_async, bed_raw};
 
 /// A small, fully hand-built history whose files and ids the tests know
 /// exactly: three changesets ending at `head`, ref `main` pointing there.
@@ -1668,6 +1668,98 @@ async fn publish_ref_force_moves_lane_not_main_on_non_ancestor() {
         w.repo.get_ref("main").expect("get_ref main"),
         main_before,
         "(b) main is untouched even by a forced lane publish"
+    );
+
+    w.server.shutdown().await;
+}
+
+// ------------------------------------------------------- M14 GBLO2
+
+/// M14 wire invariance: a > 2 MiB blob (GBLO2, chunked server-side)
+/// round-trips through the client with byte-exact reassembly, and the
+/// client cache serves the re-read with **zero** new server blob
+/// requests — the envelope is invisible above the object store.
+#[tokio::test]
+async fn chunked_blob_roundtrips_and_rereads_from_cache() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // 3 MiB of incompressible content: several FastCDC chunks, GBLO2
+    // server-side.
+    let mut heavy = Vec::with_capacity(3 << 20);
+    let mut state = 0xB00Cu64;
+    while heavy.len() < 3 << 20 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        heavy.extend_from_slice(&state.to_le_bytes());
+    }
+    fs::write(w.garden.join("chunked.bin"), &heavy).unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "chunked blob"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    // The new changeset must be on `main` for the second clone to see it.
+    let (code, out, stderr) = bed(&w.garden, &["publish"]);
+    assert_eq!(code, 0, "publish: {stderr}\n{out}");
+
+    let blob = blob_id(&heavy);
+    // Server-side: the object is GBLO2 with a multi-chunk table.
+    let hex = blob.to_hex();
+    let envelope_path = w._root.join("objects").join(&hex[..2]).join(&hex[2..]);
+    let raw = fs::read(&envelope_path).expect("server envelope");
+    assert_eq!(&raw[..5], b"GBLO2", "3 MiB blob stores GBLO2");
+    let count = u32::from_le_bytes(raw[13..17].try_into().unwrap()) as usize;
+    assert!(count >= 2, "3 MiB blob spans several chunks (got {count})");
+    assert_eq!(
+        w.repo.get_blob(blob).unwrap().unwrap(),
+        heavy,
+        "server reads it back byte-exact"
+    );
+
+    // A second, cold working copy fetches the blob over the wire
+    // (GetBlob streamed, reassembled, verified) and caches it locally.
+    let garden2 = w._dir.path().join("garden2");
+    fs::create_dir_all(&garden2).expect("garden2 dir");
+    let client = w.server.client().await;
+    let before = client.get_stats(REPO).await.expect("stats");
+    let (code, out, stderr) = bed(
+        &garden2,
+        // Multi-repo server: the clone URL names the repo.
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
+    assert_eq!(code, 0, "clone: {stderr}\n{out}");
+    let (code, out, stderr) = bed(&garden2, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse: {stderr}\n{out}");
+    let fetched = fs::read(garden2.join("chunked.bin")).expect("materialized");
+    assert_eq!(fetched, heavy, "wire reassembly is byte-exact");
+
+    // The client cache holds the blob (GBLO2 locally too — same envelope,
+    // same threshold rule); a re-read of the same file from a *warm* copy
+    // pulls zero new server blob requests.
+    let cache_path = garden2
+        .join(".bed")
+        .join("objects")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    let cached = fs::read(&cache_path).expect("client cached the blob");
+    assert_eq!(&cached[..5], b"GBLO2", "client cache stores GBLO2");
+    let (code, out, stderr) = bed_raw(&garden2, &["file", "chunked.bin"]);
+    assert_eq!(code, 0, "file: {}", String::from_utf8_lossy(&stderr));
+    assert_eq!(out, heavy, "bed file reads back exact");
+    let mid = client.get_stats(REPO).await.expect("stats");
+
+    // Second full sparse sync from the warm copy: zero duplicate fetches.
+    let (code, out, stderr) = bed(&garden2, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "re-add: {stderr}");
+    assert!(out.contains("0 tree(s) and 0 blob(s)"), "out: {out}");
+    let after = client.get_stats(REPO).await.expect("stats");
+    assert_eq!(
+        stats_get(&mid, "get_blob"),
+        stats_get(&after, "get_blob"),
+        "zero duplicate blob fetches from the warm cache"
+    );
+    assert!(
+        stats_get(&before, "get_blob") < stats_get(&after, "get_blob"),
+        "the cold fetch did hit the server (fixture sanity)"
     );
 
     w.server.shutdown().await;

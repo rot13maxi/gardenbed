@@ -105,3 +105,44 @@ fn throughput_baseline_memory() {
         ops_per_sec(n, get_time)
     );
 }
+
+/// M14 (v0.2.md §9 M14.5): put/get at 1/8/64 MiB with GBLO2 chunking live.
+/// Runs each size incompressible (the worst case for chunk frames) and
+/// records MiB/s. 1 MiB exercises the GBLO1 path (the +20% CI gate
+/// comparison point); 8 and 64 MiB are GBLO2.
+#[test]
+#[ignore = "M14 chunked put/get bench; run explicitly with --ignored"]
+fn m14_chunked_put_get_by_size() {
+    for &len in &[1usize << 20, 8 << 20, 64 << 20] {
+        for &incompressible in &[true, false] {
+            let content = if incompressible {
+                random_bytes(0x1314 ^ (len as u64), len)
+            } else {
+                compressible_bytes(0x1314 ^ (len as u64), len)
+            };
+            let root = tempfile::tempdir().expect("tempdir");
+            let store = FsObjectStore::open(root.path()).expect("open");
+
+            let t = Instant::now();
+            let id = store.put_blob(&content).expect("put");
+            let put = t.elapsed();
+            let t = Instant::now();
+            let got = store.get_blob(id).expect("get").expect("present");
+            let get = t.elapsed();
+            assert_eq!(got.len(), len);
+
+            let mib = len as f64 / (1 << 20) as f64;
+            let kind = if len > (1 << 20) { "GBLO2" } else { "GBLO1" };
+            let comp = if incompressible {
+                "random"
+            } else {
+                "compressible"
+            };
+            println!(
+                "m14 put/get {mib:>5} MiB {comp:>13} ({kind}): put {put:>10.3?} ({:6.0} MiB/s), get {get:>10.3?} ({:6.0} MiB/s)",
+                mib / put.as_secs_f64(),
+                mib / get.as_secs_f64()
+            );
+        }
+    }
+}
