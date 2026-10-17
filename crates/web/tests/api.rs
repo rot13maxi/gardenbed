@@ -498,6 +498,347 @@ async fn static_assets_are_embedded() {
     assert!(ctype.starts_with("text/css"));
 }
 
+#[tokio::test]
+async fn files_lists_all_paths_sorted_with_kinds() {
+    let (repo, [_, _, _, _, tip]) = fixture();
+    let app = gardenbed_web::router(repo);
+
+    let (status, json) = get_json(&app, "/api/files").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["cs"], tip.to_hex());
+    assert_eq!(json["truncated"], false);
+    let paths = json["paths"].as_array().unwrap();
+    let names: Vec<&str> = paths.iter().map(|p| p["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "a.txt",
+            "big.txt",
+            "bin.dat",
+            "dir/moved.txt",
+            "link",
+            "run.sh"
+        ]
+    );
+    // No directories leak into the listing; symlinks keep their kind.
+    assert!(paths.iter().all(|p| p["kind"] != "directory"));
+    let link = paths.iter().find(|p| p["path"] == "link").unwrap();
+    assert_eq!(link["kind"], "symlink");
+
+    // Substring filter on the full path, case-insensitive.
+    for needle in ["moved", "MOVED"] {
+        let (status, json) = get_json(&app, &format!("/api/files?q={needle}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = json["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["dir/moved.txt"]);
+    }
+
+    // Unknown revspec keeps the shared 404 contract.
+    let (status, _) = get_json(&app, "/api/files?cs=deadbeef").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A repo with 25 hitting lines in one file, a second hitting file, and
+/// a gitlink — for the search caps.
+fn fixture_many_hits() -> Repo {
+    let repo = Repo::new(Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+    let mut inline = BTreeMap::new();
+    let hits: String = (0..25).map(|i| format!("hit on line {i}\n")).collect();
+    let hits_id = blob_id(hits.as_bytes());
+    let other_id = blob_id(b"a hit around here\n");
+    inline.insert(hits_id.to_hex(), hits.into_bytes());
+    inline.insert(other_id.to_hex(), b"a hit around here\n".to_vec());
+    // A gitlink's blob is an opaque upstream pointer, never stored.
+    let pointer = Id::from_bytes([7u8; 32]);
+    let mut changes = vec![
+        Change {
+            path: "hits.txt".to_owned(),
+            op: Op::Add,
+            blob: Some(hits_id),
+            src_path: None,
+            mode: Mode::Regular,
+        },
+        Change {
+            path: "other.txt".to_owned(),
+            op: Op::Add,
+            blob: Some(other_id),
+            src_path: None,
+            mode: Mode::Regular,
+        },
+        Change {
+            path: "sub".to_owned(),
+            op: Op::Add,
+            blob: Some(pointer),
+            src_path: None,
+            mode: Mode::Gitlink,
+        },
+    ];
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    let cs = Changeset {
+        parents: vec![],
+        changes,
+        message: "search fixture".to_owned(),
+        author: ident(9),
+        committer: ident(9),
+        signature: None,
+    };
+    let tip = repo.create_changeset(&cs, &inline).unwrap();
+    repo.cas_ref("main", None, tip).unwrap();
+    repo
+}
+
+#[tokio::test]
+async fn search_finds_line_matches_and_skips_binary() {
+    let (repo, [_, _, _, _, tip]) = fixture();
+    let app = gardenbed_web::router(repo);
+
+    // Known content, known line number; case-insensitive.
+    for needle in ["line3", "LINE3"] {
+        let (status, json) = get_json(&app, &format!("/api/search?q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "q={needle}");
+        assert_eq!(json["query"], needle);
+        assert_eq!(json["cs"], tip.to_hex());
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "a.txt");
+        assert_eq!(files[0]["matches"][0]["line"], 3);
+        assert_eq!(files[0]["matches"][0]["text"], "line3");
+    }
+
+    // Matched lines are trimmed and hard-capped at 240 chars.
+    let (status, json) = get_json(&app, "/api/search?q=xxx").await;
+    assert_eq!(status, StatusCode::OK);
+    let big = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "big.txt")
+        .expect("big.txt matches q=xxx");
+    assert_eq!(big["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(big["matches"][0]["text"].as_str().unwrap().len(), 240);
+
+    // The binary blob yields no file entry; the symlink is skipped even
+    // though its target text contains the query substring.
+    let (status, json) = get_json(&app, "/api/search?q=%01").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 0);
+    // q=nested hits dir/moved.txt's content; q=dir would hit the
+    // symlink's target text ("dir/moved.txt") if symlinks were searched.
+    let (status, json) = get_json(&app, "/api/search?q=nested").await;
+    assert_eq!(status, StatusCode::OK);
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "dir/moved.txt");
+    assert_eq!(files[0]["matches"][0]["line"], 1);
+    let (status, json) = get_json(&app, "/api/search?q=dir%2Fmoved").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 0);
+
+    // q required.
+    for uri in ["/api/search", "/api/search?q=", "/api/search?q=%20"] {
+        let (status, json) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(json["error"], "empty query");
+    }
+}
+
+#[tokio::test]
+async fn search_honors_caps() {
+    let app = gardenbed_web::router(fixture_many_hits());
+
+    // Per-file cap: 25 hits in the blob, 20 reported, truncation flagged.
+    let (status, json) = get_json(&app, "/api/search?q=hit").await;
+    assert_eq!(status, StatusCode::OK);
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["path"], "hits.txt");
+    assert_eq!(files[0]["matches"].as_array().unwrap().len(), 20);
+    assert_eq!(files[0]["matches"][0]["line"], 1);
+    assert_eq!(files[0]["matches"][19]["line"], 20);
+    assert_eq!(files[1]["path"], "other.txt");
+    assert_eq!(files[1]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(json["truncated"], true); // hits.txt had hits beyond the cap
+
+    // Gitlink entries land in /api/files but are never searched.
+    let (status, json) = get_json(&app, "/api/files").await;
+    assert_eq!(status, StatusCode::OK);
+    let sub = json["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["path"] == "sub")
+        .expect("gitlink listed");
+    assert_eq!(sub["kind"], "gitlink");
+
+    // File cap honored: limit=1 returns a single file. ("around" hits
+    // only other.txt; hits.txt would still be scanned but not reported
+    // past the cap.)
+    let (status, json) = get_json(&app, "/api/search?q=hit&limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 1);
+    assert_eq!(json["files"][0]["path"], "hits.txt");
+    assert_eq!(json["truncated"], true);
+
+    let (status, json) = get_json(&app, "/api/search?q=around&limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 1);
+    assert_eq!(json["files"][0]["path"], "other.txt");
+}
+
+#[tokio::test]
+async fn activity_lists_newest_arrival_first_including_unpublished() {
+    let (repo, [c1, c2, c3, c4, tip]) = fixture();
+
+    // One unpublished working-copy commit on top of the tip: stored, but
+    // no ref can reach it.
+    let draft_content = b"wip: not for mainline\n";
+    let draft_blob = blob_id(draft_content);
+    let draft = Changeset {
+        parents: vec![tip],
+        changes: vec![Change {
+            path: "draft.txt".to_owned(),
+            op: Op::Add,
+            blob: Some(draft_blob),
+            src_path: None,
+            mode: Mode::Regular,
+        }],
+        message: "wip: unpublished draft".to_owned(),
+        author: ident(6),
+        committer: ident(6),
+        signature: None,
+    };
+    let draft_id = repo
+        .create_changeset(
+            &draft,
+            &BTreeMap::from([(draft_blob.to_hex(), draft_content.to_vec())]),
+        )
+        .unwrap();
+
+    let app = gardenbed_web::router(repo);
+    let (status, json) = get_json(&app, "/api/activity").await;
+    assert_eq!(status, StatusCode::OK);
+    let changesets = json["changesets"].as_array().unwrap();
+    let got: Vec<String> = changesets
+        .iter()
+        .map(|c| c["id"].as_str().unwrap().to_owned())
+        .collect();
+    let expected: Vec<String> = [draft_id, tip, c4, c3, c2, c1]
+        .iter()
+        .map(Id::to_hex)
+        .collect();
+    assert_eq!(got, expected, "arrival order, newest first");
+    // Entry shape matches /api/log.
+    assert_eq!(changesets[0]["message"], "wip: unpublished draft");
+    assert_eq!(changesets[0]["author"]["name"], "Tester 6");
+    assert_eq!(changesets[0]["changes"], 1);
+    assert_eq!(changesets[0]["parents"].as_array().unwrap().len(), 1);
+
+    // limit honored.
+    let (status, json) = get_json(&app, "/api/activity?limit=2").await;
+    assert_eq!(status, StatusCode::OK);
+    let got: Vec<&str> = json["changesets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, [draft_id.to_hex(), tip.to_hex()]);
+
+    // Over the cap behaves as the cap (200), not as an error.
+    let (status, json) = get_json(&app, "/api/activity?limit=999").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["changesets"].as_array().unwrap().len(), 6);
+
+    let (status, json) = get_json(&app, "/api/activity?limit=nope").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json["error"].as_str().unwrap().contains("limit"));
+}
+
+#[test]
+fn seed_is_deterministic_and_hides_drafts_from_main() {
+    let repo_a = Repo::new(Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+    let repo_b = Repo::new(Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+    let tip_a = gardenbed_web::seed::seed(&repo_a).unwrap().expect("seeded");
+    let tip_b = gardenbed_web::seed::seed(&repo_b).unwrap().expect("seeded");
+    assert_eq!(tip_a, tip_b, "two fresh seeds must be byte-identical");
+    assert_eq!(repo_b.get_ref("main").unwrap(), Some(tip_a));
+    // Second run against a reffed repo is a no-op.
+    assert_eq!(gardenbed_web::seed::seed(&repo_b).unwrap(), None);
+
+    // 17 changesets stored; 12 reachable from main, 5 unpublished. The
+    // five newest arrivals are the drafts, newest first (17 stress, 16
+    // rebase v2, 15 v1, 14 colors draft, 13 drip draft).
+    let activity = repo_a.activity(0).unwrap();
+    assert_eq!(activity.len(), 17);
+    let published: Vec<Id> = repo_a
+        .log(tip_a, 0)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(published.len(), 12);
+    let unpublished: Vec<&(Id, Changeset)> = activity
+        .iter()
+        .filter(|(id, _)| !published.contains(id))
+        .collect();
+    assert_eq!(unpublished.len(), 5);
+    assert_eq!(
+        unpublished[0].1.message, "Stress fixture: rewrite garden.js wholesale",
+        "newest arrival: the stress draft"
+    );
+    assert_eq!(unpublished[0].1.parents, vec![tip_a]);
+    assert_eq!(unpublished[0].1.author.name, "Moss Hale");
+    // The stress file must stay under the /api/file payload cap so the
+    // GUI fetches the full body and the diff LINE budget is what trips.
+    let stress_change = &unpublished[0].1.changes[0];
+    assert_eq!(stress_change.path, "garden.js");
+    let stress_blob = repo_a
+        .get_blob(stress_change.blob.expect("modify carries a blob"))
+        .unwrap()
+        .expect("stress blob stored");
+    let stress_text = String::from_utf8(stress_blob).unwrap();
+    assert_eq!(stress_text.lines().count(), 6000);
+    assert!(
+        stress_text.len() < 512 * 1024,
+        "must fit the file payload cap, got {} bytes",
+        stress_text.len()
+    );
+    assert_eq!(
+        unpublished[1].1.message, "Add evening mulch reminder",
+        "next newest: rebase v2"
+    );
+    assert_eq!(unpublished[1].1.parents, vec![tip_a]);
+    assert_eq!(unpublished[2].1.message, "Add evening mulch reminder"); // v1
+    let c11 = published
+        .iter()
+        .find(|id| repo_a.get_changeset(**id).unwrap().message == "Add rotation notes for 2027")
+        .copied()
+        .expect("c11 reachable from main");
+    assert_eq!(unpublished[2].1.parents, vec![c11]); // v1 sat on c11
+    assert_ne!(
+        unpublished[1].0, unpublished[2].0,
+        "rebase pair must have distinct ids"
+    );
+    assert_eq!(unpublished[3].1.message, "draft: calmer empty-bed colors");
+    assert_eq!(unpublished[3].1.author.name, "Moss Hale");
+    assert_eq!(
+        unpublished[4].1.message,
+        "Draft: drip irrigation sketch\n\nNot ready: zones still hardcoded.\n"
+    );
+    assert_eq!(unpublished[4].1.author.name, "Pike Rowan");
+    assert_eq!(unpublished[4].1.parents, vec![tip_a]);
+    // Timestamps keep increasing across all seventeen commits.
+    for (i, (_, cs)) in activity.iter().enumerate() {
+        let n = (17 - i) as u64;
+        assert_eq!(cs.committer.time_secs, 1_751_500_000 + n * 86_400);
+    }
+}
+
 /// Reference base64 for the fixture's binary blob (kept local so the
 /// assertion pins the server's encoding against an independent
 /// implementation).

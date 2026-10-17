@@ -58,3 +58,9 @@ gardenbed-harness = { path = "../harness" }
 # for a thin client.
 gardenbed-server = { path = "../server" }
 tempfile = "3"
+# Dev-only: the server_bin() staleness test touches crates/server/src
+# mtimes (dogfood finding #12 regression proof).
+filetime = "0.2"
+# Dev-only: server_bin()'s content-digest staleness oracle (dogfood #12
+# hardening) hashes crates/server/src exactly like crates/server/build.rs.
+sha2 = "0.10"
