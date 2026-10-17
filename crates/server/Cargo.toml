@@ -23,6 +23,7 @@ gardenbed-protocol = { path = "../protocol" }
 log = "0.4"
 prost = "0.14"
 thiserror = "2"
+rustix = { version = "1", features = ["fs"] }
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "macros",
@@ -49,4 +50,5 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 tempfile = "3"
 tokio-stream = "0.1"
+tokio-postgres = "0.7"
 zstd = "0.13"
