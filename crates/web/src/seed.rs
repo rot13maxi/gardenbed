@@ -365,8 +365,16 @@ Contributions welcome; keep the no-build rule.
 
 ## the sow script
 
-`bin/sow.sh` turns `data/beds.json` into a printable sowing checklist.
-Run it the morning of a sowing day; it needs only `sh` and `grep`.
+[`bin/sow.sh`](bin/sow.sh) turns `data/beds.json` into a printable
+sowing checklist. Run it the morning of a sowing day; it needs only
+`sh` and `grep`.
+
+```sh
+bin/sow.sh --bed north-1 --crop carrot --date 2026-04-11
+```
+
+Bed contents stay in [the data file](data/beds.json); the yearly plan
+lives in [plan/2026.md](plan/2026.md).
 ";
 
 const SPRING_PLAN: &str = "\
