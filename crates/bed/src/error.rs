@@ -141,6 +141,29 @@ pub enum ClientError {
         message: String,
     },
 
+    /// A merge was refused for semantic conflicts: the server lists every
+    /// conflicting path; resolution belongs in the working copy.
+    #[error(
+        "merge conflicts on: {paths}\n  \
+         next step: edit the conflicting files, commit, and merge again"
+    )]
+    MergeConflict {
+        /// The conflicting paths, comma-separated server message style.
+        paths: String,
+    },
+
+    /// A merge was refused locally: the working copy has uncommitted
+    /// work that the post-merge checkout would put at risk. Checked
+    /// before the RPC so the server stores nothing on refusal.
+    #[error(
+        "merge refuses a dirty working copy — commit or preserve local work \
+         first:\n{detail}"
+    )]
+    MergeDirtyWorkingCopy {
+        /// The `bed status` rendering of what is dirty.
+        detail: String,
+    },
+
     /// A gitlink blob id that does not follow the canonical padding
     /// convention (upstream git SHA-1 left-padded with twelve zero bytes)
     /// was asked to render as a `Subproject commit <sha>` hunk. There is
