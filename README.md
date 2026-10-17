@@ -142,6 +142,15 @@ preserve commit IDs for supported histories; signed commits, non-UTF-8
 metadata, and other exceptions are documented in
 [Git interoperability limits](docs/divergences.md).
 
+For horizontal scale-out, the server can instead run as N stateless
+replicas with metadata in PostgreSQL and objects in S3: pass
+`--storage <config.toml>` (or set `GARDENBED_STORAGE`) to `serve`,
+`import`, or `export`, and put a load balancer in front of the
+replicas. The design contract is [scale-out-design.md](docs/scale-out-design.md)
+and a ready-made compose stack (Postgres + MinIO + 3 replicas) lives in
+[tools/scale/](tools/scale/); `demo/run-scaled.sh` proves cross-replica
+visibility end to end.
+
 Verification includes differential tests against Git, process-kill
 recovery tests, fuzz targets, benchmarks, and an end-to-end demo. A Linux
 kernel history of 1.485 million commits has been imported and sampled for
