@@ -7,6 +7,45 @@ tags, and the verification record for a release lives in
 
 ## Unreleased
 
+### Added (lane p4)
+
+- **Offline commit queue (M15)**: `bed commit` completes offline when the
+  server is unreachable at connect time (and only then — a server that
+  answers is online and its error must be seen): the changeset is built
+  and content-addressed locally, blobs are staged into `.bed/objects`,
+  and one sqlite transaction records the queue row that `bed sync`
+  replays as an idempotent re-upload. `switch`, `rebase`, and `publish`
+  refuse while commits are pending (the strand-the-chain rule), as do
+  `log`/`diff` at a pending tip; `status` prints the pending line
+  offline. The connect handshake is bounded by a 5s
+  `Endpoint::connect_timeout`, so a hung server (SIGSTOP) fails as a
+  connect error within the deadline instead of blocking forever.
+- **`bed rebase --stack`**: replay the whole first-parent chain from the
+  merge base onto a new parent, oldest first, via the same per-changeset
+  `Rebase` RPC (each step gets the server's conflict check against the
+  tree it applies to). A conflict anywhere aborts the stack before the
+  working copy moves. Unrelated histories and non-first-parent merge
+  bases are refused up front.
+
+### Fixed (lane p4)
+
+- Server: `PutBlob` bodies are capped at 1 GiB, checked per chunk before
+  the buffer grows (oversized streams refused after their first frames);
+  `CreateChangeset` inline payloads are capped at 2 MiB aggregate,
+  refused before any store write.
+- Server: the `log` walk fetches each changeset exactly once (push-time
+  cache) instead of twice per node.
+- Server: rebase conflict checking is no longer quadratic in the number
+  of changes — one lockstep diff between the new parent and the
+  pre-image, then membership tests and binary searches. Conflict
+  messages are byte-identical.
+- Wave-1 review fixes carried onto main: allocation-free `Id::to_hex`,
+  ancestry error-propagation (`is_ancestor` degrades only on `NotFound`),
+  de-quadratic merge-base candidate selection, streaming git export
+  (2 fetches per changeset, RAM O(ids)), sqlite read pool
+  (`open_with_readers`; `open` unchanged) with CacheMap/BlobCache
+  accounting, MCP 1 MiB stdin line cap with `-32600` on oversized lines.
+
 ### Added
 
 - **Web GUI**: `gardenbed-web` (`crates/web`) — a read-only web interface

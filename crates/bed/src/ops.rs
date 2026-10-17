@@ -553,6 +553,116 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     ))
 }
 
+/// `bed rebase --stack <new-parent>` — replay the whole first-parent
+/// chain from the merge base of (current, new parent) up to the current
+/// changeset, oldest first, onto the new parent.
+///
+/// The stack is walked with one `GetChangeset` per link and replayed via
+/// the same `Rebase` RPC the single form uses, so each step gets the
+/// server's conflict check against the tree it is applied to. A conflict
+/// anywhere aborts the entire stack: the RPC fails before the working
+/// copy moves, and the server has created nothing the chain depends on
+/// (each replay names its predecessor as parent, and the first failure
+/// stops the sequence before any later link exists). The working-copy
+/// move is the plain `rebase` move at the final tip.
+pub async fn rebase_stack(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
+    let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
+    let session = Session::open(&bed).await?;
+    let current = session.resolve_current_cs(&bed, "rebase --stack").await?;
+    let parent = session.resolve(&parsed, "rebase --stack").await?;
+    let repo = bed.config().repo.clone();
+
+    // The chain current → base, exclusive, oldest first. A missing merge
+    // base (unrelated histories) refuses before anything is replayed.
+    let base = session
+        .client
+        .merge_base(&repo, current, parent)
+        .await
+        .map_err(|status| ClientError::Rpc {
+            command: "rebase --stack",
+            code: status.code(),
+            message: status.message().to_owned(),
+        })?
+        .ok_or(ClientError::ConfigInvalid(
+            "the current changeset and the new parent share no history — \
+             a stack rebase needs a merge base"
+                .into(),
+        ))?;
+    let mut chain: Vec<Id> = Vec::new();
+    let mut walk = current;
+    while walk != base {
+        chain.push(walk);
+        let cs = session.get_changeset(walk, "rebase --stack").await?;
+        let Some(next) = cs.parents.first().copied() else {
+            return Err(ClientError::ConfigInvalid(
+                "the merge base is not on the current changeset's first-parent \
+                 chain — a stack rebase replays first-parent history only"
+                    .into(),
+            ));
+        };
+        walk = next;
+    }
+    chain.reverse(); // oldest first: replay applies each link onto the last
+
+    // Replay. Each step's parent is the previous step's result; the first
+    // step replays onto the requested new parent. `Rebase` is atomic per
+    // changeset, and a failure at step i means steps i+1.. were never
+    // created — but steps 1..i-1 WERE. That is the abort contract: the
+    // working copy never moves (still at `current`), and the partially
+    // replayed prefix is ordinary server content no ref points at, not a
+    // divergence.
+    let mut replayed = Vec::with_capacity(chain.len());
+    let mut onto = parent;
+    for &cs_id in &chain {
+        let rebased = session
+            .client
+            .rebase(&repo, cs_id, onto)
+            .await
+            .map_err(|status| ClientError::Rpc {
+                command: "rebase --stack",
+                code: status.code(),
+                message: status.message().to_owned(),
+            })?;
+        replayed.push(rebased);
+        onto = rebased;
+    }
+    let tip = replayed[replayed.len() - 1];
+
+    // The working-copy move, exactly the single-rebase one, at the tip.
+    let root = session.root_tree(tip, "rebase --stack").await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
+    let (plan, bed_state) = exclude_bed_state(plan);
+    let treestate = bed.treestate()?;
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
+        &prefixes,
+        plan,
+        session.fetcher(),
+        &treestate,
+    )
+    .await?;
+    bed.config_mut().current_cs = Some(tip.to_hex());
+    bed.save_config()?;
+    bed.heads().repoint(current, tip)?;
+
+    let links: Vec<String> = replayed.iter().map(|id| id.short()).collect();
+    Ok(format!(
+        "rebased {} change(s) onto {} as {}\n  {}\n\
+         fetched {} tree(s), {} blob(s)\n{}{}\n",
+        chain.len(),
+        parent.short(),
+        tip.short(),
+        links.join(" -> "),
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        bed_state_note(&bed_state),
+        outcome.summarize(),
+    ))
+}
+
 /// `bed publish` — fast-forward a ref to the working copy's current changeset.
 ///
 /// `ref_name = None` publishes `main` (the classic form). A named ref is the

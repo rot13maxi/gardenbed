@@ -190,10 +190,14 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             Ok(0)
         }
 
-        Command::Rebase { new_parent } => {
+        Command::Rebase { new_parent, stack } => {
             let _bed = WorkingCopy::open(&cli.state_dir)?;
             CsOrRef::parse(new_parent)?;
-            let out = gardenbed::ops::rebase(&cli.state_dir, new_parent).await?;
+            let out = if *stack {
+                gardenbed::ops::rebase_stack(&cli.state_dir, new_parent).await?
+            } else {
+                gardenbed::ops::rebase(&cli.state_dir, new_parent).await?
+            };
             print!("{out}");
             Ok(0)
         }
