@@ -27,6 +27,7 @@ use tonic::Code;
 use crate::error::ClientError;
 use crate::render::{self, DiffEntry, LogEntry};
 use crate::rpc::{self, Session};
+use crate::status;
 use crate::sync;
 use crate::workspace::WorkingCopy;
 
@@ -625,6 +626,25 @@ pub async fn merge(
     let current = session.resolve_current_cs(&bed, "merge").await?;
     let theirs = session.resolve(&parsed, "merge").await?;
 
+    // Refuse a dirty working copy BEFORE the RPC: the merge changeset is
+    // stored server-side the moment the server accepts it, so a client
+    // that then fails its own checkout (local edits in the way) would
+    // leave a stored merge behind — and a retry seconds later would
+    // store a SECOND one (a fresh now_stamp identity is a fresh id).
+    // The same scan `bed status` runs, offline, before any network I/O.
+    {
+        let report = status::scan_status(
+            &bed.workspace_root(),
+            &bed.config().sparse,
+            &bed.treestate()?,
+            false,
+        )?;
+        if !report.is_clean() {
+            return Err(ClientError::MergeDirtyWorkingCopy {
+                detail: report.render(),
+            });
+        }
+    }
     // The merge is the server's decision; conflicts come back as a
     // FAILED_PRECONDITION whose message lists every conflicting path.
     let message = message

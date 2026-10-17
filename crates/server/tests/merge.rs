@@ -222,6 +222,118 @@ async fn merge_concurrent_same_pair_converges_on_one_id() {
 }
 
 #[tokio::test]
+async fn merge_and_publish_race_one_winner_per_position() {
+    // M10.2's second half: N merges of the same pair race M publishes
+    // of ascending children of the merge. Every merge converges on one
+    // id (determinism), so the publishers race CAS on `main` from a
+    // shared base: exactly one Won per position, losers get
+    // NotFastForward, and `main` ends on a published child.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = ServerProc::spawn(dir.path()).await;
+    let repo = "garden";
+    let client = server.client().await;
+    let (_, ours, theirs) = diverge(&client, repo).await;
+
+    // Merging first (deterministically) gives the publishers their
+    // shared parent; the race under test is the publish CAS.
+    let (merged, _) = client
+        .merge(
+            repo,
+            ours,
+            theirs,
+            "merge theirs",
+            &identity("amy", 3),
+            &identity("amy", 3),
+        )
+        .await
+        .expect("merge ok");
+
+    // M ascending children of the merge.
+    const PUBLISHERS: usize = 8;
+    let mut children = Vec::new();
+    for k in 0..PUBLISHERS {
+        let child = client
+            .create_changeset(
+                repo,
+                &Changeset {
+                    parents: vec![merged],
+                    changes: vec![add(&format!("post_merge_{k}"), b"child\n")],
+                    message: format!("post {k}"),
+                    author: identity("amy", 4),
+                    committer: identity("amy", 4),
+                    signature: None,
+                },
+                blobs(&[b"child\n"]),
+            )
+            .await
+            .expect("child created");
+        children.push(child);
+    }
+
+    // N fresh merges of the same pair race the publishes: all must
+    // answer the same id, concurrently with the CAS traffic.
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let c = server.client().await;
+        handles.push(tokio::spawn(async move {
+            c.merge(
+                repo,
+                ours,
+                theirs,
+                "merge theirs",
+                &identity("amy", 3),
+                &identity("amy", 3),
+            )
+            .await
+            .expect("merge ok")
+        }));
+    }
+    let mut publishers = Vec::new();
+    for child in children.iter().copied() {
+        let c = server.client().await;
+        publishers.push(tokio::spawn(async move { c.publish(repo, child).await }));
+    }
+
+    let mut merge_ids = Vec::new();
+    for h in handles {
+        merge_ids.push(h.await.expect("task joined").0);
+    }
+    assert!(
+        merge_ids.iter().all(|id| *id == merged),
+        "racing merges still converge on one id, got {merge_ids:?}"
+    );
+
+    // Every publish outcome is Won or NotFastForward; count the wins.
+    let mut wins = 0;
+    for h in publishers {
+        match h.await.expect("publisher joined") {
+            Ok(_tip) => wins += 1,
+            Err(status) => {
+                assert_eq!(
+                    status.code(),
+                    tonic::Code::FailedPrecondition,
+                    "publish loses only to NotFastForward, got {status:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(wins, 1, "exactly one publish winner per race");
+
+    // `main` ends on one of the published children, and the merge is
+    // its ancestor (publish only fast-forwards).
+    let tip = client
+        .get_ref(repo, "main")
+        .await
+        .expect("ref readable")
+        .expect("main set");
+    assert!(
+        children.contains(&tip),
+        "main ends on a published child of the merge, got {tip:?}"
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn merge_then_publish_uses_unchanged_publish_path() {
     let dir = tempfile::tempdir().expect("tempdir");
     let server = ServerProc::spawn(dir.path()).await;
@@ -523,14 +635,19 @@ async fn merge_repo_direct_is_deterministic_and_idempotent() {
     }
 }
 
-/// SIGKILL crash safety: for each iteration, spawn a server, commit a
-/// divergent pair, race a merge against a kill at a varying delay.
-/// Afterwards the on-disk repo must reopen, and a fresh `Repo::merge`
-/// of the same pair must still succeed — the absent-or-complete
-/// contract (no half-written changeset a later merge cannot rebuild).
+/// SIGKILL crash safety (v0.2.md M10.5, ×100): for each iteration,
+/// spawn a server, commit a divergent pair, race a merge against a kill
+/// at a delay swept across the merge window (tens of milliseconds —
+/// past fixture setup, into derivation, staging, and the write
+/// transaction). Afterwards the on-disk repo must reopen, and a fresh
+/// `Repo::merge` of the interrupted pair — when its fixture completed —
+/// must re-merge to a stable id (deterministic rebuild; the
+/// absent-or-complete contract: no half-written changeset a later merge
+/// cannot rebuild).
 #[test]
 fn merge_sigkill_leaves_absent_or_complete_state() {
-    for i in 0..20usize {
+    const ITERATIONS: usize = 100;
+    for i in 0..ITERATIONS {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_path_buf();
         let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
@@ -562,23 +679,29 @@ fn merge_sigkill_leaves_absent_or_complete_state() {
             .build()
             .expect("rt");
         let mut child2 = child;
-        rt.block_on(async {
-            let client = match GardenbedClient::connect(&format!("http://{addr}")).await {
-                Ok(c) => c,
-                Err(_) => return, // killed extremely early: fine
-            };
+        // (ours, theirs, merge-completed) when the fixture landed before
+        // the kill; None when the server died before the divergent pair
+        // existed — that iteration still exercises repo reopening below.
+        let interrupted: Option<(Id, Id, bool)> = rt.block_on(async {
+            let client = GardenbedClient::connect(&format!("http://{addr}"))
+                .await
+                .ok()?;
             let repo = "garden";
-            // The server may be killed mid-fixture: on error bail —
-            // this iteration still validates repo reopening below.
+            // The server may be killed mid-fixture: on error bail.
             let (_r, ours, theirs) = diverge(&client, repo).await;
             let author = identity("amy", 3);
             let committer = identity("amy", 3);
             let merge_fut = client.merge(repo, ours, theirs, "crash merge", &author, &committer);
+            // Kill delay sweeps the merge window in tens of ms — past
+            // fixture setup, into derivation, blob staging, and the
+            // write transaction (0-5 ms only ever killed the fixture).
+            let delay_ms = 10 + ((i % 10) as u64) * 10; // 10..=100 ms
             let kill_fut = async {
-                tokio::time::sleep(std::time::Duration::from_millis((i % 6) as u64)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 let _ = child2.kill();
             };
-            let _ = tokio::join!(merge_fut, kill_fut);
+            let (merge_outcome, ()) = tokio::join!(merge_fut, kill_fut);
+            Some((ours, theirs, merge_outcome.is_ok()))
         });
         let _ = child2.wait();
 
@@ -605,8 +728,39 @@ fn merge_sigkill_leaves_absent_or_complete_state() {
         let metadata = Arc::new(SqliteMetadataStore::open(&meta_path).expect("meta reopen"))
             as Arc<dyn MetadataStore>;
         let repo = Repo::new(objects.clone(), metadata.clone());
-        // A fresh merge must be possible: create a fresh pair locally
-        // and merge it (deterministic rebuild contract).
+        // THE interrupted pair — when its fixture completed — must
+        // re-merge to a stable id: the absent-or-complete contract on
+        // the exact pair the kill raced, not a fresh pair.
+        if let Some((ours, theirs, merge_completed)) = interrupted {
+            let (id_a, _) = repo
+                .merge(
+                    ours,
+                    theirs,
+                    "crash merge",
+                    &identity("amy", 3),
+                    &identity("amy", 3),
+                )
+                .expect("interrupted pair re-merges (absent-or-complete)");
+            let (id_b, _) = repo
+                .merge(
+                    ours,
+                    theirs,
+                    "crash merge",
+                    &identity("amy", 3),
+                    &identity("amy", 3),
+                )
+                .expect("second re-merge succeeds");
+            assert_eq!(id_a, id_b, "re-merge id is stable");
+            if merge_completed {
+                // The kill raced a merge that had already answered: the
+                // stored changeset must still be there and equal.
+                let _ = repo
+                    .get_changeset(id_a)
+                    .expect("completed merge survives the kill");
+            }
+        }
+        // A fresh pair must also merge on the reopened repo (deterministic
+        // rebuild contract, independent of the interrupted pair).
         let base_text = b"crash base 1\ncrash base 2\ncrash base 3\n".to_vec();
         let root2 = repo
             .create_changeset(

@@ -200,6 +200,11 @@ async fn bed_merge_conflict_lists_every_path() {
         stderr.contains("merge") && stderr.contains("doc.txt"),
         "conflict error names the merge and every path: {stderr}"
     );
+    // The next step rides along (the docs/cli.md contract).
+    assert!(
+        stderr.contains("next step: edit the conflicting files, commit, and merge again"),
+        "conflict error names the next step: {stderr}"
+    );
     // The working copy is untouched on conflict.
     let doc = fs::read(w.mine.join("doc.txt")).expect("doc untouched");
     assert_eq!(doc, b"line 1\nMINE\nline 3\nrest\n");
@@ -267,5 +272,55 @@ async fn bed_merge_message_default_and_author_env() {
     );
     assert_eq!(cs.author.name, "Env Merger", "GARDENBED_AUTHOR used");
     assert_eq!(cs.author.email, "env@bed.example");
+    w.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn bed_merge_refuses_dirty_working_copy_without_storing() {
+    let mut w = setup().await;
+    // Diverge theirs and publish, as usual.
+    commit_file(&w.theirs, "doc.txt", "theirs diverged\n", "theirs");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "theirs publish: {stderr}");
+
+    // Dirty the working copy: an uncommitted edit mine has not committed.
+    fs::write(w.mine.join("notes.txt"), "uncommitted local work\n").expect("dirty");
+
+    // The merge must refuse BEFORE the RPC: the server must not store a
+    // merge changeset for a client that cannot take the checkout.
+    let (code, _out, stderr) = bed(&w.mine, &["merge", "main"]);
+    assert_ne!(code, 0, "dirty merge must fail");
+    assert!(
+        stderr.contains("dirty working copy"),
+        "error names the dirty working copy: {stderr}"
+    );
+    // The current changeset is unchanged by the refusal…
+    let before = current_cs(&w.mine);
+    // …and the server stored no merge for this pair: a retry after
+    assert_eq!(
+        before,
+        current_cs(&w.mine),
+        "no local state move on refusal"
+    );
+    // committing the local work must produce exactly one new changeset,
+    // not two (the pre-check means the refused attempt stored nothing).
+    let (code, _, stderr) = bed(&w.mine, &["commit", "-m", "local work"]);
+    assert_eq!(code, 0, "commit local work: {stderr}");
+    let (code, _, stderr) = bed(&w.mine, &["merge", "main"]);
+    assert_eq!(code, 0, "merge after commit: {stderr}");
+    let merged = current_cs(&w.mine);
+    let cs = w.repo.get_changeset(merged).expect("merged cs");
+    assert_eq!(cs.parents.len(), 2, "two parents");
+
+    // The refused attempt stored nothing: the only two-parent changeset
+    // reachable from the merge (both sides are ancestors) is the merge
+    // itself. Walk the store directly from the merged tip.
+    let log = w.repo.log(merged, 100).expect("log");
+    let merges: Vec<_> = log.iter().filter(|(_, cs)| cs.parents.len() == 2).collect();
+    assert_eq!(
+        merges.len(),
+        1,
+        "exactly one stored merge (the refused attempt stored none): {merges:?}"
+    );
     w.server.shutdown().await;
 }
