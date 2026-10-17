@@ -20,17 +20,6 @@
 //!   the cut); symlinks answer with their target text.
 //! * `GET /api/blame?cs=<revspec>&path=<p>` — first-parent line ranges.
 //! * `GET /api/diff?a=<revspec>&b=<revspec>` — tree diff `a` → `b`.
-//! * `GET /api/files?cs=<revspec>&q=<substring>` — full file-path
-//!   listing (fuzzy-finder data), case-insensitive substring filter on
-//!   the full path, capped at [`MAX_FILES`] paths.
-//! * `GET /api/search?cs=<revspec>&q=<string>&limit=<n>` — content grep
-//!   across file blobs: case-insensitive line matches, skipping symlinks,
-//!   gitlinks, and binary blobs, with scan/match/file caps reported as
-//!   `truncated: true`.
-//! * `GET /api/activity?limit=<n>` — the most recently stored changesets
-//!   (newest arrival first, default 50, capped at 200), **including
-//!   unpublished ones** — agent working copies commit straight to the
-//!   server, so ref-less changesets are the heartbeat this feeds.
 //! * `GET /api/stats` — the server's per-RPC counters.
 //! * `GET /api/server-info` — serving-process facts (crate version,
 //!   repository root, bound address) for connect-instructions UIs.
@@ -69,16 +58,6 @@ pub const DEFAULT_REF: &str = "main";
 
 /// Largest file payload served before truncation (512 KiB).
 pub const MAX_FILE_PAYLOAD: usize = 512 * 1024;
-
-/// Most paths `/api/files` reports before `truncated: true`.
-pub const MAX_FILES: usize = 2_000;
-
-/// Content `/api/search` scans at most before `truncated: true` (25 MiB
-/// of blob bytes across the whole walk).
-pub const MAX_SEARCH_SCANNED: usize = 25 * 1024 * 1024;
-
-/// Most matches `/api/search` reports per file.
-pub const MAX_MATCHES_PER_FILE: usize = 20;
 
 /// The single-page app assets, embedded so the binary is self-contained.
 const INDEX_HTML: &str = include_str!("../static/index.html");
@@ -123,9 +102,6 @@ pub fn router_with_info(repo: Repo, info: ServerInfo) -> Router {
         .route("/api/file", get(handlers::file))
         .route("/api/blame", get(handlers::blame))
         .route("/api/diff", get(handlers::diff))
-        .route("/api/activity", get(handlers::activity))
-        .route("/api/files", get(handlers::files))
-        .route("/api/search", get(handlers::search))
         .route("/api/stats", get(handlers::stats))
         .route("/api/server-info", get(handlers::server_info))
         .route("/", get(handlers::index))
@@ -356,49 +332,6 @@ fn file_entry(repo: &Repo, cs: Id, path: &str) -> Result<TreeEntry, ApiError> {
     }
 }
 
-/// Every non-directory entry under `cs`, as `(full path, entry)` pairs
-/// sorted by full-path bytes — the walk behind `/api/files` and
-/// `/api/search`.
-fn walk_files(repo: &Repo, cs: Id) -> Result<Vec<(String, TreeEntry)>, ApiError> {
-    fn descend(
-        repo: &Repo,
-        prefix: &str,
-        tree: &Tree,
-        out: &mut Vec<(String, TreeEntry)>,
-    ) -> Result<(), ApiError> {
-        for entry in &tree.entries {
-            let path = if prefix.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{prefix}/{}", entry.name)
-            };
-            match (entry.kind, entry.tree) {
-                (TreeKind::Dir, Some(t)) => {
-                    let subtree = repo.get_tree(t)?.ok_or_else(|| {
-                        ApiError::internal(format!("tree {t} missing from store"))
-                    })?;
-                    descend(repo, &path, &subtree, out)?;
-                }
-                (TreeKind::Dir, None) => {} // empty derived directory: nothing inside
-                (TreeKind::File, _) => out.push((path, entry.clone())),
-            }
-        }
-        Ok(())
-    }
-
-    let mut out = Vec::new();
-    let root = repo.root_tree(cs)?;
-    let Some(root) = root else {
-        return Ok(out); // no files anywhere in this history
-    };
-    let tree = repo
-        .get_tree(root)?
-        .ok_or_else(|| ApiError::internal(format!("tree {root} missing from store")))?;
-    descend(repo, "", &tree, &mut out)?;
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    Ok(out)
-}
-
 // ------------------------------------------------------------- handlers
 
 /// Runs one synchronous `Repo` operation on the blocking pool and joins
@@ -606,153 +539,6 @@ mod handlers {
             Ok(Json(
                 json!({ "a": a.to_hex(), "b": b.to_hex(), "changes": changes }),
             ))
-        })
-        .await
-    }
-
-    /// `/api/files`: the full path listing at `cs` — the data behind the
-    /// client's fuzzy file finder. `q` is a case-insensitive substring on
-    /// the full path; the listing caps at [`MAX_FILES`] paths
-    /// (`truncated: true` beyond, never an error).
-    pub(super) async fn files(
-        State(s): State<AppState>,
-        Query(q): Query<HashMap<String, String>>,
-    ) -> Result<Json<Value>, ApiError> {
-        blocking(s, move |repo| {
-            let cs = resolve(repo, q.get("cs").map(String::as_str))?;
-            let needle = q.get("q").map(|s| s.to_lowercase());
-            let files = walk_files(repo, cs)?;
-            let truncated = files.len() > MAX_FILES;
-            let paths: Vec<Value> = files
-                .into_iter()
-                .take(MAX_FILES)
-                .filter(|(path, _)| {
-                    needle
-                        .as_ref()
-                        .is_none_or(|n| path.to_lowercase().contains(n))
-                })
-                .map(|(path, entry)| json!({ "path": path, "kind": entry_kind(&entry) }))
-                .collect();
-            Ok(Json(json!({
-                "cs": cs.to_hex(),
-                "paths": paths,
-                "truncated": truncated,
-            })))
-        })
-        .await
-    }
-
-    /// `/api/search`: a case-insensitive content grep over the blobs at
-    /// `cs`. Symlinks, gitlinks, and binary blobs (a NUL in the first
-    /// 8 KiB) are skipped; the walk bails with `truncated: true` once
-    /// [`MAX_SEARCH_SCANNED`] blob bytes have been read, once a file
-    /// reaches [`MAX_MATCHES_PER_FILE`] hits, or once `limit` files have
-    /// matched. Line numbers are 1-based; matched lines are trimmed and
-    /// hard-capped at 240 chars.
-    pub(super) async fn search(
-        State(s): State<AppState>,
-        Query(q): Query<HashMap<String, String>>,
-    ) -> Result<Json<Value>, ApiError> {
-        blocking(s, move |repo| {
-            let cs = resolve(repo, q.get("cs").map(String::as_str))?;
-            let query = q.get("q").map(String::as_str).unwrap_or("").trim();
-            if query.is_empty() {
-                return Err(ApiError::bad_request("empty query"));
-            }
-            let needle = query.to_lowercase();
-            let limit: usize = match q.get("limit") {
-                None => 25,
-                Some(raw) => raw
-                    .parse()
-                    .map_err(|_| ApiError::bad_request(format!("invalid limit {raw:?}")))?,
-            }
-            .min(100);
-
-            let mut files_out: Vec<Value> = Vec::new();
-            let mut truncated = false;
-            let mut scanned = 0usize;
-            'files: for (path, entry) in walk_files(repo, cs)? {
-                if entry.mode == Mode::Symlink || entry.mode == Mode::Gitlink {
-                    continue;
-                }
-                let Some(blob) = entry.blob else { continue };
-                let Some(content) = repo.get_blob(blob)? else {
-                    continue;
-                };
-                scanned += content.len();
-                if scanned > MAX_SEARCH_SCANNED {
-                    truncated = true;
-                    break;
-                }
-                // Binary blobs: a NUL in the first 8 KiB.
-                if content[..content.len().min(8 * 1024)].contains(&0) {
-                    continue;
-                }
-                let text = String::from_utf8_lossy(&content);
-                let mut matches: Vec<Value> = Vec::new();
-                let mut capped = false;
-                for (idx, line) in text.lines().enumerate() {
-                    if line.to_lowercase().contains(&needle) {
-                        if matches.len() == MAX_MATCHES_PER_FILE {
-                            capped = true; // hits remain beyond the per-file cap
-                            break;
-                        }
-                        let clipped: String = line.trim().chars().take(240).collect();
-                        matches.push(json!({ "line": idx + 1, "text": clipped }));
-                    }
-                }
-                if capped {
-                    truncated = true;
-                }
-                if !matches.is_empty() {
-                    files_out.push(json!({ "path": path, "matches": matches }));
-                    if files_out.len() == limit {
-                        truncated = true;
-                        break 'files;
-                    }
-                }
-            }
-
-            Ok(Json(json!({
-                "query": query,
-                "cs": cs.to_hex(),
-                "files": files_out,
-                "truncated": truncated,
-            })))
-        })
-        .await
-    }
-
-    /// `/api/activity`: newest-arrival-first stored changesets, including
-    /// unpublished ones — no revspec, no ref filtering. Default 50,
-    /// capped at 200; entry shape matches `/api/log`'s entries.
-    pub(super) async fn activity(
-        State(s): State<AppState>,
-        Query(q): Query<HashMap<String, String>>,
-    ) -> Result<Json<Value>, ApiError> {
-        blocking(s, move |repo| {
-            let limit: u32 = match q.get("limit") {
-                None => 50,
-                Some(raw) => raw
-                    .parse()
-                    .map_err(|_| ApiError::bad_request(format!("invalid limit {raw:?}")))?,
-            }
-            .min(200);
-            let changesets: Vec<Value> = repo
-                .activity(limit)?
-                .into_iter()
-                .map(|(id, cs)| {
-                    json!({
-                        "id": id.to_hex(),
-                        "parents": cs.parents.iter().map(Id::to_hex).collect::<Vec<_>>(),
-                        "message": cs.message,
-                        "author": identity_json(&cs.author),
-                        "committer": identity_json(&cs.committer),
-                        "changes": cs.changes.len(),
-                    })
-                })
-                .collect();
-            Ok(Json(json!({ "changesets": changesets })))
         })
         .await
     }

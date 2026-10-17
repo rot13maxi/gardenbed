@@ -67,15 +67,6 @@ CREATE TABLE IF NOT EXISTS derived (
 );
 ";
 
-/// Schema amendments applied after SCHEMA on every open
-/// (`IF NOT EXISTS`-guarded, so idempotent). `arrived` tracks insertion
-/// order for `recent_changesets` (SQLite has rowid; Postgres needs an
-/// explicit sequence column). Rows from before the column existed order
-/// behind all tracked arrivals.
-const MIGRATIONS: &str = "
-ALTER TABLE changesets ADD COLUMN IF NOT EXISTS arrived BIGSERIAL;
-";
-
 /// The PostgreSQL (metadata) metadata store.
 ///
 /// Connections come from a `deadpool-postgres` pool sized to the CPU
@@ -115,7 +106,6 @@ impl PostgresMetadataStore {
             // (instead of at the first trait call) and create the schema.
             let conn = pool.get().await.map_err(pg_err)?;
             conn.batch_execute(SCHEMA).await.map_err(pg_err)?;
-            conn.batch_execute(MIGRATIONS).await.map_err(pg_err)?;
             Ok::<Pool, StoreError>(pool)
         })?;
         Ok(PostgresMetadataStore { pool, driver })
@@ -344,30 +334,6 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                     Ok(Some((decoded, canonical)))
                 }
             }
-        })
-    }
-
-    /// Newest-arrival first via the `arrived` serial column (the
-    /// Postgres counterpart of SQLite's rowid scan). Rows predating the
-    /// column (arrival order unknown — they existed before tracking)
-    /// sort behind tracked arrivals; ties broken by id for stability.
-    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
-        let pool = self.pool.clone();
-        self.driver.block_on(async move {
-            let conn = pool.get().await.map_err(pg_err)?;
-            let rows = conn
-                .query(
-                    "SELECT id FROM changesets \
-                     ORDER BY arrived DESC NULLS LAST, id DESC LIMIT $1",
-                    &[&i64::from(limit)],
-                )
-                .await
-                .map_err(pg_err)?;
-            let mut out = Vec::with_capacity(rows.len());
-            for row in rows {
-                out.push(id_from_bytea(row.get(0))?);
-            }
-            Ok(out)
         })
     }
 

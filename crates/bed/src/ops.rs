@@ -27,6 +27,7 @@ use tonic::Code;
 use crate::error::ClientError;
 use crate::render::{self, DiffEntry, LogEntry};
 use crate::rpc::{self, Session};
+use crate::status;
 use crate::sync;
 use crate::workspace::WorkingCopy;
 
@@ -550,6 +551,110 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     ))
 }
 
+/// `bed merge <target> [-m MESSAGE] [--author …]` — merge a changeset or
+/// ref into the working copy's current changeset (the server-side
+/// two-parent merge, v0.2.md D9–D11), then move the working copy onto
+/// the merge changeset rebase-shaped.
+///
+/// The server returns the merge changeset's id, or refuses with
+/// `FAILED_PRECONDITION` naming every conflicting path — surfaced as
+/// [`ClientError::Rpc`], verbatim (resolution belongs in the working
+/// copy; nothing is stored on conflict). When the target is already an
+/// ancestor of the current changeset, the answer is up to date: the
+/// working copy stays where it is. On success the working copy treats
+/// the result like a `rebase`/`switch`: the sparse selection is
+/// re-planned and re-synced at the merged changeset, the config moves,
+/// and the heads stack is re-pointed from the old changeset to the
+/// merge.
+pub async fn merge(
+    state_dir: &Path,
+    target: &str,
+    message: Option<&str>,
+    author: Option<&str>,
+) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
+    let parsed = crate::revspec::CsOrRef::parse(target)?;
+    let session = Session::open(&bed).await?;
+    let current = session.resolve_current_cs(&bed, "merge").await?;
+    let theirs = session.resolve(&parsed, "merge").await?;
+
+    // Refuse a dirty working copy BEFORE the RPC: the merge changeset is
+    // stored server-side the moment the server accepts it, so a client
+    // that then fails its own checkout (local edits in the way) would
+    // leave a stored merge behind — and a retry seconds later would
+    // store a SECOND one (a fresh now_stamp identity is a fresh id).
+    // The same scan `bed status` runs, offline, before any network I/O.
+    {
+        let report = status::scan_status(
+            &bed.workspace_root(),
+            &bed.config().sparse,
+            &bed.treestate()?,
+            false,
+        )?;
+        if !report.is_clean() {
+            return Err(ClientError::MergeDirtyWorkingCopy {
+                detail: report.render(),
+            });
+        }
+    }
+    // The merge is the server's decision; conflicts come back as a
+    // FAILED_PRECONDITION whose message lists every conflicting path.
+    let message = message
+        .map(|m| m.to_owned())
+        .unwrap_or_else(|| format!("merge {target}"));
+    let (name, email) = crate::commit::resolve_author(author)?;
+    let (time_secs, tz_min) = crate::commit::now_stamp();
+    let identity = gardenbed_model::Identity {
+        name,
+        email,
+        time_secs,
+        tz_min,
+    };
+    let (merged, up_to_date) = session
+        .merge(current, theirs, &message, &identity, &identity, "merge")
+        .await?;
+    if up_to_date {
+        return Ok(format!(
+            "already up to date — {} is an ancestor of {}; nothing to merge\n",
+            theirs.short(),
+            current.short(),
+        ));
+    }
+
+    // Move the working copy like `rebase` does: plan the sparse
+    // selection at the merge changeset, then fetch + sync.
+    // `.bed`-shaded repo paths never reach the state directory; say
+    // what was skipped.
+    let root = session.root_tree(merged, "merge").await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
+    let (plan, bed_state) = exclude_bed_state(plan);
+    let treestate = bed.treestate()?;
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
+        &prefixes,
+        plan,
+        session.fetcher(),
+        &treestate,
+    )
+    .await?;
+    bed.config_mut().current_cs = Some(merged.to_hex());
+    bed.save_config()?;
+    bed.heads().repoint(current, merged)?;
+
+    Ok(format!(
+        "merged {} into {} as {}\n\
+         fetched {} tree(s), {} blob(s)\n{}{}\n",
+        theirs.short(),
+        current.short(),
+        merged.short(),
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        bed_state_note(&bed_state),
+        outcome.summarize(),
+    ))
+}
+
 /// `bed publish` — fast-forward a ref to the working copy's current changeset.
 ///
 /// `ref_name = None` publishes `main` (the classic form). A named ref is the
@@ -923,19 +1028,6 @@ async fn file_side_at(
     }
 }
 
-/// Whether `path` names nothing under `cs`'s tree — the rename-pairing
-/// guard: an `R100` block is honest only for a destination that was
-/// absent on the old side (git apply refuses a rename onto a path that
-/// already exists).
-async fn dst_absent_at(
-    session: &Session,
-    cs: Id,
-    path: &str,
-    wanted: &mut HashSet<Id>,
-) -> Result<bool, ClientError> {
-    Ok(file_side_at(session, cs, path, wanted).await?.is_none())
-}
-
 /// Builds render entries for the scoped diff forms (`bed diff <cs>`, and
 /// the no-argument form on an otherwise-clean copy), where `newer` is
 /// diffed against exactly its first parent — the delta base its recorded
@@ -978,12 +1070,8 @@ async fn build_scoped_entries(
                     ))
                 })?;
                 let src_old = file_side_at(session, older, &src, &mut wanted).await?;
-                let dst_absent = dst_absent_at(session, older, &change.path, &mut wanted).await?;
                 if let Some(old) = src_old
-                    && new_side.is_some_and(|n| {
-                        n.blob == old.blob && render::same_entry_kind(n.mode, old.mode)
-                    })
-                    && dst_absent
+                    && new_side.is_some_and(|n| n.blob == old.blob)
                 {
                     entries.push(DiffEntry {
                         path: change.path,
@@ -994,12 +1082,9 @@ async fn build_scoped_entries(
                     });
                     continue;
                 }
-                // Not renderable as a pure rename — moved-and-edited, or
-                // a guarded corner (the destination existed on the old
-                // side, or the kinds differ): no similarity below 100% is
-                // ever claimed — the move expands to a delete at the
-                // source path and a write at the destination, git's own
-                // applicable shape.
+                // Moved and edited: no similarity below 100% is ever
+                // claimed — the move expands to a delete at the source
+                // path and a write at the destination.
                 let dst_old = file_side_at(session, older, &change.path, &mut wanted).await?;
                 entries.push(DiffEntry {
                     path: src,
@@ -1103,12 +1188,52 @@ async fn build_paired_entries(
         });
     }
 
-    render::pair_renames(&mut entries);
+    pair_renames(&mut entries);
 
     // Fetch everything the renderer will read, cache-first, before any
     // output is produced.
     session.fetcher().blobs(&wanted).await?;
     Ok(entries)
+}
+
+/// Pairs delete + write entries carrying an identical blob into renames,
+/// in place — the same rule `bed commit` uses to record one. For each
+/// write (in path order) the first unconsumed delete of the same blob at
+/// a different path becomes its source; the paired entry keeps the
+/// write's position (git prints renames at the destination's slot) and
+/// the consumed delete is dropped. Modes may differ — git prints `old
+/// mode`/`new mode` inside an `R100` entry. A moved-and-edited file
+/// (blobs differ) keeps the delete + write shape.
+fn pair_renames(entries: &mut Vec<DiffEntry>) {
+    // Candidate sources — one-sided deletes — in path order.
+    let sources: Vec<usize> = (0..entries.len())
+        .filter(|&i| entries[i].old.is_some() && entries[i].new.is_none())
+        .collect();
+    let mut used = vec![false; sources.len()];
+    let mut drop = vec![false; entries.len()];
+    for w in 0..entries.len() {
+        let Some(new) = entries[w].new else { continue };
+        let Some(s) = (0..sources.len()).find(|&s| {
+            !used[s]
+                && sources[s] != w
+                && entries[sources[s]].path != entries[w].path
+                && entries[sources[s]].old.is_some_and(|o| o.blob == new.blob)
+        }) else {
+            continue;
+        };
+        used[s] = true;
+        let d = sources[s];
+        entries[w].op = render::DiffOp::Rename;
+        entries[w].src_path = Some(entries[d].path.clone());
+        entries[w].old = entries[d].old;
+        drop[d] = true;
+    }
+    *entries = entries
+        .drain(..)
+        .enumerate()
+        .filter(|(i, _)| !drop[*i])
+        .map(|(_, e)| e)
+        .collect();
 }
 
 /// `bed blame <path> [--cs id-or-ref]` — first-parent lineage blame of one

@@ -38,7 +38,6 @@ use gardenbed_model::codec::validate_changeset;
 use gardenbed_model::{Change, Changeset, Id, Identity, Mode, Op, blob_id};
 
 use crate::error::ClientError;
-use crate::render;
 use crate::rpc::Session;
 use crate::status::{ScanDelta, mtime_ns, scan_paths};
 use crate::treestate::{HINT_VERIFIED, TreestateEntry};
@@ -127,7 +126,7 @@ pub async fn commit(
 
     // ---- scan + read: the whole delta is known before any network I/O.
     let items = scan_paths(&root, &sparse, &treestate, false)?;
-    let mut deletes: Vec<(String, Option<Id>, Option<i64>)> = Vec::new();
+    let mut delete_blobs: Vec<(String, Option<Id>)> = Vec::new();
     let mut writes: Vec<WriteEntry> = Vec::new();
     for item in items {
         match item.delta {
@@ -138,10 +137,8 @@ pub async fn commit(
                 // renames. A row that vanished since is a concurrent-switch
                 // race — commit the plain delete (no pairing) and let the
                 // server's tree apply decide.
-                let row = treestate.lookup(&item.path)?;
-                let blob = row.as_ref().map(|row| row.blob_id);
-                let mode = row.as_ref().map(|row| row.mode);
-                deletes.push((item.path, blob, mode));
+                let blob = treestate.lookup(&item.path)?.map(|row| row.blob_id);
+                delete_blobs.push((item.path, blob));
             }
             ScanDelta::Modified { .. } | ScanDelta::Untracked { .. } => {
                 let is_new = matches!(item.delta, ScanDelta::Untracked { .. });
@@ -161,13 +158,13 @@ pub async fn commit(
                         mtime_ns: entry.mtime_ns,
                         is_new,
                     }),
-                    None => deletes.push((item.path, None, None)),
+                    None => delete_blobs.push((item.path, None)),
                 }
             }
         }
     }
 
-    let (changes, renamed) = build_changes(deletes, &mut writes)?;
+    let (changes, renamed) = build_changes(delete_blobs, &mut writes)?;
     if changes.is_empty() {
         return Err(ClientError::NothingToCommit);
     }
@@ -419,7 +416,7 @@ pub fn parse_author(raw: &str) -> Result<(String, String), ClientError> {
 
 /// The wall-clock identity stamp: Unix seconds plus the local zone offset
 /// in minutes east of UTC (git-native, never normalized).
-fn now_stamp() -> (u64, i32) {
+pub(crate) fn now_stamp() -> (u64, i32) {
     let now = chrono::Local::now();
     let secs = now.timestamp().max(0) as u64;
     let tz_min = now.offset().local_minus_utc() / 60;
@@ -519,46 +516,29 @@ async fn put_blob_heavy(
 ///   identical tree);
 /// * pairing is deterministic: both sides sorted by path bytes, greedily
 ///   matched in order;
-/// * a rename is recorded only when the write's destination is a new path
-///   (untracked — `is_new`) and its entry kind matches the deleted side's
-///   (regular/exec are one kind): `bed diff` renders a recorded rename as
-///   git's `R100`, and git apply refuses a rename onto a pre-existing
-///   path or across entry kinds — the recorded fact must stay renderable;
 /// * the result is sorted strictly ascending by path bytes (the codec's
 ///   canonical form; paths are disjoint across the sources by
 ///   construction, so no duplicates can arise).
 ///
-/// Deletes whose treestate row was gone (`None` blob or mode) never pair —
-/// there is nothing to move from.
+/// Deletes whose treestate row was gone (`None` blob) never pair — there
+/// is nothing to move from.
 fn build_changes(
-    mut deletes: Vec<(String, Option<Id>, Option<i64>)>,
+    mut delete_blobs: Vec<(String, Option<Id>)>,
     writes: &mut [WriteEntry],
 ) -> Result<(Vec<Change>, usize), ClientError> {
-    deletes.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    delete_blobs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
     writes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
 
-    let mut consumed = vec![false; deletes.len()];
+    let mut consumed = vec![false; delete_blobs.len()];
     let mut renames: Vec<(String, usize)> = Vec::new(); // (src, index into writes)
     let mut plain: Vec<usize> = Vec::new();
     for (wi, w) in writes.iter().enumerate() {
-        // A rename is recorded only for a brand-new destination of the
-        // same entry kind as the deleted source — the pairing `bed diff`
-        // renders as git's `R100`, which git apply accepts. A rewrite of
-        // a pre-existing path, or a cross-kind move, stays a write (and
-        // the delete stays a delete).
-        if !w.is_new {
-            plain.push(wi);
-            continue;
-        }
-        let write_kind = mode_code_to_mode(w.mode);
         let mut hit = None;
-        for (di, (dp, db, dmode)) in deletes.iter().enumerate() {
+        for (di, (dp, db)) in delete_blobs.iter().enumerate() {
             if !consumed[di]
                 && *dp != w.path
                 && let Some(db) = db
-                && let Some(dmode) = dmode
                 && *db == w.blob
-                && render::same_entry_kind(mode_code_to_mode(*dmode), write_kind)
             {
                 hit = Some(di);
                 break;
@@ -567,15 +547,16 @@ fn build_changes(
         match hit {
             Some(di) => {
                 consumed[di] = true;
-                renames.push((deletes[di].0.clone(), wi));
+                renames.push((delete_blobs[di].0.clone(), wi));
             }
             None => plain.push(wi),
         }
     }
     let renamed = renames.len();
 
-    let mut changes: Vec<Change> = Vec::with_capacity(plain.len() + renames.len() + deletes.len());
-    for (di, (path, ..)) in deletes.iter().enumerate() {
+    let mut changes: Vec<Change> =
+        Vec::with_capacity(plain.len() + renames.len() + delete_blobs.len());
+    for (di, (path, _)) in delete_blobs.iter().enumerate() {
         if !consumed[di] {
             changes.push(Change {
                 path: path.clone(),
@@ -639,11 +620,7 @@ mod tests {
     #[test]
     fn pure_rename_pairs_by_identical_blob() {
         let mut writes = vec![write("b.txt", b"same", true)];
-        let deletes = vec![(
-            "a.txt".to_owned(),
-            Some(blob_id(b"same")),
-            Some(crate::treestate::MODE_REGULAR),
-        )];
+        let deletes = vec![("a.txt".to_owned(), Some(blob_id(b"same")))];
         let (changes, renamed) = build_changes(deletes, &mut writes).unwrap();
         assert_eq!(renamed, 1);
         assert_eq!(changes.len(), 1);
@@ -656,11 +633,7 @@ mod tests {
     #[test]
     fn moved_and_edited_commits_as_delete_plus_add() {
         let mut writes = vec![write("b.txt", b"edited!", true)];
-        let deletes = vec![(
-            "a.txt".to_owned(),
-            Some(blob_id(b"original")),
-            Some(crate::treestate::MODE_REGULAR),
-        )];
+        let deletes = vec![("a.txt".to_owned(), Some(blob_id(b"original")))];
         let (changes, renamed) = build_changes(deletes, &mut writes).unwrap();
         assert_eq!(renamed, 0);
         assert_eq!(changes.len(), 2);
@@ -672,16 +645,8 @@ mod tests {
     fn changes_are_canonical_and_disjoint() {
         let mut writes = vec![write("z.md", b"z", true), write("m.rs", b"m", false)];
         let deletes = vec![
-            (
-                "k.txt".to_owned(),
-                Some(blob_id(b"k")),
-                Some(crate::treestate::MODE_REGULAR),
-            ),
-            (
-                "a.rs".to_owned(),
-                Some(blob_id(b"m.rs-content")),
-                Some(crate::treestate::MODE_REGULAR),
-            ),
+            ("k.txt".to_owned(), Some(blob_id(b"k"))),
+            ("a.rs".to_owned(), Some(blob_id(b"m.rs-content"))),
         ];
         // The a.rs delete pairs with nothing (different blob), so it stays
         // a delete; z.md is an add; m.rs a modify.
@@ -697,7 +662,7 @@ mod tests {
     #[test]
     fn delete_without_a_row_never_pairs() {
         let mut writes = vec![write("b.txt", b"content", true)];
-        let deletes = vec![("a.txt".to_owned(), None, None)];
+        let deletes = vec![("a.txt".to_owned(), None)];
         let (changes, renamed) = build_changes(deletes, &mut writes).unwrap();
         assert_eq!(renamed, 0);
         assert_eq!(changes.len(), 2);
@@ -710,58 +675,9 @@ mod tests {
         let mut w = write("b.txt", b"same", true);
         w.mode = crate::treestate::MODE_EXEC;
         let mut writes = vec![w];
-        let deletes = vec![(
-            "a.txt".to_owned(),
-            Some(blob_id(b"same")),
-            Some(crate::treestate::MODE_REGULAR),
-        )];
+        let deletes = vec![("a.txt".to_owned(), Some(blob_id(b"same")))];
         let (changes, _) = build_changes(deletes, &mut writes).unwrap();
         assert_eq!(changes[0].mode, Mode::Exec);
-    }
-
-    #[test]
-    fn rewrite_of_preexisting_path_never_pairs() {
-        // Delete src.txt + rewrite a *pre-existing* dst.txt to the same
-        // bytes: recording a rename would claim dst.txt was created by
-        // the move when it existed — git apply refuses that shape. The
-        // delete stays a delete; the rewrite stays a modify.
-        let mut writes = vec![write("dst.txt", b"same", false)];
-        let deletes = vec![(
-            "src.txt".to_owned(),
-            Some(blob_id(b"same")),
-            Some(crate::treestate::MODE_REGULAR),
-        )];
-        let (changes, renamed) = build_changes(deletes, &mut writes).unwrap();
-        assert_eq!(renamed, 0);
-        assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].op, Op::Modify); // dst.txt < src.txt
-        assert_eq!(changes[0].path, "dst.txt");
-        assert_eq!(changes[1].op, Op::Delete);
-        assert_eq!(changes[1].path, "src.txt");
-    }
-
-    #[test]
-    fn cross_kind_move_never_pairs() {
-        // Delete a regular file + create a symlink whose target equals
-        // its content: identical blob, different entry kinds. A recorded
-        // rename would render an `R100` with mismatched modes — git apply
-        // refuses ("new mode does not match"). Stays delete + add.
-        let mut w = write("link", b"target", true);
-        w.mode = crate::treestate::MODE_SYMLINK;
-        let mut writes = vec![w];
-        let deletes = vec![(
-            "file.txt".to_owned(),
-            Some(blob_id(b"target")),
-            Some(crate::treestate::MODE_REGULAR),
-        )];
-        let (changes, renamed) = build_changes(deletes, &mut writes).unwrap();
-        assert_eq!(renamed, 0);
-        assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].op, Op::Delete); // file.txt < link
-        assert_eq!(changes[0].path, "file.txt");
-        assert_eq!(changes[1].op, Op::Add);
-        assert_eq!(changes[1].path, "link");
-        assert_eq!(changes[1].mode, Mode::Symlink);
     }
 
     #[test]

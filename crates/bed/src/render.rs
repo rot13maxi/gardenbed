@@ -245,68 +245,6 @@ pub fn git_mode(mode: Mode) -> &'static str {
     }
 }
 
-/// The entry *kind* a rename pairing requires to match: regular and exec
-/// files are one kind (git prints `old mode`/`new mode` inside an `R100`
-/// entry for that flip); symlinks and gitlinks are their own kinds.
-pub fn same_entry_kind(a: Mode, b: Mode) -> bool {
-    type_of(Some(a)) == type_of(Some(b))
-}
-
-/// Pairs delete + write entries carrying an identical blob into renames,
-/// in place — the same rule `bed commit` records one by. For each write
-/// (in path order) the first unconsumed delete of the same blob, of the
-/// same entry kind, at a different path, **whose destination was absent
-/// on the old side**, becomes its source; the paired entry keeps the
-/// write's position (git prints renames at the destination's slot) and
-/// the consumed delete is dropped.
-///
-/// The two guards are git-apply's acceptability surface, not a similarity
-/// taste: git refuses a rename onto a path that already exists ("already
-/// exists in working directory"), and refuses a cross-kind `R100` ("new
-/// mode does not match"). A delete paired with a *modified* pre-existing
-/// path, or with a cross-kind write, therefore stays a delete plus a
-/// write — git's own `D`+`M`/`A`+`D` shape, which applies. A
-/// moved-and-edited file (blobs differ) keeps the same shape.
-pub fn pair_renames(entries: &mut Vec<DiffEntry>) {
-    // Candidate sources — one-sided deletes — in path order.
-    let sources: Vec<usize> = (0..entries.len())
-        .filter(|&i| entries[i].old.is_some() && entries[i].new.is_none())
-        .collect();
-    let mut used = vec![false; sources.len()];
-    let mut drop = vec![false; entries.len()];
-    for w in 0..entries.len() {
-        let Some(new) = entries[w].new else { continue };
-        // The destination must be a creation: pairing a delete with a
-        // pre-existing path's rewrite claims that path was renamed when
-        // it in fact still exists — a shape git apply refuses.
-        if entries[w].old.is_some() {
-            continue;
-        }
-        let Some(s) = (0..sources.len()).find(|&s| {
-            !used[s]
-                && sources[s] != w
-                && entries[sources[s]].path != entries[w].path
-                && entries[sources[s]]
-                    .old
-                    .is_some_and(|o| o.blob == new.blob && same_entry_kind(o.mode, new.mode))
-        }) else {
-            continue;
-        };
-        used[s] = true;
-        let d = sources[s];
-        entries[w].op = DiffOp::Rename;
-        entries[w].src_path = Some(entries[d].path.clone());
-        entries[w].old = entries[d].old;
-        drop[d] = true;
-    }
-    *entries = entries
-        .drain(..)
-        .enumerate()
-        .filter(|(i, _)| !drop[*i])
-        .map(|(_, e)| e)
-        .collect();
-}
-
 /// How many leading bytes the binary probe samples. git's buffer-text
 /// check (`BUFFER_TEXT_CHECK`) samples its `FIRST_FEW_BYTES` = 8000; bed
 /// samples 8 KiB — the same heuristic class: a NUL byte in the prefix

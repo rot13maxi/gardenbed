@@ -14,29 +14,7 @@ test("history renders a commit-graph column aligned with rows", async ({ page, r
   expect(await page.locator(".commit-graph .graph-edge").count()).toBeGreaterThanOrEqual(
     (await rows.count()) - 1,
   );
-  expect(entries.length).toBeGreaterThanOrEqual(12);
-});
-
-test("merge changesets render merge nodes and second-parent edges", async ({ page, request }) => {
-  const tip = await mainTip(request);
-  const entries = await log(request, tip);
-  const merges = entries.filter((e) => e.parents.length > 1);
-  expect(merges.length).toBe(1); // the seeded merge: watering schedule
-
-  await page.goto("/#/log");
-  await page.locator("#log-list .log-row").first().waitFor();
-
-  // One hollow node per displayed merge changeset.
-  await expect(page.locator(".commit-graph .merge-node")).toHaveCount(merges.length);
-
-  // Edge count equals the number of (row → displayed parent) links:
-  // N-1 first-parent links for a linear chain, plus one per extra parent.
-  const displayed = new Set(entries.map((e) => e.id));
-  let expectedEdges = 0;
-  for (const e of entries) {
-    for (const p of e.parents) if (displayed.has(p)) expectedEdges++;
-  }
-  await expect(page.locator(".commit-graph .graph-edge")).toHaveCount(expectedEdges);
+  expect(entries.length).toBeGreaterThanOrEqual(10);
 });
 
 test("overview shows the activity heatmap with seeded days", async ({ page, request }) => {

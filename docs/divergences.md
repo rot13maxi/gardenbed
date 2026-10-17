@@ -195,22 +195,14 @@ on generated histories: the 25%-edit rename histories render
 (`moved_and_edited_files_render_delete_plus_write`), never a spurious
 rename block.
 
-**Residual — pairing-rule corners:** pairing matches `commit`'s
-recorded-rename rule — a delete plus a *new* path of the identical blob
-and the same entry kind — where git's `-M` heuristic scores content
-similarity across arbitrary adds and modifies. Two letter divergences
-follow, both counted: git may pair an *edited* rename bed cannot (a
-`R<similarity<100>` entry where bed prints delete + write, the residual
-above), and git may pair a *cross-kind* move as one entry where bed
-prints `D` plus `A` (bed never pairs across entry kinds — git apply
-refuses a cross-kind `R100` with "new mode does not match"). Both
-corners need hand-crafted content (duplicate blob bytes across paths, or
-a symlink whose target equals a deleted file's content); generated
-histories mint globally unique blob content per write, so neither occurs
-there. Pre-fix, pairing also matched *rewrites of pre-existing paths*,
-rendering an `R100` git apply refuses ("already exists in working
-directory"); that is fixed — pairing requires the destination to have
-been absent on the old side (`guarded_corners_render_delete_plus_write_and_apply`).
+**Residual — pairing-rule corners:** the two-argument form pairs a
+delete with *any* write of the identical blob (add, modify, or
+typechange — `commit`'s rule), where git's `-M` only pairs adds. In the
+corner "path deleted at `src` while an unrelated path is *modified* to
+the same blob" (only reachable with duplicate blob content across
+paths), bed prints `R100` where git prints a `D` plus an `M`. Generated
+histories mint globally unique blob content per write, so the corner
+cannot occur there; it needs a hand-crafted duplicate-content pair.
 
 **Repro:** commit a moved-and-edited file (`git mv a b && edit b && bed
 commit`) and run `bed diff <cs>`: `a` renders a `deleted file mode`
@@ -248,6 +240,79 @@ sides' shapes in one block is a v0.2+ candidate.
 that retargets one prints the `-Subproject commit <old>` /
 `+Subproject commit <new>` hunk; a path switching from a regular file
 to a gitlink prints only `old mode`/`new mode`.
+
+## 8. Merge is rename-blind (v0.2.md D9)
+
+**What:** the merge walk pairs entries by path only. A rename on one
+side is indistinguishable from a delete+add pair, so rename/rename
+(both sides rename the same file to different destinations) merges as
+two independent add/add pairs — each new path conflicts only when the
+file's content also changed on both sides; rename/delete merges as
+delete (one side) vs modify (the other, at the old path), a
+modify/delete conflict naming the *original* path. Git's
+`merge-ort` detects the renames and reports rename/rename or
+rename/delete conflicts at both endpoints.
+
+**Repro:**
+
+```sh
+git init rr && cd rr && git config user.email a@b.c && git config user.name A
+echo x > f && git add f && git commit -qm base
+git checkout -qb o && git mv f one && git commit -qm "ours renames f->one"
+git checkout -q main && git checkout -qb t && git mv f two && git commit -qm "theirs renames f->two"
+git merge-tree --write-tree o t   # git: rename/rename conflict at one, two, f
+```
+
+Gardenbed merges this cleanly (`one` and `two` both appear; the two
+adds touch different paths), where git refuses.
+
+**Cost:** a rename/rename or rename/delete merge can silently succeed
+where git would stop for review; blame stays correct either way —
+renames are recorded as `Op::Rename` with `src_path`, and blame follows
+`src_path` down the first-parent chain regardless of how the merge was
+classified. The content merge itself never mixes up files: it only ever
+pairs a path with itself across the three trees.
+
+**Why not fixed:** rename detection at merge time needs a similarity
+heuristic over candidate (deleted, added) pairs on each side — the same
+machinery git's `-M` uses, deliberately absent from the model so far
+(v0.1.md D8 imports renames only because git reports them). The
+divergence is documented as the v0.2 boundary: renames must be resolved
+by hand (rename on one side + edit on the other merges correctly as
+modify at the surviving path).
+
+## 9. Criss-cross merge bases pick a deterministic tie-break, not git's
+
+**What:** when the two merge candidates have multiple equally-good
+merge bases (a criss-cross history), git's `merge-base` picks one
+implementation-defined candidate; gardenbed's `merge_base` resolves the
+tie deterministically — newest committer timestamp first, then
+descending id bytes — and the merge then runs against exactly that base.
+
+**Repro:**
+
+```sh
+git init cc && cd cc && git config user.email a@b.c && git config user.name A
+echo base > f && git add f && git commit -qm base
+git checkout -qb a && echo A > f && git commit -qam a
+git checkout -qb b main && echo B > f && git commit -qam b
+git checkout -q a && git merge -q -m ab b 2>/dev/null || true
+git checkout -q b && git merge -q -m ba a 2>/dev/null || true
+# `a` and `b` now have two merge bases (the two cross-merges)
+git merge-base a b   # git picks one; gardenbed may pick the other
+```
+
+**Cost:** a criss-cross merge can differ from git's in *which* hunks
+count as "ours changed" vs "theirs changed" around the differing base
+region — occasionally flipping a clean merge to a conflict (or the
+reverse) relative to git's choice. Both answers are defensible; only
+one is ours, and it is stable across runs, replicas and rebuilds.
+
+**Why not fixed:** "recursive merge" (merging the bases first, as
+`merge-ort` does) multiplies conflict surfaces and can invent
+intermediate trees that exist in neither history; the v0.2 spec (D10)
+chose the deterministic single-base rule knowingly. The tie-break
+order is part of the merge contract and tested for stability.
 
 ## Explicitly *not* divergences
 

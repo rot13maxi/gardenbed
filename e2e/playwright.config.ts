@@ -2,9 +2,11 @@ import { defineConfig } from "@playwright/test";
 
 export const E2E_ROOT = "/tmp/gardenbed-web-e2e-root";
 export const BASE_URL = "http://127.0.0.1:18430";
+const BIN = `${__dirname}/../target/debug/gardenbed-web`;
 
 export default defineConfig({
   testDir: "./tests",
+  globalSetup: "./global-setup.ts",
   timeout: 30_000,
   retries: 0,
   workers: 1,
@@ -16,11 +18,9 @@ export default defineConfig({
     trace: "retain-on-failure",
   },
   webServer: {
-    command: `sh ${__dirname}/serve-e2e.sh`,
+    command: `${BIN} --root ${E2E_ROOT} --addr 127.0.0.1:18430`,
     url: `${BASE_URL}/api/refs`,
     reuseExistingServer: false,
-    // The serve script runs `cargo build` inline; a cold target dir needs
-    // minutes, not seconds.
-    timeout: 300_000,
+    timeout: 30_000,
   },
 });

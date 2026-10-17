@@ -23,10 +23,6 @@ struct MemoryInner {
     trees: HashMap<Id, Vec<u8>>,
     /// Changeset id → (decoded, canonical bytes).
     changesets: HashMap<Id, (Changeset, Vec<u8>)>,
-    /// Insertion order of `changesets`: the arrival log behind
-    /// `recent_changesets`. First arrival wins (idempotent re-puts keep
-    /// the original position), mirroring SQLite's rowid.
-    changeset_arrival: std::collections::VecDeque<Id>,
     /// Ref name → changeset id.
     refs: BTreeMap<String, Id>,
     /// Git SHA (lowercase) → changeset id.
@@ -149,7 +145,6 @@ impl MetadataStore for MemoryStore {
             Some(_) => Err(StoreError::ImmutabilityViolation(id)),
             None => {
                 s.changesets.insert(id, (cs.clone(), canonical));
-                s.changeset_arrival.push_back(id);
                 Ok(())
             }
         })?;
@@ -296,9 +291,6 @@ impl MetadataStore for MemoryStore {
                     ));
                 }
             }
-            if !s.changesets.contains_key(&id) {
-                s.changeset_arrival.push_back(id); // first arrival only
-            }
             s.changesets.insert(id, (cs.clone(), canonical));
             s.validated_v1.insert(id, root_tree);
             if let Some(sha) = sha {
@@ -310,17 +302,6 @@ impl MetadataStore for MemoryStore {
                     .insert((row.kind.clone(), row.cs), row.bytes.clone());
             }
             Ok(id)
-        })
-    }
-
-    fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
-        self.read(|s| {
-            s.changeset_arrival
-                .iter()
-                .rev()
-                .take(limit as usize)
-                .copied()
-                .collect()
         })
     }
 
