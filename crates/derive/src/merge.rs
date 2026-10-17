@@ -115,7 +115,18 @@ pub fn merge3(base: Option<&[u8]>, ours: Option<&[u8]>, theirs: Option<&[u8]>) -
         .collect();
     let shared_regions: Vec<Region> = ours_regions.iter().filter(|r| shared(r)).cloned().collect();
     if conflicts_with(&ours_kept, &theirs_unique) {
-        return Merge3Outcome::Conflict;
+        // XDL_MERGE_ZEALOUS post-pass (git's `xdl_refine_conflicts`,
+        // the mode-4 case): before declaring a conflict, git compares
+        // the two sides' replacement bytes over each overlapping
+        // cluster; a cluster both sides rewrote identically resolves
+        // clean. This generalizes the shared-region filter above —
+        // the base spans may differ while the replacement bytes agree.
+        if !clusters_clean(&recs_b, &ours_kept, &theirs_unique) {
+            return Merge3Outcome::Conflict;
+        }
+        // Mode-4-resolved clusters are rendered from either side's
+        // postimage (they are equal); falling through to the
+        // interleave below emits ours', which is exactly that.
     }
     // Non-overlapping: interleave the region sets in base order.
     let mut all: Vec<Region> = ours_kept
@@ -246,6 +257,60 @@ fn conflicts_with(a: &[Region], b: &[Region]) -> bool {
     false
 }
 
+/// XDL_MERGE_ZEALOUS refinement of the overlapping region pairs (git's
+/// `xdl_refine_conflicts`, the mode-4 pass): a conflict cluster
+/// resolves when the two sides' postimage SLICES over it are equal —
+/// the sides produced the same lines for the whole cluster, just with
+/// differently-shaped base spans. The slice is not merely the region's
+/// own replacement: it is what the side's file looks like across the
+/// cluster's full base span (its replacement plus the base records it
+/// left standing in between), which is exactly what git re-diffs.
+/// Equal slices with empty replacements are still skipped (git's
+/// `chg1 == 0 || chg2 == 0`): an empty replacement is a deletion, not
+/// a re-shaped edit, and stays a conflict.
+fn clusters_clean(base: &[&[u8]], ours: &[Region], theirs: &[Region]) -> bool {
+    for o in ours {
+        for t in theirs {
+            // Overlapping or touching spans — the same predicate as
+            // `conflicts_with`.
+            if o.base_lo <= t.base_hi && t.base_lo <= o.base_hi {
+                if o.lines.is_empty() || t.lines.is_empty() {
+                    return false;
+                }
+                // The cluster's base span: union of the two regions'.
+                let lo = o.base_lo.min(t.base_lo);
+                let hi = o.base_hi.max(t.base_hi);
+                // Each side's slice over the cluster: its replacement
+                // run(s) interleaved with the base records it kept.
+                // Both sides' regions within one cluster were merged
+                // maximally by `regions_base`, so each side contributes
+                // exactly one region here.
+                let ours_slice = slice_over(base, o, lo, hi);
+                let theirs_slice = slice_over(base, t, lo, hi);
+                if ours_slice != theirs_slice {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// A side's postimage records over the base span `[lo, hi)`: the base
+/// records outside the side's region, and the region's replacement
+/// inside it. (Both arguments' spans are within `[lo, hi)`.)
+fn slice_over(base: &[&[u8]], region: &Region, lo: usize, hi: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for rec in &base[lo..region.base_lo] {
+        out.extend_from_slice(rec);
+    }
+    out.extend_from_slice(&region.lines);
+    for rec in &base[region.base_hi..hi] {
+        out.extend_from_slice(rec);
+    }
+    out
+}
+
 /// The recursive 3-way tree walk: `(base, ours, theirs)` → the change
 /// list vs OURS, or every conflicting path.
 ///
@@ -283,31 +348,15 @@ fn walk(
     if theirs == base {
         return Ok(()); // theirs unchanged: keep ours
     }
-    if ours.is_none() {
-        // Ours lacks the directory. Base did too: theirs added content
-        // here — a pure add, adopted wholesale.
-        if base.is_none() {
-            extend_prefixed(&*engine.objects, changes, dir, None, theirs)?;
-            return Ok(());
-        }
-        // Ours deleted this subtree; theirs changed something inside.
-        // Conflict at file-path granularity: the paths theirs changed
-        // vs base are the modify/delete conflicts git reports. Paths
-        // theirs also deleted are mutual deletes — clean.
-        changed_paths_opts(engine, base, theirs, dir, conflicts, depth, true)?;
-        return Ok(());
-    }
-    if theirs.is_none() {
-        // Theirs deleted this subtree (base had it); ours changed it.
-        // If ours changed nothing vs base, the merge is theirs' delete;
-        // otherwise the changed paths conflict.
-        if changed_paths(engine, base, ours, dir, &mut Vec::new(), depth)?.is_empty() {
-            extend_prefixed(&*engine.objects, changes, dir, ours, None)?;
-        } else {
-            changed_paths_opts(engine, base, ours, dir, conflicts, depth, true)?;
-        }
-        return Ok(());
-    }
+    // `None` here is the empty tree, never a deleted subtree: the root
+    // call passes `derive_tree`'s `Option<Id>` (None = empty root), and
+    // the child recursion passes `Dir` entries' tree ids, which are
+    // always `Some` (`apply` omits empty subtrees from parent entries).
+    // A side that emptied its root therefore merges entry by entry
+    // below — an absent name is ours' delete, and a name theirs added
+    // on top of an absent base is a clean add — exactly like any other
+    // divergence. (Treating a None root as "deleted the subtree" would
+    // conflict theirs' root-level adds against ours' empty tree.)
     // Both sides have a directory here; merge entry by entry.
     let b_tree = load_or_default(&*engine.objects, base)?;
     let o_tree = load_or_default(&*engine.objects, ours)?;
@@ -454,6 +503,14 @@ fn merge_entry(
                     eo.and_then(|o| o.tree),
                     e.tree,
                 )?;
+                Ok(())
+            }
+            // Theirs added a directory where neither base nor ours had
+            // one (ours == base == absent): a pure add — diff it in
+            // from nothing (`take` is file-only: a Dir entry carries a
+            // tree id, not a blob).
+            (None, Some(e)) if e.kind == TreeKind::Dir => {
+                extend_prefixed(&*engine.objects, changes, &path, None, e.tree)?;
                 Ok(())
             }
             // Anything else present on theirs' side is a file entry
