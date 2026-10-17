@@ -33,6 +33,51 @@ tags, and the verification record for a release lives in
   only one the session answers from; an unknown name exits 1 listing
   what the root serves.
 
+- **Web GUI**: `gardenbed-web` (`crates/web`) — a read-only web interface
+  over a repository: history timeline, ref cards, changeset detail with a
+  grouped change list, tree browsing with breadcrumbs, file view with
+  line numbers and first-parent blame, diff compare, and the server's
+  request counters. It opens `--root` in process on the same `Repo`
+  service layer as the gRPC server and MCP, serves an embedded
+  no-build-step SPA plus a same-origin JSON API
+  (`/api/refs|log|changeset|tree|file|blame|diff|stats`), and ships a
+  `seed` subcommand that writes a deterministic demo history. The UI
+  includes an agent hand-off dialog ("Use in agent") that generates a
+  copyable connect-and-work prompt from `/api/server-info` plus the refs
+  listing, an SVG commit-graph lane column on History, an activity
+  heatmap and authors chart on Overview, and per-changeset diffstat
+  chips. Browse directory pages render the directory's README
+  GitHub-style (client-side, injection-escaped markdown subset; relative
+  links and images resolve to the viewed revision's own files). See
+  [docs/web.md](docs/web.md). Verified by in-memory router
+  integration tests (`crates/web/tests/api.rs`) and a Playwright
+  end-to-end suite (`e2e/`) that drives a real browser through every
+  page against the seeded repository.
+
+- Horizontal scale-out backends: Postgres metadata (`PostgresMetadataStore`)
+  and S3 objects (`S3ObjectStore`) behind the unchanged storage traits, and
+  `gardenbed-store` `StorageConfig` (TOML) to select them.
+- `gardenbed-server --storage <config.toml>` (plus `GARDENBED_STORAGE` env
+  fallback) for `serve`, `import`, and `export`: stateless replicas over
+  off-box Postgres + S3 instead of local `--root` mode, which stays the
+  default.
+- `tools/scale/compose.yaml`: a Postgres + MinIO (`pgsty/minio`) + N-replica
+  server deployment (see `tools/scale/README.md`); `crates/server/tests/scale.rs`
+  proves read-your-writes, single-winner CAS, and idempotent creates across
+  replicas, gated on `GARDENBED_SCALE_TEST` + live-service env vars.
+
+- `bed publish --ref <branch>` (+ `--force`): publish to a named lane ref
+  instead of `main` (dogfood finding #10 — lane agents committing
+  off-main had no way to advance their branch, so a fresh clone's
+  `bed switch <branch>` resolved the stale imported tip). The
+  `PublishReq` wire message gained an optional `ref` field and a `force`
+  flag (absent/empty `ref` = the exact v0.1 main publish; old clients
+  are unchanged), lane ref targets get the same compare-and-swap
+  semantics plus the import rewind guard (a non-descendant move is
+  refused naming the ref, both tips, and the fell-off count unless
+  `--force` is passed), and naming `main` in the `ref` field is rejected
+  (main publishes stay the plain, review-gated form).
+
 ### Changed
 
 - `gardenbed-server --root` takes the server root (one subdirectory per
@@ -40,11 +85,12 @@ tags, and the verification record for a release lives in
   the v0.1 way (stores at the top level) keeps serving unchanged as the
   repository named `default`, so existing roots need no migration; use
   `gardenbed-server move --from default --into NAME` to adopt the
-  per-directory layout. A serving server holds an exclusive advisory
-  lock on `<root>/gardenbed.lock` for its lifetime: a second server over
-  the same root refuses to start, and repository resolution rechecks the
-  directory under the open gate so a concurrent move cannot recreate an
-  empty repository at a vacated name.
+  per-directory layout. A serving server holds a **shared** advisory
+  lock on `<root>/gardenbed.lock` for its lifetime (many servers may
+  serve many roots, but file-relocating operations are fenced — see
+  `move`), and repository resolution rechecks the directory under the
+  open gate so a concurrent move cannot recreate an empty repository at
+  a vacated name.
 - Per-repository request counters are cumulative per name for the
   server's lifetime: LRU eviction closes idle repositories, and a reopen
   keeps counting where the evicted epoch left off (`get_stats` no longer
@@ -52,6 +98,111 @@ tags, and the verification record for a release lives in
 - `bed clone` refuses an http(s) URL whose path has more than one
   segment (`http://host:port/a/b` — it cannot name a repository) instead
   of silently cloning `default`.
+
+
+- **`bed diff` renders renames and submodule pointer hunks** (v0.2
+  D22/D23): a pure rename renders git's `R100` form (`similarity index
+  100%` / `rename from` / `rename to`) in every diff form — the
+  changeset-scoped forms (`bed diff <cs>`, no-arg on a clean copy)
+  render from the changeset's recorded `Rename` op, and the two-sided
+  form pairs a delete with a write of the identical blob at render
+  time, the same rule `bed commit` pairs by. A moved-and-edited file
+  still renders as a delete plus a write — no similarity below 100% is
+  ever claimed (divergences §6 residual). Submodule pointers render
+  git's `Subproject commit <sha>` hunks on add, delete, and retarget,
+  with the real upstream SHA from the padded gitlink id — replacing the
+  v0.1 `Binary files … differ` line (divergences §7 residual:
+  gitlink↔regular typechanges still render mode lines only). Every
+  rendered shape reapplies with `git apply` (gitlink entries via
+  `--cached`). Verified by letter/byte parity with `git diff-tree -M`
+  and `--submodule=short` on generated rename/gitlink histories, plus
+  real-`git apply` tests (`crates/bed/tests/read_path.rs`,
+  `crates/bed/tests/render_patch.rs`). The MCP `diff` tool is
+  unchanged, keeping its `--no-renames` letter parity deliberately.
+
+- **`bed` honors `.gitignore` for untracked-file discovery**: `bed
+  status` and `bed commit` now read `.gitignore` files from the working
+  copy (root plus one per directory walked) and hide matching untracked
+  files — the dogfood gap where every cargo `target/` landed in status
+  and rode into commits. Supported subset: blank lines, `#` comments,
+  trailing `/` (dir-only), `*` `?` `**` globs, a leading `/` anchor, and
+  bracket expressions (`[…]` character ranges like `*.[oa]` and POSIX
+  `[:class:]` forms). Deliberately unsupported: `!` negation and
+  global excludes. Git semantics are kept where they matter: ignore
+  never un-tracks (tracked files keep reporting changes, and tracked
+  content defeats directory pruning), an ignored directory with no
+  tracked content is pruned wholesale (a fresh `target/` costs one
+  stat), and untracked `.gitignore` files themselves still report.
+  Matching uses `gix-glob` (already in the workspace lock via the
+  `gardenbed-git` dependency). Verified against `git check-ignore`
+  behavior (including bracket expressions) and by integration tests
+  (`crates/bed/tests/gitignore.rs`) against a real server process.
+
+### Fixed
+
+- `bed switch` now prunes directories its removals left empty (dogfood:
+  switching off a changeset that introduced `crates/web` left the empty
+  `crates/web/{src,static,tests}` behind, so a workspace glob `crates/*`
+  matched a member with no `Cargo.toml` and `cargo check` failed). A
+  directory is pruned only when it contains nothing at all — untracked
+  or ignored content, other directories, or a sparse-selected prefix
+  keep it on disk; the working-copy root and the state directory are
+  never candidates; the sparse selection itself stays recorded in the
+  config regardless of disk state.
+- `bed sparse list` marks selected prefixes that match nothing at the
+  current changeset (suffix ` (empty at this changeset)`), computed
+  offline from the treestate's materialized rows — a dead selection no
+  longer reads like live coverage. Recording empty selections ahead of
+  history is unchanged by design.
+- **No-argument `bed diff` now reads the working copy with the scanner's
+  metadata discipline** (`symlink_metadata`, never following): a
+  retargeted tracked symlink's new side is its link-target bytes — the
+  same bytes `commit` records, not the target file's content — so a
+  dangling link and a tracked file replaced by a directory both render
+  (the latter as a deletion, matching `status`) instead of exiting 1
+  ('No such file or directory' / 'Is a directory'). Also: a working
+  copy dirty only by untracked files no longer prints a header-only
+  empty working-copy diff — untracked files were never part of it, so
+  the diff falls back to the committed current-vs-parent diff (git
+  parity, `docs/cli.md`); empty diffs (identical sides, a root
+  changeset with no parent) now print their header too, stating the
+  fact (`— both sides are equal` / `— a root changeset has no parent`)
+  instead of printing nothing; and the two-argument header claims
+  "against its first parent" only when the older side really is the
+  newer's first parent — any other pair reads `diff of <older> against
+  <newer>` (regression tests in `crates/bed/tests/write_path.rs`:
+  `diff_retargeted_symlink_shows_link_target_bytes_not_target_content`,
+  `diff_dangling_symlink_renders_instead_of_failing`,
+  `diff_tracked_file_replaced_by_directory_renders_as_deletion`,
+  `diff_two_arg_header_names_both_sides_for_non_parent_pair`,
+  `diff_untracked_only_dirt_falls_back_to_committed_diff`).
+- **`gardenbed-server import` no longer silently rewinds refs** when an
+  incremental import moves a ref to a tip that is not a descendant of
+  the ref's current value (e.g. re-importing a git repository whose
+  `main` is behind the store's published `main` — the dogfood incident:
+  published work fell off `main` with exit 0 and no output). Such an
+  import now fails non-zero before any ref is touched when the move
+  would lose changesets, naming the ref, both tips, and the count;
+  `--allow-rewind` opts in (force-push parity) and the move is reported
+  in the import report (`refs_rewound`) plus a loud stderr warning.
+  Fell-off changesets are counted exactly via a metadata-only BFS.
+  Forward moves are unchanged (silent). Tests:
+  `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
+  `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
+
+- **`gardenbed-server import` no longer partially moves refs on a
+  refused rewind**, and `--limit` no longer bypasses the rewind guard.
+  The refusal is now decided for every selected ref before any ref is
+  touched (two-phase): a multi-ref import where one ref would move
+  forward and another would rewind fails without moving the forward
+  ref either, and every offending ref is named in the single error.
+  Under `--limit` a non-descendant ref move is refused by default too —
+  the fell-off count is not computable there (slice re-rooting breaks
+  real ancestry), so the loss is reported as uncounted;
+  `--allow-rewind` still permits the move, reported in the import
+  report (`refs_rewound`) plus a loud stderr warning. Tests:
+  `crates/git/tests/incremental.rs::rewind_refusal_moves_no_refs_in_multi_ref_import`,
+  `crates/git/tests/incremental.rs::limit_import_refuses_rewind_by_default`.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
@@ -66,6 +217,18 @@ tags, and the verification record for a release lives in
   state uses `index.sqlite3` and a `sparse` configuration field. This is a
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
+- No-argument `bed diff` is context-aware and always self-describing: a
+  working copy dirty by modified or deleted tracked files diffs local
+  bytes against the current changeset (untracked files excluded, git
+  parity, so untracked-only dirt falls back to the committed diff;
+  deleted files render as removal to `/dev/null`), while an otherwise
+  clean one keeps the current-changeset-vs-first-parent diff. Every
+  diff — empty ones included — prints a one-line header naming what is
+  being diffed (`diff of working copy against <cs>` /
+  `diff of <cs> against its first parent` / `diff of <a> against <b>`
+  for non-parent pairs); explicit `bed diff A [B]` still means
+  changesets, now with the same header line.
+
 
 ## [0.1.0] - 2026-10-16
 

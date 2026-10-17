@@ -28,9 +28,29 @@
 //! `synchronous=NORMAL`), and a live connection holds `-shm` plus the
 //! inode. So a move must checkpoint the WAL into the database first, must
 //! carry `-wal`/`-shm` along with it, and must refuse to run while any
-//! process has the repository open — a serving server holds an exclusive
+//! process has the repository open — a serving server holds a shared
 //! flock on `<root>/gardenbed.lock` for exactly this check. The move is
 //! an offline operation: stop the server, move, restart.
+//!
+//! ## The root-lock contract
+//!
+//! One advisory lockfile per root, [`ROOT_LOCK`], with reader/writer
+//! semantics (the unified scheme for every process that must not race a
+//! serving server):
+//!
+//! * `serve` holds it **shared** for its process lifetime (many servers
+//!   may serve many roots, but one root's files are read-consistent for
+//!   all of them);
+//! * offline operations that relocate or reclaim repository files —
+//!   `move`, offline `gc` — take it **exclusive, without waiting**: any
+//!   shared holder (a live server) means refuse.
+//!
+//! A shared-mode serve is deliberate: it lets future read-only holders
+//! (a mirror, an exporter) coexist with a server while still fencing
+//! *file-relocating* operations, which is the only class that strands
+//! sqlite WAL/SHM state. Until every deployed binary speaks this
+//! contract, an old binary locking some other file has no mutual
+//! exclusion with a new one — see CHANGELOG for the deployment note.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -47,20 +67,23 @@ pub const DEFAULT_REPO: &str = "default";
 /// The default open-handle cap (`--max-repos`).
 pub const DEFAULT_MAX_REPOS: usize = 256;
 
-/// The advisory lockfile a serving server holds on the root for its
-/// lifetime: `gardenbed-server move` (and any second server) refuses to
-/// run while it is held, because renaming repository files under a live
+/// The advisory lockfile every process coordinating over a root uses
+/// (see the module docs for the shared/exclusive contract): a serving
+/// server holds it shared for its lifetime; `gardenbed-server move` (and
+/// any other file-relocating offline operation) takes it exclusive and
+/// refuses while held, because renaming repository files under a live
 /// sqlite connection strands the WAL and the SHM.
 pub const ROOT_LOCK: &str = "gardenbed.lock";
 
 /// Names a repository directory can never take (v0.2.md §5 layout rules):
 /// reserved for root-level files a repository must not shadow.
-const RESERVED_NAMES: [&str; 5] = [
+const RESERVED_NAMES: [&str; 6] = [
     "objects",
     "metadata.sqlite3",
     "seedbed.sqlite3",
     "git-mirror.git",
     "tmp",
+    ROOT_LOCK,
 ];
 
 /// Is `name` a valid repository name? 1..=64 bytes of `[A-Za-z0-9._-]`, not
@@ -78,36 +101,102 @@ pub fn valid_repo_name(name: &str) -> bool {
     !RESERVED_NAMES.contains(&name)
 }
 
-/// Takes the root's advisory lock without waiting: `Ok(file)` means no
-/// other process holds the root (the returned file releases on drop —
-/// a serving server holds it for its lifetime), `Err(None)` means one
-/// does. Both callers want the immediate answer: a second server must
-/// fail fast rather than queue behind the first, and a move must refuse.
-pub fn try_lock_root(root: &Path) -> Result<File, Option<RepoResolveError>> {
-    let file = std::fs::OpenOptions::new()
+/// Why a root-lock acquisition failed: someone holds the lock in a mode
+/// the request cannot coexist with, or the lockfile itself is unusable.
+/// The contract is deliberate about *who* is in the way (see the module
+/// docs) so each caller can say what to do about it.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum RootLockError {
+    /// Another process holds the lock; the holder's mode says what kind
+    /// of process it is (a serving server holds shared, an offline
+    /// `move`/`gc` holds exclusive).
+    #[error("the root lock is held {mode}")]
+    Held {
+        /// How the holder holds it ("shared (a server is likely
+        /// serving this root)" or "exclusive (an offline move or gc is
+        /// likely running)").
+        mode: &'static str,
+    },
+    /// The lockfile could not be opened or locked for a non-contention
+    /// reason (permissions, I/O error).
+    #[error("cannot lock {path}: {source}")]
+    Io {
+        /// The lockfile path.
+        path: PathBuf,
+        /// The underlying failure.
+        source: std::io::Error,
+    },
+}
+
+/// Takes the root's advisory lock **shared, without waiting**: the
+/// serving mode. `Ok(file)` releases on drop — `serve` holds it for the
+/// process lifetime. `Err(RootLockError::Held { .. })` means an offline
+/// operation (a move, an offline gc) owns the root and will finish;
+/// a serving server does not queue behind a finite offline operation.
+pub fn try_lock_root_shared(root: &Path) -> Result<File, RootLockError> {
+    open_lock_file(root).and_then(|file| {
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+            Ok(()) => Ok(file),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(RootLockError::Held {
+                mode: "exclusive (an offline move or gc is likely running)",
+            }),
+            Err(e) => Err(RootLockError::Io {
+                path: root.join(ROOT_LOCK),
+                source: std::io::Error::from(e),
+            }),
+        }
+    })
+}
+
+/// Takes the root's advisory lock **exclusive, without waiting**: the
+/// offline mode of every operation that relocates or reclaims repository
+/// files (see the module docs). `Err(RootLockError::Held { .. })` means
+/// a server (or any shared holder) is live over the root — the caller
+/// refuses, because moving files under live sqlite connections strands
+/// the WAL and the SHM.
+pub fn try_lock_root_exclusive(root: &Path) -> Result<File, RootLockError> {
+    open_lock_file(root).and_then(|file| {
+        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(file),
+            Err(rustix::io::Errno::WOULDBLOCK) => Err(RootLockError::Held {
+                mode: "shared (a server is likely serving this root)",
+            }),
+            Err(e) => Err(RootLockError::Io {
+                path: root.join(ROOT_LOCK),
+                source: std::io::Error::from(e),
+            }),
+        }
+    })
+}
+
+/// Opens (creating when absent, mode 0600) the root's lockfile. A
+/// directory occupying the lockfile path fails with a plain I/O error
+/// naming the collision — `ROOT_LOCK` is a reserved repository name, so
+/// this only happens when the root was built by hand.
+fn open_lock_file(root: &Path) -> Result<File, RootLockError> {
+    let path = root.join(ROOT_LOCK);
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .mode(0o600)
-        .open(root.join(ROOT_LOCK))
-        .map_err(|e| {
-            Some(RepoResolveError::Open {
-                name: root.display().to_string(),
-                source: ServerError::Store(gardenbed_store::StoreError::Io(format!(
-                    "cannot open {}: {e}",
-                    root.join(ROOT_LOCK).display()
-                ))),
-            })
-        })?;
-    match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
-        Ok(()) => Ok(file),
-        Err(rustix::io::Errno::WOULDBLOCK) => Err(None),
-        Err(e) => Err(Some(RepoResolveError::Open {
-            name: root.display().to_string(),
-            source: ServerError::Store(gardenbed_store::StoreError::Io(e.to_string())),
-        })),
-    }
+        .open(&path)
+        .map_err(|e| RootLockError::Io {
+            path: path.clone(),
+            source: if e.kind() == std::io::ErrorKind::IsADirectory {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "a directory occupies the lockfile path {} — remove it                          (this name is reserved; repositories cannot be named {ROOT_LOCK})",
+                        path.display()
+                    ),
+                )
+            } else {
+                e
+            },
+        })
 }
 
 /// Why a repo name failed to resolve: not a legal name
@@ -181,7 +270,10 @@ impl RepoHandle {
 /// concurrent requesters wait and share the result), and a use counter on
 /// each handle keeps in-flight requests alive while LRU eviction runs.
 pub struct RepoSet {
-    root: PathBuf,
+    /// The backing mode: a root directory of repositories, or one
+    /// already-open repository (scaled `--storage` serving, where the
+    /// request's `repo` name is a label, not a directory).
+    mode: RepoSetMode,
     max_repos: usize,
     /// Open handles by name. Repositories are opened (and inserted here)
     /// under the write lock; reads take the read lock only to clone an
@@ -199,6 +291,18 @@ pub struct RepoSet {
     open_gate: Mutex<()>,
 }
 
+/// Which repositories a [`RepoSet`] serves.
+enum RepoSetMode {
+    /// Every repository directory under a root (the registry; D12).
+    Root(PathBuf),
+    /// One already-open repository under any valid request name — the
+    /// scaled `--storage` serving shape, where `Repo::open_stores` built
+    /// the repository from a `StorageConfig` and there is no directory
+    /// to consult. Counters stay per-name (the label the client used),
+    /// so a client renaming mid-session is visible in `GetStats` output.
+    Single(Arc<Repo>),
+}
+
 impl std::fmt::Debug for RepoSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let names: Vec<String> = self
@@ -207,10 +311,19 @@ impl std::fmt::Debug for RepoSet {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
         f.debug_struct("RepoSet")
-            .field("root", &self.root)
+            .field("mode", &self.mode)
             .field("max_repos", &self.max_repos)
             .field("open", &names)
             .finish()
+    }
+}
+
+impl std::fmt::Debug for RepoSetMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RepoSetMode::Root(root) => f.debug_tuple("Root").field(root).finish(),
+            RepoSetMode::Single(_) => f.debug_tuple("Single").finish(),
+        }
     }
 }
 
@@ -219,8 +332,18 @@ impl RepoSet {
     /// `metadata_dir` probe) so `serve` can log it, but no repository is
     /// opened until a request names it.
     pub fn new(root: &Path, max_repos: usize) -> Self {
+        RepoSet::with_mode(RepoSetMode::Root(root.to_path_buf()), max_repos)
+    }
+
+    /// The serving set over one already-open repository (scaled
+    /// `--storage` serving): every valid request name resolves to `repo`.
+    pub fn single(repo: Arc<Repo>) -> Self {
+        RepoSet::with_mode(RepoSetMode::Single(repo), 1)
+    }
+
+    fn with_mode(mode: RepoSetMode, max_repos: usize) -> Self {
         RepoSet {
-            root: root.to_path_buf(),
+            mode,
             max_repos: max_repos.max(1),
             open: RwLock::new(HashMap::new()),
             counters: Mutex::new(HashMap::new()),
@@ -229,9 +352,13 @@ impl RepoSet {
         }
     }
 
-    /// The server root this set serves.
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// The server root this set serves. [`None`] in single mode (the
+    /// repository is already open; there is no root directory).
+    pub fn root(&self) -> Option<&Path> {
+        match &self.mode {
+            RepoSetMode::Root(root) => Some(root),
+            RepoSetMode::Single(_) => None,
+        }
     }
 
     /// The open-handle cap.
@@ -247,21 +374,33 @@ impl RepoSet {
     }
 
     /// The directory of repository `name` (`root/name`; the legacy root
-    /// itself for [`DEFAULT_REPO`]).
+    /// itself for [`DEFAULT_REPO`]). Panics in single mode — there is no
+    /// directory; callers there already hold the open repository.
     pub fn repo_dir(&self, name: &str) -> PathBuf {
-        if name == DEFAULT_REPO && Self::is_legacy_root(&self.root) {
-            self.root.clone()
+        let RepoSetMode::Root(root) = &self.mode else {
+            unreachable!("repo_dir is a root-mode operation")
+        };
+        if name == DEFAULT_REPO && Self::is_legacy_root(root) {
+            root.clone()
         } else {
-            self.root.join(name)
+            root.join(name)
         }
     }
 
-    /// The names this server serves: every subdirectory of the root holding
-    /// `metadata.sqlite3` or `objects/`, plus `default` for a legacy root.
-    /// Sorted; a repository exists iff it appears here (D12: the directory
-    /// is the registry).
+    /// The names this server serves. Root mode: every subdirectory of the
+    /// root holding `metadata.sqlite3` or `objects/`, plus `default` for
+    /// a legacy root (sorted; a repository exists iff it appears here —
+    /// D12: the directory is the registry). Single mode: the names
+    /// clients have used so far (the set has no fixed registry; any
+    /// valid name serves).
     pub fn served_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(&self.root)
+        if let RepoSetMode::Single(_) = &self.mode {
+            return self.open_names();
+        }
+        let RepoSetMode::Root(root) = &self.mode else {
+            unreachable!("checked above")
+        };
+        let mut names: Vec<String> = std::fs::read_dir(root)
             .map(|entries| {
                 entries
                     .filter_map(|e| e.ok())
@@ -276,7 +415,7 @@ impl RepoSet {
             })
             .unwrap_or_default();
         names.sort();
-        if Self::is_legacy_root(&self.root) && !names.contains(&DEFAULT_REPO.to_owned()) {
+        if Self::is_legacy_root(root) && !names.contains(&DEFAULT_REPO.to_owned()) {
             names.push(DEFAULT_REPO.to_owned());
         }
         names
@@ -350,12 +489,19 @@ impl RepoSet {
         Ok(guard)
     }
 
-    /// True if repository `name` is served (legacy `default` included).
+    /// True if repository `name` is served. Root mode: legacy `default`
+    /// included. Single mode: any valid name (the one repository serves
+    /// under every name a client may use).
     pub fn exists(&self, name: &str) -> bool {
-        if name == DEFAULT_REPO && Self::is_legacy_root(&self.root) {
-            return true;
+        match &self.mode {
+            RepoSetMode::Single(_) => valid_repo_name(name),
+            RepoSetMode::Root(root) => {
+                if name == DEFAULT_REPO && Self::is_legacy_root(root) {
+                    return true;
+                }
+                valid_repo_name(name) && Self::is_repo_dir(&root.join(name))
+            }
         }
-        valid_repo_name(name) && Self::is_repo_dir(&self.repo_dir(name))
     }
 
     /// The comma-separated served-name list for error messages.
@@ -371,7 +517,16 @@ impl RepoSet {
     /// Opens (or joins) repository `name`, evicting LRU handles over the
     /// cap. Singleflighted: the open itself happens under the write lock,
     /// so concurrent first requests for one repository open it once.
+    ///
+    /// Single mode never opens anything: the one repository is already
+    /// open, and each distinct request name gets its own handle to the
+    /// same `Arc<Repo>` (per-name counters, no eviction — the cap is 1
+    /// handle but the underlying repository is shared, so an "evicted"
+    /// name simply re-registers on its next request).
     fn open_handle(&self, name: &str) -> Result<Arc<RepoHandle>, RepoResolveError> {
+        if let RepoSetMode::Single(repo) = &self.mode {
+            return self.register_single(repo.clone(), name);
+        }
         // Fast path: already open.
         if let Some(h) = self
             .open
@@ -443,6 +598,50 @@ impl RepoSet {
         }
     }
 
+    /// Single-mode half of [`RepoSet::open_handle`]: registers (or joins)
+    /// a per-name handle around the already-open repository. The handle's
+    /// `Arc<Repo>` is the set's own, so dropping a handle never closes
+    /// the shared stores.
+    fn register_single(
+        &self,
+        repo: Arc<Repo>,
+        name: &str,
+    ) -> Result<Arc<RepoHandle>, RepoResolveError> {
+        // Fast path: the name is already registered.
+        if let Some(h) = self
+            .open
+            .read()
+            .map(|m| m.get(name).cloned())
+            .unwrap_or(None)
+        {
+            h.stamp(&self.clock);
+            h.uses.fetch_add(1, Ordering::Relaxed);
+            return Ok(h);
+        }
+        let mut map = self.open.write().map_err(|_| RepoResolveError::Open {
+            name: name.to_owned(),
+            source: ServerError::Invalid("repo map lock poisoned".into()),
+        })?;
+        if let Some(h) = map.get(name).cloned() {
+            h.stamp(&self.clock);
+            h.uses.fetch_add(1, Ordering::Relaxed);
+            return Ok(h);
+        }
+        let handle = Arc::new(RepoHandle {
+            repo,
+            uses: AtomicU64::new(1),
+            last_used: AtomicU64::new(0),
+        });
+        if let Ok(mut parked) = self.counters.lock() {
+            parked.insert(name.to_owned(), handle.counters().clone());
+        }
+        handle.stamp(&self.clock);
+        map.insert(name.to_owned(), handle.clone());
+        // No eviction: every handle shares the one repository, and the
+        // parked counters keep per-name counts alive across re-registrations.
+        Ok(handle)
+    }
+
     /// The under-lock half of [`RepoSet::exists`]: the directory still
     /// holds a repository (`Repo::open` would otherwise create one), and
     /// a legacy `default` is still a legacy root.
@@ -491,6 +690,14 @@ impl RepoSet {
                     .into(),
             });
         }
+        let RepoSetMode::Root(_) = &self.mode else {
+            return Err(RepoResolveError::InvalidName {
+                name: name.to_owned(),
+                reason: "this RepoSet serves one already-open repository; there is no \
+                         directory to name"
+                    .into(),
+            });
+        };
         Ok(self.repo_dir(name))
     }
 
@@ -515,7 +722,17 @@ impl RepoSet {
                     .into(),
             });
         }
-        let legacy = Self::is_legacy_root(&self.root);
+        // Move is a root-mode operation: it renames directories, and a
+        // single-mode set (scaled --storage serving) has none.
+        let Some(root) = self.root() else {
+            return Err(RepoResolveError::InvalidName {
+                name: format!("{from} -> {to}"),
+                reason: "this RepoSet serves one already-open repository; move \
+                         applies to a server root"
+                    .into(),
+            });
+        };
+        let legacy = Self::is_legacy_root(root);
         let from_dir = self.repo_dir(from);
         let to_dir = self.repo_dir(to);
         if legacy && from == DEFAULT_REPO {
@@ -547,14 +764,18 @@ impl RepoSet {
         }
         // No process may be serving this root: a live server's sqlite
         // connections keep the WAL/SHM open against the database inode, so
-        // renaming under it strands committed data (the advisory lock is
-        // the server's side of that contract).
-        let _root_lock = try_lock_root(&self.root).map_err(|_| RepoResolveError::InvalidName {
-            name: from.to_owned(),
-            reason: "a server is serving this root — stop it before moving \
-                         repositories (move is an offline operation)"
-                .into(),
-        })?;
+        // renaming under it strands committed data. The root lock taken
+        // exclusive-nonblocking is the contract's fence (module docs).
+        let _root_lock =
+            try_lock_root_exclusive(root).map_err(|e| RepoResolveError::InvalidName {
+                name: from.to_owned(),
+                reason: match e {
+                    RootLockError::Held { .. } => "a server is serving this root — stop it \
+                         before moving repositories (move is an offline operation)"
+                        .to_owned(),
+                    other => format!("cannot take the root lock: {other}"),
+                },
+            })?;
         // The source must not be open in this process either (its sqlite
         // connection holds the file).
         if self.open_names().contains(&from.to_owned()) {
@@ -594,7 +815,7 @@ impl RepoSet {
                 "metadata.sqlite3-shm",
                 "git-mirror.git",
             ] {
-                let src = self.root.join(entry);
+                let src = root.join(entry);
                 if src.exists() {
                     do_rename(&src, &to_dir.join(entry))?;
                 }

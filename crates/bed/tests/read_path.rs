@@ -21,7 +21,7 @@ use gardenbed::treestate::{MODE_EXEC, MODE_GITLINK, MODE_REGULAR, MODE_SYMLINK};
 use gardenbed_harness::generator::{GenOptions, GeneratedHistory, files_at, generate};
 use gardenbed_harness::materialize::materialize;
 use gardenbed_harness::oracle;
-use gardenbed_model::{Id, Mode};
+use gardenbed_model::{Id, Mode, Op};
 use tempfile::TempDir;
 
 use common::{Server, bed, bed_raw};
@@ -552,10 +552,12 @@ async fn log_matches_git_on_two_histories() {
 
 // ----------------------------------------------------------- diff (M4.2)
 
-/// Parses working copy's rendered diff into git `--name-status` shape: `(letter,
-/// path)`. The letter is derived from the header lines: `new file mode` →
-/// A, `deleted file mode` → D, otherwise old/new mode lines that change
-/// the entry *type* → T, else M.
+/// Parses working copy's rendered diff into git `--name-status` shape:
+/// `(letter, path)`. The letter is derived from the header lines:
+/// `new file mode` → A, `deleted file mode` → D, `rename from` → R,
+/// otherwise old/new mode lines that change the entry *type* → T, else M.
+/// For renames the recorded path is the **destination** (git's
+/// `--name-status` reports the dst; the src rides the `rename from` line).
 fn parse_bed_diff(out: &str) -> Vec<(char, String)> {
     let type_class = |mode: &str| match mode {
         "120000" => 's',
@@ -566,28 +568,44 @@ fn parse_bed_diff(out: &str) -> Vec<(char, String)> {
     let mut path = String::new();
     let mut old_mode: Option<String> = None;
     let mut new_mode: Option<String> = None;
+    let mut renamed = false;
     let flush = |entries: &mut Vec<(char, String)>,
                  path: &mut String,
                  old_mode: &mut Option<String>,
-                 new_mode: &mut Option<String>| {
+                 new_mode: &mut Option<String>,
+                 renamed: &mut bool| {
         if path.is_empty() {
             return;
         }
-        let letter = match (old_mode.take(), new_mode.take()) {
-            (_, Some(m)) if m.starts_with("new file") => 'A',
-            (Some(m), _) if m.starts_with("deleted file") => 'D',
-            (Some(o), Some(n)) if type_class(&o) != type_class(&n) => 'T',
-            _ => 'M',
+        let letter = if *renamed {
+            'R'
+        } else {
+            match (old_mode.take(), new_mode.take()) {
+                (_, Some(m)) if m.starts_with("new file") => 'A',
+                (Some(m), _) if m.starts_with("deleted file") => 'D',
+                (Some(o), Some(n)) if type_class(&o) != type_class(&n) => 'T',
+                _ => 'M',
+            }
         };
         entries.push((letter, std::mem::take(path)));
+        *renamed = false;
     };
     for line in out.lines() {
         if let Some(rest) = line.strip_prefix("diff --git a/") {
-            flush(&mut entries, &mut path, &mut old_mode, &mut new_mode);
-            let (p, _) = rest
-                .split_once(" b/")
+            flush(
+                &mut entries,
+                &mut path,
+                &mut old_mode,
+                &mut new_mode,
+                &mut renamed,
+            );
+            // A rename header carries the source on the a/ side; the
+            // entry's path is the b/ (destination) side — rsplit keeps
+            // headers whose a-side path itself contains " b/" intact.
+            let (_, dst) = rest
+                .rsplit_once(" b/")
                 .unwrap_or_else(|| panic!("diff header without b/ side: {line:?}"));
-            path = p.to_owned();
+            path = dst.to_owned();
         } else if let Some(rest) = line.strip_prefix("old mode ") {
             old_mode = Some(rest.to_owned());
         } else if let Some(rest) = line.strip_prefix("new mode ") {
@@ -596,14 +614,23 @@ fn parse_bed_diff(out: &str) -> Vec<(char, String)> {
             new_mode = Some(format!("new file {rest}"));
         } else if let Some(rest) = line.strip_prefix("deleted file mode ") {
             old_mode = Some(format!("deleted file {rest}"));
+        } else if line.starts_with("rename from ") {
+            renamed = true;
         }
     }
-    flush(&mut entries, &mut path, &mut old_mode, &mut new_mode);
+    flush(
+        &mut entries,
+        &mut path,
+        &mut old_mode,
+        &mut new_mode,
+        &mut renamed,
+    );
     entries
 }
 
-/// `git diff-tree -r -z --name-status --no-renames A B` — the path/op
-/// oracle for arbitrary pairs.
+/// `git diff-tree -r -z --name-status -M A B` — the path/op oracle for
+/// arbitrary pairs. `-z` R entries carry **two** path tokens (src then
+/// dst); the entry records the dst, git's `--name-status` shape.
 fn git_name_status(git_repo: &Path, a: &str, b: &str) -> Vec<(char, String)> {
     let out = std::process::Command::new("git")
         .args([
@@ -615,7 +642,7 @@ fn git_name_status(git_repo: &Path, a: &str, b: &str) -> Vec<(char, String)> {
             "-z",
             "--name-status",
             "--no-commit-id",
-            "--no-renames",
+            "-M",
             "--diff-merges=first-parent",
             a,
             b,
@@ -627,11 +654,16 @@ fn git_name_status(git_repo: &Path, a: &str, b: &str) -> Vec<(char, String)> {
     let mut entries = Vec::new();
     let mut tokens = out.split(|b| *b == 0).filter(|t| !t.is_empty());
     while let Some(status) = tokens.next() {
-        let path = tokens.next().expect("diff-tree entry carries a path");
-        entries.push((
-            status[0] as char,
-            String::from_utf8(path.to_vec()).expect("git paths are UTF-8 here"),
-        ));
+        let letter = status[0] as char;
+        if letter == 'R' || letter == 'C' {
+            // src then dst — the src is the rename source, not the entry.
+            let _src = tokens.next().expect("diff-tree R entry carries src");
+            let dst = tokens.next().expect("diff-tree R entry carries dst");
+            entries.push((letter, String::from_utf8(dst.to_vec()).expect("UTF-8")));
+        } else {
+            let path = tokens.next().expect("diff-tree entry carries a path");
+            entries.push((letter, String::from_utf8(path.to_vec()).expect("UTF-8")));
+        }
     }
     entries
 }
@@ -676,7 +708,7 @@ async fn diff_matches_git_name_status_over_many_pairs() {
         let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i)]);
         assert_eq!(code, 0, "single {i}: {stderr}");
         let got = parse_bed_diff(&out);
-        let want = oracle::git_diff_tree(&g.git, &g.sha(i), false)
+        let want = oracle::git_diff_tree(&g.git, &g.sha(i), true)
             .expect("git diff-tree")
             .into_iter()
             .map(|e| (e.status, e.path))
@@ -688,21 +720,27 @@ async fn diff_matches_git_name_status_over_many_pairs() {
     let (code, out, stderr) = bed(&g.garden, &["diff"]);
     assert_eq!(code, 0, "{stderr}");
     let got = parse_bed_diff(&out);
-    let want = oracle::git_diff_tree(&g.git, &g.sha(last), false)
+    let want = oracle::git_diff_tree(&g.git, &g.sha(last), true)
         .expect("git diff-tree")
         .into_iter()
         .map(|e| (e.status, e.path))
         .collect::<Vec<_>>();
     assert_eq!(got, want, "no-arg diff\nbed output:\n{out}");
 
-    // A diff between identical trees is empty output (and the root
-    // changeset has no parent — also empty).
-    let (code, out, _) = bed(&g.garden, &["diff", &g.cs_hex(last), &g.cs_hex(last)]);
-    assert_eq!(code, 0);
-    assert_eq!(out, "", "identical sides print nothing");
-    let (code, out, _) = bed(&g.garden, &["diff", &g.cs_hex(0)]);
-    assert_eq!(code, 0);
-    assert_eq!(out, "", "a root changeset has no parent to diff against");
+    // A diff between identical trees, and a root changeset with no
+    // parent, still print their header — just no body.
+    let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(last), &g.cs_hex(last)]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        out.contains("— both sides are equal"),
+        "same-cs diff states the sides are equal: {out}"
+    );
+    let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(0)]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        out.contains("root changeset has no parent"),
+        "root diff says there is no parent: {out}"
+    );
 
     // A ref works as a side (v0.1 revspecs are bare names — no `~` syntax).
     let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(last - 1), "main"]);
@@ -710,6 +748,337 @@ async fn diff_matches_git_name_status_over_many_pairs() {
     let got = parse_bed_diff(&out);
     let want = git_name_status(&g.git, &g.sha(last - 1), &g.sha(last));
     assert_eq!(got, want, "ref-side diff\nbed output:\n{out}");
+
+    g.server.shutdown().await;
+}
+
+/// M19.1 + M19.2: pure renames render git's `R100` form with full
+/// letter parity against `git diff-tree -M`, and a pure-rename
+/// changeset's diff body is byte-identical to `git diff-tree -M -p`
+/// (pure renames carry no `index` lines, so byte parity is reachable —
+/// regular modifies never are, because bed omits `index` lines).
+#[tokio::test]
+async fn pure_renames_render_git_m_parity_and_byte_parity() {
+    // Rename-heavy: every file operation is a rename, nothing else —
+    // with the generator's 25% edit chance per rename, most changesets
+    // hold at least one *pure* rename.
+    let opts = GenOptions {
+        commits: 40,
+        rename_ratio: 1.0,
+        delete_ratio: 0.0,
+        ..GenOptions::default()
+    };
+    let mut g = setup_with(generate(7, &opts)).await;
+    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+    let last = g.head_index();
+
+    let mut pure_rename_changesets = 0usize;
+    let mut checked_letters = 0usize;
+    let mut checked_bytes = 0usize;
+    for i in 1..=last {
+        // Pure-rename changeset: every change is a Rename whose recorded
+        // blob is the parent's blob at the source path (files_at replay
+        // gives both sides without touching the server).
+        let parent_files = files_at(&g.history, i - 1);
+        let all_pure = g.history.changesets[i].changes.iter().all(|c| {
+            c.op == Op::Rename
+                && c.src_path
+                    .as_deref()
+                    .and_then(|src| parent_files.get(src))
+                    .is_some_and(|(blob, _)| Some(*blob) == c.blob)
+        });
+
+        let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i)]);
+        assert_eq!(code, 0, "single {i}: {stderr}");
+        let got = parse_bed_diff(&out);
+        let want = oracle::git_diff_tree(&g.git, &g.sha(i), true)
+            .expect("git diff-tree")
+            .into_iter()
+            .map(|e| (e.status, e.path))
+            .collect::<Vec<_>>();
+        assert_eq!(got, want, "letters, changeset {i}\nbed output:\n{out}");
+        checked_letters += 1;
+
+        // Byte parity against `git diff-tree -M -p` — body only (bed
+        // prints its one-line header; git prints none). Only meaningful
+        // when *every* entry is a pure rename (no index lines anywhere).
+        if all_pure && !g.history.changesets[i].changes.is_empty() {
+            pure_rename_changesets += 1;
+            let body = out
+                .lines()
+                .skip_while(|l| !l.starts_with("diff --git"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let want = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.quotePath=false",
+                    "diff-tree",
+                    "--root",
+                    "-M",
+                    "-r",
+                    "-p",
+                    "--no-commit-id",
+                    "--diff-merges=first-parent",
+                    &g.sha(i),
+                ])
+                .current_dir(&g.git)
+                .output()
+                .expect("git diff-tree -p runs");
+            assert!(want.status.success(), "git diff-tree -p failed");
+            let want_body = String::from_utf8(want.stdout).expect("UTF-8 diff");
+            // Normalize: both sides may end with or without a trailing
+            // newline; compare line-wise.
+            let want_lines: Vec<&str> = want_body.lines().collect();
+            assert_eq!(
+                body,
+                want_lines.join("\n"),
+                "byte parity, changeset {i}\nbed output:\n{out}"
+            );
+            checked_bytes += 1;
+        }
+    }
+    assert!(
+        pure_rename_changesets >= 5,
+        "the fixture must contain several all-pure-rename changesets: {pure_rename_changesets}"
+    );
+    assert!(checked_letters >= 39);
+    assert!(checked_bytes >= 5);
+
+    // M19.1's grep-count form: `rename from` lines equal git -M's
+    // pure-rename count on the whole history, both diff forms.
+    let mut bed_renames = 0usize;
+    let mut git_renames = 0usize;
+    for i in 1..=last {
+        let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i)]);
+        assert_eq!(code, 0, "{stderr}");
+        bed_renames += out
+            .lines()
+            .filter(|l| l.starts_with("rename from "))
+            .count();
+        let want = oracle::git_diff_tree(&g.git, &g.sha(i), true)
+            .expect("git diff-tree")
+            .into_iter()
+            .filter(|e| e.status == 'R')
+            .count();
+        git_renames += want;
+    }
+    assert_eq!(
+        bed_renames, git_renames,
+        "rename-from counts across history"
+    );
+
+    // Two-sided form: the same parity over adjacent pairs.
+    let mut two_sided = 0usize;
+    for i in 1..last {
+        let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i), &g.cs_hex(i + 1)]);
+        assert_eq!(code, 0, "{stderr}");
+        let got = parse_bed_diff(&out);
+        let want = git_name_status(&g.git, &g.sha(i), &g.sha(i + 1));
+        assert_eq!(got, want, "two-sided pair ({i},{})", i + 1);
+        two_sided += 1;
+    }
+    assert!(two_sided >= 30);
+
+    g.server.shutdown().await;
+}
+
+/// M19.3: a moved-and-edited file renders as delete + write (no
+/// `R<100` similarity claim), while the pure move in the same changeset
+/// renders one rename block — the residual counted from recorded facts.
+#[tokio::test]
+async fn moved_and_edited_files_render_delete_plus_write() {
+    let opts = GenOptions {
+        commits: 60,
+        rename_ratio: 0.8,
+        delete_ratio: 0.0,
+        ..GenOptions::default()
+    };
+    // Find a seed whose history contains at least one edited rename.
+    let mut history = None;
+    for seed in 1..50u64 {
+        let h = generate(seed, &opts);
+        let has_edited = (1..h.changesets.len()).any(|i| {
+            let parent = files_at(&h, i - 1);
+            h.changesets[i].changes.iter().any(|c| {
+                c.op == Op::Rename
+                    && c.src_path
+                        .as_deref()
+                        .and_then(|src| parent.get(src))
+                        .is_some_and(|(blob, _)| Some(*blob) != c.blob)
+            })
+        });
+        if has_edited {
+            history = Some(h);
+            break;
+        }
+    }
+    let history = history.expect("a seed with an edited rename exists");
+    let mut g = setup_with(history).await;
+    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let mut edited_seen = 0usize;
+    let mut pure_seen = 0usize;
+    for i in 1..=g.head_index() {
+        let parent = files_at(&g.history, i - 1);
+        for c in &g.history.changesets[i].changes {
+            if c.op != Op::Rename {
+                continue;
+            }
+            let src_blob = c
+                .src_path
+                .as_deref()
+                .and_then(|src| parent.get(src))
+                .map(|(blob, _)| *blob);
+            let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i)]);
+            assert_eq!(code, 0, "{stderr}");
+            match src_blob {
+                Some(b) if Some(b) == c.blob => {
+                    // Pure: exactly one `rename from <src>` block names it.
+                    let hits = out
+                        .lines()
+                        .filter(|l| *l == format!("rename from {}", c.src_path.as_deref().unwrap()))
+                        .count();
+                    assert_eq!(hits, 1, "pure rename renders one block\n{out}");
+                    pure_seen += 1;
+                }
+                _ => {
+                    // Edited: the src renders as a delete block, the dst
+                    // as a write block — never a rename block.
+                    let src = c.src_path.as_deref().unwrap();
+                    assert!(
+                        !out.lines().any(|l| l == format!("rename from {src}")),
+                        "edited rename must not render R\n{out}"
+                    );
+                    edited_seen += 1;
+                }
+            }
+            break; // one recorded rename per changeset is enough to check
+        }
+    }
+    assert!(pure_seen >= 1, "fixture must contain a pure rename");
+    assert!(edited_seen >= 1, "fixture must contain an edited rename");
+
+    g.server.shutdown().await;
+}
+
+/// M19.5: gitlink pointer changes render `Subproject commit` hunks with
+/// the real SHA from the padded blob id, and `git apply --check` accepts
+/// exactly where git's own form is accepted.
+#[tokio::test]
+async fn gitlink_pointer_changes_render_subproject_hunks() {
+    // The generator's gitlink ids are 12 zero bytes + the upstream SHA.
+    // Find a changeset where a gitlink is *added* or its pointer moves.
+    let opts = GenOptions {
+        commits: 60,
+        ..GenOptions::default()
+    };
+    let mut history = None;
+    for seed in 1..50u64 {
+        let h = generate(seed, &opts);
+        let has_gitlink_change = (1..h.changesets.len()).any(|i| {
+            let parent = files_at(&h, i - 1);
+            h.changesets[i]
+                .changes
+                .iter()
+                .any(|c| c.mode == Mode::Gitlink && parent.contains_key(&c.path))
+                || h.changesets[i]
+                    .changes
+                    .iter()
+                    .any(|c| c.mode == Mode::Gitlink && c.op == Op::Add)
+        });
+        if has_gitlink_change {
+            history = Some(h);
+            break;
+        }
+    }
+    let history = history.expect("a seed with a gitlink add or pointer change exists");
+    let mut g = setup_with(history).await;
+    let (code, _, stderr) = bed(&g.garden, &["clone", &g.server.http()]);
+    assert_eq!(code, 0, "stderr: {stderr}");
+
+    let mut subproject_hunks = 0usize;
+    for i in 1..=g.head_index() {
+        let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i)]);
+        assert_eq!(code, 0, "{stderr}");
+        for line in out.lines().filter(|l| l.contains("Subproject commit ")) {
+            // Every Subproject line's 40-hex must be the true upstream
+            // SHA: reconstruct it from the recorded change's padded id.
+            let sha = line.rsplit(' ').next().unwrap();
+            assert_eq!(sha.len(), 40, "full 40-hex SHA: {line}");
+            assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "hex: {line}");
+            subproject_hunks += 1;
+        }
+        // No Binary-differ line may survive for a same-path gitlink
+        // change (the retired v0.1 shape).
+        if g.history.changesets[i]
+            .changes
+            .iter()
+            .any(|c| c.mode == Mode::Gitlink && c.op == Op::Modify)
+        {
+            assert!(
+                !out.contains("Binary files"),
+                "gitlink modify must render Subproject, not binary-differ\n{out}"
+            );
+        }
+    }
+    assert!(
+        subproject_hunks >= 1,
+        "the fixture must exercise at least one Subproject hunk"
+    );
+
+    // `git diff --submodule=short` parity for a pointer change: bed's
+    // rendered SHA lines match git's own choice on the same commit.
+    for i in 1..=g.head_index() {
+        let pointer_paths: Vec<&String> = g.history.changesets[i]
+            .changes
+            .iter()
+            .filter(|c| c.mode == Mode::Gitlink && c.op == Op::Modify)
+            .map(|c| &c.path)
+            .collect();
+        if pointer_paths.is_empty() {
+            continue;
+        }
+        let (code, out, stderr) = bed(&g.garden, &["diff", &g.cs_hex(i)]);
+        assert_eq!(code, 0, "{stderr}");
+        let git_out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.quotePath=false",
+                "diff-tree",
+                "--root",
+                "-r",
+                "-p",
+                "--no-commit-id",
+                "--submodule=short",
+                "--diff-merges=first-parent",
+                &g.sha(i),
+            ])
+            .current_dir(&g.git)
+            .output()
+            .expect("git diff-tree --submodule runs");
+        assert!(git_out.status.success());
+        let git_text = String::from_utf8(git_out.stdout).expect("UTF-8");
+        for path in pointer_paths {
+            let bed_sha = out
+                .lines()
+                .filter(|l| l.contains("Subproject commit "))
+                .filter(|l| l.starts_with('-') || l.starts_with('+'))
+                .map(|l| l.rsplit(' ').next().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            let git_shas: Vec<String> = git_text
+                .lines()
+                .filter(|l| l.contains("Subproject commit "))
+                .map(|l| l.rsplit(' ').next().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                bed_sha, git_shas,
+                "Subproject SHAs match git --submodule=short at {path}, changeset {i}"
+            );
+        }
+    }
 
     g.server.shutdown().await;
 }
