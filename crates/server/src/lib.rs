@@ -5,8 +5,10 @@
 //! [`Engine`] into the Task-B service layer: changeset creation with blob
 //! validation and eager derivation, object access, the ancestry queries,
 //! refs with compare-and-swap, server-side rebase (linearized rebase), and
-//! the publish fast-forward. [`GardenbedService`] adapts [`Repo`] to the
-//! generated tonic `Gardenbed` trait (v0.1.md §5).
+//! the publish fast-forward. A server process serves N repositories
+//! through a [`repos::RepoSet`]; [`GardenbedService`] resolves each
+//! request's `repo` field through it and adapts [`Repo`] to the generated
+//! tonic `Gardenbed` trait (v0.1.md §5, v0.2.md §5).
 //!
 //! Error philosophy: a conforming client never sees an error for a *result*
 //! (ref CAS conflicts come back in `CasResp`, empty answers as absent
@@ -16,6 +18,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
+
+use crate::repos::RepoSet;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -25,6 +30,8 @@ use gardenbed_model::{Change, Changeset, Id, Mode, blob_id};
 use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
+
+pub mod repos;
 
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
 /// must be uploaded with `PutBlob` first (v0.1.md §5).
@@ -113,8 +120,8 @@ impl Stats {
 /// The repository service: stores + derived data engine + counters.
 ///
 /// Cheap to share: every method takes `&self`, both stores live behind
-/// `Arc`, and all counters are atomics. One `Repo` per process in v0.1
-/// (single-repo servers).
+/// `Arc`, and all counters are atomics. One `Repo` per repository; a
+/// server holds them in a [`repos::RepoSet`].
 pub struct Repo {
     objects: Arc<dyn ObjectStore>,
     metadata: Arc<dyn MetadataStore>,
@@ -790,29 +797,38 @@ impl From<ServerError> for Status {
     }
 }
 
-/// The tonic adapter over one [`Repo`]: implements the generated
-/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5).
+/// The tonic adapter over a [`RepoSet`]: implements the generated
+/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5) over N repositories.
+///
+/// Every handler resolves its request's `repo` field through
+/// [`RepoSet::resolve`] — the one seam where authentication lands (v0.3).
 pub struct GardenbedService {
-    repo: Arc<Repo>,
+    set: Arc<RepoSet>,
 }
 
 impl GardenbedService {
-    /// A service over `repo` (shared behind an `Arc`).
-    pub fn new(repo: Arc<Repo>) -> Self {
-        GardenbedService { repo }
+    /// A service over the repositories under `set`'s root.
+    pub fn new(set: Arc<RepoSet>) -> Self {
+        GardenbedService { set }
     }
 
-    /// The request's `repo` field: validated non-empty and logged. Every
-    /// request carries it (v0.1.md §5); v0.1 serves a single repo, so the
-    /// name is accepted as-is once non-empty.
-    fn repo_field<'a>(&self, repo: &'a str, rpc: &'static str) -> Result<&'a str, Status> {
-        if repo.is_empty() {
-            return Err(Status::invalid_argument(
-                "request carries no repo name (the `repo` field is mandatory)",
-            ));
-        }
+    /// The serving set (tests, the binary's logging).
+    pub fn set(&self) -> &RepoSet {
+        &self.set
+    }
+
+    /// Resolves the request's `repo` field to an in-use repository. The
+    /// name rules and errors are [`RepoSet::resolve`]'s: illegal names
+    /// (empty, bad characters, reserved) → `invalid_argument`; legal but
+    /// unserved → `not_found` listing the served names; a store that will
+    /// not open → `internal` naming the repository.
+    fn repo_guard(&self, repo: &str, rpc: &'static str) -> Result<repos::RepoGuard<'_>, Status> {
         log::debug!("request rpc={rpc} repo={repo}");
-        Ok(repo)
+        self.set.resolve(repo).map_err(|e| match e {
+            repos::RepoResolveError::InvalidName { .. } => Status::invalid_argument(e.to_string()),
+            repos::RepoResolveError::NotFound { .. } => Status::not_found(e.to_string()),
+            repos::RepoResolveError::Open { .. } => Status::internal(e.to_string()),
+        })
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -825,9 +841,10 @@ impl GardenbedService {
         })
     }
 
-    /// Bumps one of the counted RPC counters (no-op for uncounted names).
-    fn bump(&self, name: &str) {
-        if let Some(c) = self.repo.counter(name) {
+    /// Bumps one of the counted RPC counters on `repo` (no-op for
+    /// uncounted names).
+    fn bump(repo: &Repo, name: &str) {
+        if let Some(c) = repo.counter(name) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -852,9 +869,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::RootTreeResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "RootTree")?;
+        let repo = self.repo_guard(&req.repo, "RootTree")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let tree = self.repo.root_tree(cs_id)?;
+        let tree = repo.root_tree(cs_id)?;
         Ok(Response::new(pb::RootTreeResp {
             tree_id: tree.map(id_to_bytes),
         }))
@@ -865,10 +882,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetTreeReq>,
     ) -> Result<Response<pb::TreeResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetTree")?;
-        self.bump("get_tree");
+        let repo = self.repo_guard(&req.repo, "GetTree")?;
+        Self::bump(&repo, "get_tree");
         let id = Self::id(&req.id, "id")?;
-        let Some(tree) = self.repo.get_tree(id)? else {
+        let Some(tree) = repo.get_tree(id)? else {
             return Err(Status::not_found(format!("tree {id} not found")));
         };
         let resp = pb::TreeResp::try_from(&tree)
@@ -881,10 +898,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetBlobReq>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetBlob")?;
-        self.bump("get_blob");
+        let repo = self.repo_guard(&req.repo, "GetBlob")?;
+        Self::bump(&repo, "get_blob");
         let id = Self::id(&req.id, "id")?;
-        let Some(content) = self.repo.get_blob(id)? else {
+        let Some(content) = repo.get_blob(id)? else {
             return Err(Status::not_found(format!("blob {id} not found")));
         };
         // Own the chunks up front: the stream must be 'static and the blob
@@ -899,9 +916,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::ChangesetMsg>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetChangeset")?;
+        let repo = self.repo_guard(&req.repo, "GetChangeset")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let cs = self.repo.get_changeset(cs_id)?;
+        let cs = repo.get_changeset(cs_id)?;
         let msg = pb::ChangesetMsg::try_from(&cs).map_err(|e| {
             Status::internal(format!("stored changeset {cs_id} has no wire form: {e}"))
         })?;
@@ -931,7 +948,7 @@ impl Gardenbed for GardenbedService {
                 ));
             }
         };
-        self.repo_field(&repo_name, "PutBlob")?;
+        let repo = self.repo_guard(&repo_name, "PutBlob")?;
 
         let mut body = Vec::new();
         while let Some(chunk) = stream.message().await? {
@@ -949,8 +966,8 @@ impl Gardenbed for GardenbedService {
                 }
             }
         }
-        let id = self.repo.put_blob(&body)?;
-        self.bump("put_blob");
+        let id = repo.put_blob(&body)?;
+        Self::bump(&repo, "put_blob");
         Ok(Response::new(pb::PutBlobResp {
             id: id_to_bytes(id),
         }))
@@ -961,7 +978,7 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::CreateChangesetReq>,
     ) -> Result<Response<pb::CreateChangesetResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "CreateChangeset")?;
+        let repo = self.repo_guard(&req.repo, "CreateChangeset")?;
         let msg = req
             .cs
             .ok_or_else(|| Status::invalid_argument("CreateChangesetReq carries no changeset"))?;
@@ -981,8 +998,8 @@ impl Gardenbed for GardenbedService {
             .into_iter()
             .map(|(key, content)| (key, content.to_vec()))
             .collect();
-        let id = self.repo.create_changeset(&cs, &inline)?;
-        self.bump("create_changeset");
+        let id = repo.create_changeset(&cs, &inline)?;
+        Self::bump(&repo, "create_changeset");
         Ok(Response::new(pb::CreateChangesetResp {
             id: id_to_bytes(id),
         }))
@@ -993,10 +1010,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::MergeBaseReq>,
     ) -> Result<Response<pb::MergeBaseResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "MergeBase")?;
+        let repo = self.repo_guard(&req.repo, "MergeBase")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let base = self.repo.merge_base(a, b)?;
+        let base = repo.merge_base(a, b)?;
         Ok(Response::new(pb::MergeBaseResp {
             id: base.map(id_to_bytes),
         }))
@@ -1007,10 +1024,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::IsAncestorReq>,
     ) -> Result<Response<pb::IsAncestorResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "IsAncestor")?;
+        let repo = self.repo_guard(&req.repo, "IsAncestor")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let is_ancestor = self.repo.is_ancestor(a, b)?;
+        let is_ancestor = repo.is_ancestor(a, b)?;
         Ok(Response::new(pb::IsAncestorResp { is_ancestor }))
     }
 
@@ -1019,10 +1036,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::DiffReq>,
     ) -> Result<Response<Self::DiffStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Diff")?;
+        let repo = self.repo_guard(&req.repo, "Diff")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let changes = self.repo.diff(a, b)?;
+        let changes = repo.diff(a, b)?;
         let items = changes.into_iter().map(|c| {
             pb::ChangeMsg::try_from(&c)
                 .map_err(|e| Status::internal(format!("change has no wire form: {e}")))
@@ -1032,9 +1049,9 @@ impl Gardenbed for GardenbedService {
 
     async fn log(&self, request: Request<pb::LogReq>) -> Result<Response<Self::LogStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Log")?;
+        let repo = self.repo_guard(&req.repo, "Log")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let entries = self.repo.log(cs_id, req.limit)?;
+        let entries = repo.log(cs_id, req.limit)?;
         let items = entries.into_iter().map(|(id, cs)| {
             Ok(pb::ChangesetSummary {
                 cs_id: id_to_bytes(id),
@@ -1052,9 +1069,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::BlameReq>,
     ) -> Result<Response<Self::BlameStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Blame")?;
+        let repo = self.repo_guard(&req.repo, "Blame")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let ranges = self.repo.blame(cs_id, &req.path)?;
+        let ranges = repo.blame(cs_id, &req.path)?;
         let items = ranges.into_iter().map(|(lo, hi, cs)| {
             Ok(pb::BlameRange {
                 lo,
@@ -1070,8 +1087,8 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::ListRefsReq>,
     ) -> Result<Response<Self::ListRefsStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "ListRefs")?;
-        let refs = self.repo.list_refs()?;
+        let repo = self.repo_guard(&req.repo, "ListRefs")?;
+        let refs = repo.list_refs()?;
         let items = refs.into_iter().map(|(name, cs_id)| {
             Ok(pb::RefEntry {
                 name,
@@ -1094,11 +1111,11 @@ impl Gardenbed for GardenbedService {
         // 64-hex token stays a ref name here — clients parse those as ids
         // before any lookup.
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetRef")?;
+        let repo = self.repo_guard(&req.repo, "GetRef")?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
-        let cs_id = self.repo.get_ref(&req.name)?;
+        let cs_id = repo.get_ref(&req.name)?;
         Ok(Response::new(pb::GetRefResp {
             cs_id: cs_id.map(id_to_bytes),
         }))
@@ -1109,7 +1126,7 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::CasRefReq>,
     ) -> Result<Response<pb::CasResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "CasRef")?;
+        let repo = self.repo_guard(&req.repo, "CasRef")?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
@@ -1118,7 +1135,7 @@ impl Gardenbed for GardenbedService {
             None => None,
         };
         let new = Self::id(&req.new, "new")?;
-        let outcome = self.repo.cas_ref(&req.name, expected, new)?;
+        let outcome = repo.cas_ref(&req.name, expected, new)?;
         let result = match outcome {
             RefCas::Won { .. } => pb::cas_resp::Result::Won(true),
             RefCas::Conflict { current } => {
@@ -1135,10 +1152,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::RebaseReq>,
     ) -> Result<Response<pb::RebaseResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Rebase")?;
+        let repo = self.repo_guard(&req.repo, "Rebase")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let new_parent = Self::id(&req.new_parent, "new_parent")?;
-        let id = self.repo.rebase(cs_id, new_parent)?;
+        let id = repo.rebase(cs_id, new_parent)?;
         Ok(Response::new(pb::RebaseResp {
             id: id_to_bytes(id),
         }))
@@ -1149,9 +1166,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::PublishReq>,
     ) -> Result<Response<pb::PublishResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Publish")?;
+        let repo = self.repo_guard(&req.repo, "Publish")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let id = self.repo.publish(cs_id)?;
+        let id = repo.publish(cs_id)?;
         Ok(Response::new(pb::PublishResp {
             id: id_to_bytes(id),
         }))
@@ -1162,9 +1179,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetStatsReq>,
     ) -> Result<Response<pb::StatsResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetStats")?;
+        let repo = self.repo_guard(&req.repo, "GetStats")?;
         Ok(Response::new(pb::StatsResp {
-            counters: self.repo.stats().into_iter().collect(),
+            counters: repo.stats().into_iter().collect(),
         }))
     }
 }

@@ -974,7 +974,7 @@ async fn rpc_classes_survive_sigkill_mid_call() {
     let root = dir.path().join("server");
 
     let t0 = std::time::Instant::now();
-    let fx = build_fixture(&root);
+    let fx = build_fixture(&root.join(REPO));
     println!(
         "chaos: fixture built in {:.1?} ({} first-parent log entries, {} blame ranges)",
         t0.elapsed(),
@@ -1019,7 +1019,7 @@ async fn rpc_classes_survive_sigkill_mid_call() {
 
             // 3. offline: objects checksum sweep, metadata integrity, derived
             //    rebuild determinism.
-            verified_objects = sweep_objects(&root);
+            verified_objects = sweep_objects(&root.join(REPO));
             integrity_check(&root);
             rebuild_derived_deterministically(&fx);
             let entry = tally.entry(class.label()).or_insert((0, 0));
