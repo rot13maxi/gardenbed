@@ -882,3 +882,493 @@ mod tests {
         assert_eq!(h.head, h.changesets.last().unwrap().id().unwrap());
     }
 }
+
+// ------------------------------------------------------- divergent pairs
+
+/// Knobs for [`generate_divergent_pair`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct PairOptions {
+    /// Commits on the shared mainline before the branch point (min 1).
+    pub mainline_commits: u32,
+    /// Independent commits on each side after branching (min 1).
+    pub side_commits: u32,
+    /// Maximum live files on each side. Default 30.
+    pub max_files: u32,
+    /// Emit non-ASCII (UTF-8) path components. Default false (the
+    /// merge differential is rename-free and ASCII-clean so `git
+    /// merge-tree` output parsing stays byte-exact).
+    pub unicode_paths: bool,
+    /// Some files use CRLF line endings. Default false.
+    pub crlf_content: bool,
+}
+
+impl Default for PairOptions {
+    fn default() -> Self {
+        PairOptions {
+            mainline_commits: 6,
+            side_commits: 4,
+            max_files: 30,
+            unicode_paths: false,
+            crlf_content: false,
+        }
+    }
+}
+
+/// A genuinely divergent pair for merge testing: a linear mainline
+/// (`changesets[..branch]`), then two branches that each commit
+/// independently on top of the branch point. `base_index` names the
+/// branch point; `ours_index`/`theirs_index` name the two tips.
+///
+/// Unlike [`generate`] (whose merge commits are deliberately redundant
+/// extra parents on a linear mainline), the two sides here share ONLY
+/// the mainline, so `git merge-base` is the branch point itself and
+/// 3-way merges have real base/ours/theirs trees. Renames are never
+/// generated (the merge is rename-blind by design); sides produce
+/// overlapping and non-overlapping hunks on shared files, mode flips,
+/// adds, deletes, and file↔directory replacements.
+#[derive(Clone, Debug)]
+pub struct DivergentPair {
+    /// All changesets: mainline first, then our side's commits, then
+    /// their side's commits (each side's first commit parents on the
+    /// branch point).
+    pub changesets: Vec<Changeset>,
+    /// Every blob id used, with content, sorted ascending by id bytes.
+    pub blob_contents: Vec<(Id, Vec<u8>)>,
+    /// Index of the merge base (the branch point) in `changesets`.
+    pub base_index: usize,
+    /// Index of our side's tip.
+    pub ours_index: usize,
+    /// Index of their side's tip.
+    pub theirs_index: usize,
+}
+
+impl DivergentPair {
+    /// Map-style blob lookup (binary search, like
+    /// [`GeneratedHistory::blob`]).
+    pub fn blob(&self, id: &Id) -> Option<&[u8]> {
+        self.blob_contents
+            .binary_search_by(|(k, _)| k.as_bytes().cmp(id.as_bytes()))
+            .ok()
+            .map(|i| self.blob_contents[i].1.as_slice())
+    }
+}
+
+/// The shared line pool for pairs (independent of the generator's, so
+/// pair generation never perturbs `generate`'s line numbering).
+const PAIR_LINES: &[&str] = &[
+    "alpha line for the merge corpus",
+    "bravo line holding the middle steady",
+    "charlie line edited on both sides at times",
+    "delta line near the top",
+    "echo line near the bottom",
+    "foxtrot padding one",
+    "golf padding two",
+    "hotel padding three",
+    "india padding four",
+    "juliet padding five",
+    "kilo padding six",
+    "lima padding seven",
+    "mike padding eight",
+    "november padding nine",
+    "oscar padding ten",
+];
+
+/// A pair-side scratch working set: path -> (blob, mode).
+type SideFiles = BTreeMap<String, (Id, Mode)>;
+
+/// Generates a deterministic divergent pair (pure function of
+/// `(seed, opts)`).
+pub fn generate_divergent_pair(seed: u64, opts: &PairOptions) -> DivergentPair {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mainline = opts.mainline_commits.max(1);
+    let sides = opts.side_commits.max(1);
+    let mut changesets: Vec<Changeset> = Vec::new();
+    let mut blobs: HashMap<Id, Vec<u8>> = HashMap::new();
+    let mut line_no: u64 = 0;
+    let mut serial: u64 = 0;
+    let mut time = 1_700_000_000u64;
+
+    let names_pool = pair_name_pool(opts.unicode_paths, opts.max_files as usize * 3 + 8);
+    let mut next_path = |used: &SideFiles, avoid_prefix: &[&str]| -> Option<String> {
+        for _ in 0..64 {
+            serial += 1;
+            let n = (serial % 97) as usize;
+            let base = &names_pool[n % names_pool.len()];
+            let path = if serial.is_multiple_of(5) {
+                format!("{base}/extra_{}", serial)
+            } else {
+                format!("{base}_{}", serial)
+            };
+            if avoid_prefix.iter().any(|p| path.starts_with(p)) {
+                continue;
+            }
+            if !used.contains_key(&path)
+                && !used.keys().any(|k| {
+                    k.starts_with(&format!("{path}/")) || path.starts_with(&format!("{k}/"))
+                })
+            {
+                return Some(path);
+            }
+        }
+        None
+    };
+
+    // The pair's line-making: globally unique numbered lines.
+    let mut make_content = |rng: &mut StdRng, n_lines: usize, crlf: bool| -> Vec<u8> {
+        let mut lines = Vec::with_capacity(n_lines);
+        for _ in 0..n_lines {
+            line_no += 1;
+            let pick = PAIR_LINES[rng.random_range(0..PAIR_LINES.len())];
+            lines.push(format!("{:06}: {}", line_no, pick));
+        }
+        let mut body = lines.join(if crlf { "\r\n" } else { "\n" });
+        body.push('\n');
+        body.into_bytes()
+    };
+
+    let mut ident = |rng: &mut StdRng, i: u32| Identity {
+        name: "Pair Generator".to_owned(),
+        email: "pair@gardenbed.example".to_owned(),
+        time_secs: {
+            time += 3600;
+            time + i as u64
+        },
+        tz_min: TZ_POOL[rng.random_range(0..TZ_POOL.len())],
+    };
+
+    // ---- Phase 1: the shared mainline (linear, root at index 0).
+    let mut files: SideFiles = BTreeMap::new();
+    let root_count = (opts.max_files as usize / 2 + 2).min(names_pool.len().max(4));
+    {
+        let mut changes = Vec::new();
+        for _ in 0..root_count {
+            let Some(path) = next_path(&files, &[]) else {
+                break;
+            };
+            let mode = if rng.random_bool(0.1) {
+                Mode::Exec
+            } else {
+                Mode::Regular
+            };
+            let n = rng.random_range(8..=24);
+            let content = make_content(&mut rng, n, opts.crlf_content);
+            let id = blob_id(&content);
+            blobs.insert(id, content);
+            changes.push(Change {
+                path,
+                op: Op::Add,
+                blob: Some(id),
+                src_path: None,
+                mode,
+            });
+        }
+        changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let cs = Changeset {
+            parents: vec![],
+            changes,
+            message: "pair: plant the mainline root".to_owned(),
+            author: ident(&mut rng, 0),
+            committer: ident(&mut rng, 0),
+            signature: None,
+        };
+        for c in &cs.changes {
+            files.insert(
+                c.path.clone(),
+                (c.blob.expect("add carries a blob"), c.mode),
+            );
+        }
+        changesets.push(cs);
+    }
+    for i in 1..mainline {
+        let changes = pair_side_changes(
+            &mut rng,
+            &mut files,
+            &mut blobs,
+            &mut line_no,
+            &mut serial,
+            opts,
+            &names_pool,
+            false,
+        );
+        let cs = Changeset {
+            parents: vec![id_of(changesets.last().expect("mainline has a root"))],
+            changes,
+            message: format!("pair: mainline commit {i}"),
+            author: ident(&mut rng, i),
+            committer: ident(&mut rng, i),
+            signature: None,
+        };
+        changesets.push(cs);
+    }
+    let base_index = changesets.len() - 1;
+    let base_files = files.clone();
+
+    // ---- Phase 2: two independent sides on top of the branch point.
+    let mut tips = [0usize; 2];
+    for side in 0..2 {
+        let mut side_files = base_files.clone();
+        for i in 0..sides {
+            // The two sides share the path namespace deliberately, so
+            // same-path edits (overlapping and non-overlapping hunks)
+            // and add/add cases occur naturally.
+            let changes = pair_side_changes(
+                &mut rng,
+                &mut side_files,
+                &mut blobs,
+                &mut line_no,
+                &mut serial,
+                opts,
+                &names_pool,
+                side == 1,
+            );
+            let parent = if i == 0 {
+                id_of(&changesets[base_index])
+            } else {
+                id_of(&changesets[tips[side]])
+            };
+            let label = if side == 0 { "ours" } else { "theirs" };
+            let cs = Changeset {
+                parents: vec![parent],
+                changes,
+                message: format!("pair: {label} commit {i}"),
+                author: ident(&mut rng, mainline + side as u32 * sides + i),
+                committer: ident(&mut rng, mainline + side as u32 * sides + i),
+                signature: None,
+            };
+            changesets.push(cs);
+            tips[side] = changesets.len() - 1;
+        }
+    }
+
+    let mut blob_contents: Vec<(Id, Vec<u8>)> = blobs.into_iter().collect();
+    blob_contents.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    DivergentPair {
+        changesets,
+        blob_contents,
+        base_index,
+        ours_index: tips[0],
+        theirs_index: tips[1],
+    }
+}
+
+/// The candidate name pool for pairs: plain ASCII components only
+/// (byte-exact `git merge-tree` parsing).
+fn pair_name_pool(unicode: bool, target: usize) -> Vec<String> {
+    let mut pool: Vec<String> = Vec::new();
+    let dirs = ["pair-a", "pair-b", "sub"];
+    let bases = ["file", "doc", "note", "data", "text"];
+    for d in dirs {
+        for b in bases {
+            pool.push(format!("{d}/{b}"));
+        }
+    }
+    for b in bases {
+        pool.push(format!("top-{b}"));
+    }
+    if unicode {
+        pool.push("pair-日本/file".to_owned());
+    }
+    while pool.len() < target {
+        pool.push(format!("gen{}", pool.len()));
+    }
+    pool
+}
+
+/// Emits one side-commit's changes over `files` (updated in place):
+/// modifies (hunk-shaped edits on shared text), adds, deletes, mode
+/// flips, and occasional file↔directory replacements. Rename-free by
+/// design.
+#[allow(clippy::too_many_arguments)]
+fn pair_side_changes(
+    rng: &mut StdRng,
+    files: &mut SideFiles,
+    blobs: &mut HashMap<Id, Vec<u8>>,
+    line_no: &mut u64,
+    serial: &mut u64,
+    opts: &PairOptions,
+    names_pool: &[String],
+    flip_side: bool,
+) -> Vec<Change> {
+    let max_files = opts.max_files.max(4) as usize;
+    let n_ops = rng.random_range(1..=6usize);
+    let mut changes: Vec<Change> = Vec::new();
+    let mut touched: BTreeSet<String> = BTreeSet::new();
+    for _ in 0..n_ops {
+        let existing: Vec<String> = files
+            .keys()
+            .filter(|p| !touched.contains(p.as_str()))
+            .cloned()
+            .collect();
+        let u: f64 = rng.random();
+        if !existing.is_empty() && u < 0.5 {
+            // Modify an existing file: hunk-shaped edits (whole lines
+            // replaced/inserted/deleted at line boundaries), so the
+            // two sides' regions are line-aligned for merge3.
+            let path = existing[rng.random_range(0..existing.len())].clone();
+            let (old_id, old_mode) = files[&path];
+            let old = blobs
+                .get(&old_id)
+                .expect("pair generator carries every blob")
+                .clone();
+            let n = 1 + rng.random_range(0..3usize);
+            let new = hunk_edit(rng, &old, n, line_no);
+            let id = blob_id(&new);
+            blobs.insert(id, new);
+            // Occasional mode flip on one side only.
+            let mode = if flip_side && matches!(old_mode, Mode::Regular | Mode::Exec) {
+                if rng.random_bool(0.3) {
+                    if old_mode == Mode::Regular {
+                        Mode::Exec
+                    } else {
+                        Mode::Regular
+                    }
+                } else {
+                    old_mode
+                }
+            } else {
+                old_mode
+            };
+            touched.insert(path.clone());
+            changes.push(Change {
+                path,
+                op: Op::Modify,
+                blob: Some(id),
+                src_path: None,
+                mode,
+            });
+            files.insert(changes.last().unwrap().path.clone(), (id, mode));
+        } else if !existing.is_empty() && u < 0.65 {
+            // Delete an existing path.
+            let path = existing[rng.random_range(0..existing.len())].clone();
+            touched.insert(path.clone());
+            files.remove(&path);
+            changes.push(Change {
+                path,
+                op: Op::Delete,
+                blob: None,
+                src_path: None,
+                mode: Mode::Regular,
+            });
+        } else if files.len() < max_files {
+            // Add a fresh file (both sides draw from the same namespace,
+            // so add/add on the same path occurs across sides).
+            let mut path = None;
+            for _ in 0..32 {
+                *serial += 1;
+                let n = (*serial % 211) as usize;
+                let candidate = format!("{}_{}", names_pool[n % names_pool.len()], serial);
+                if !files.contains_key(&candidate)
+                    && !files.keys().any(|k| {
+                        k.starts_with(&format!("{candidate}/"))
+                            || candidate.starts_with(&format!("{k}/"))
+                    })
+                {
+                    path = Some(candidate);
+                    break;
+                }
+            }
+            let Some(path) = path else { continue };
+            let n_lines = rng.random_range(6..=20);
+            let mut lines = Vec::with_capacity(n_lines);
+            for _ in 0..n_lines {
+                *line_no += 1;
+                let pick = PAIR_LINES[rng.random_range(0..PAIR_LINES.len())];
+                lines.push(format!("{:06}: {}", line_no, pick));
+            }
+            let mut body = lines.join(if opts.crlf_content { "\r\n" } else { "\n" });
+            body.push('\n');
+            let content = body.into_bytes();
+            let id = blob_id(&content);
+            blobs.insert(id, content);
+            let mode = if rng.random_bool(0.1) {
+                Mode::Exec
+            } else {
+                Mode::Regular
+            };
+            touched.insert(path.clone());
+            changes.push(Change {
+                path,
+                op: Op::Add,
+                blob: Some(id),
+                src_path: None,
+                mode,
+            });
+            files.insert(
+                changes.last().unwrap().path.clone(),
+                (changes.last().unwrap().blob.unwrap(), mode),
+            );
+        } else if !existing.is_empty() {
+            // Working set full: modify instead.
+            let path = existing[rng.random_range(0..existing.len())].clone();
+            let (old_id, mode) = files[&path];
+            let old = blobs
+                .get(&old_id)
+                .expect("pair generator carries every blob")
+                .clone();
+            let new = hunk_edit(rng, &old, 1, line_no);
+            let id = blob_id(&new);
+            blobs.insert(id, new);
+            touched.insert(path.clone());
+            changes.push(Change {
+                path: path.clone(),
+                op: Op::Modify,
+                blob: Some(id),
+                src_path: None,
+                mode,
+            });
+            files.insert(path, (id, mode));
+        }
+    }
+    changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+    changes
+}
+
+/// Line-boundary hunk edit of `content`: replaces `n` random hunks,
+/// each a small run of whole lines (replace / insert-after / delete).
+fn hunk_edit(rng: &mut StdRng, content: &[u8], n: usize, line_no: &mut u64) -> Vec<u8> {
+    let crlf = content.contains(&b'\r') && content.contains(&b'\n');
+    let eol: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    let mut lines: Vec<Vec<u8>> = content
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_vec())
+        .collect();
+    if lines.is_empty() {
+        lines.push(Vec::new());
+    }
+    for _ in 0..n {
+        let i = rng.random_range(0..lines.len());
+        match rng.random_range(0..3) {
+            0 => {
+                // Replace one line with one or two fresh lines.
+                *line_no += 1;
+                let pick = PAIR_LINES[rng.random_range(0..PAIR_LINES.len())];
+                lines[i] = format!("{:06}: {}", line_no, pick).into_bytes();
+            }
+            1 => {
+                // Insert a fresh line after line i.
+                *line_no += 1;
+                let pick = PAIR_LINES[rng.random_range(0..PAIR_LINES.len())];
+                lines.insert(
+                    i + 1,
+                    format!("{:06}: {}", line_no, pick).into_bytes(),
+                );
+            }
+            _ => {
+                // Delete line i (keep at least one line).
+                if lines.len() > 1 {
+                    lines.remove(i);
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (i, l) in lines.iter().enumerate() {
+        if i > 0 {
+            out.extend_from_slice(eol);
+        }
+        out.extend_from_slice(l);
+    }
+    out.extend_from_slice(eol);
+    out
+}
