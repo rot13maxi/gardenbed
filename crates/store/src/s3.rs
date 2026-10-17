@@ -77,18 +77,18 @@ impl S3ObjectStore {
             .with_conditional_put(object_store::aws::S3ConditionalPut::ETagMatch);
         // `false` (the builder default) is path-style addressing.
         let builder = builder.with_virtual_hosted_style_request(!path_style);
-        let inner = builder
-            .build()
-            .map_err(|e| StoreError::Invalid(format!("s3 client: {e}")))?;
-        let store = S3ObjectStore {
-            inner: Arc::new(inner),
-            driver: Driver::new("gardenbed-s3-driver"),
-        };
+        let inner = Arc::new(
+            builder
+                .build()
+                .map_err(|e| StoreError::Invalid(format!("s3 client: {e}")))?,
+        );
+        let driver = Driver::new("gardenbed-s3-driver");
         // Fail fast: HEAD a probe key. A missing key is the healthy case
         // (NotFound); an unreachable endpoint or missing bucket surfaces
         // here, at open, not at the first put.
-        store.driver.block_on(async {
-            match store.inner.head(&Path::from("gardenbed-open-probe")).await {
+        let probe = Arc::clone(&inner);
+        driver.block_on(async move {
+            match probe.head(&Path::from("gardenbed-open-probe")).await {
                 Ok(_) => {}
                 Err(object_store::Error::NotFound { .. }) => {}
                 Err(e) => {
@@ -97,6 +97,7 @@ impl S3ObjectStore {
             }
             Ok::<(), StoreError>(())
         })?;
+        let store = S3ObjectStore { inner, driver };
         Ok(store)
     }
 
@@ -113,7 +114,7 @@ impl S3ObjectStore {
     fn put_if_absent(&self, key: &Path, payload: Vec<u8>) -> Result<bool, StoreError> {
         let inner = Arc::clone(&self.inner);
         let key = key.clone();
-        self.driver.block_on(async {
+        self.driver.block_on(async move {
             let opts = PutOptions::from(PutMode::Create);
             let result = inner
                 .put_opts(&key, PutPayload::from(payload), opts)
@@ -134,7 +135,7 @@ impl S3ObjectStore {
     fn get_raw(&self, key: &Path) -> Result<Option<Vec<u8>>, StoreError> {
         let inner = Arc::clone(&self.inner);
         let key = key.clone();
-        self.driver.block_on(async {
+        self.driver.block_on(async move {
             match inner.get(&key).await {
                 Ok(get_result) => {
                     let bytes = get_result.bytes().await.map_err(s3_err)?;
@@ -190,7 +191,7 @@ impl S3ObjectStore {
     fn put_unconditional(&self, key: &Path, payload: Vec<u8>) -> Result<(), StoreError> {
         let inner = Arc::clone(&self.inner);
         let key = key.clone();
-        self.driver.block_on(async {
+        self.driver.block_on(async move {
             inner
                 .put_opts(&key, PutPayload::from(payload), PutOptions::default())
                 .await
@@ -258,7 +259,7 @@ impl crate::traits::ObjectStore for S3ObjectStore {
     fn has(&self, id: Id) -> Result<bool, StoreError> {
         let inner = Arc::clone(&self.inner);
         let key = Self::key_for(id);
-        self.driver.block_on(async {
+        self.driver.block_on(async move {
             match inner.head(&key).await {
                 Ok(_) => Ok(true),
                 Err(object_store::Error::NotFound { .. }) => Ok(false),
