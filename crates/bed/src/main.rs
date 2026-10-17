@@ -94,12 +94,15 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
                 return Ok(0);
             }
             let treestate = bed.treestate()?;
-            let report = gardenbed::status::scan_status(
-                &bed.workspace_root(),
-                &sparse,
-                &treestate,
-                *full_scan,
-            )?;
+            let report = gardenbed::status::status_via_daemon(bed.dir(), *full_scan, || async {
+                gardenbed::status::scan_status(
+                    &bed.workspace_root(),
+                    &sparse,
+                    &treestate,
+                    *full_scan,
+                )
+            })
+            .await?;
             let rendered = report.render();
             if rendered.is_empty() {
                 println!("working copy is clean — nothing modified, deleted, or untracked.");

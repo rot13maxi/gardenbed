@@ -20,6 +20,10 @@ gardenbed-model.workspace = true
 gardenbed-store = { path = "../store" }
 # The wire client (M4 read path): thin, runtime-only — bed never links the
 # server; tests ingest fixtures through `gardenbed-server` as a dev-dep.
+# The local daemon tier (v0.2 M16): bed links only the daemon *library* —
+# the generated sidecar client and path rules. bed never spawns the
+# daemon binary and never depends on it being present.
+gardenbed-daemon = { path = "../daemon" }
 gardenbed-protocol = { path = "../protocol" }
 rustix = { version = "1", features = ["fs"] }
 rusqlite = { version = "0.32", features = ["bundled"] }

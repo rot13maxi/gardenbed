@@ -114,14 +114,53 @@ impl Session {
         endpoint: &str,
         concurrency: usize,
     ) -> Result<Self, ClientError> {
-        let client =
+        Self::connect_via_daemon(repo, objects, endpoint, concurrency).await
+    }
+
+    /// [`Session::connect`] with the daemon-first probe spelled out:
+    /// connect to the daemon socket when one is listening (the embedded
+    /// endpoint is kept as the fetch-phase fallback), else connect to
+    /// `endpoint` directly (v0.2.md D19).
+    ///
+    /// An absent or dead daemon is not an error — it is a normal state of
+    /// an optional tier. When the daemon is primary, fetch RPCs retry
+    /// exactly once against the embedded client on daemon death, so a
+    /// daemon crash mid-`sparse add` is invisible to the command's
+    /// outcome; write RPCs are never blindly retried.
+    pub async fn connect_via_daemon(
+        repo: &str,
+        objects: gardenbed_store::FsObjectStore,
+        endpoint: &str,
+        concurrency: usize,
+    ) -> Result<Self, ClientError> {
+        let connect_embedded = || async {
             GardenbedClient::connect(endpoint)
                 .await
                 .map_err(|e| ClientError::Connect {
                     server: endpoint.to_owned(),
                     message: e.to_string(),
-                })?;
-        let fetcher = Arc::new(Fetcher::new(client.clone(), repo, objects, concurrency));
+                })
+        };
+        let (client, fallback) = match crate::daemon::socket_path() {
+            Some(path) => {
+                let daemon_endpoint = format!("unix://{}", path.display());
+                match GardenbedClient::connect(&daemon_endpoint).await {
+                    Ok(daemon_client) => {
+                        let embedded_client = connect_embedded().await?;
+                        (daemon_client, Some(embedded_client))
+                    }
+                    Err(_) => (connect_embedded().await?, None),
+                }
+            }
+            None => (connect_embedded().await?, None),
+        };
+        let fetcher = Arc::new(Fetcher::new(
+            client.clone(),
+            fallback,
+            repo,
+            objects,
+            concurrency,
+        ));
         Ok(Session {
             client,
             repo: repo.to_owned(),
@@ -364,6 +403,10 @@ fn rpc<T: Clone>(
 /// cache — the store re-verifies the hash at write time too).
 pub struct Fetcher {
     client: GardenbedClient,
+    /// The embedded (config.server) client, present only when `client`
+    /// talks to the daemon: fetch RPCs retry exactly once against it on
+    /// daemon transport death (v0.2.md D19). Write RPCs never touch it.
+    fallback: Option<GardenbedClient>,
     repo: String,
     objects: gardenbed_store::FsObjectStore,
     bound: Arc<Semaphore>,
@@ -378,15 +421,18 @@ pub struct Fetcher {
 
 impl Fetcher {
     /// A fetcher over `objects` for `repo`, with at most `concurrency`
-    /// fetches in flight.
+    /// fetches in flight. `fallback` is the embedded endpoint, set only
+    /// when `client` is the daemon.
     fn new(
         client: GardenbedClient,
+        fallback: Option<GardenbedClient>,
         repo: &str,
         objects: gardenbed_store::FsObjectStore,
         concurrency: usize,
     ) -> Self {
         Fetcher {
             client,
+            fallback,
             repo: repo.to_owned(),
             objects,
             bound: Arc::new(Semaphore::new(concurrency.max(1))),
@@ -396,6 +442,46 @@ impl Fetcher {
         }
     }
 
+    /// True when a status means the daemon's socket went away mid-RPC
+    /// (transport death) — the one fetch-phase failure worth one retry
+    /// against the embedded endpoint. Anything else (auth, refusal,
+    /// not-found) is a real answer, not a transport event.
+    fn daemon_transport_dead(status: &tonic::Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::Internal
+        )
+    }
+
+    /// Runs `call` against the primary client, retrying exactly once
+    /// against the embedded endpoint when the primary is the daemon and
+    /// it died mid-RPC (fetch RPCs only — writes are never blindly
+    /// retried). Maps both failures onto working copy's error voice.
+    async fn fetch_with_fallback<T, F, Fut>(&self, call: F) -> Result<T, ClientError>
+    where
+        F: Fn(GardenbedClient) -> Fut,
+        Fut: Future<Output = Result<T, tonic::Status>>,
+    {
+        let command: &'static str = "fetch";
+        let to_error = |status: tonic::Status| ClientError::Rpc {
+            command,
+            code: status.code(),
+            message: status.message().to_owned(),
+        };
+        match call(self.client.clone()).await {
+            Ok(value) => Ok(value),
+            Err(status) => {
+                let retry = self
+                    .fallback
+                    .as_ref()
+                    .filter(|_| Self::daemon_transport_dead(&status));
+                match retry {
+                    Some(embedded) => call(embedded.clone()).await.map_err(to_error),
+                    None => Err(to_error(status)),
+                }
+            }
+        }
+    }
     /// How many objects this run pulled over the wire so far: `(trees,
     /// blobs)`.
     pub fn fetched(&self) -> (u64, u64) {
@@ -431,15 +517,14 @@ impl Fetcher {
             .acquire()
             .await
             .expect("semaphore is never closed");
+        let repo = self.repo.clone();
         let tree = self
-            .client
-            .get_tree(&self.repo, id)
-            .await
-            .map_err(|status| ClientError::Rpc {
-                command: "fetch",
-                code: status.code(),
-                message: status.message().to_owned(),
-            })?;
+            .fetch_with_fallback(move |client| {
+                let repo = repo.clone();
+                async move { client.get_tree(&repo, id).await }
+            })
+            .await?;
+
         let bytes = tree
             .canonical_bytes()
             .map_err(|_| ClientError::BlobHashMismatch(id))?;
@@ -459,15 +544,13 @@ impl Fetcher {
             .acquire()
             .await
             .expect("semaphore is never closed");
+        let repo = self.repo.clone();
         let mut stream = self
-            .client
-            .get_blob(&self.repo, id)
-            .await
-            .map_err(|status| ClientError::Rpc {
-                command: "fetch",
-                code: status.code(),
-                message: status.message().to_owned(),
-            })?;
+            .fetch_with_fallback(move |client| {
+                let repo = repo.clone();
+                async move { client.get_blob(&repo, id).await }
+            })
+            .await?;
         let mut content = Vec::new();
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|status| ClientError::Rpc {
