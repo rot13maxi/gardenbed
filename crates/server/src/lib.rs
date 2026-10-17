@@ -13,8 +13,10 @@
 //! optional fields); errors are reserved for genuinely absent objects
 //! (`not_found`), bad input (`invalid_argument`), and semantic precondition
 //! violations (`failed_precondition`).
+pub mod repos;
 
 use std::collections::{BTreeMap, HashMap};
+use crate::repos::RepoSet;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,8 +29,22 @@ use gardenbed_store::{
 };
 
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
-/// must be uploaded with `PutBlob` first (v0.1.md §5).
 pub const MAX_INLINE_BLOB_LEN: usize = 1 << 20;
+
+
+/// Largest total inline payload accepted on `CreateChangeset` (2 MiB) —
+/// mirrors the client budget (`INLINE_TOTAL_LIMIT` in `bed`'s commit path)
+/// so a conforming client never trips it. Larger aggregates — and any
+/// single blob over [`MAX_INLINE_BLOB_LEN`] — must stream through
+/// `PutBlob` first.
+pub const MAX_INLINE_TOTAL_LEN: usize = 2 << 20;
+
+/// Largest blob accepted through the `PutBlob` streaming RPC (1 GiB).
+/// Deliberately tighter than the object store's defensive read bound
+/// (4 GiB, `MAX_BLOB_LEN` in gardenbed-store): a `PutBlob` body is fully
+/// buffered in server memory before the store ever sees it, so this cap
+/// bounds that buffer no matter how many chunks a client streams.
+pub const MAX_PUT_BLOB_LEN: usize = 1 << 30;
 
 /// Errors from [`Repo`] and the gRPC layer.
 #[derive(Debug, thiserror::Error)]
@@ -119,7 +135,7 @@ pub struct Repo {
     objects: Arc<dyn ObjectStore>,
     metadata: Arc<dyn MetadataStore>,
     engine: Engine,
-    stats: Stats,
+    stats: Arc<Stats>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -156,7 +172,7 @@ impl Repo {
             objects,
             metadata,
             engine,
-            stats: Stats::default(),
+            stats: Arc::new(Stats::default()),
         }
     }
 
@@ -359,16 +375,25 @@ impl Repo {
         } else {
             limit as usize
         };
+        // One get_changeset per node: every heap entry is pushed with its
+        // decoded changeset (the push needs committer.time_secs anyway),
+        // and popped entries hand theirs back — so the head seeds the
+        // cache and every node is fetched exactly once.
+        let mut cache: HashMap<Id, Changeset> = HashMap::new();
+        cache.insert(cs_id, head);
         let mut out: Vec<(Id, Changeset)> = Vec::with_capacity(cap.min(64));
         while let Some((_, _, id_bytes)) = heap.pop() {
             let id = Id::from_bytes(id_bytes);
             // Insert the parents on pop (git inserts parents when a commit
             // is taken off its date-sorted list), each with a fresh seq.
-            let cs = self.get_changeset(id)?;
+            let cs = cache
+                .remove(&id)
+                .ok_or(ServerError::ChangesetNotFound(id))?;
             for p in &cs.parents {
                 if seen.insert(*p) {
                     let parent = self.get_changeset(*p)?;
                     heap.push((parent.committer.time_secs, Reverse(seq), *p.as_bytes()));
+                    cache.insert(*p, parent);
                     seq += 1;
                 }
             }
@@ -529,11 +554,15 @@ impl Repo {
             None => BTreeMap::new(),
         };
 
+        // Precompute once: the paths that differ between the new parent
+        // and the pre-image (the whole lockstep diff, sorted).
+        let changed = changed_paths(&files, &pre);
+
         let mut conflicts: Vec<String> = Vec::new();
         for c in &cs.changes {
             match c.op {
                 gardenbed_model::Op::Add | gardenbed_model::Op::Modify => {
-                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(&files, &c.path, c.blob, c.mode, &changed, &mut conflicts);
                 }
                 gardenbed_model::Op::Delete => {
                     check_removal(&files, &pre, &c.path, &mut conflicts);
@@ -544,7 +573,7 @@ impl Repo {
                         continue;
                     };
                     check_removal(&files, &pre, src, &mut conflicts);
-                    check_write(&files, &pre, &c.path, c.blob, c.mode, &mut conflicts);
+                    check_write(&files, &c.path, c.blob, c.mode, &changed, &mut conflicts);
                 }
             }
         }
@@ -599,6 +628,19 @@ impl Repo {
     /// A snapshot of the request counters, sorted by name.
     pub fn stats(&self) -> BTreeMap<String, u64> {
         self.stats.snapshot()
+    }
+
+    /// The shared counters behind [`Repo::stats`] — shared with the
+    /// owning [`crate::repos::RepoHandle`] so eviction cannot reset them.
+    pub(crate) fn counters(&self) -> &Arc<Stats> {
+        &self.stats
+    }
+
+    /// Swaps in an earlier epoch's counters (an eviction reopen keeping
+    /// the name's counts cumulative). No effect on already-served
+    /// snapshots.
+    pub(crate) fn adopt_counters(&mut self, stats: &Arc<Stats>) {
+        self.stats = stats.clone();
     }
 
     /// The stats counters (bumped by the gRPC handlers only).
@@ -734,12 +776,63 @@ fn check_removal(
     }
 }
 
+/// Would appending `chunk` more bytes to a body already at `len_so_far`
+/// stay within `cap`? Pure so the PutBlob cap is unit-testable without
+/// streaming a gigabyte.
+fn chunk_fits(len_so_far: usize, chunk: usize, cap: usize) -> bool {
+    len_so_far <= cap && chunk <= cap - len_so_far
+}
+
+/// The lockstep diff of two flat trees: paths whose (mode, blob) differs
+/// between `files` and `pre`, sorted (both maps are BTreeMaps, so one
+/// two-cursor merge yields sorted output). Computed once per rebase call
+/// instead of once per change.
+fn changed_paths<'a>(
+    files: &'a BTreeMap<String, (Mode, Id)>,
+    pre: &'a BTreeMap<String, (Mode, Id)>,
+) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut fi = files.iter();
+    let mut pi = pre.iter();
+    let (mut f, mut p) = (fi.next(), pi.next());
+    loop {
+        match (f, p) {
+            (None, None) => return out,
+            (Some((fk, _fv)), None) => {
+                out.push(fk.as_str());
+                f = fi.next();
+            }
+            (None, Some((pk, _))) => {
+                out.push(pk.as_str());
+                p = pi.next();
+            }
+            (Some((fk, fv)), Some((pk, pv))) => match fk.cmp(pk) {
+                std::cmp::Ordering::Less => {
+                    out.push(fk.as_str());
+                    f = fi.next();
+                }
+                std::cmp::Ordering::Greater => {
+                    out.push(pk.as_str());
+                    p = pi.next();
+                }
+                std::cmp::Ordering::Equal => {
+                    if fv != pv {
+                        out.push(fk.as_str());
+                    }
+                    f = fi.next();
+                    p = pi.next();
+                }
+            },
+        }
+    }
+}
+
 fn check_write(
     files: &BTreeMap<String, (Mode, Id)>,
-    pre: &BTreeMap<String, (Mode, Id)>,
     path: &str,
     blob: Option<Id>,
     mode: Mode,
+    changed: &[&str],
     conflicts: &mut Vec<String>,
 ) {
     let Some(blob) = blob else {
@@ -750,28 +843,31 @@ fn check_write(
     if existing == Some(&(mode, blob)) {
         return; // Exact desired result: no path or subtree is overwritten.
     }
-    if existing != pre.get(path) {
+    // Paths whose (mode, blob) differs between the new parent and the
+    // pre-image, precomputed once per rebase call (sorted; binary-searched).
+    if changed.binary_search(&path).is_ok() {
         conflicts.push(format!("{path:?} was changed or deleted"));
     }
     let mut ancestor = path;
     while let Some((parent, _)) = ancestor.rsplit_once('/') {
-        if let Some(value) = files.get(parent)
-            && pre.get(parent) != Some(value)
-        {
+        // Only a file that still exists on the new parent can have been
+        // changed under; a parent absent from `files` was removed, not
+        // changed (the removed subtree is checked by the removal paths).
+        if files.contains_key(parent) && changed.binary_search(&parent).is_ok() {
             conflicts.push(format!("{path:?} sits under a concurrently changed file"));
         }
         ancestor = parent;
     }
     // Replacing a directory must not erase concurrent additions, edits,
-    // mode changes, or deletions anywhere in the swallowed subtree.
+    // mode changes, or deletions anywhere in the swallowed subtree. The
+    // first differing path sorted after "path/" is inside that subtree iff
+    // any differing path is: every non-descendant greater than "path/"
+    // (e.g. "dir0" for path "dir") sorts after every descendant.
     let prefix = format!("{path}/");
-    let descendants = |map: &BTreeMap<String, (Mode, Id)>| {
-        map.range(prefix.clone()..)
-            .take_while(|(p, _)| p.starts_with(&prefix))
-            .map(|(p, value)| (p.clone(), *value))
-            .collect::<BTreeMap<_, _>>()
-    };
-    if descendants(files) != descendants(pre) {
+    let i = changed
+        .binary_search_by(|p| p.as_bytes().cmp(prefix.as_bytes()))
+        .unwrap_err();
+    if i < changed.len() && changed[i].starts_with(&prefix) {
         conflicts.push(format!("directory {path:?} was changed"));
     }
 }
@@ -817,29 +913,38 @@ impl From<ServerError> for Status {
     }
 }
 
-/// The tonic adapter over one [`Repo`]: implements the generated
-/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5).
+/// The tonic adapter over a [`RepoSet`]: implements the generated
+/// `Gardenbed` trait (all 17 RPCs of v0.1.md §5) over N repositories.
+///
+/// Every handler resolves its request's `repo` field through
+/// [`RepoSet::resolve`] — the one seam where authentication lands (v0.3).
 pub struct GardenbedService {
-    repo: Arc<Repo>,
+    set: Arc<RepoSet>,
 }
 
 impl GardenbedService {
-    /// A service over `repo` (shared behind an `Arc`).
-    pub fn new(repo: Arc<Repo>) -> Self {
-        GardenbedService { repo }
+    /// A service over the repositories under `set`'s root.
+    pub fn new(set: Arc<RepoSet>) -> Self {
+        GardenbedService { set }
     }
 
-    /// The request's `repo` field: validated non-empty and logged. Every
-    /// request carries it (v0.1.md §5); v0.1 serves a single repo, so the
-    /// name is accepted as-is once non-empty.
-    fn repo_field<'a>(&self, repo: &'a str, rpc: &'static str) -> Result<&'a str, Status> {
-        if repo.is_empty() {
-            return Err(Status::invalid_argument(
-                "request carries no repo name (the `repo` field is mandatory)",
-            ));
-        }
+    /// The serving set (tests, the binary's logging).
+    pub fn set(&self) -> &RepoSet {
+        &self.set
+    }
+
+    /// Resolves the request's `repo` field to an in-use repository. The
+    /// name rules and errors are [`RepoSet::resolve`]'s: illegal names
+    /// (empty, bad characters, reserved) → `invalid_argument`; legal but
+    /// unserved → `not_found` listing the served names; a store that will
+    /// not open → `internal` naming the repository.
+    fn repo_guard(&self, repo: &str, rpc: &'static str) -> Result<repos::RepoGuard<'_>, Status> {
         log::debug!("request rpc={rpc} repo={repo}");
-        Ok(repo)
+        self.set.resolve(repo).map_err(|e| match e {
+            repos::RepoResolveError::InvalidName { .. } => Status::invalid_argument(e.to_string()),
+            repos::RepoResolveError::NotFound { .. } => Status::not_found(e.to_string()),
+            repos::RepoResolveError::Open { .. } => Status::internal(e.to_string()),
+        })
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -852,9 +957,10 @@ impl GardenbedService {
         })
     }
 
-    /// Bumps one of the counted RPC counters (no-op for uncounted names).
-    fn bump(&self, name: &str) {
-        if let Some(c) = self.repo.counter(name) {
+    /// Bumps one of the counted RPC counters on `repo` (no-op for
+    /// uncounted names).
+    fn bump(repo: &Repo, name: &str) {
+        if let Some(c) = repo.counter(name) {
             c.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -879,9 +985,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::RootTreeResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "RootTree")?;
+        let repo = self.repo_guard(&req.repo, "RootTree")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let tree = self.repo.root_tree(cs_id)?;
+        let tree = repo.root_tree(cs_id)?;
         Ok(Response::new(pb::RootTreeResp {
             tree_id: tree.map(id_to_bytes),
         }))
@@ -892,10 +998,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetTreeReq>,
     ) -> Result<Response<pb::TreeResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetTree")?;
-        self.bump("get_tree");
+        let repo = self.repo_guard(&req.repo, "GetTree")?;
+        Self::bump(&repo, "get_tree");
         let id = Self::id(&req.id, "id")?;
-        let Some(tree) = self.repo.get_tree(id)? else {
+        let Some(tree) = repo.get_tree(id)? else {
             return Err(Status::not_found(format!("tree {id} not found")));
         };
         let resp = pb::TreeResp::try_from(&tree)
@@ -908,10 +1014,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetBlobReq>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetBlob")?;
-        self.bump("get_blob");
+        let repo = self.repo_guard(&req.repo, "GetBlob")?;
+        Self::bump(&repo, "get_blob");
         let id = Self::id(&req.id, "id")?;
-        let Some(content) = self.repo.get_blob(id)? else {
+        let Some(content) = repo.get_blob(id)? else {
             return Err(Status::not_found(format!("blob {id} not found")));
         };
         // Own the chunks up front: the stream must be 'static and the blob
@@ -926,9 +1032,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetChangesetReq>,
     ) -> Result<Response<pb::ChangesetMsg>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetChangeset")?;
+        let repo = self.repo_guard(&req.repo, "GetChangeset")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let cs = self.repo.get_changeset(cs_id)?;
+        let cs = repo.get_changeset(cs_id)?;
         let msg = pb::ChangesetMsg::try_from(&cs).map_err(|e| {
             Status::internal(format!("stored changeset {cs_id} has no wire form: {e}"))
         })?;
@@ -958,12 +1064,24 @@ impl Gardenbed for GardenbedService {
                 ));
             }
         };
-        self.repo_field(&repo_name, "PutBlob")?;
+        let repo = self.repo_guard(&repo_name, "PutBlob")?;
 
+        // The body is fully buffered before the store sees it: cap it at
+        // MAX_PUT_BLOB_LEN no matter how many chunks arrive (checked per
+        // chunk, before the extend, so an over-cap stream is rejected
+        // without first allocating its full size).
         let mut body = Vec::new();
         while let Some(chunk) = stream.message().await? {
             match chunk.frame {
-                Some(pb::put_blob_chunk::Frame::Data(d)) => body.extend_from_slice(&d),
+                Some(pb::put_blob_chunk::Frame::Data(d)) => {
+                    if !chunk_fits(body.len(), d.len(), MAX_PUT_BLOB_LEN) {
+                        return Err(Status::resource_exhausted(format!(
+                            "PutBlob body exceeds the {}-byte limit",
+                            MAX_PUT_BLOB_LEN
+                        )));
+                    }
+                    body.extend_from_slice(&d);
+                }
                 Some(pb::put_blob_chunk::Frame::Header(_)) => {
                     return Err(Status::invalid_argument(
                         "duplicate header frame in a PutBlob stream",
@@ -976,8 +1094,8 @@ impl Gardenbed for GardenbedService {
                 }
             }
         }
-        let id = self.repo.put_blob(&body)?;
-        self.bump("put_blob");
+        let id = repo.put_blob(&body)?;
+        Self::bump(&repo, "put_blob");
         Ok(Response::new(pb::PutBlobResp {
             id: id_to_bytes(id),
         }))
@@ -988,7 +1106,7 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::CreateChangesetReq>,
     ) -> Result<Response<pb::CreateChangesetResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "CreateChangeset")?;
+        let repo = self.repo_guard(&req.repo, "CreateChangeset")?;
         let msg = req
             .cs
             .ok_or_else(|| Status::invalid_argument("CreateChangesetReq carries no changeset"))?;
@@ -1003,13 +1121,24 @@ impl Gardenbed for GardenbedService {
                 ))
             })?;
         }
+        // The whole inline payload rides one unary request: cap its total
+        // the same way the client budget does. Larger blobs — or
+        // aggregates — must stream through PutBlob first.
+        let total: usize = req.inline_blobs.values().map(|v| v.len()).sum();
+        if total > MAX_INLINE_TOTAL_LEN {
+            return Err(Status::resource_exhausted(format!(
+                "inline_blobs total {} bytes exceeds the {}-byte limit; \
+                 larger blobs must be uploaded via PutBlob first",
+                total, MAX_INLINE_TOTAL_LEN
+            )));
+        }
         let inline: BTreeMap<String, Vec<u8>> = req
             .inline_blobs
             .into_iter()
             .map(|(key, content)| (key, content.to_vec()))
             .collect();
-        let id = self.repo.create_changeset(&cs, &inline)?;
-        self.bump("create_changeset");
+        let id = repo.create_changeset(&cs, &inline)?;
+        Self::bump(&repo, "create_changeset");
         Ok(Response::new(pb::CreateChangesetResp {
             id: id_to_bytes(id),
         }))
@@ -1020,10 +1149,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::MergeBaseReq>,
     ) -> Result<Response<pb::MergeBaseResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "MergeBase")?;
+        let repo = self.repo_guard(&req.repo, "MergeBase")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let base = self.repo.merge_base(a, b)?;
+        let base = repo.merge_base(a, b)?;
         Ok(Response::new(pb::MergeBaseResp {
             id: base.map(id_to_bytes),
         }))
@@ -1034,10 +1163,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::IsAncestorReq>,
     ) -> Result<Response<pb::IsAncestorResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "IsAncestor")?;
+        let repo = self.repo_guard(&req.repo, "IsAncestor")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let is_ancestor = self.repo.is_ancestor(a, b)?;
+        let is_ancestor = repo.is_ancestor(a, b)?;
         Ok(Response::new(pb::IsAncestorResp { is_ancestor }))
     }
 
@@ -1046,10 +1175,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::DiffReq>,
     ) -> Result<Response<Self::DiffStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Diff")?;
+        let repo = self.repo_guard(&req.repo, "Diff")?;
         let a = Self::id(&req.a, "a")?;
         let b = Self::id(&req.b, "b")?;
-        let changes = self.repo.diff(a, b)?;
+        let changes = repo.diff(a, b)?;
         let items = changes.into_iter().map(|c| {
             pb::ChangeMsg::try_from(&c)
                 .map_err(|e| Status::internal(format!("change has no wire form: {e}")))
@@ -1059,9 +1188,9 @@ impl Gardenbed for GardenbedService {
 
     async fn log(&self, request: Request<pb::LogReq>) -> Result<Response<Self::LogStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Log")?;
+        let repo = self.repo_guard(&req.repo, "Log")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let entries = self.repo.log(cs_id, req.limit)?;
+        let entries = repo.log(cs_id, req.limit)?;
         let items = entries.into_iter().map(|(id, cs)| {
             Ok(pb::ChangesetSummary {
                 cs_id: id_to_bytes(id),
@@ -1079,9 +1208,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::BlameReq>,
     ) -> Result<Response<Self::BlameStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Blame")?;
+        let repo = self.repo_guard(&req.repo, "Blame")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let ranges = self.repo.blame(cs_id, &req.path)?;
+        let ranges = repo.blame(cs_id, &req.path)?;
         let items = ranges.into_iter().map(|(lo, hi, cs)| {
             Ok(pb::BlameRange {
                 lo,
@@ -1097,8 +1226,8 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::ListRefsReq>,
     ) -> Result<Response<Self::ListRefsStream>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "ListRefs")?;
-        let refs = self.repo.list_refs()?;
+        let repo = self.repo_guard(&req.repo, "ListRefs")?;
+        let refs = repo.list_refs()?;
         let items = refs.into_iter().map(|(name, cs_id)| {
             Ok(pb::RefEntry {
                 name,
@@ -1121,11 +1250,11 @@ impl Gardenbed for GardenbedService {
         // 64-hex token stays a ref name here — clients parse those as ids
         // before any lookup.
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetRef")?;
+        let repo = self.repo_guard(&req.repo, "GetRef")?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
-        let cs_id = self.repo.get_ref(&req.name)?;
+        let cs_id = repo.get_ref(&req.name)?;
         Ok(Response::new(pb::GetRefResp {
             cs_id: cs_id.map(id_to_bytes),
         }))
@@ -1136,7 +1265,7 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::CasRefReq>,
     ) -> Result<Response<pb::CasResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "CasRef")?;
+        let repo = self.repo_guard(&req.repo, "CasRef")?;
         if req.name.is_empty() {
             return Err(Status::invalid_argument("ref name must be non-empty"));
         }
@@ -1145,7 +1274,7 @@ impl Gardenbed for GardenbedService {
             None => None,
         };
         let new = Self::id(&req.new, "new")?;
-        let outcome = self.repo.cas_ref(&req.name, expected, new)?;
+        let outcome = repo.cas_ref(&req.name, expected, new)?;
         let result = match outcome {
             RefCas::Won { .. } => pb::cas_resp::Result::Won(true),
             RefCas::Conflict { current } => {
@@ -1162,10 +1291,10 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::RebaseReq>,
     ) -> Result<Response<pb::RebaseResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Rebase")?;
+        let repo = self.repo_guard(&req.repo, "Rebase")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
         let new_parent = Self::id(&req.new_parent, "new_parent")?;
-        let id = self.repo.rebase(cs_id, new_parent)?;
+        let id = repo.rebase(cs_id, new_parent)?;
         Ok(Response::new(pb::RebaseResp {
             id: id_to_bytes(id),
         }))
@@ -1176,9 +1305,9 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::PublishReq>,
     ) -> Result<Response<pb::PublishResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "Publish")?;
+        let repo = self.repo_guard(&req.repo, "Publish")?;
         let cs_id = Self::id(&req.cs_id, "cs_id")?;
-        let id = self.repo.publish(cs_id)?;
+        let id = repo.publish(cs_id)?;
         Ok(Response::new(pb::PublishResp {
             id: id_to_bytes(id),
         }))
@@ -1189,10 +1318,25 @@ impl Gardenbed for GardenbedService {
         request: Request<pb::GetStatsReq>,
     ) -> Result<Response<pb::StatsResp>, Status> {
         let req = request.into_inner();
-        self.repo_field(&req.repo, "GetStats")?;
+        let repo = self.repo_guard(&req.repo, "GetStats")?;
         Ok(Response::new(pb::StatsResp {
-            counters: self.repo.stats().into_iter().collect(),
+            counters: repo.stats().into_iter().collect(),
         }))
+    }
+
+    /// Server-side two-parent merge (v0.2.md D9-D11). NOT implemented
+    /// here: the adopted implementation lives on feat/merge (98ec4bf) and
+    /// lands by rebasing it over this shape — this stub only satisfies
+    /// the generated trait so the server compiles with the Merge RPC in
+    /// the proto.
+    async fn merge(
+        &self,
+        request: Request<pb::MergeReq>,
+    ) -> Result<Response<pb::MergeResp>, Status> {
+        let _ = request;
+        Err(Status::unimplemented(
+            "merge lands with feat/merge (98ec4bf)",
+        ))
     }
 }
 
@@ -1528,5 +1672,54 @@ mod ref_normalization_tests {
             repo.list_refs().expect("refs"),
             vec![("main".to_owned(), r2)]
         );
+    }
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// `chunk_fits` at the exact boundary: a body may fill the cap but
+    /// not exceed it by even one byte.
+    #[test]
+    fn chunk_fits_boundary() {
+        let cap = 10;
+        assert!(chunk_fits(0, 10, cap), "exactly filling the cap fits");
+        assert!(chunk_fits(10, 0, cap), "a zero-length chunk always fits");
+        assert!(!chunk_fits(0, 11, cap), "one byte over is rejected");
+        assert!(!chunk_fits(10, 1, cap), "overflowing a full body is rejected");
+        assert!(!chunk_fits(11, 0, cap), "an already-over body never fits");
+        assert!(chunk_fits(0, 0, 0), "a zero cap admits only nothing");
+        assert!(!chunk_fits(0, 1, 0));
+        // The real caps' documented relationship: the PutBlob cap is far
+        // above the inline limits, both far below the store's read bound.
+        assert!(MAX_INLINE_BLOB_LEN < MAX_INLINE_TOTAL_LEN);
+        assert!(MAX_INLINE_TOTAL_LEN < MAX_PUT_BLOB_LEN);
+        assert!(MAX_PUT_BLOB_LEN < 4 << 30);
+    }
+
+    /// `changed_paths` is the sorted lockstep diff of two flat trees.
+    #[test]
+    fn changed_paths_is_the_sorted_diff() {
+        let b = |s: &str| blob_id(s.as_bytes());
+        let entry = |content: &str, mode: Mode| (mode, b(content));
+        let files = BTreeMap::from([
+            ("a.txt".to_owned(), entry("same", Mode::Regular)),
+            ("dir/f".to_owned(), entry("edited", Mode::Regular)),
+            ("dir/sub/g".to_owned(), entry("added", Mode::Regular)),
+        ]);
+        let pre = BTreeMap::from([
+            ("a.txt".to_owned(), entry("same", Mode::Regular)),
+            ("dir/f".to_owned(), entry("old", Mode::Regular)),
+            ("dir/gone".to_owned(), entry("deleted", Mode::Regular)),
+        ]);
+        assert_eq!(
+            changed_paths(&files, &pre),
+            vec!["dir/f", "dir/gone", "dir/sub/g"]
+        );
+        // A mode-only difference counts too.
+        let exec = BTreeMap::from([("x".to_owned(), (Mode::Exec, b("x")))]);
+        let reg = BTreeMap::from([("x".to_owned(), (Mode::Regular, b("x")))]);
+        assert_eq!(changed_paths(&exec, &reg), vec!["x"]);
     }
 }
