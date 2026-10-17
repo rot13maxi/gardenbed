@@ -71,7 +71,7 @@ async fn world() -> World {
     let root = tempfile::tempdir().unwrap();
     let garden = root.path().join("garden");
     fs::create_dir(&garden).unwrap();
-    let store_root = root.path().join("server");
+    let store_root = root.path().join("server").join(REPO);
     let repo = Repo::open(&store_root).unwrap();
     let cs1 = create(
         &repo,
@@ -86,7 +86,7 @@ async fn world() -> World {
     );
     let cs2 = create(&repo, vec![], &[("a", b"older")]);
     repo.cas_ref("main", None, cs1).unwrap();
-    let server = Server::spawn(&store_root).await;
+    let server = Server::spawn(store_root.parent().unwrap()).await;
     let (code, _, err) = bed(
         &garden,
         &[
