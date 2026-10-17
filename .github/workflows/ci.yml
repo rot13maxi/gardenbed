@@ -103,7 +103,7 @@ jobs:
       # 30 s per target: enough to smoke the parsers, not to *fuzz* them
       # (the release gate runs 120 s per target locally, docs/release-0.1.md).
       - run: |
-          for t in fuzz_tree_apply fuzz_diff fuzz_difftree_parse fuzz_mcp_line; do
+          for t in fuzz_tree_apply fuzz_diff fuzz_difftree_parse fuzz_mcp_line fuzz_pack_reader; do
             cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
           done
         working-directory: fuzz

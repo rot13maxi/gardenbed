@@ -45,7 +45,18 @@ CREATE TABLE IF NOT EXISTS derived (
     bytes BLOB NOT NULL,
     PRIMARY KEY (kind, cs)
 );
+CREATE TABLE IF NOT EXISTS git_raw_commit (
+    cs   BLOB PRIMARY KEY REFERENCES changesets(id),
+    data BLOB NOT NULL
+);
 ";
+
+/// zstd level for raw-commit frames — fixed for determinism (D21).
+pub(crate) const ZSTD_LEVEL: i32 = 3;
+
+/// Sanity bound on a decompressed raw commit (64 MiB): far above any real
+/// commit object, small enough to refuse a corrupt frame's huge claim.
+pub(crate) const MAX_RAW_COMMIT: usize = 64 * 1024 * 1024;
 
 /// The SQLite (metadata) metadata store.
 ///
@@ -143,6 +154,7 @@ impl SqliteMetadataStore {
         git_sha_hex: Option<&str>,
         derived: &[crate::traits::DerivedRow],
         validated_tree: Option<Option<Id>>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         use sha2::Digest;
         let sha = git_sha_hex.map(normalize_git_sha).transpose()?;
@@ -253,6 +265,44 @@ impl SqliteMetadataStore {
                         params![id.as_bytes(), payload],
                     )
                     .map_err(db_err)?;
+                }
+            }
+            if let Some(raw) = raw_commit {
+                // Sparse capture (D21): keep any existing row for the same
+                // bytes; a different row is an immutability violation
+                // (content addressing means the same changeset id always
+                // reconstructs the same original commit).
+                let previous: Option<Vec<u8>> = tx
+                    .query_row(
+                        "SELECT data FROM git_raw_commit WHERE cs = ?1",
+                        params![id.as_bytes()],
+                        |r| r.get::<_, Vec<u8>>(0),
+                    )
+                    .optional()
+                    .map_err(db_err)?;
+                let previous = previous
+                    .map(|frame| {
+                        // Rows are zstd frames; compare the *bytes* they
+                        // decode to, so a level change never fabricates an
+                        // immutability violation.
+                        zstd::bulk::decompress(&frame, MAX_RAW_COMMIT)
+                            .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+                    })
+                    .transpose()?;
+                match previous {
+                    Some(bytes) if bytes == raw => {}
+                    Some(_) => {
+                        return Err(StoreError::ImmutabilityViolation(id));
+                    }
+                    None => {
+                        let frame = zstd::bulk::compress(raw, ZSTD_LEVEL)
+                            .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))?;
+                        tx.execute(
+                            "INSERT INTO git_raw_commit(cs, data) VALUES(?1, ?2)",
+                            params![id.as_bytes(), frame],
+                        )
+                        .map_err(db_err)?;
+                    }
                 }
             }
             Ok(())
@@ -532,7 +582,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         git_sha_hex: &str,
         derived: &[crate::traits::DerivedRow],
     ) -> Result<Id, StoreError> {
-        self.write_changeset(canonical, Some(git_sha_hex), derived, None)
+        self.write_changeset(canonical, Some(git_sha_hex), derived, None, None)
     }
 
     fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
@@ -556,17 +606,44 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .transpose()
     }
 
+    fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.lock()?;
+        let frame: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM git_raw_commit WHERE cs = ?1",
+                params![cs.as_bytes()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        // One zstd frame per row (D21: `data BLOB zstd`), level fixed for
+        // determinism — matching the blob-envelope convention.
+        frame
+            .map(|f| {
+                zstd::bulk::decompress(&f, MAX_RAW_COMMIT)
+                    .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+            })
+            .transpose()
+    }
+
     fn put_validated_changeset(
         &self,
         cs: &Changeset,
         root_tree: Option<Id>,
         derived: &[crate::traits::DerivedRow],
         git_sha_hex: Option<&str>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         let canonical = cs
             .canonical_bytes()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        self.write_changeset(&canonical, git_sha_hex, derived, Some(root_tree))
+        self.write_changeset(
+            &canonical,
+            git_sha_hex,
+            derived,
+            Some(root_tree),
+            raw_commit,
+        )
     }
 }
 

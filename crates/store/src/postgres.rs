@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS derived (
     bytes bytea NOT NULL,
     PRIMARY KEY (kind, cs)
 );
+CREATE TABLE IF NOT EXISTS git_raw_commit (
+    cs   bytea PRIMARY KEY REFERENCES changesets(id),
+    data bytea NOT NULL
+);
 ";
 
 /// Schema amendments applied after SCHEMA on every open
@@ -134,6 +138,7 @@ impl PostgresMetadataStore {
         git_sha_hex: Option<&str>,
         derived: &[DerivedRow],
         validated_tree: Option<Option<Id>>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         let sha = git_sha_hex.map(normalize_git_sha).transpose()?;
         let cs = Changeset::decode(canonical)
@@ -152,6 +157,17 @@ impl PostgresMetadataStore {
             })
             .collect();
         let parents: Vec<Vec<u8>> = cs.parents.iter().map(|p| p.as_bytes().to_vec()).collect();
+        // One zstd frame per row (D21), level fixed for determinism —
+        // matching the SQLite backend's convention.
+        let raw_frame = raw_commit
+            .map(|raw| {
+                zstd::bulk::compress(raw, crate::sqlite::ZSTD_LEVEL)
+                    .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+            })
+            .transpose()?;
+        // Decoded bytes for the immutability compare (a level change must
+        // not fabricate a violation — SQLite twin).
+        let raw_bytes = raw_commit.map(|raw| raw.to_vec());
         let pool = self.pool.clone();
         self.driver.block_on(async move {
             let mut conn = pool.get().await.map_err(pg_err)?;
@@ -253,6 +269,36 @@ impl PostgresMetadataStore {
                 )
                 .await
                 .map_err(pg_err)?;
+            }
+            if let Some(frame) = &raw_frame {
+                // Compare decoded bytes, never frames: a level change must
+                // not fabricate an immutability violation (SQLite twin).
+                let previous = tx
+                    .query_opt(
+                        "SELECT data FROM git_raw_commit WHERE cs = $1",
+                        &[&id.as_bytes().to_vec()],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                let previous = previous
+                    .map(|row| {
+                        let frame: Vec<u8> = row.get(0);
+                        zstd::bulk::decompress(&frame, crate::sqlite::MAX_RAW_COMMIT)
+                            .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+                    })
+                    .transpose()?;
+                match previous {
+                    Some(bytes) if raw_bytes.as_deref() == Some(bytes.as_slice()) => {}
+                    Some(_) => return Err(StoreError::ImmutabilityViolation(id)),
+                    None => {
+                        tx.execute(
+                            "INSERT INTO git_raw_commit(cs, data) VALUES($1, $2)",
+                            &[&id.as_bytes().to_vec(), &frame],
+                        )
+                        .await
+                        .map_err(pg_err)?;
+                    }
+                }
             }
             if let Some(root) = validated_tree {
                 let payload: Vec<u8> = root.map(|rid| rid.as_bytes().to_vec()).unwrap_or_default();
@@ -647,7 +693,7 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         git_sha_hex: &str,
         derived: &[DerivedRow],
     ) -> Result<Id, StoreError> {
-        self.write_changeset(canonical, Some(git_sha_hex), derived, None)
+        self.write_changeset(canonical, Some(git_sha_hex), derived, None, None)
     }
 
     fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
@@ -682,11 +728,41 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         root_tree: Option<Id>,
         derived: &[DerivedRow],
         git_sha_hex: Option<&str>,
+        raw_commit: Option<&[u8]>,
     ) -> Result<Id, StoreError> {
         let canonical = cs
             .canonical_bytes()
             .map_err(|e| StoreError::Invalid(e.to_string()))?;
-        self.write_changeset(&canonical, git_sha_hex, derived, Some(root_tree))
+        self.write_changeset(
+            &canonical,
+            git_sha_hex,
+            derived,
+            Some(root_tree),
+            raw_commit,
+        )
+    }
+
+    fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let conn = pool.get().await.map_err(pg_err)?;
+            let frame: Option<Vec<u8>> = conn
+                .query_opt(
+                    "SELECT data FROM git_raw_commit WHERE cs = $1",
+                    &[&cs.as_bytes().to_vec()],
+                )
+                .await
+                .map_err(pg_err)?
+                .map(|row| row.get(0));
+            // One zstd frame per row (D21: `data bytea zstd`), level fixed
+            // for determinism — matching the SQLite backend's convention.
+            frame
+                .map(|f| {
+                    zstd::bulk::decompress(&f, crate::sqlite::MAX_RAW_COMMIT)
+                        .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
+                })
+                .transpose()
+        })
     }
 }
 

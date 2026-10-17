@@ -348,8 +348,11 @@ impl MetadataStore for CountingMetadata {
         root: Option<gardenbed_model::Id>,
         rows: &[gardenbed_store::DerivedRow],
         git: Option<&str>,
+        raw: Option<&[u8]>,
     ) -> Result<gardenbed_model::Id, gardenbed_store::StoreError> {
-        let id = self.inner.put_validated_changeset(cs, root, rows, git)?;
+        let id = self
+            .inner
+            .put_validated_changeset(cs, root, rows, git, raw)?;
         self.certificates_written
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(id)

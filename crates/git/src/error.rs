@@ -4,8 +4,8 @@ use gardenbed_model::Id;
 use gardenbed_model::codec::CodecError;
 use gardenbed_store::StoreError;
 
-/// I/O failures inside the export pipeline (stream writing, marks file
-/// handling) surface as git errors: the stream's only consumer is git.
+/// I/O failures inside the export pipeline (pack/idx/ref writing) surface
+/// as git errors: the files' only consumer is git.
 impl From<std::io::Error> for ExportError {
     fn from(e: std::io::Error) -> Self {
         ExportError::Git(format!("io: {e}"))
