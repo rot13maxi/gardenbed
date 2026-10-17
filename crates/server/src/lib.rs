@@ -26,6 +26,14 @@ use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
 
+/// The build fingerprint: a SHA-256 over `crates/server/src/**` file
+/// contents at build time (`build.rs`). The test harness compares it
+/// against the same digest computed over the *current* sources to catch a
+/// binary built from different tree state — mtime checks are blind to
+/// that (`bed switch` materializes sources with commit-time mtimes;
+/// dogfood finding #12's core).
+pub const SRC_DIGEST: &str = env!("GARDENBED_SERVER_SRC_DIGEST");
+
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
 /// must be uploaded with `PutBlob` first (v0.1.md §5).
 pub const MAX_INLINE_BLOB_LEN: usize = 1 << 20;
