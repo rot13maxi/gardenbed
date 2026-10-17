@@ -110,6 +110,27 @@ tags, and the verification record for a release lives in
 
 ### Changed
 
+
+- **`bed diff` renders renames and submodule pointer hunks** (v0.2
+  D22/D23): a pure rename renders git's `R100` form (`similarity index
+  100%` / `rename from` / `rename to`) in every diff form — the
+  changeset-scoped forms (`bed diff <cs>`, no-arg on a clean copy)
+  render from the changeset's recorded `Rename` op, and the two-sided
+  form pairs a delete with a write of the identical blob at render
+  time, the same rule `bed commit` pairs by. A moved-and-edited file
+  still renders as a delete plus a write — no similarity below 100% is
+  ever claimed (divergences §6 residual). Submodule pointers render
+  git's `Subproject commit <sha>` hunks on add, delete, and retarget,
+  with the real upstream SHA from the padded gitlink id — replacing the
+  v0.1 `Binary files … differ` line (divergences §7 residual:
+  gitlink↔regular typechanges still render mode lines only). Every
+  rendered shape reapplies with `git apply` (gitlink entries via
+  `--cached`). Verified by letter/byte parity with `git diff-tree -M`
+  and `--submodule=short` on generated rename/gitlink histories, plus
+  real-`git apply` tests (`crates/bed/tests/read_path.rs`,
+  `crates/bed/tests/render_patch.rs`). The MCP `diff` tool is
+  unchanged, keeping its `--no-renames` letter parity deliberately.
+
 - **`bed` honors `.gitignore` for untracked-file discovery**: `bed
   status` and `bed commit` now read `.gitignore` files from the working
   copy (root plus one per directory walked) and hide matching untracked
