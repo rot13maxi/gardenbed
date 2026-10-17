@@ -15,5 +15,6 @@ thiserror = "2"
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
+gardenbed-server = { path = "../server" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tempfile = "3"
