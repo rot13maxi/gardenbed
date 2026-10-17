@@ -54,3 +54,23 @@ every commit records it and reviewers filter by author.
 - All 12 git branch refs are imported; `bed switch <branch>` works
 - New commits made in git (not bed) need a server re-import — ping wG:p9
 - GitHub pushes: export main via `gardenbed-server export`, then push from the git mirror
+
+## Dogfood findings (2026-10-17)
+- **#11 — Export leaves a non-bare mirror's index/worktree stale**: `gardenbed-server
+  export` drives `git fast-import` (`crates/git/src/export.rs`), which advances the ref but
+  never touches the index or working tree. Every export into `/home/user/code/gardenbed`
+  (non-bare) therefore stages the prior checkout's content as deletions against the new
+  HEAD (observed: 226 files/361k lines, 7 files, 1 file across three exports today).
+  Coordinator mitigation: `git reset --hard main` in the mirror after every export.
+  Exports themselves are unaffected (export reads server metadata). Product fix on backlog.
+- **#12 — `cargo test -p gardenbed` spawns a stale workspace server binary**:
+  `crates/bed/tests/common/mod.rs::server_bin()` starts `target/{debug,release}/gardenbed-server`
+  without rebuilding it. After a `crates/server` change, protocol-dependent tests fail in
+  ways that look like code regressions (real case: `publish_ref_advances` failed
+  identically on a rebased tree AND pristine main until `cargo build -p gardenbed-server`
+  ran). Rebuild the server package before re-running bed tests after server changes.
+
+## Backlog — product fixes from dogfood findings
+- **#11 product fix**: `export_to_path` should reset/checkout the target ref when the
+  destination is a non-bare repo (or refuse/warn on non-bare targets). Owner: unassigned.
+  Will bite any future non-bare mirror consumer.
