@@ -319,6 +319,14 @@ impl MetadataStore for CountingMetadata {
     ) -> Result<(), gardenbed_store::StoreError> {
         self.inner.derived_put(kind, cs, bytes)
     }
+    fn recent_changesets(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<gardenbed_model::Id>, gardenbed_store::StoreError> {
+        // Not a per-changeset history read: the counter assertions are
+        // about get_changeset traffic, so this stays uncounted.
+        self.inner.recent_changesets(limit)
+    }
     fn derived_get(
         &self,
         kind: &str,

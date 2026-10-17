@@ -52,6 +52,22 @@ function currentRev() {
   return state.rev || "main";
 }
 
+/* session caches: files by (rev,path), changesets by id */
+const FILE_CACHE = {};
+function fetchFileCached(rev, path) {
+  const k = rev + " " + path;
+  if (!FILE_CACHE[k]) {
+    FILE_CACHE[k] = api("/api/file?" + qs({ cs: rev, path: path }));
+    FILE_CACHE[k].catch(() => { delete FILE_CACHE[k]; }); // failures never stick — retry must recover
+  }
+  return FILE_CACHE[k];
+}
+const CS_CACHE = {};
+function fetchChangesetCached(id) {
+  if (!CS_CACHE[id]) CS_CACHE[id] = api("/api/changeset?" + qs({ id: id }));
+  return CS_CACHE[id];
+}
+
 function loadRefs() {
   const sel = document.getElementById("ref-select");
   return api("/api/refs").then((data) => {
@@ -78,6 +94,8 @@ function loadRefs() {
       safeStorage("set", REF_KEY, state.rev);
       route();
     });
+    for (const r of state.refs) lastTips[r.name] = r.cs; // live-poll baseline
+    startLivePoll();
   }).catch(() => {
     sel.textContent = "";
     sel.appendChild(option("refs unavailable", ""));
@@ -382,6 +400,31 @@ function copyButton(getText, label) {
   return btn;
 }
 
+function flashBtn(btn, label, restore) {
+  const orig = btn.textContent;
+  btn.textContent = label;
+  setTimeout(() => { btn.textContent = restore || orig; }, 1200);
+}
+
+/** Copy a permalink to the current view. */
+function permalinkButton(title) {
+  const btn = el("button", {
+    class: "btn btn-sm permalink-btn", type: "button",
+    title: title || "copy link to this view",
+  }, "link");
+  btn.addEventListener("click", async () => {
+    try {
+      const href = typeof location !== "undefined" && location.href
+        ? String(location.href) : "#" + String(location.hash || "");
+      await copyText(href);
+      flashBtn(btn, "copied", "link");
+    } catch (_) {
+      flashBtn(btn, "copy failed", "link");
+    }
+  });
+  return btn;
+}
+
 const OP_META = {
   add:    { letter: "A", cls: "add",    label: "Added" },
   modify: { letter: "M", cls: "modify", label: "Modified" },
@@ -389,11 +432,17 @@ const OP_META = {
   rename: { letter: "R", cls: "rename", label: "Renamed" },
 };
 
-/** Hook-required change list, shared by changeset & compare views. */
-function changeList(changes, fileRev) {
+/**
+ * Hook-required change list, shared by changeset & compare views. Each row
+ * grows a diff expander; below the row sits a lazily-filled unified diff
+ * block (old = oldRev @ src_path|path, new = newRev @ path).
+ */
+function changeList(changes, newRev, oldRev) {
   const groups = { add: [], modify: [], delete: [], rename: [], other: [] };
   for (const c of changes || []) (groups[c.op] || groups.other).push(c);
   const wrap = el("div", { class: "change-list" });
+  const ctx = { newRev: newRev, oldRev: oldRev };
+  const jobs = [];
   const order = ["add", "modify", "delete", "rename", "other"];
   for (const op of order) {
     const list = groups[op];
@@ -402,6 +451,22 @@ function changeList(changes, fileRev) {
     wrap.appendChild(el("div", { class: "op-group-title" }, meta.label + " · " + list.length));
     for (const c of list) {
       const row = el("div", { class: "change-row", dataset: { op: c.op || "other" } });
+      let job = null;
+      if (c.mode !== "gitlink") {
+        const exp = el("button", {
+          class: "diff-expander", type: "button",
+          "aria-expanded": "false", "aria-label": "show diff",
+        }, "▸");
+        const block = el("div", { class: "diff-block", hidden: "" });
+        const metaEl = el("span", { class: "diff-meta mono" });
+        job = { exp: exp, block: block, meta: metaEl, change: c, loaded: false, loading: null, open: false, rendered: false, ops: null };
+        exp.addEventListener("click", () => {
+          if (job.loaded) setDiffOpen(job, !job.open);
+          else if (job.loading) job.loading.then(() => setDiffOpen(job, true)); // user intent wins over auto
+          else loadDiff(job, ctx, false); // retry allowed: loadDiff only marks loaded on success
+        });
+        row.appendChild(exp);
+      }
       row.appendChild(el("span", { class: "change-badge " + meta.cls }, meta.letter));
       if (c.op === "rename" && c.src_path) {
         row.appendChild(el("span", { class: "change-path" },
@@ -414,14 +479,24 @@ function changeList(changes, fileRev) {
       if (c.mode && c.mode !== "regular") {
         row.appendChild(el("span", { class: "mode-chip" }, c.mode));
       }
+      if (job) {
+        row.appendChild(job.meta);
+        row.appendChild(el("span", { class: "spacer" }));
+      }
       if ((c.op === "add" || c.op === "modify" || c.op === "rename") &&
-          c.mode !== "gitlink" && fileRev) {
-        row.appendChild(el("a", { class: "view-file", href: fileHref(fileRev, c.path) }, "view file"));
+          c.mode !== "gitlink" && newRev) {
+        row.appendChild(el("a", { class: "view-file", href: fileHref(newRev, c.path) }, "view file"));
       }
       wrap.appendChild(row);
+      if (job) {
+        wrap.appendChild(job.block);
+        jobs.push(job);
+      }
     }
   }
   if (!wrap.firstChild) wrap.appendChild(emptyState("No changes", null, "this diff is empty"));
+  // eager load decides auto-expand (≤ DIFF_AUTO_MAX lines) vs collapsed
+  for (const job of jobs) loadDiff(job, ctx, true);
   return wrap;
 }
 
@@ -494,6 +569,17 @@ function pickHost(addr) {
   return (typeof location !== "undefined" && location.hostname) || "localhost";
 }
 
+/** POSIX single-quote: '…' with embedded ' escaped as '"'"'. */
+function shellQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\"'\"'") + "'";
+}
+
+/** Bare when the value is a plain host/token char class, else shell-quoted. */
+function shellArg(s) {
+  const v = String(s);
+  return /^[A-Za-z0-9._-]+$/.test(v) ? v : shellQuote(v);
+}
+
 /** The markdown prompt an operator can paste into any agent. */
 function buildAgentPrompt(info, refs) {
   info = info || {};
@@ -502,6 +588,13 @@ function buildAgentPrompt(info, refs) {
   const mainRef = refs.find((r) => r.name === "refs/heads/main") || refs[0];
   const host = pickHost(info.addr);
   const root = info.root || "(unknown)";
+  // Shell lines are pasted verbatim: quote paths unconditionally, hosts when
+  // they wander outside the plain [A-Za-z0-9._-] alphabet (spaces, $(…), …).
+  const rootMcp = shellQuote(info.root || "(the repo root from your operator)");
+  const rootQ = shellQuote(root);
+  const hostQ = shellArg(host);
+  const bareHost = hostQ === host;
+  const cloneUrl = "http://" + host + ":9418";
   const origin = (typeof location !== "undefined" && location.origin) || "(this web UI)";
   L.push(
     "# Working with this gardenbed repository", "",
@@ -518,12 +611,12 @@ function buildAgentPrompt(info, refs) {
       "; repo root on the server machine: " + root, "",
     "## Option A — MCP (queries only, no checkout)", "",
     "If your agent host supports MCP servers, register:", "",
-    "    gardenbed-mcp --root " + (info.root || "(the repo root from your operator)"), "",
+    "    gardenbed-mcp --root " + rootMcp, "",
     "Gives you log / diff / file / blame tools with zero checkout.", "",
     "## Option B — bed CLI (full read/write)", "",
     "Ask your operator for the gRPC endpoint (or start it on the repo machine:",
-    "`gardenbed-server --root " + root + " --addr " + host + ":9418`). Then:", "",
-    "    bed clone http://" + host + ":9418        # creates .bed, fetches nothing",
+    "`gardenbed-server --root " + rootQ + " --addr " + hostQ + ":9418`). Then:", "",
+    "    bed clone " + (bareHost ? cloneUrl : shellQuote(cloneUrl)) + "        # creates .bed, fetches nothing",
     "    bed sparse add crates                   # materialize only what you need",
     "    bed status",
     "    GARDENBED_AUTHOR=\"Name <email>\" bed commit -m \"...\"",
@@ -532,7 +625,8 @@ function buildAgentPrompt(info, refs) {
     "- History queries without checkout: bed log / bed diff / bed file / bed blame accept refs,",
     "  full 64-hex ids, or unambiguous prefixes.",
     "- publish never merges for you; on conflict rebase and republish — your changeset is kept.",
-    "- Only commit inside a sparse working copy after `bed sparse add`-ing the paths you touch.", "",
+    "- Only commit inside a sparse working copy after `bed sparse add`-ing the paths you touch.",
+    "- Review and land changesets through the bed CLI (bed diff / bed rebase / bed publish); this web UI is read-only.", "",
     "Full docs: docs/quickstart.md and docs/cli.md in the gardenbed repository.");
   return L.join("\n");
 }
@@ -749,6 +843,837 @@ function buildAuthors(entries, top) {
       el("span", { class: "author-count mono" }, String(n))));
   }
   return wrap;
+}
+
+/* ---------- unified diff (myers, no deps) ---------- */
+
+const DIFF_AUTO_MAX = 80; // auto-expand diffs with at most this many lines
+const DIFF_LINE_BUDGET = 3000; // beyond this we note-and-skip: no trace, no DOM
+
+/** Classic Myers over the middle of the arrays; prefix/suffix are trimmed by
+ *  diffLines (identical tails dominate real-world edits). */
+function myersCore(a, b) {
+  const N = a.length, M = b.length;
+  if (!N && !M) return [];
+  if (!N) return b.map((t) => ({ type: "add", text: t }));
+  if (!M) return a.map((t) => ({ type: "del", text: t }));
+  const max = N + M, OFF = max;
+  let v = new Int32Array(2 * max + 1);
+  const trace = [];
+  let found = max;
+  outer: for (let d = 0; d <= max; d++) {
+    trace.push(v.slice());
+    for (let k = -d; k <= d; k += 2) {
+      let x = (k === -d || (k !== d && v[OFF + k - 1] < v[OFF + k + 1])) ? v[OFF + k + 1] : v[OFF + k - 1] + 1;
+      let y = x - k;
+      while (x < N && y < M && a[x] === b[y]) { x++; y++; }
+      v[OFF + k] = x;
+      if (x >= N && y >= M) { found = d; break outer; }
+    }
+  }
+  const ops = [];
+  let x = N, y = M;
+  for (let d = found; d > 0; d--) {
+    const vv = trace[d];
+    const k = x - y;
+    const prevK = (k === -d || (k !== d && vv[OFF + k - 1] < vv[OFF + k + 1])) ? k + 1 : k - 1;
+    const prevX = vv[OFF + prevK], prevY = prevX - prevK;
+    while (x > prevX && y > prevY) { ops.push({ type: "ctx", text: a[x - 1] }); x--; y--; }
+    if (x === prevX) { ops.push({ type: "add", text: b[y - 1] }); y--; }
+    else { ops.push({ type: "del", text: a[x - 1] }); x--; }
+  }
+  while (x > 0 && y > 0) { ops.push({ type: "ctx", text: a[x - 1] }); x--; y--; }
+  ops.reverse();
+  return ops;
+}
+
+function diffLines(aStr, bStr) {
+  const a = aStr ? String(aStr).split("\n") : [];
+  const b = bStr ? String(bStr).split("\n") : [];
+  // classic edge trim: strip the common prefix/suffix before the O(ND) core
+  let lo = 0;
+  while (lo < a.length && lo < b.length && a[lo] === b[lo]) lo++;
+  let hiA = a.length, hiB = b.length;
+  while (hiA > lo && hiB > lo && a[hiA - 1] === b[hiB - 1]) { hiA--; hiB--; }
+  const pre = a.slice(0, lo).map((t) => ({ type: "ctx", text: t }));
+  const post = a.slice(hiA).map((t) => ({ type: "ctx", text: t }));
+  return pre.concat(myersCore(a.slice(lo, hiA), b.slice(lo, hiB)), post);
+}
+
+/** Group ops into hunks with up to 3 context lines; longer runs collapse away. */
+function buildHunks(ops) {
+  const CTX = 3;
+  const keep = ops.map((op, i) => {
+    if (op.type !== "ctx") return true;
+    for (let j = Math.max(0, i - CTX); j <= Math.min(ops.length - 1, i + CTX); j++) {
+      if (ops[j].type !== "ctx") return true;
+    }
+    return false;
+  });
+  const hunks = [];
+  let on = 1, nn = 1, cur = null;
+  ops.forEach((op, i) => {
+    if (keep[i] && (i === 0 || !keep[i - 1])) {
+      cur = { oldStart: on, newStart: nn, oldLines: 0, newLines: 0, items: [] };
+      hunks.push(cur);
+    }
+    if (keep[i] && cur) {
+      cur.items.push({ type: op.type, text: op.text, oldNo: op.type !== "add" ? on : 0, newNo: op.type !== "del" ? nn : 0 });
+      if (op.type !== "add") cur.oldLines++;
+      if (op.type !== "del") cur.newLines++;
+    }
+    if (op.type !== "add") on++;
+    if (op.type !== "del") nn++;
+  });
+  // git-style: single-line ranges show just the start
+  for (const h of hunks) {
+    h.header = "@@ -" + h.oldStart + "," + h.oldLines + " +" + h.newStart + "," + h.newLines + " @@";
+  }
+  return hunks;
+}
+
+/* diff job plumbing: one per change row */
+function setDiffOpen(job, open) {
+  if (open) ensureDiffRendered(job); // DOM for collapsed blocks is built lazily
+  job.open = open;
+  job.exp.setAttribute("aria-expanded", String(open));
+  job.exp.textContent = open ? "▾" : "▸";
+  if (open) job.block.removeAttribute("hidden");
+  else job.block.setAttribute("hidden", "");
+}
+
+/** Build hunk DOM only on first open; ops are computed eagerly for the count. */
+function ensureDiffRendered(job) {
+  if (!job.rendered && job.ops) {
+    renderDiffHunks(job, buildHunks(job.ops));
+    job.rendered = true;
+  }
+}
+
+function renderDiffNote(job, text) {
+  while (job.block.firstChild) job.block.removeChild(job.block.firstChild);
+  job.block.appendChild(el("div", { class: "diff-note" }, text));
+  job.noteOnly = true;
+}
+
+function renderDiffHunks(job, hunks) {
+  while (job.block.firstChild) job.block.removeChild(job.block.firstChild);
+  for (const h of hunks) {
+    job.block.appendChild(el("div", { class: "diff-hunk" }, h.header));
+    for (const it of h.items) {
+      const sign = it.type === "add" ? "+" : it.type === "del" ? "-" : " ";
+      job.block.appendChild(el("div", { class: "diff-line diff-" + it.type },
+        el("span", { class: "dn" }, it.oldNo ? String(it.oldNo) : ""),
+        el("span", { class: "dn" }, it.newNo ? String(it.newNo) : ""),
+        el("span", { class: "diff-sign" }, sign),
+        el("span", { class: "diff-text" }, it.text)));
+    }
+  }
+}
+
+async function loadDiff(job, ctx, auto) {
+  if (job.loading) return job.loading;
+  if (job.loaded) { if (!auto) setDiffOpen(job, !job.open); return Promise.resolve(); }
+  const c = job.change;
+  job.meta.textContent = "loading…";
+  job.loading = (async () => {
+    try {
+      const oldPath = c.op === "rename" && c.src_path ? c.src_path : c.path;
+      let of = null, nf = null;
+      const tasks = [];
+      if (ctx.oldRev && c.op !== "add") tasks.push(fetchFileCached(ctx.oldRev, oldPath).then((r) => { of = r; }));
+      if (c.op !== "delete") tasks.push(fetchFileCached(ctx.newRev, c.path).then((r) => { nf = r; }));
+      await Promise.all(tasks);
+      const unusable = (f) => f && (f.encoding !== "utf8" || f.truncated);
+      if (unusable(of) || unusable(nf)) {
+        renderDiffNote(job, "binary or too large to diff");
+      } else {
+        const a = of ? String(of.content || "") : "";
+        const b = nf ? String(nf.content || "") : "";
+        if (c.op === "rename" && a === b) {
+          renderDiffNote(job, "content unchanged — path only");
+        } else {
+          const lines = (s) => (s === "" ? 0 : String(s).split("\n").length);
+          const mx = Math.max(lines(a), lines(b));
+          if (mx > DIFF_LINE_BUDGET) {
+            // budget bail: a full trace + thousands of DOM rows is not worth it
+            renderDiffNote(job, "too many lines to diff (" + mx + " > " + DIFF_LINE_BUDGET + ")");
+          } else {
+            job.ops = diffLines(a, b); // DOM deferred to first open
+            job.lineCount = job.ops.length;
+            job.meta.textContent = job.lineCount + " line" + (job.lineCount === 1 ? "" : "s");
+          }
+        }
+      }
+      job.loaded = true;
+      const wantsOpen = auto
+        ? (job.lineCount === undefined ? true : job.lineCount <= DIFF_AUTO_MAX)
+        : true;
+      setDiffOpen(job, wantsOpen);
+      if (job.lineCount === undefined) job.meta.textContent = "";
+    } catch (err) {
+      // note only — job.loaded stays false so the next click retries the fetch
+      renderDiffNote(job, "could not load diff: " + (err && err.message ? err.message : err));
+      job.meta.textContent = "";
+      setDiffOpen(job, true);
+    } finally {
+      job.loading = null;
+    }
+  })();
+  return job.loading;
+}
+
+/* ---------- live polling (tip watcher) ---------- */
+
+let liveTimer = null;
+let lastTips = {};
+let toastEl = null;
+let toastTimer = null;
+
+function hideToast() {
+  if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
+  toastEl = null;
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+}
+
+async function showLiveToast(ref, oldCs, newCs) {
+  let suffix = "", n = null;
+  try {
+    const log = await api("/api/log?" + qs({ cs: newCs, limit: 50 }));
+    let count = 0, found = false;
+    for (const e of log.entries || []) { if (e.id === oldCs) { found = true; break; } count++; }
+    if (found) { n = count; suffix = " (+" + n + (n === 1 ? " changeset)" : " changesets)"); }
+  } catch (_) { /* count unavailable — ids alone tell the story */ }
+  // the toast is transient; the events panel is the durable record
+  recordEvent({
+    kind: "publish",
+    key: "p:" + oldCs + ":" + newCs,
+    text: shortId(oldCs, 8) + " → " + shortId(newCs, 8) +
+      (n !== null ? " · +" + n + " changeset" + (n === 1 ? "" : "s") : ""),
+    ts: Math.floor(Date.now() / 1000),
+  });
+  if (!toastEl) {
+    toastEl = el("div", { id: "live-toast", role: "status" });
+    (document.body || document.documentElement).appendChild(toastEl);
+  } else {
+    while (toastEl.firstChild) toastEl.removeChild(toastEl.firstChild); // replace, reset timer
+  }
+  const refName = ref.name.replace(/^refs\/(heads\/)?/, "");
+  toastEl.appendChild(el("span", { class: "toast-text" },
+    refName + " moved: ",
+    el("span", { class: "mono" }, shortId(oldCs, 8)),
+    " → ",
+    el("span", { class: "mono" }, shortId(newCs, 8)),
+    suffix));
+  toastEl.appendChild(el("button", {
+    class: "btn btn-sm toast-refresh", type: "button",
+    onclick: () => { hideToast(); route(); },
+  }, "refresh"));
+  toastEl.appendChild(el("button", {
+    class: "btn btn-sm toast-close", type: "button", "aria-label": "dismiss",
+    onclick: hideToast,
+  }, "✕"));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, 12000);
+}
+
+async function pollTick() {
+  if (typeof document !== "undefined" && document.hidden) return; // paused while hidden
+  let data, activity, log = null;
+  try {
+    data = await api("/api/refs");
+    // activity + log let the feed learn rebase/landed transitions on each tick
+    activity = await api("/api/activity?" + qs({ limit: ACTIVITY_LIMIT })).catch(() => ({ changesets: [] }));
+  } catch (_) { return; }
+  const fresh = (data && data.refs) || [];
+  const mainRef = fresh.find((r) => r.name === "refs/heads/main");
+  try {
+    log = await api("/api/log?" + qs({ cs: mainRef ? mainRef.cs : currentRev(), limit: 500 }));
+  } catch (_) { log = null; }
+  let deriv2 = null, pub2 = null;
+  if (log) {
+    pub2 = new Set((log.entries || []).map((e) => e.id));
+    const hydrated = await hydrateChangesEntries(activity.changesets || []);
+    deriv2 = buildDerivation(hydrated, pub2);
+    processDerivation(deriv2);
+  }
+  const hadBaseline = !!Object.keys(lastTips).length;
+  const prev = lastTips;
+  lastTips = {};
+  for (const r of fresh) lastTips[r.name] = r.cs;
+  const sel = document.getElementById("ref-select");
+  if (sel && state.refsLoaded) {
+    const known = new Set(fresh.map((r) => r.name));
+    state.refs = fresh;
+    while (sel.firstChild) sel.removeChild(sel.firstChild);
+    for (const r of fresh) sel.appendChild(option(r.name, r.name));
+    if (known.has(state.rev)) sel.value = state.rev;
+  }
+  if (hadBaseline) {
+    const moved = fresh.find((r) => r.name === state.rev && prev[r.name] && prev[r.name] !== r.cs);
+    if (moved) await showLiveToast(moved, prev[moved.name], moved.cs); // await: its event lands before repaint
+  }
+  // incremental repaint of the visible overview: landing a watched draft flips
+  // badges in place; touching nothing when nothing relevant changed
+  // (and never re-rendering another route's page).
+  if (overviewLive && isOverviewRoute() && deriv2) {
+    const newKey = statusKey(deriv2, pub2);
+    const newFeed = eventsFeed().length;
+    if (newKey !== overviewLive.key || newFeed !== overviewLive.feedLen) {
+      overviewLive = { key: newKey, feedLen: newFeed, published: pub2 };
+      const watchMeta = await Promise.all(getWatchlist().map((id) =>
+        fetchChangesetCached(id).then((cs) => ({ id: id, cs: cs })).catch(() => ({ id: id, cs: null }))));
+      swapPanel("workers-panel", buildWorkersPanel(deriv2, watchMeta));
+      swapPanel("events-panel", buildEventsPanel());
+    }
+  }
+}
+
+function startLivePoll() {
+  if (typeof setInterval !== "undefined") liveTimer = setInterval(pollTick, 10000);
+  if (document.addEventListener) {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollTick(); // catch up immediately on refocus
+    });
+  }
+}
+
+/* ---------- file finder (fuzzy) ---------- */
+
+let finderFiles = { rev: null, paths: null }; // cached per rev
+let overlayDepth = 0; // any modal open → global keys suppressed
+
+/** Subsequence score: contiguous runs > word starts (after / - _ .) > scattered. */
+function fuzzyScore(q, name) {
+  const ql = q.toLowerCase(), nl = name.toLowerCase();
+  let score = 0, qi2 = 0, last = -2, start = 0, first = -1;
+  const matched = new Array(name.length).fill(false);
+  for (let i = 0; i < nl.length && qi2 < ql.length;) {
+    if (nl[i] === ql[qi2]) {
+      matched[i] = true;
+      if (last === i - 1) score += 8; // contiguous run
+      else if (i > 0 && "/-_.".includes(name[i - 1])) score += 5; // word start
+      else score += 1;
+      if (first < 0) first = i;
+      last = i;
+      qi2++;
+      i++;
+    } else i++;
+  }
+  if (qi2 < ql.length) return null; // not a subsequence
+  score -= first * 0.05 + (name.length - ql.length) * 0.01; // early, short names win ties
+  void start;
+  return { score, matched };
+}
+
+function openFileFinder() {
+  if (overlayDepth) return;
+  const rev = currentRev();
+  overlayDepth++;
+  const prev = { focus: document.activeElement && document.activeElement.focus ? document.activeElement : null };
+
+  const input = el("input", {
+    id: "file-finder-input", class: "input", type: "text",
+    placeholder: "type to filter files at " + revName(rev) + "…",
+    "aria-label": "filter files",
+  });
+  const countEl = el("div", { class: "finder-count mono" }, "loading…");
+  const listEl = el("div", { class: "finder-list mono" });
+  const panel = el("div", {
+    id: "file-finder", role: "dialog", "aria-modal": "true",
+    "aria-labelledby": "file-finder-title", tabindex: "-1",
+  },
+    el("div", { class: "modal-head" },
+      el("h2", { id: "file-finder-title" }, "Find file"),
+      el("button", { class: "btn btn-sm modal-close", type: "button", "aria-label": "Close", onclick: () => close() }, "✕")),
+    input, countEl, listEl);
+  const backdrop = el("div", { class: "modal-backdrop" }, panel);
+
+  let idx = 0, rows = [];
+  const close = () => {
+    overlayDepth--;
+    if (document.removeEventListener) document.removeEventListener("keydown", onKey);
+    if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+    if (prev.focus && prev.focus.focus) prev.focus.focus();
+  };
+  const selectIdx = (n) => {
+    idx = Math.max(0, Math.min(rows.length - 1, n));
+    rows.forEach((r, i2) => {
+      const kls = "finder-row" + (i2 === idx ? " kbd-selected" : "");
+      r.setAttribute("class", kls);
+    });
+  };
+  const render = (all, q) => {
+    while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+    rows = [];
+    let shown = all;
+    let scored = null;
+    if (q) {
+      scored = [];
+      for (const p of all) {
+        const s = fuzzyScore(q, p.path);
+        if (s) scored.push({ p, s });
+      }
+      scored.sort((a, b) => b.s.score - a.s.score);
+      shown = scored;
+    }
+    countEl.textContent = shown.length + " of " + all.length + " files";
+    for (const it of shown.slice(0, 50)) {
+      const p = scored ? it.p : it;
+      const a = el("a", { class: "finder-row", href: fileHref(rev, p.path) });
+      // highlight matched chars
+      if (scored) {
+        let buf = "", hl = false;
+        const pushSeg = (txt, isHl) => {
+          if (!txt) return;
+          a.appendChild(isHl ? el("b", {}, txt) : document.createTextNode(txt));
+        };
+        for (let i2 = 0; i2 < p.path.length; i2++) {
+          const m = it.s.matched[i2];
+          if (m !== hl) { pushSeg(buf, hl); buf = ""; hl = m; }
+          buf += p.path[i2];
+        }
+        pushSeg(buf, hl);
+      } else {
+        a.appendChild(document.createTextNode(p.path));
+      }
+      a.appendChild(el("span", { class: "finder-kind" }, p.kind));
+      a.addEventListener("click", () => close());
+      listEl.appendChild(a);
+      rows.push(a);
+    }
+    if (!shown.length) listEl.appendChild(el("div", { class: "finder-empty" }, "no matches"));
+    selectIdx(0);
+  };
+
+  const onKey = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault && ev.preventDefault(); close(); }
+    else if (ev.key === "ArrowDown") { ev.preventDefault && ev.preventDefault(); selectIdx(idx + 1); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault && ev.preventDefault(); selectIdx(idx - 1); }
+    else if (ev.key === "Enter") {
+      const a = rows[idx];
+      if (a) { ev.preventDefault && ev.preventDefault(); location.hash = a.getAttribute("href"); close(); }
+    }
+  };
+  // Arrows/Enter/Escape handled in EXACTLY one place: the document-level
+  // listener (input-level would double-fire via bubbling).
+  if (document.addEventListener) document.addEventListener("keydown", onKey);
+  input.addEventListener("input", () => {
+    if (finderFiles.paths && finderFiles.rev === rev) render(finderFiles.paths, input.value.trim());
+  });
+
+  backdrop.addEventListener("click", (ev) => { if (ev.target === backdrop) close(); });
+  (document.body || document.documentElement).appendChild(backdrop);
+  if (input.focus) input.focus();
+
+  const ensure = finderFiles.rev === rev && finderFiles.paths
+    ? Promise.resolve(finderFiles.paths)
+    : api("/api/files?" + qs({ cs: rev })).then((d) => {
+        finderFiles = { rev: rev, paths: (d && d.paths) || [] };
+        return finderFiles.paths;
+      });
+  ensure.then((paths) => render(paths, input.value.trim()))
+    .catch((err) => {
+      countEl.textContent = "";
+      while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+      listEl.appendChild(el("div", { class: "finder-empty" }, "could not list files: " + (err && err.message ? err.message : err)));
+    });
+}
+
+/* ---------- keyboard navigation + help ---------- */
+
+let kbdSel = -1;
+
+function primaryRows() {
+  const root = app();
+  if (!root || !root.querySelectorAll) return [];
+  for (const sel of ["#search-results .search-line", ".tree-row", ".log-row", ".change-row"]) {
+    const rows = root.querySelectorAll(sel);
+    if (rows.length) return Array.prototype.slice.call(rows);
+  }
+  return [];
+}
+
+function moveKbdSel(dir, rows) {
+  if (!rows.length) return;
+  if (kbdSel < 0) kbdSel = 0; else kbdSel = Math.max(0, Math.min(rows.length - 1, kbdSel + dir));
+  rows.forEach((r, i) => {
+    const has = String(r.className || "").split(" ").includes("kbd-selected");
+    if (i === kbdSel && !has) {
+      r.setAttribute("class", (String(r.className || "") + " kbd-selected").trim());
+      if (r.scrollIntoView) r.scrollIntoView({ block: "nearest" });
+    } else if (i !== kbdSel && has) {
+      r.setAttribute("class",
+        String(r.className || "").split(" ").filter((c) => c && c !== "kbd-selected").join(" "));
+    }
+  });
+}
+
+function openKbdSel(rows) {
+  if (kbdSel < 0 || kbdSel >= rows.length) return;
+  const row = rows[kbdSel];
+  const links = row.querySelectorAll ? row.querySelectorAll("a") : [];
+  for (const a of links) {
+    const h = a.getAttribute && a.getAttribute("href");
+    if (h && h.charAt(0) === "#") { location.hash = h; return; }
+  }
+}
+
+let kbdHelpEl = null;
+function toggleKbdHelp() {
+  if (kbdHelpEl) {
+    overlayDepth--;
+    if (kbdHelpEl.parentNode) kbdHelpEl.parentNode.removeChild(kbdHelpEl);
+    kbdHelpEl = null;
+    return;
+  }
+  overlayDepth++;
+  const rows = [
+    ["j / k", "move selection down / up"],
+    ["Enter", "open selected row"],
+    ["t", "file finder… fuzzy filter at the selected ref"],
+    ["/", "focus the grep box"],
+    ["?", "this help"],
+    ["Esc", "close dialogs"],
+  ];
+  const table = el("div", { class: "kbd-table" });
+  for (const [k, d] of rows) {
+    table.appendChild(el("div", { class: "kbd-row" },
+      el("kbd", {}, k), el("span", {}, d)));
+  }
+  kbdHelpEl = el("div", { class: "modal-backdrop" },
+    el("div", { id: "kbd-help", role: "dialog", "aria-modal": "true", tabindex: "-1" },
+      el("div", { class: "modal-head" },
+        el("h2", null, "Keyboard shortcuts"),
+        el("button", { class: "btn btn-sm modal-close", type: "button", "aria-label": "Close", onclick: toggleKbdHelp }, "✕")),
+      table));
+  kbdHelpEl.addEventListener("click", (ev) => { if (ev.target === kbdHelpEl) toggleKbdHelp(); });
+  (document.body || document.documentElement).appendChild(kbdHelpEl);
+}
+
+function isFormTarget(t) {
+  if (!t) return false;
+  const tag = String(t.tagName || "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!t.isContentEditable;
+}
+
+function onGlobalKey(ev) {
+  if (!ev) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (isFormTarget(ev.target)) return;
+  if (modalClose || overlayDepth) {
+    if (ev.key === "Escape" && kbdHelpEl) toggleKbdHelp();
+    return;
+  }
+  const rows = primaryRows();
+  switch (ev.key) {
+    case "j": moveKbdSel(1, rows); ev.preventDefault && ev.preventDefault(); break;
+    case "k": moveKbdSel(-1, rows); ev.preventDefault && ev.preventDefault(); break;
+    case "Enter": openKbdSel(rows); break;
+    case "t": openFileFinder(); break;
+    case "/": {
+      const gs = document.getElementById("global-search");
+      if (gs && gs.focus) { gs.focus(); ev.preventDefault && ev.preventDefault(); }
+      break;
+    }
+    case "?": toggleKbdHelp(); break;
+    default: return;
+  }
+}
+
+/* ---------- workspace derivation (multi-worker visibility) ---------- */
+
+const ACTIVITY_LIMIT = 200;
+
+function firstTopSegment(p) { return String(p || "").split("/")[0]; }
+
+/**
+ * /api/activity entries arrive either as full changesets (changes array) or
+ * log-shaped stubs (changes = integer count). Pair detection only needs real
+ * paths for same-author + same-first-line groups, so hydrate just those.
+ */
+function hydrateChangesEntries(all) {
+  const groups = {};
+  for (const c of all) {
+    const k = ((c.author || {}).name || "") + "|" + firstLine(c.message);
+    (groups[k] = groups[k] || []).push(c);
+  }
+  const need = [];
+  for (const k in groups) {
+    if (groups[k].length < 2) continue;
+    for (const c of groups[k]) if (!Array.isArray(c.changes)) need.push(c.id);
+  }
+  const byId = {};
+  return Promise.all(need.map((id) =>
+    fetchChangesetCached(id).then((cs) => { byId[id] = cs; }).catch(() => {})))
+    .then(() => all.map((c) =>
+      Array.isArray(c.changes) ? c : Object.assign({}, c, { changes: (byId[c.id] && byId[c.id].changes) || [] })));
+}
+
+/**
+ * published = ids the ref's log reaches; unpublished = activity minus that.
+ * Rebase pair: distinct ids, same author.name, same message first line, and
+ * at least one shared top-level path segment; the older committer time marks
+ * the superseded side. Entries must be pre-hydrated (hydrateChangesEntries);
+ * tolerates count-shaped `changes` as a belt-and-braces measure.
+ */
+function buildDerivation(activityChangesets, publishedSet) {
+  const all = activityChangesets || [];
+  const published = publishedSet;
+  const unpublished = all.filter((c) => !published.has(c.id));
+  const pairs = [];
+  for (let i = 0; i < all.length; i++) {
+    for (let j = i + 1; j < all.length; j++) {
+      const A = all[i], B = all[j];
+      if (A.id === B.id) continue;
+      if (((A.author || {}).name || "") !== ((B.author || {}).name || "")) continue;
+      if (firstLine(A.message) !== firstLine(B.message)) continue;
+      const chA = Array.isArray(A.changes) ? A.changes : [];
+      const chB = Array.isArray(B.changes) ? B.changes : [];
+      const segsA = new Set(chA.map((c) => firstTopSegment(c.path)));
+      let shared = false;
+      for (const c of chB) {
+        if (segsA.has(firstTopSegment(c.path))) { shared = true; break; }
+      }
+      if (!shared) continue;
+      const ta = (A.committer || {}).time_secs || 0;
+      const tb = (B.committer || {}).time_secs || 0;
+      pairs.push({ kind: "rebase", superseded: ta <= tb ? A : B, current: ta <= tb ? B : A });
+    }
+  }
+  return { all, unpublished, pairs, published };
+}
+
+/* ---------- durable event feed (origin-scoped, cap 200) ---------- */
+
+const EVENTS_KEY = "gb-events";
+const EVENTS_CAP = 200;
+const EVENT_ICONS = { publish: "🚀", rebase: "✏️", landed: "🌱" };
+let eventsFeedCache = null;
+
+function eventsFeed() {
+  if (eventsFeedCache) return eventsFeedCache;
+  let raw = [];
+  try { raw = JSON.parse(safeStorage("get", EVENTS_KEY) || "[]"); } catch (_) { raw = []; }
+  eventsFeedCache = Array.isArray(raw) ? raw : [];
+  return eventsFeedCache;
+}
+function hasEventKey(key) { return eventsFeed().some((e) => e.key === key); }
+function recordEvent(ev) {
+  if (hasEventKey(ev.key)) return false; // dedupe: publish by tips, rebase by new id, landed by id
+  eventsFeed().unshift(ev);
+  eventsFeedCache = eventsFeed().slice(0, EVENTS_CAP);
+  safeStorage("set", EVENTS_KEY, JSON.stringify(eventsFeedCache));
+  return true;
+}
+
+function fmtClock(ts) {
+  const d = new Date(ts * 1000);
+  return pad2(d.getHours()) + ":" + pad2(d.getMinutes());
+}
+
+function buildEventsPanel() {
+  const panel = el("section", { id: "events-panel", class: "panel" },
+    el("h2", { class: "panel-title" }, "Events"));
+  const feed = eventsFeed();
+  if (!feed.length) {
+    panel.appendChild(emptyState("No events yet", null, "publishes, rebases, and landings are recorded here"));
+    return panel;
+  }
+  const list = el("div", { class: "event-list" });
+  for (const ev of feed.slice(0, 50)) {
+    list.appendChild(el("div", { class: "event-row", dataset: { kind: ev.kind } },
+      el("span", { class: "event-icon", "aria-hidden": "true" }, EVENT_ICONS[ev.kind] || "•"),
+      el("span", { class: "event-text" }, ev.text),
+      el("span", { class: "event-time mono" }, ev.ts ? fmtClock(ev.ts) : "")));
+  }
+  panel.appendChild(list);
+  return panel;
+}
+
+/* ---------- watchlist ("watch a changeset") ---------- */
+
+const WATCH_KEY = "gb-watchlist";
+let watchCache = null;
+
+function getWatchlist() {
+  if (watchCache) return watchCache;
+  let raw = [];
+  try { raw = JSON.parse(safeStorage("get", WATCH_KEY) || "[]"); } catch (_) { raw = []; }
+  watchCache = Array.isArray(raw) ? raw : [];
+  return watchCache;
+}
+function saveWatch() { safeStorage("set", WATCH_KEY, JSON.stringify(watchCache)); }
+
+/** Prefix ≥8: resolve against the activity index client-side, else verify via API. */
+function resolveWatchInput(v) {
+  v = String(v || "").trim();
+  if (v.length < 8) return Promise.reject(new Error("need at least 8 hex chars"));
+  return api("/api/activity?" + qs({ limit: ACTIVITY_LIMIT })).then((act) => {
+    const hits = (act.changesets || []).filter((c) => String(c.id).startsWith(v));
+    if (hits.length === 1) return hits[0].id;
+    return api("/api/changeset?" + qs({ id: v })).then((cs) => cs.id);
+  });
+}
+
+function addWatch(v) {
+  return resolveWatchInput(v).catch(() => v).then((id) => { // unresolved ids land as .missing rows
+    if (!getWatchlist().includes(id)) { watchCache = getWatchlist().concat([id]); saveWatch(); }
+  });
+}
+function removeWatch(id) {
+  watchCache = getWatchlist().filter((x) => x !== id);
+  saveWatch();
+}
+
+function renderWatchRows(list, published) {
+  while (list.firstChild) list.removeChild(list.firstChild);
+  const ids = getWatchlist();
+  if (!ids.length) {
+    list.appendChild(el("div", { class: "watch-hint" }, "watching nothing — paste a changeset id or ≥8-hex prefix above"));
+    return;
+  }
+  for (const id of ids) {
+    const row = el("div", { class: "watch-row", dataset: { id: id } });
+    row.appendChild(el("button", {
+      class: "watch-remove", type: "button", "aria-label": "unwatch",
+      onclick: () => { removeWatch(id); renderWatchRows(list, published); },
+    }, "✕"));
+    const body = el("span", { class: "watch-id mono" }, shortId(id, 12) + "…");
+    row.appendChild(body);
+    list.appendChild(row);
+    fetchChangesetCached(id).then((cs) => {
+      const landed = published && published.has(cs.id);
+      body.textContent = "";
+      body.appendChild(el("a", { class: "mono", href: "#/changeset/" + encodeURIComponent(cs.id) }, shortId(cs.id, 12)));
+      row.appendChild(el("span", { class: landed ? "badge-published" : "badge-draft" }, landed ? "landed" : "draft"));
+      row.appendChild(el("span", { class: "watch-meta" },
+        ((cs.author || {}).name || "?") + " — " + firstLine(cs.message)));
+    }).catch((err) => {
+      row.setAttribute("class", "watch-row missing");
+      row.setAttribute("title", "could not resolve: " + (err && err.message ? err.message : err));
+      body.textContent = String(id).slice(0, 16) + " (unreachable)";
+    });
+  }
+}
+
+/* ---------- derivation → events (rebase + landed) ---------- */
+
+let derivBaseline = false;
+let prevDrafts = new Set();
+
+function processDerivation(d) {
+  for (const p of d.pairs) {
+    const cur = p.current, old = p.superseded;
+    recordEvent({
+      kind: "rebase",
+      key: "r:" + cur.id,
+      text: ((cur.author || {}).name || "?") + " rebased " + firstLine(cur.message) +
+        " (" + shortId(old.id, 8) + " → " + shortId(cur.id, 8) + ")",
+      ts: (cur.committer || {}).time_secs || undefined,
+    });
+  }
+  const byId = {};
+  d.all.forEach((c) => { byId[c.id] = c; });
+  const candidates = new Set(getWatchlist());
+  if (derivBaseline) for (const id of prevDrafts) candidates.add(id);
+  for (const id of candidates) {
+    if (!d.published.has(id)) continue;
+    const cs = byId[id];
+    recordEvent({
+      kind: "landed",
+      key: "l:" + id,
+      text: "landed " + shortId(id, 8) + " — " + (cs ? firstLine(cs.message) : "(outside the activity window)"),
+      ts: cs && cs.committer ? cs.committer.time_secs : undefined,
+    });
+  }
+  prevDrafts = new Set(d.unpublished.map((c) => c.id));
+  derivBaseline = true;
+}
+
+/* ---------- workers panel ---------- */
+
+function buildWorkersPanel(deriv, watchMeta) {
+  const byAuthor = {};
+  const order = [];
+  const putRow = (name, row) => {
+    if (!byAuthor[name]) { byAuthor[name] = []; order.push(name); }
+    byAuthor[name].push(row);
+  };
+  for (const c of deriv.unpublished) {
+    putRow(((c.author || {}).name) || "unknown", { cs: c });
+  }
+  for (const wm of watchMeta || []) {
+    if (!wm.cs) continue;
+    const name = ((wm.cs.author || {}).name) || "unknown";
+    // a watched changeset joins its author's card even once landed
+    if (!(byAuthor[name] || []).some((r) => r.cs.id === wm.cs.id)) putRow(name, { cs: wm.cs });
+  }
+  order.sort((a, b) => {
+    const t = (n) => Math.max(0, ...byAuthor[n].map((r) => (r.cs.committer || {}).time_secs || 0));
+    return t(b) - t(a);
+  });
+  const panel = el("section", { id: "workers-panel", class: "panel" },
+    el("h2", { class: "panel-title" }, "Workers"));
+  if (!order.length) {
+    panel.appendChild(emptyState("No unpublished work", null,
+      "no unpublished work — every changeset reachable from a ref"));
+  } else {
+    const grid = el("div", { class: "worker-grid" });
+    for (const name of order) {
+      const rows = byAuthor[name].slice().sort((a, b) => commitTime(b.cs) - commitTime(a.cs));
+      const drafts = rows.filter((r) => !deriv.published.has(r.cs.id));
+      const hue = idHue(name);
+      const card = el("div", {
+        class: "worker-card", dataset: { author: name },
+        style: "border-left:3px solid hsl(" + hue + ",40%,50%)",
+      });
+      card.appendChild(el("div", { class: "worker-head" },
+        el("span", { class: "worker-name" }, name),
+        drafts.length
+          ? el("span", { class: "badge-draft" }, drafts.length + " draft" + (drafts.length === 1 ? "" : "s"))
+          : el("span", { class: "badge-published" }, "all landed")));
+      const latest = rows[0];
+      if (latest) {
+        card.appendChild(el("a", { class: "worker-latest", href: "#/changeset/" + encodeURIComponent(latest.cs.id) },
+          firstLine(latest.cs.message)));
+        card.appendChild(el("div", { class: "worker-time" },
+          latest.cs.committer ? relativeTime(latest.cs.committer.time_secs) : ""));
+      }
+      for (const r of rows.slice(0, 3)) {
+        const landed = deriv.published.has(r.cs.id);
+        card.appendChild(el("div", { class: "worker-draft-row" },
+          el("span", { class: landed ? "badge-published" : "badge-draft" }, landed ? "landed" : "draft"),
+          el("a", { class: "mono", href: "#/changeset/" + encodeURIComponent(r.cs.id) }, shortId(r.cs.id, 8))));
+      }
+      grid.appendChild(card);
+    }
+    panel.appendChild(grid);
+  }
+  // watchlist controls
+  const watchIn = el("input", {
+    id: "watch-add", class: "input", type: "text",
+    placeholder: "watch a changeset — id or ≥8-hex prefix",
+    "aria-label": "watch a changeset",
+  });
+  const list = el("div", { id: "watch-list" });
+  const errRow = el("div", { class: "watch-err" });
+  const doAdd = () => {
+    const v = watchIn.value.trim();
+    if (!v) return;
+    addWatch(v).then(() => {
+      watchIn.value = "";
+      errRow.textContent = "";
+      renderWatchRows(list, deriv.published);
+    }).catch((err) => { errRow.textContent = String(err && err.message ? err.message : err); });
+  };
+  const watchBtn = el("button", { id: "watch-add-btn", class: "btn btn-sm", type: "button", onclick: doAdd }, "watch");
+  watchIn.addEventListener("keydown", (ev) => { if (ev.key === "Enter") doAdd(); });
+  panel.appendChild(el("div", { class: "watch-add-row" }, watchIn, watchBtn));
+  panel.appendChild(errRow);
+  panel.appendChild(list);
+  renderWatchRows(list, deriv.published);
+  return panel;
 }
 
 /* ---------- readme panel + minimal markdown renderer ----------
@@ -1040,23 +1965,63 @@ function buildReadmePanel(f, rev, rpath) {
 
 const app = () => document.getElementById("app");
 
+/**
+ * Live overview state: when the poll discovers the published set (or the
+ * event feed) changed, we repaint ONLY the workers/events panels in place —
+ * the rest of the overview is left alone. Non-overview routes repaint on
+ * their next render anyway; `overviewLive === null` offroute.
+ */
+let overviewLive = null;
+
+function statusKey(deriv, published) {
+  return getWatchlist().concat(deriv.all.map((c) => c.id))
+    .filter((id, i, a) => published.has(id) && a.indexOf(id) === i)
+    .sort()
+    .join(",");
+}
+
+function isOverviewRoute() {
+  try { return parseHash().segs.length === 0; } catch (_) { return false; }
+}
+
+function swapPanel(id, fresh) {
+  const root = app();
+  if (!root) return;
+  let old = null;
+  for (const c of root.children || []) {
+    if (c.getAttribute && c.getAttribute("id") === id) { old = c; break; }
+  }
+  if (!old) return;
+  root.insertBefore(fresh, old);
+  root.removeChild(old);
+}
+
 function viewOverview(root) {
   document.title = "gardenbed — overview";
   setNav("overview");
   clear(root).appendChild(skeleton(8));
   const rev = currentRev();
-  // Refs/stats are independent of history: on an unseeded repo the log
-  // fetch 404s ("no ref or changeset matching main") and must not discard
-  // the rest of the overview. A non-404 log error still fails the page.
-  const logP = api("/api/log?" + qs({ cs: rev, limit: 500 })).catch((err) => {
-    if (err && err.status === 404) return { entries: [] };
-    throw err;
-  });
-  Promise.all([
-    api("/api/refs"),
-    api("/api/stats"),
-    logP,
-  ]).then(([refs, stats, log]) => {
+  // Refs arrive first: an unseeded repo (zero refs) never asks for history
+  // at all — the log endpoint would 404 ("no ref or changeset matching
+  // main") and the browser would log a failed-resource error. A repo WITH
+  // refs keeps the eager fetch, still with a 404 safety net for a stale
+  // selected rev; other log errors still fail the page.
+  api("/api/refs").then((refs) => {
+    const haveRefs = (refs.refs || []).length > 0;
+    const logP = haveRefs
+      ? api("/api/log?" + qs({ cs: rev, limit: 500 })).catch((err) => {
+          if (err && err.status === 404) return { resolved: "", entries: [] };
+          throw err;
+        })
+      : Promise.resolve({ resolved: "", entries: [] });
+    const actP = api("/api/activity?" + qs({ limit: ACTIVITY_LIMIT })).catch(() => ({ changesets: [] }));
+    const watchP = Promise.all(getWatchlist().map((id) =>
+      fetchChangesetCached(id).then((cs) => ({ id: id, cs: cs })).catch(() => ({ id: id, cs: null }))));
+    return Promise.all([Promise.resolve(refs), api("/api/stats"), logP, actP, watchP]);
+  }).then(([refs, stats, log, activity, watchMeta]) =>
+    hydrateChangesEntries(activity.changesets || [])
+      .then((hydrated) => ({ refs, stats, log, hydrated, watchMeta }))
+  ).then(({ refs, stats, log, hydrated, watchMeta }) => {
     clear(root);
     const counters = (stats && stats.counters) || {};
     const totalReq = Object.keys(counters).reduce((a, k) => a + (Number(counters[k]) || 0), 0);
@@ -1093,6 +2058,15 @@ function viewOverview(root) {
         el("div", { class: "ref-id" }, shortId(r.cs, 12))));
     }
     if ((refs.refs || []).length) root.appendChild(cards);
+
+    // multi-worker visibility: workers + durable events feed
+    const published = new Set((log.entries || []).map((e) => e.id));
+    const deriv = buildDerivation(hydrated, published);
+    processDerivation(deriv);
+    root.appendChild(buildWorkersPanel(deriv, watchMeta));
+    root.appendChild(buildEventsPanel());
+    overviewLive = null;
+    overviewLive = { key: statusKey(deriv, published), feedLen: eventsFeed().length, published: published };
 
     // two-column: recent history + stats
     const twoCol = el("div", { class: "two-col" });
@@ -1196,7 +2170,9 @@ function viewChangeset(root, id) {
     const header = el("header", { id: "cs-header", class: "panel" });
     const idRow = el("div", { class: "cs-id-row" },
       el("span", { class: "cs-id" }, cs.id),
-      copyButton(() => cs.id, "copy id"));
+      copyButton(() => cs.id, "copy id"),
+      permalinkButton("copy link to this changeset"),
+      el("a", { class: "btn btn-sm review-link", href: "#/review/" + encodeURIComponent(cs.id) }, "review"));
     idRow.id = "cs-header-row"; // keep #cs-header on the panel (hook)
     header.appendChild(idRow);
     header.appendChild(el("div", { class: "cs-message" }, cs.message || "(no message)"));
@@ -1245,7 +2221,7 @@ function viewChangeset(root, id) {
     const chPanel = el("section", { class: "panel" });
     chPanel.appendChild(el("h2", { class: "panel-title" },
       "Changes · " + ((cs.changes || []).length)));
-    chPanel.appendChild(changeList(cs.changes || [], cs.id));
+    chPanel.appendChild(changeList(cs.changes || [], cs.id, cs.parents && cs.parents[0]));
     root.appendChild(chPanel);
 
     if (cs.parents && cs.parents.length) {
@@ -1273,6 +2249,12 @@ function viewBrowse(root, rev, path) {
   api("/api/tree?" + qs({ cs: rev, path: path })).then((tree) => {
     clear(root);
     root.appendChild(el("h1", { class: "page-title" }, "Browse"));
+    root.appendChild(el("div", { class: "browse-actions" },
+      el("button", {
+        id: "file-finder-btn", class: "btn btn-sm", type: "button",
+        onclick: () => openFileFinder(),
+      }, "find file"),
+      el("span", { class: "hint" }, "or press t")));
     root.appendChild(breadcrumb(rev, path, false));
     const panel = el("section", { class: "panel", style: "padding:6px 8px" });
     const scroller = el("div", { class: "table-scroll" });
@@ -1332,6 +2314,7 @@ function viewFile(root, rev, path) {
     header.appendChild(el("span", { class: "file-size" }, humanSize(f.size)));
     header.appendChild(el("span", { class: "spacer" }));
     header.appendChild(copyButton(() => f.content, "copy content"));
+    header.appendChild(permalinkButton("copy link to this file view"));
     let blameBtn = null;
     if (f.encoding === "utf8") {
       blameBtn = el("button", { id: "blame-toggle", class: "btn btn-sm", type: "button",
@@ -1397,7 +2380,13 @@ function viewFile(root, rev, path) {
         blameOn = !blameOn;
         blameBtn.textContent = blameOn ? "hide blame" : "blame";
         blameBtn.setAttribute("aria-pressed", String(blameOn));
-        applyBlame(codeLines, blameOn ? blameData : null, lines.length);
+        if (blameOn) {
+          blameAgeMap(blameData).then((ages) => {
+            if (blameOn) applyBlame(codeLines, blameData, lines.length, ages);
+          });
+        } else {
+          applyBlame(codeLines, null, lines.length, null);
+        }
       });
     }
   }).catch((err) => {
@@ -1405,12 +2394,42 @@ function viewFile(root, rev, path) {
   });
 }
 
+/**
+ * Age heat for blame: rank the file's distinct changesets by committer time
+ * and interpolate hue 30 (oldest, warm brown) → 95 (newest, spring green).
+ * Missing/failed fetches simply fade out of `out`; callers fall back to the
+ * deterministic per-id hash color.
+ */
+async function blameAgeMap(data) {
+  const ids = [];
+  for (const r of (data && data.ranges) || []) if (r.cs && !ids.includes(r.cs)) ids.push(r.cs);
+  const info = {};
+  await Promise.all(ids.map((id) =>
+    fetchChangesetCached(id).then((cs) => { info[id] = cs; }).catch(() => {})));
+  const ranked = ids
+    .filter((id) => info[id])
+    .sort((a, b) => commitTime(info[a]) - commitTime(info[b]));
+  const out = {};
+  ranked.forEach((id, i) => {
+    const t = ranked.length > 1 ? i / (ranked.length - 1) : 1;
+    const who = info[id].committer || info[id].author || {};
+    out[id] = { hue: 30 + t * 65, name: who.name || "", date: civilTime(who) };
+  });
+  return out;
+}
+
+function commitTime(cs) {
+  const c = (cs && (cs.committer || cs.author)) || {};
+  return typeof c.time_secs === "number" ? c.time_secs : 0;
+}
+
 function wrap64(s) {
   return String(s || "").replace(/.{1,76}/g, (m) => m + "\n");
 }
 
-/** Paint or clear blame gutter blocks on #code-lines. */
-function applyBlame(codeLines, data, totalLines) {
+/** Paint or clear blame gutter blocks on #code-lines; ageMeta colors by
+ *  relative age in this file (see blameAgeMap), absent → per-id hash hue. */
+function applyBlame(codeLines, data, totalLines, ageMeta) {
   const rows = [];
   for (let i = 0; i < codeLines.children.length; i++) {
     const c = codeLines.children[i];
@@ -1432,17 +2451,23 @@ function applyBlame(codeLines, data, totalLines) {
   for (const range of data.ranges || []) {
     const lo = Math.max(1, range.lo || 1);
     const hi = Math.min(totalLines, Math.min(rows.length, range.hi || lo));
-    const hue = idHue(String(range.cs || ""));
+    const info = ageMeta && ageMeta[String(range.cs || "")];
+    const h = info ? Math.round(info.hue) : idHue(String(range.cs || ""));
     const short = String(range.cs || "").slice(0, 8);
+    const style = info
+      ? "background:hsl(" + h + ",40%,24%);border-left:3px solid hsl(" + h + ",55%,62%);color:#f0ead8"
+      : "background:hsl(" + h + ",30%,26%);border-left:3px solid hsl(" + h + ",45%,52%);color:#f0ead8";
+    const title = info
+      ? short + " · " + info.name + (info.date ? " · " + info.date : "") +
+        " — colored by relative age in this file"
+      : String(range.cs || short);
     for (let ln = lo; ln <= hi; ln++) {
       const g = rows[ln - 1] && rows[ln - 1].children[0];
       if (!g) continue;
       g.className = "gutter gutter-block";
       g.setAttribute("data-cs", short);
-      g.setAttribute("title", range.cs || short);
-      g.setAttribute("style",
-        "background:hsl(" + hue + ",30%,26%);" +
-        "border-left:3px solid hsl(" + hue + ",45%,52%);color:#f0ead8");
+      g.setAttribute("title", title);
+      g.setAttribute("style", style);
       while (g.firstChild) g.removeChild(g.firstChild);
       if (ln === lo) g.appendChild(document.createTextNode(short));
       const target = range.cs;
@@ -1503,11 +2528,130 @@ function viewCompare(root, query) {
       el("span", { title: d.b }, shortId(d.b, 8) + "…"),
       el("span", { class: "cmp-count" }, "  " + ((d.changes || []).length) + " changes")));
     const panel = el("section", { class: "panel" });
-    panel.appendChild(changeList(d.changes || [], d.b));
+    panel.appendChild(changeList(d.changes || [], d.b, d.a));
     results.appendChild(panel);
   }).catch((err) => {
     clear(results).appendChild(emptyState("Compare failed", String(err && err.message ? err.message : err)));
   });
+}
+
+/** Wrap case-insensitive occurrences of q in <mark>, untrusted-safe. */
+function markMatches(node, text, q) {
+  const tl = String(text).toLowerCase(), ql = String(q).toLowerCase();
+  if (!ql) { node.textContent = String(text); return node; }
+  let i = 0, idx, marked = false;
+  while ((idx = tl.indexOf(ql, i)) >= 0) {
+    if (idx > i) node.appendChild(document.createTextNode(text.slice(i, idx)));
+    node.appendChild(el("mark", {}, text.slice(idx, idx + ql.length)));
+    i = idx + ql.length;
+    marked = true;
+  }
+  if (i < text.length) node.appendChild(document.createTextNode(text.slice(i)));
+  if (!marked && !i) node.textContent = String(text);
+  return node;
+}
+
+function viewSearch(root, query) {
+  const q0 = (query.get("q") || "").trim();
+  const rev = currentRev();
+  document.title = "gardenbed — grep " + q0;
+  setNav(null);
+  clear(root);
+  root.appendChild(el("h1", { class: "page-title" }, "Search"));
+  const results = el("div", { id: "search-results" });
+  root.appendChild(results);
+  if (!q0) {
+    results.appendChild(emptyState("Nothing to grep", null, "type in the grep box (or press /) and hit Enter"));
+    return;
+  }
+  results.appendChild(skeleton(6));
+  api("/api/search?" + qs({ cs: rev, q: q0, limit: 100 })).then((d) => {
+    clear(results);
+    const files = d.files || [];
+    results.appendChild(el("div", { class: "search-head" },
+      files.length + " file" + (files.length === 1 ? "" : "s") + " match ",
+      el("span", { class: "mono" }, "“" + q0 + "”"),
+      " at " + revName(rev) + " · " + shortId(d.cs || "", 8)));
+    if (d.truncated) {
+      results.appendChild(el("div", { class: "banner warn" }, "result set truncated — showing the server-capped first matches"));
+    }
+    if (!files.length) {
+      results.appendChild(emptyState("No matches", null, 'no matches for "' + q0 + '" — try a shorter substring'));
+      return;
+    }
+    for (const f of files) {
+      const matches = (f.matches || []).slice(0, 20);
+      const sf = el("div", { class: "search-file panel" },
+        el("div", { class: "search-file-head" },
+          el("a", { class: "mono", href: fileHref(rev, f.path) }, f.path),
+          el("span", { class: "search-count mono" }, matches.length + (matches.length === 1 ? " match" : " matches"))));
+      for (const m of matches) {
+        sf.appendChild(el("div", { class: "search-line" },
+          el("a", { class: "search-ln mono", href: fileHref(rev, f.path) }, String(m.line)),
+          markMatches(el("code", { class: "search-text" }), String(m.text == null ? "" : m.text), q0)));
+      }
+      results.appendChild(sf);
+    }
+  }).catch((err) => {
+    clear(results).appendChild(emptyState("Search failed", String(err && err.message ? err.message : err)));
+  });
+}
+
+function viewReview(root, id) {
+  document.title = "gardenbed — review " + shortId(id, 12);
+  setNav(null);
+  clear(root).appendChild(skeleton(8));
+  Promise.all([
+    api("/api/changeset?" + qs({ id: id })),
+    api("/api/log?" + qs({ cs: currentRev(), limit: 500 })).catch((err) =>
+      err && err.status === 404 ? { entries: [] } : Promise.reject(err)),
+  ]).then(([cs, log]) => {
+    clear(root);
+    document.title = "gardenbed — review " + shortId(cs.id, 12);
+    const published = new Set((log.entries || []).map((e) => e.id));
+    const landed = published.has(cs.id);
+    root.appendChild(el("h1", { class: "page-title" }, "Review"));
+
+    const header = el("header", { id: "review-header", class: "panel" });
+    header.appendChild(el("div", { class: "cs-id-row" },
+      el("span", { class: "cs-id" }, cs.id),
+      copyButton(() => cs.id, "copy id"),
+      el("span", { class: landed ? "badge-published" : "badge-draft" }, landed ? "landed" : "draft"),
+      el("a", { class: "btn btn-sm", href: "#/changeset/" + encodeURIComponent(cs.id) }, "open full page")));
+    header.appendChild(el("div", { class: "cs-message" }, cs.message || "(no message)"));
+    header.appendChild(el("div", { class: "cs-people" },
+      personBlock("author", cs.author),
+      personBlock("committer", cs.committer)));
+    if (cs.parents && cs.parents.length) {
+      const chips = el("div", { class: "parent-chips" });
+      if (cs.parents.length > 1) chips.appendChild(el("span", { class: "badge-merge" }, "merge"));
+      for (const p of cs.parents) {
+        chips.appendChild(el("a", { class: "parent-chip", href: "#/changeset/" + encodeURIComponent(p), title: p }, shortId(p, 12)));
+      }
+      header.appendChild(chips);
+    }
+    root.appendChild(header);
+
+    const chPanel = el("section", { class: "panel" });
+    chPanel.appendChild(el("h2", { class: "panel-title" }, "Changes · " + ((cs.changes || []).length)));
+    chPanel.appendChild(changeList(cs.changes || [], cs.id, cs.parents && cs.parents[0]));
+    root.appendChild(chPanel);
+
+    // read-only: show, never run — the CLI writes
+    const topSeg = firstTopSegment(cs.changes && cs.changes[0] && cs.changes[0].path) || "<crate>";
+    const lines = [
+      "bed diff " + cs.id,
+      "# check: cargo test -p " + topSeg,
+      "bed rebase main && bed publish",
+    ];
+    const cmdPanel = el("section", { class: "panel" },
+      el("h2", { class: "panel-title" }, "Land it"),
+      el("div", { class: "land-commands" },
+        el("div", { class: "land-note" }, "Reads live here; writes happen in bed."),
+        el("pre", { class: "land-pre mono" }, lines.join("\n")),
+        copyButton(() => lines.join("\n"), "copy all")));
+    root.appendChild(cmdPanel);
+  }).catch((err) => mountError(root, err, "Changeset not found"));
 }
 
 function viewNotFound(root, path) {
@@ -1545,6 +2689,8 @@ function parseHash() {
 }
 
 function route() {
+  kbdSel = -1; // keyboard selection is per-page
+  overviewLive = null; // repaint-on-poll only lives on the overview
   const root = app();
   const r = parseHash();
   const segs = r.segs;
@@ -1555,21 +2701,40 @@ function route() {
     case "changeset":
       if (!segs[1]) return viewNotFound(root, r.path);
       return viewChangeset(root, segs[1]);
+    case "review":
+      if (!segs[1]) return viewNotFound(root, r.path);
+      return viewReview(root, segs[1]);
     case "browse":
       return viewBrowse(root, segs[1] || "", segs.slice(2).join("/"));
     case "file":
       return viewFile(root, segs[1] || "", segs.slice(2).join("/"));
     case "compare":
       return viewCompare(root, r.query);
+    case "search":
+      return viewSearch(root, r.query);
     default:
       return viewNotFound(root, r.path);
   }
 }
 
+/* Test/maintainer handle: intentional, stable, undocumented surface. */
+const __gb = { pollTick, diffLines, buildHunks, fuzzyScore, buildAgentPrompt, shellQuote, shellArg, buildDerivation };
+if (typeof window !== "undefined") window.__gb = __gb;
+
 function boot() {
   addEventListener("hashchange", route);
   const agentBtn = document.getElementById("agent-prompt-btn");
   if (agentBtn) agentBtn.addEventListener("click", openAgentModal);
+  const gs = document.getElementById("global-search");
+  if (gs) {
+    gs.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        const v = String(gs.value || "").trim();
+        if (v) { location.hash = "#/search?" + qs({ q: v }); ev.preventDefault && ev.preventDefault(); }
+      }
+    });
+  }
+  if (document.addEventListener) document.addEventListener("keydown", onGlobalKey);
   // Populate the ref selector, then render (selector load is non-blocking).
   loadRefs().then(route, route);
 }
