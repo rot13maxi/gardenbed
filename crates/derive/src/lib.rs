@@ -23,12 +23,14 @@
 mod ancestry;
 mod apply;
 mod blame;
+mod cuttings;
 mod diff;
 mod pathsummary;
 mod xdiff;
 
 pub use ancestry::SegmentEntry;
 pub use blame::BlameRange;
+pub use cuttings::{Cutting, CuttingKind, Cuttings};
 pub use pathsummary::{BLOOM_BITS, MAX_SUMMARY_PATHS, PathSummary};
 
 use std::collections::{HashMap, VecDeque};
@@ -46,6 +48,9 @@ pub const DERIVED_SKIPLIST: &str = "skiplist";
 /// Derived-data kind tag for the per-changeset path summary (blame's
 /// segment-skip data: bounded touched-path set + segment bloom).
 pub const DERIVED_PATHSUMMARY: &str = "pathsummary";
+/// Derived-data kind tag for the per-changeset exact-blob copy/rename
+/// facts.
+pub const DERIVED_CUTTINGS: &str = "cuttings";
 
 /// One registered derived-data kind — the single registration point a
 /// kind passes through. Both eager paths iterate the registry
@@ -111,11 +116,24 @@ fn pathsummary_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<()
     Ok(())
 }
 
+/// Cuttings eager hook: the lazy getter computes and persists.
+fn cuttings_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    engine.cuttings_entry(cs_id).map(|_| ())
+}
+
+/// Cuttings batched hook: flat compute from the changeset + first parent's
+/// tree; always contributes a row (empty facts included).
+fn cuttings_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    let entry = cuttings::build_cuttings(engine, flow.cs)?;
+    flow.push(DERIVED_CUTTINGS, entry.encode());
+    Ok(())
+}
+
 /// The derived-data kind registry, in eager-write and row order: tree,
-/// skiplist, pathsummary. The order is part of the batched-import
-/// contract (the row list keeps this exact sequence); the skiplist's
-/// segment entry flows to the pathsummary through [`DerivedFlow`], so it
-/// is computed exactly once per flow.
+/// skiplist, pathsummary, cuttings. The order is part of the
+/// batched-import contract (the row list keeps this exact sequence); the
+/// skiplist's segment entry flows to the pathsummary through
+/// [`DerivedFlow`], so it is computed exactly once per flow.
 static DERIVED_KINDS: &[DerivedKind] = &[
     DerivedKind {
         name: DERIVED_TREE,
@@ -131,6 +149,11 @@ static DERIVED_KINDS: &[DerivedKind] = &[
         name: DERIVED_PATHSUMMARY,
         eager: pathsummary_eager,
         for_new: pathsummary_for_new,
+    },
+    DerivedKind {
+        name: DERIVED_CUTTINGS,
+        eager: cuttings_eager,
+        for_new: cuttings_for_new,
     },
 ];
 
