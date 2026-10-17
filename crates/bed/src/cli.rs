@@ -113,10 +113,16 @@ pub enum Command {
         author: Option<String>,
     },
 
-    /// Rebase the current changeset onto another changeset or ref.
+    /// Rebase the current changeset onto another changeset or ref. With
+    /// `--stack`, replay the whole first-parent chain from the merge
+    /// base up to the current changeset, oldest first — a conflict
+    /// anywhere aborts the entire stack (nothing is replayed).
     Rebase {
         /// The new parent: changeset id or ref.
         new_parent: String,
+        /// Replay the entire first-parent stack, not just the tip.
+        #[arg(long)]
+        stack: bool,
     },
 
     /// Publish the current changeset by fast-forwarding a ref (default
@@ -360,7 +366,14 @@ mod tests {
             other => panic!("expected Commit, got {other:?}"),
         }
         match parsed(&["rebase", "main"]).command {
-            Command::Rebase { new_parent } => assert_eq!(new_parent, "main"),
+            Command::Rebase { new_parent, stack } => {
+                assert_eq!(new_parent, "main");
+                assert!(!stack);
+            }
+            other => panic!("expected Rebase, got {other:?}"),
+        }
+        match parsed(&["rebase", "--stack", "main"]).command {
+            Command::Rebase { stack, .. } => assert!(stack),
             other => panic!("expected Rebase, got {other:?}"),
         }
         match parsed(&["publish"]).command {

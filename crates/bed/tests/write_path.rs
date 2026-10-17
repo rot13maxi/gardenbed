@@ -626,6 +626,171 @@ async fn rebase_replays_onto_moved_main_and_conflicts_name_paths() {
     w.server.shutdown().await;
 }
 
+/// `bed rebase --stack`: a 3-deep local stack replays onto a moved main
+/// oldest-first, each replayed link parented on the previous one, and
+/// the working copy lands at the new tip.
+#[tokio::test]
+async fn stack_rebase_replays_the_whole_first_parent_chain() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Build a 3-deep stack of working-copy commits.
+    let mut tips = Vec::new();
+    for i in 1..=3 {
+        fs::write(
+            w.garden.join(format!("src/stack-{i}.rs")),
+            format!("pub fn layer{i}() {{}}\n").as_bytes(),
+        )
+        .unwrap();
+        let (code, out, stderr) = bed(&w.garden, &["commit", "-m", &format!("layer {i}")]);
+        assert_eq!(code, 0, "layer {i}: {stderr}\n{out}");
+        tips.push(current_cs(&w.garden));
+    }
+    let stack_bottom = w
+        .repo
+        .get_changeset(tips[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // Upstream moves main off the stack's base: a fresh file, so every
+    // stack link's Add applies cleanly on top of it.
+    let (up_change, up_content) = add("src/upstream.rs", b"pub fn upstream() {}\n", Mode::Regular);
+    let up_blob = up_change.blob.unwrap();
+    let upstream_cs = cs(
+        vec![stack_bottom],
+        vec![up_change],
+        "upstream",
+        1_700_000_300,
+    );
+    let upstream_id = w
+        .repo
+        .create_changeset(
+            &upstream_cs,
+            &std::collections::BTreeMap::from([(up_blob.to_hex(), up_content)]),
+        )
+        .expect("upstream ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), upstream_id)
+        .expect("main moves");
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "stack rebase: {stderr}\n{out}");
+    assert!(out.contains("rebased 3 change(s)"), "output: {out}");
+    let tip = current_cs(&w.garden);
+    assert_ne!(tip, tips[2], "the working copy moved to the replayed tip");
+
+    // Chain shape: replayed tip -> replayed(2) -> replayed(1) -> upstream.
+    let mut ids = Vec::new();
+    let mut walk = tip;
+    for _ in 0..5 {
+        ids.push(walk);
+        let cs = w.repo.get_changeset(walk).unwrap();
+        walk = cs.parents.first().copied().unwrap();
+    }
+    assert_eq!(ids[3], upstream_id, "the chain roots on the new main");
+    // The ORIGINAL stack links are not reused: every replayed link is a
+    // fresh changeset parented on the previous replay, and none of the
+    // original tips appears in the new chain.
+    for t in &tips {
+        assert!(
+            !ids.contains(t),
+            "original stack link {t:?} was replayed, not reused"
+        );
+    }
+    for id in ids.iter().take(3) {
+        assert_eq!(w.repo.get_changeset(*id).unwrap().parents.len(), 1);
+    }
+    // The union tree: seed + upstream + all three layers.
+    assert!(flat_files(&w.repo, tip).contains_key(&"src/stack-3.rs".to_owned()));
+    assert!(flat_files(&w.repo, tip).contains_key(&"src/upstream.rs".to_owned()));
+
+    // The working copy came along and is clean.
+    let (code, out, stderr) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "status: {stderr}");
+    assert!(out.contains("working copy is clean"), "status: {out}");
+
+    w.server.shutdown().await;
+}
+
+/// `bed rebase --stack`: a conflict mid-stack aborts the whole stack —
+/// the working copy never moves off its current changeset.
+#[tokio::test]
+async fn stack_rebase_conflict_mid_stack_aborts_clean() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Two working-copy layers.
+    fs::write(w.garden.join("src/layer-a.rs"), b"pub fn a() {}\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "layer a"]);
+    assert_eq!(code, 0, "layer a: {stderr}\n{out}");
+    let first = current_cs(&w.garden);
+
+    // Layer B modifies docs/readme.md — chosen to clash with upstream.
+    fs::write(w.garden.join("docs/readme.md"), b"# hello\n\n layer b\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "layer b"]);
+    assert_eq!(code, 0, "layer b: {stderr}\n{out}");
+    let before = current_cs(&w.garden);
+    let stack_bottom = w
+        .repo
+        .get_changeset(first)
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // Upstream modifies the same readme — the conflict lands when layer
+    // B replays (the SECOND link), after layer A has replayed cleanly.
+    let up_modify = Change {
+        path: "docs/readme.md".into(),
+        op: Op::Modify,
+        blob: Some(blob_id(b"# hello\n\n upstream\n")),
+        src_path: None,
+        mode: Mode::Regular,
+    };
+    let up_blob = up_modify.blob.unwrap();
+    let upstream_cs = cs(
+        vec![stack_bottom],
+        vec![up_modify],
+        "upstream readme",
+        1_700_000_400,
+    );
+    let upstream_id = w
+        .repo
+        .create_changeset(
+            &upstream_cs,
+            &std::collections::BTreeMap::from([(
+                up_blob.to_hex(),
+                b"# hello\n\n upstream\n".to_vec(),
+            )]),
+        )
+        .expect("upstream ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), upstream_id)
+        .expect("main moves");
+
+    // The stack rebase fails: layer A applies, layer B conflicts.
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 1, "a mid-stack conflict must fail: {out}");
+    assert!(stderr.contains("rebase"), "stderr names rebase: {stderr}");
+    // The working copy never moved: still at the pre-rebase tip.
+    assert_eq!(
+        current_cs(&w.garden),
+        before,
+        "an aborted stack rebase leaves the working copy untouched"
+    );
+    // And the disk never moved either: layer B's content is still there.
+    assert_eq!(
+        fs::read_to_string(w.garden.join("docs/readme.md")).unwrap(),
+        "# hello\n\n layer b\n"
+    );
+
+    w.server.shutdown().await;
+}
+
 /// M5 write path 3: a lone publish fast-forwards `main`; a working copy left
 /// behind gets the not-fast-forward refusal with the recipe spelled out.
 #[tokio::test]
