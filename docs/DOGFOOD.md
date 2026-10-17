@@ -38,6 +38,11 @@ every commit records it and reviewers filter by author.
 
 ## Rules of the road
 - Scope test runs: `cargo test -p <your-crate>`; full-workspace runs fight 10 agents for CPU
+- `cargo test -p gardenbed` does NOT rebuild the workspace `gardenbed-server`
+  binary its tests spawn from `target/{debug,release}`. After a change in
+  `crates/server`, rebuild first (`cargo build -p gardenbed-server`) or a stale
+  binary will fail protocol-dependent tests in ways that look like code
+  regressions (same class as the e2e-vs-cli binary mismatch).
 - Before publishing: `cargo fmt --all && cargo clippy -p <pkg> --all-targets -- -D warnings`
 - Hit a bed bug or papercut? Report to wG:p9 (`herdr agent prompt wG:p9 "..."`) with the
   exact command + error. Fixing bed is the point of this dogfood. Don't silently work around.
