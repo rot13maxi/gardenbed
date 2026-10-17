@@ -104,6 +104,7 @@ impl Hist {
         )
     }
 
+    #[allow(dead_code)]
     fn modify(&mut self, path: &str, content: &[u8]) -> Change {
         chg(
             &mut self.blobs,
@@ -280,7 +281,7 @@ fn every_changeset_writes_a_row_eagerly() {
 #[test]
 fn lazy_and_eager_bytes_are_identical() {
     let (h, ids) = fixture();
-    let (ids_a, engine_a, meta_a) = setup(&h, true);
+    let (ids_a, _engine_a, meta_a) = setup(&h, true);
     let (_, engine_b, meta_b) = setup(&h, false);
     for (i, cs) in ids.iter().enumerate() {
         let a = meta_a

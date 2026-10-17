@@ -126,14 +126,19 @@ lost CAS race is a clean conflict result, not an error.
   with change size, not repo size). Trees are cached in object store and
   identified by their canonical bytes, so identical trees reached via
   different histories share one object.
-- **Three derived caches** (the metadata store `derived` table, keyed
-  `(kind, cs)`):
+- **Four derived caches** (the metadata store `derived` table, keyed
+  `(kind, cs)`), each registered in the `DerivedKind` registry
+  (`crates/derive/src/lib.rs`) — the registry drives both eager paths
+  (`on_changeset_created` per-kind hooks; `derived_rows_for_validated_tree`
+  per-kind rows for batched import), so a new kind is one module plus one
+  registry entry:
 
 | kind | what it is | what it buys |
 |---|---|---|
 | `tree` | the changeset's derived root tree id (the tree object itself lives in the object store) | clone/sparse/export resolve trees immediately (D3 eager materialization); recompute is a cache miss, never a wrong answer |
 | `skiplist` | segmented ancestry changelog over mainline (roots and merges are segment heads) | fast `MergeBase`/`IsAncestor` and blame segment skips |
 | `pathsummary` | per-changeset bounded touched-path set + cumulative per-segment Bloom filter | blame skips a whole linear segment with **one** derived read when the summary proves the path untouched (a false positive costs a step, never a wrong answer) |
+| `cuttings` | per-changeset exact-blob copy/rename facts against the first parent (rename = unchanged-blob move; copy = add duplicating an existing blob, source = lexicographically smallest matching path) | the `copies` MCP tool answers without walking history; exact blob equality only — no similarity heuristic |
 
 Everything derived is a **cache**: wipe + rebuild must converge to
 identical state (verified in M6 and re-verified after every chaos kill).
@@ -170,7 +175,7 @@ WAL), 5 s busy timeout:
 | `changesets` | `id BLOB PK, canonical BLOB NOT NULL` | the changeset log; `canonical` is the identity bytes |
 | `refs` | `name TEXT PK, cs BLOB NOT NULL` | full ref names (`refs/heads/main`); moved only by CAS |
 | `git_map` | `git_sha TEXT PK, cs BLOB NOT NULL UNIQUE` | the git↔changeset bijection; import skips mapped history, export reads it back |
-| `derived` | `kind, cs, bytes, PK(kind, cs)` | the three caches above |
+| `derived` | `kind, cs, bytes, PK(kind, cs)` | the four caches above |
 
 `cas_ref` performs its read-and-compare inside one `BEGIN IMMEDIATE`
 transaction — a ref swap is a single atomic compare-and-swap. The import
@@ -255,7 +260,7 @@ against the parent side with the store's own xdiff port; added lines
 attribute to the touching changeset, matched lines inherit and continue
 downward; a rename is followed through `src_path` when the path did not
 exist in the parent's tree. Merge commits blame through first parent
-only. Three caches keep the walk off the hot path: the `pathsummary`
+only. The caches keeping the walk off the hot path: the `pathsummary`
 bloom proves whole segments untouched in one read; a per-walk blob cache
 exploits the consecutive-toucher invariant (a path touched by consecutive
 chain steps re-reads one blob); and results are memoized per engine
