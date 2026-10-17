@@ -75,6 +75,7 @@ pub enum ServerError {
     /// Merge hit semantic conflicts; the paths are listed in the message.
     #[error("merge conflicts on: {}", .0.join(", "))]
     MergeConflict(Vec<String>),
+
     /// Publish named "main" in the `ref` field: main publishes stay the
     /// plain (ref-less) request form, gated on protocol review.
     #[error(
