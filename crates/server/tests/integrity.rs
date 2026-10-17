@@ -41,7 +41,7 @@ fn invalid_changesets_never_become_visible_or_publishable() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store.clone());
     let root = commit(&repo, &changeset(vec![], vec![], "root"));
-    repo.publish(root, None, false).unwrap();
+    repo.publish(root).unwrap();
     let invalid = changeset(
         vec![root],
         vec![change("absent", Op::Delete, None, Mode::Regular, None)],
@@ -51,7 +51,7 @@ fn invalid_changesets_never_become_visible_or_publishable() {
     for _ in 0..2 {
         assert!(repo.create_changeset(&invalid, &BTreeMap::new()).is_err());
         assert!(store.get_changeset(invalid_id).unwrap().is_none());
-        assert!(repo.publish(invalid_id, None, false).is_err());
+        assert!(repo.publish(invalid_id).is_err());
         assert!(repo.cas_ref("invalid-branch", None, invalid_id).is_err());
         assert_eq!(repo.get_ref("main").unwrap(), Some(root));
         assert_eq!(repo.get_ref("invalid-branch").unwrap(), None);
@@ -63,7 +63,7 @@ fn legacy_invalid_history_cannot_be_published_even_as_a_nonfirst_parent() {
     let store = Arc::new(MemoryStore::new());
     let repo = Repo::new(store.clone(), store.clone());
     let root = commit(&repo, &changeset(vec![], vec![], "root"));
-    repo.publish(root, None, false).unwrap();
+    repo.publish(root).unwrap();
     // Simulate metadata retained by a server predating validation-before-put.
     let bad = store
         .put_changeset(&changeset(
@@ -77,7 +77,7 @@ fn legacy_invalid_history_cannot_be_published_even_as_a_nonfirst_parent() {
     // Its own first-parent tree is valid, so checking only the head misses it.
     assert!(repo.root_tree(merge_id).is_ok());
     for id in [bad, merge_id] {
-        assert!(repo.publish(id, None, false).is_err());
+        assert!(repo.publish(id).is_err());
         assert!(repo.cas_ref("invalid-branch", None, id).is_err());
     }
     assert!(repo.create_changeset(&merge, &BTreeMap::new()).is_err());

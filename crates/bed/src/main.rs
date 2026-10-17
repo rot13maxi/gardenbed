@@ -167,13 +167,9 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             Ok(0)
         }
 
-        Command::Publish { ref_name, force } => {
-            if let Some(name) = &ref_name {
-                // A ref-shaped argument must parse as one (the revspec
-                // rules catch bad names before any RPC).
-                gardenbed::revspec::CsOrRef::parse(name)?;
-            }
-            let out = gardenbed::ops::publish(&cli.state_dir, ref_name.as_deref(), *force).await?;
+        Command::Publish => {
+            let _bed = WorkingCopy::open(&cli.state_dir)?;
+            let out = gardenbed::ops::publish(&cli.state_dir).await?;
             print!("{out}");
             Ok(0)
         }

@@ -162,84 +162,77 @@ every non-blank line in the corpus attributed identically. Matching git
 line-for-line would require reimplementing xdiff's heuristics in the
 derive diff; if exact parity ever matters, that is the fix.
 
-## 6. Renames below 100% similarity render as delete + add (retired v0.2)
+## 6. `bed diff` renders renames as delete + add
 
-**Status:** retired by D22 (v0.2 M19). Pure renames — a moved file whose
-blob is unchanged — render git's `R100` form (`similarity index 100%` /
-`rename from` / `rename to`) in every `bed diff` form. The scoped forms
-(`bed diff <cs>`, and the no-argument form on a clean copy) render from
-the changeset's recorded `Op::Rename`; the two-argument form pairs a
-delete with a write carrying an identical blob at render time — the same
-rule `bed commit` uses to record a rename, so no second pairing
-convention exists. Letter parity with `git diff-tree -M` and byte parity
-of pure-rename changeset bodies (`git diff-tree -M -p`) hold on
-generated rename histories (`pure_renames_render_git_m_parity_and_byte_parity`
-in `crates/bed/tests/read_path.rs`), and rendered rename blocks reapply
-with `git apply` (`git_apply_accepts_every_rendered_shape` in
-`crates/bed/tests/render_patch.rs`). The MCP `diff` tool deliberately
-keeps its v0.1 letter parity (`git diff-tree --no-renames`); that is a
-deliberate scope decision recorded with D22, not an oversight.
+**What:** `bed diff` never pairs renames at the render level: a rename
+changeset renders as a delete + an add — two `diff --git` blocks (one
+`deleted file mode`, one `new file mode`) — never git's
+`similarity index 100%` / `rename from` / `rename to` form. The renderer
+consumes the server's tree diff, which runs with rename detection off
+(`Add`/`Modify`/`Delete` per path), and classifies each path by presence
+alone — `DiffOp` has no rename classification — so no rename is ever
+available to pair; the renderer's documented parity target is
+`git diff-tree -r --no-renames` (`crates/bed/src/render.rs`). The MCP
+`diff` tool answers from the same tree diffs, so a rename shows as `D`
+and `A` letters there too.
 
-**Residual — moved-and-edited files:** a file that moved *and* changed
-content renders as a delete plus a write, never git's
-`R<similarity<100>` form. Gardenbed claims no similarity score below
-100%, because it has none: the model records rename facts (identical
-blob) and the deterministic delete+write expansion otherwise. git's
-`-M` heuristic would print one `R` block with a similarity index for
-the same change, so review tooling diffing outputs still sees two
-blocks where git prints one. `commit` records these as a delete+add
-pair (never a `Rename`), so the residual matches what the changeset
-records — one model fact, one rendering. Counted from recorded facts
-on generated histories: the 25%-edit rename histories render
-`delete`/`write` pairs exactly for edited moves
-(`moved_and_edited_files_render_delete_plus_write`), never a spurious
-rename block.
+**Cost:** purely output fidelity — review parity. Compared with
+`git diff-tree -M` on the QA regression pass's rename pairs, entry
+counts differ (1,318 vs 1,321 and 4,794 vs 5,128 entries), and
+`grep '^rename from '` over `bed diff` output finds 0 hits, so review
+tooling (or a human) diffing working copy's output against rename-aware git sees
+a different shape for every moved file. What is *not* affected: the
+trees and the changesets — imported changesets record renames as git's
+own `-M` detection reported them (the D8 import mechanism,
+`docs/v0.1.md` §3), `commit` pairs a pure rename — a deleted path and an
+added path with the identical blob id — into one canonical `Op::Rename`
+carrying `src_path` (op `3 rename` in the canonical encoding spec's
+`change` table, `docs/canonical-encoding.md`), and patches built from
+the delete + add rendering reapply cleanly with `git apply` (verified in
+the same pass). The identity half of this shape is already catalogued
+under "Explicitly *not* divergences" below: rename vs. delete+add builds
+the same tree and the same commit SHA. Only the rendered diff differs.
 
-**Residual — pairing-rule corners:** the two-argument form pairs a
-delete with *any* write of the identical blob (add, modify, or
-typechange — `commit`'s rule), where git's `-M` only pairs adds. In the
-corner "path deleted at `src` while an unrelated path is *modified* to
-the same blob" (only reachable with duplicate blob content across
-paths), bed prints `R100` where git prints a `D` plus an `M`. Generated
-histories mint globally unique blob content per write, so the corner
-cannot occur there; it needs a hand-crafted duplicate-content pair.
+**Why not fixed:** render-level similarity pairing is not implemented in
+v0.1 — the diff parity contract was written against `--no-renames` from
+the start. Import-level rename detection is a separate mechanism (D8)
+and does exist; only the render level lacks it. The fix is render-local:
+pair identical-blob delete + add entries at render time (the
+deterministic rule `commit` already applies), or reuse the changeset's
+recorded `Rename` ops for changeset-scoped diffs instead of re-deriving
+from trees — a v0.2 candidate.
 
-**Repro:** commit a moved-and-edited file (`git mv a b && edit b && bed
-commit`) and run `bed diff <cs>`: `a` renders a `deleted file mode`
-block and `b` a `new file mode` block; `git diff-tree -M
---name-status` prints one `R` entry. A pure move in the same changeset
-renders one rename block, matching git.
+**Repro:** commit a pure rename (or import a history containing one) and
+run `bed diff <cs>` — that changeset against its first parent. The old
+path renders as a `deleted file mode` block and the new path as a
+`new file mode` block, while `git diff-tree -M --name-status` on the
+same pair shows the two paths as a single rename entry.
 
-## 7. Gitlink↔regular typechanges render mode lines only (retired v0.2)
+## 7. Gitlink pointer changes render as a binary-differ line
 
-**Status:** retired by D23 (v0.2 M19) for the gitlink add, delete, and
-pointer-change cases. All three render git's `Subproject commit <sha>`
-form — the real upstream SHA read from the gitlink's padded blob id
-(twelve zero bytes + SHA-1, `docs/canonical-encoding.md`) — as `new
-file mode 160000` + a one-line add hunk, `deleted file mode 160000` +
-`--- a/<p>` + a one-line delete hunk, and `--- a/<p>` / `+++ b/<p>` +
-a one-line swap respectively. The retired v0.1 shape (`Binary files …
-differ`) is gone: `git apply --cached` accepts the add and pointer
-forms (`git_apply_accepts_every_rendered_shape` in
-`crates/bed/tests/render_patch.rs`), and rendered SHAs match `git
-diff-tree --submodule=short` on the same changesets
-(`gitlink_pointer_changes_render_subproject_hunks`). One formal byte
-difference stays: git prints an `index` line on gitlink entries; bed
-omits it, as on every entry (bed does not abbreviate ids dynamically),
-and `git apply` accepts both.
+**What:** a submodule pointer change in `bed diff` renders the gitlink's
+mode lines (`new file mode 160000` / `deleted file mode 160000` /
+`old mode` + `new mode` for a typechange) plus git's binary one-liner
+`Binary files a/<p> and b/<p> differ` — not git's
+`@@ -1 +1 @@` hunk with `-Subproject commit <sha>` / `+Subproject commit
+<sha>`. Gitlink blobs in the canonical model are synthetic padded ids
+(the import convention, `docs/canonical-encoding.md`), not git's
+submodule SHAs, so emitting a `Subproject commit` line would write bytes
+git would then apply as a *wrong* pointer target.
 
-**Residual — gitlink↔regular typechange:** a path that was a regular
-file and becomes a gitlink (or back) renders its `old mode`/`new mode`
-lines only — no content hunk of either shape — the v0.1 typechange
-form. git prints the mode lines plus a content/`Subproject commit`
-hybrid. The renderer treats a typechange between entry kinds as
-shapeless (neither bytes nor a pointer to render); rendering both
-sides' shapes in one block is a v0.2+ candidate.
+**Cost:** review parity, and one patch consequence: `git apply` refuses
+the pointer-change entry (`cannot apply binary patch … without full
+index line`) where git's own `Subproject commit` form applies. The
+refusal is per-entry and parse-safe — other entries in the same patch
+still apply (the pre-fix renderer leaked the gitlink's path into the
+next entry's parse and poisoned the whole patch). Gitlink
+additions/deletions render mode lines only and apply cleanly. The
+faithful oracle for pointer targets remains `git diff --submodule` /
+`git submodule status`.
 
-**Repro:** in a history with submodules, `bed diff <cs>` on a changeset
-that retargets one prints the `-Subproject commit <old>` /
-`+Subproject commit <new>` hunk; a path switching from a regular file
-to a gitlink prints only `old mode`/`new mode`.
+**Why not fixed:** an honest `Subproject commit` line needs git's real
+submodule SHAs imported and stored as first-class ids — model work, not
+render work. A v0.2 candidate alongside rename pairing (§6).
 
 ## Explicitly *not* divergences
 

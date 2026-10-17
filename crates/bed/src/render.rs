@@ -15,19 +15,13 @@
 //! normalized) in an ISO-like shape rather than git's locale words.
 //!
 //! **Diff** (structural parity target: same changed path set and op
-//! classification as `git diff-tree -r -M` for pure renames — a moved
-//! file with an identical blob renders git's `R100` form — and as
-//! `git diff-tree -r --no-renames` otherwise; moved-and-edited files
-//! keep delete + add rendering, a counted divergence in
-//! `docs/divergences.md` §6): a `diff --git` header per path, git-
-//! compatible `new file mode` / `deleted file mode` / `old mode` /
-//! `new mode` lines, `similarity index 100%` + `rename from` / `rename to`
-//! for pure moves (extended-header order pinned against `git diff-tree
-//! -M -p`), `---`/`+++` markers, then unified hunks from a hand-rolled
-//! LCS line diff with 3 context lines. **Hunk internals are a documented
-//! divergence** — git's Myers implementation may split or align hunks
-//! differently; the path/op classification above is the parity contract.
-//! Files whose last line lacks a trailing newline get git's
+//! classification as `git diff-tree -r --no-renames`): a `diff --git`
+//! header per path, git-compatible `new file mode` / `deleted file mode` /
+//! `old mode` / `new mode` lines, `---`/`+++` markers, then unified hunks
+//! from a hand-rolled LCS line diff with 3 context lines. **Hunk internals
+//! are a documented divergence** — git's Myers implementation may split or
+//! align hunks differently; the path/op classification above is the parity
+//! contract. Files whose last line lacks a trailing newline get git's
 //! `\ No newline at end of file` marker.
 //!
 //! Two entry classes render git's payload-free forms instead of hunks:
@@ -39,22 +33,19 @@
 //!   mode-only changes (identical blob on both sides) render no binary
 //!   line. (git applies binary patches only from `--binary` payloads;
 //!   bed prints the same informational line plain `git diff` does.)
-//! - **Gitlinks** — never content-fetched hunks (their blob ids are
-//!   synthetic padded ids, so the store holds no bytes to diff): the
-//!   padding is stripped and the pointer rendered as git's
-//!   `Subproject commit <sha>` line — an add or delete carries its mode
-//!   line plus a `@@ -0,0 +1 @@` / `@@ -1 +0,0 @@` hunk, a surviving
-//!   pointer change the `@@ -1 +1 @@` swap hunk (git's own form minus
-//!   the `index` line, whose abbreviated lengths bed cannot reproduce;
-//!   `git apply` accepts the form exactly where it accepts git's own).
-//!   A gitlink↔regular typechange keeps v0.1's mode-lines-only shape
-//!   (a counted divergence in `docs/divergences.md` §7).
+//! - **Gitlinks** — mode lines only, never content hunks: the import's
+//!   gitlink blob ids are synthetic padded ids, *not* git's submodule
+//!   SHAs, so no honest `Subproject commit <sha>` line exists to print.
+//!   A gitlink add/delete keeps its `new file mode` / `deleted file mode`
+//!   line (git apply accepts those); a surviving gitlink→gitlink pointer
+//!   change has no mode lines to print, so its change rides the
+//!   `Binary files … differ` line.
 //!
 //! A payload-free entry whose header would carry neither mode lines nor
-//! `---`/`+++` markers (a plain content modification) also prints the
-//! `---`/`+++` markers: git apply only consumes a header it can pair
-//! with a payload or metadata, and a bare `diff --git` header leaks its
-//! name into the *next* entry's parse.
+//! `---`/`+++` markers (a plain content modification, or the gitlink
+//! pointer change) also prints the `---`/`+++` markers: git apply only
+//! consumes a header it can pair with a payload or metadata, and a bare
+//! `diff --git` header leaks its name into the *next* entry's parse.
 
 use gardenbed_model::Mode;
 
@@ -164,10 +155,6 @@ pub enum DiffOp {
     Modify,
     /// Entry type changed (regular↔symlink↔gitlink; git `T`).
     TypeChange,
-    /// Pure move of an identical blob (git `R100`): recorded fact or
-    /// paired delete+add at render time — never a similarity heuristic
-    /// (v0.2 D22).
-    Rename,
 }
 
 impl DiffOp {
@@ -178,7 +165,6 @@ impl DiffOp {
             DiffOp::Delete => 'D',
             DiffOp::Modify => 'M',
             DiffOp::TypeChange => 'T',
-            DiffOp::Rename => 'R',
         }
     }
 }
@@ -202,9 +188,6 @@ pub struct DiffEntry {
     pub old: Option<DiffSide>,
     /// The `b` side (absent for deletes).
     pub new: Option<DiffSide>,
-    /// For `DiffOp::Rename`: the source path the identical blob moved
-    /// from (git's `rename from`). Absent for every other op.
-    pub src_path: Option<String>,
 }
 
 /// The entry *type* git's `T` classification compares: regular and exec
@@ -296,34 +279,6 @@ fn render_diff_entry(
     content_of: &dyn Fn(gardenbed_model::Id) -> Result<Vec<u8>, ClientError>,
     out: &mut String,
 ) -> Result<(), ClientError> {
-    // A pure rename renders git's `R100` form and never fetches content:
-    // the blob is identical on both sides, and even a moved *gitlink*
-    // renders the pure-move form (git does the same — verified against
-    // `git diff-tree -M -p`).
-    if entry.op == DiffOp::Rename {
-        let src = entry.src_path.clone().ok_or_else(|| {
-            ClientError::MalformedRpc(format!(
-                "rename entry for {} carries no source path",
-                entry.path
-            ))
-        })?;
-        out.push_str(&format!("diff --git a/{src} b/{}\n", entry.path));
-        // git prints `old mode`/`new mode` before `similarity index` when
-        // the move also flips the mode (pinned against `git diff-tree -M -p`).
-        if entry.old.map(|s| s.mode) != entry.new.map(|s| s.mode) {
-            if let Some(s) = entry.old {
-                out.push_str(&format!("old mode {}\n", git_mode(s.mode)));
-            }
-            if let Some(s) = entry.new {
-                out.push_str(&format!("new mode {}\n", git_mode(s.mode)));
-            }
-        }
-        out.push_str("similarity index 100%\n");
-        out.push_str(&format!("rename from {src}\n"));
-        out.push_str(&format!("rename to {}\n", entry.path));
-        return Ok(());
-    }
-
     out.push_str(&format!("diff --git a/{} b/{}\n", entry.path, entry.path));
     // git's `old mode` / `new mode` / `new file mode` / `deleted file mode`
     // lines. Their presence decides how git apply parses a payload-free
@@ -353,56 +308,25 @@ fn render_diff_entry(
                 mode_lines = false;
             }
         }
-        DiffOp::Rename => unreachable!("handled above"),
     }
 
-    // Gitlink pointers render git's `Subproject commit` hunks from the
-    // real submodule SHA stored (zero-padded) in the blob id — never a
-    // content fetch (gitlink ids are synthetic; the store holds no bytes).
-    if let (Some(old), Some(new)) = (entry.old, entry.new)
-        && old.mode == Mode::Gitlink
-        && new.mode == Mode::Gitlink
-    {
-        // Pointer change: no mode lines (both sides 160000); the
-        // `---`/`+++` markers and the one-line swap hunk are git's
-        // own form minus the `index` line (git's abbreviated-length
-        // choice is not reproducible; `git apply` accepts without it).
-        out.push_str(&format!("--- a/{}\n+++ b/{}\n", entry.path, entry.path));
-        let old_sha = subproject_sha(old.blob)?;
-        let new_sha = subproject_sha(new.blob)?;
-        out.push_str("@@ -1 +1 @@\n");
-        out.push_str(&format!("-Subproject commit {old_sha}\n"));
-        out.push_str(&format!("+Subproject commit {new_sha}\n"));
-        return Ok(());
-    }
-    if let Some(new) = entry.new
-        && new.mode == Mode::Gitlink
-        && entry.old.is_none()
-    {
-        out.push_str("--- /dev/null\n");
-        out.push_str(&format!("+++ b/{}\n", entry.path));
-        let new_sha = subproject_sha(new.blob)?;
-        out.push_str("@@ -0,0 +1 @@\n");
-        out.push_str(&format!("+Subproject commit {new_sha}\n"));
-        return Ok(());
-    }
-    if let Some(old) = entry.old
-        && old.mode == Mode::Gitlink
-        && entry.new.is_none()
-    {
-        out.push_str(&format!("--- a/{}\n", entry.path));
-        out.push_str("+++ /dev/null\n");
-        let old_sha = subproject_sha(old.blob)?;
-        out.push_str("@@ -1 +0,0 @@\n");
-        out.push_str(&format!("-Subproject commit {old_sha}\n"));
-        return Ok(());
-    }
-    if entry.old.is_some_and(|s| s.mode == Mode::Gitlink)
-        || entry.new.is_some_and(|s| s.mode == Mode::Gitlink)
-    {
-        // A gitlink↔regular typechange: v0.1's mode-lines-only shape
-        // stays (a counted divergence in `docs/divergences.md` §7) —
-        // neither side's bytes honestly diff against the other's.
+    // Content hunks. Gitlinks and non-text content never render as hunks
+    // (see the module doc); symlinks diff as their target bytes; adds and
+    // deletes diff against nothing.
+    let old_gitlink = entry.old.is_some_and(|s| s.mode == Mode::Gitlink);
+    let new_gitlink = entry.new.is_some_and(|s| s.mode == Mode::Gitlink);
+    if old_gitlink || new_gitlink {
+        // The import's gitlink blob ids are synthetic padded ids, not git's
+        // submodule SHAs — any `Subproject commit <sha>` line would be
+        // wrong bytes, so gitlink entries render mode lines only. A
+        // surviving pointer change (gitlink on both sides) has no mode
+        // lines and no hunks to show: the change rides git's
+        // `Binary files … differ` line, with the `---`/`+++` markers git's
+        // own gitlink diffs carry keeping the entry parseable.
+        if old_gitlink && new_gitlink {
+            out.push_str(&format!("--- a/{}\n+++ b/{}\n", entry.path, entry.path));
+            out.push_str(&binary_differ_line(&entry.path, true, true));
+        }
         return Ok(());
     }
 
@@ -461,31 +385,6 @@ fn render_diff_entry(
         }
     }
     Ok(())
-}
-
-/// The 40-hex submodule SHA a gitlink blob id carries: the canonical
-/// padding convention is the upstream git SHA-1 left-padded with twelve
-/// zero bytes. A non-padded id cannot name a pointer honestly — refuse
-/// loudly rather than render a SHA git would apply as a wrong target
-/// (mirrors export's stripper).
-fn subproject_sha(id: gardenbed_model::Id) -> Result<String, ClientError> {
-    let bytes = id.as_bytes();
-    if bytes[..12].iter().any(|b| *b != 0) {
-        return Err(ClientError::InvalidGitlinkId(id));
-    }
-    Ok(hex(&bytes[12..]))
-}
-
-/// Lowercase hex of raw bytes (git prints submodule SHAs in full 40-hex
-/// lowercase).
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push(DIGITS[(b >> 4) as usize] as char);
-        s.push(DIGITS[(b & 0xf) as usize] as char);
-    }
-    s
 }
 
 /// A byte file split into lines (without the `\n`), remembering whether
@@ -947,13 +846,12 @@ mod tests {
 
     // --------------------------------------------- binary and gitlink rules
 
-    /// A gitlink blob id as the import/generator store it: the 20-byte
-    /// submodule SHA left-padded to 32 bytes — the id *is* the padding,
-    /// never a hash of it.
+    /// A gitlink blob id as the import stores it: synthetic padded bytes,
+    /// not a git submodule SHA.
     fn gitlink_id(byte: u8) -> gardenbed_model::Id {
         let mut padded = [0u8; 32];
         padded[12..].copy_from_slice(&[byte; 20]);
-        gardenbed_model::Id::from_bytes(padded)
+        gardenbed_model::blob_id(&padded)
     }
 
     fn diff_entry(
@@ -967,22 +865,6 @@ mod tests {
             op,
             old: old.map(|(blob, mode)| DiffSide { blob, mode }),
             new: new.map(|(blob, mode)| DiffSide { blob, mode }),
-            src_path: None,
-        }
-    }
-
-    fn rename_entry(
-        dst: &str,
-        src: &str,
-        old: Option<(gardenbed_model::Id, Mode)>,
-        new: Option<(gardenbed_model::Id, Mode)>,
-    ) -> DiffEntry {
-        DiffEntry {
-            path: dst.to_owned(),
-            op: DiffOp::Rename,
-            old: old.map(|(blob, mode)| DiffSide { blob, mode }),
-            new: new.map(|(blob, mode)| DiffSide { blob, mode }),
-            src_path: Some(src.to_owned()),
         }
     }
 
@@ -1142,7 +1024,7 @@ mod tests {
     }
 
     #[test]
-    fn gitlink_entries_render_subproject_hunks() {
+    fn gitlink_entries_render_mode_lines_only() {
         let sub_old = gitlink_id(0x19);
         let sub_new = gitlink_id(0x5a);
         let file = gardenbed_model::blob_id(b"file bytes\n");
@@ -1156,8 +1038,7 @@ mod tests {
             }
         };
 
-        // Add: git's own gitlink-add form minus the `index` line (bed
-        // cannot reproduce git's dynamic abbreviation length).
+        // Add: git's `new file mode 160000` alone — git apply accepts it.
         let out = render_diff(
             &[diff_entry(
                 "sub",
@@ -1168,15 +1049,9 @@ mod tests {
             &content_of,
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "diff --git a/sub b/sub\nnew file mode 160000\n--- /dev/null\n\
-             +++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit \
-             5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\n"
-        );
+        assert_eq!(out, "diff --git a/sub b/sub\nnew file mode 160000\n");
 
-        // Delete: `--- a/sub` keeps git apply's old-name bookkeeping
-        // straight (`--- /dev/null` would make it reject the patch).
+        // Delete: `deleted file mode 160000` alone.
         let out = render_diff(
             &[diff_entry(
                 "sub",
@@ -1187,14 +1062,12 @@ mod tests {
             &content_of,
         )
         .unwrap();
-        assert_eq!(
-            out,
-            "diff --git a/sub b/sub\ndeleted file mode 160000\n--- a/sub\n\
-             +++ /dev/null\n@@ -1 +0,0 @@\n-Subproject commit \
-             1919191919191919191919191919191919191919\n"
-        );
+        assert_eq!(out, "diff --git a/sub b/sub\ndeleted file mode 160000\n");
 
-        // Surviving pointer change: git's one-line swap hunk.
+        // Surviving pointer change: no mode lines exist (both sides are
+        // 160000) and no honest Subproject sha to print — the binary line
+        // carries the change, with the markers git's own gitlink diffs
+        // use so the entry parses as a patch.
         let out = render_diff(
             &[diff_entry(
                 "sub",
@@ -1207,14 +1080,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             out,
-            "diff --git a/sub b/sub\n--- a/sub\n+++ b/sub\n@@ -1 +1 @@\n\
-             -Subproject commit 1919191919191919191919191919191919191919\n\
-             +Subproject commit 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a\n"
+            "diff --git a/sub b/sub\n--- a/sub\n+++ b/sub\n\
+             Binary files a/sub and b/sub differ\n"
         );
 
-        // Type changes to/from a gitlink keep the v0.1 mode-lines-only
-        // shape — a counted §7 divergence (git prints delete+add
-        // sections; neither side's bytes honestly diff).
+        // Type changes to/from a gitlink render mode lines only — never
+        // content hunks.
         let out = render_diff(
             &[diff_entry(
                 "sub",
@@ -1248,85 +1119,6 @@ mod tests {
         // metadata alone (the synthetic gitlink blobs are not even in the
         // local store), even when the other side is a regular file.
         assert!(fetched.borrow().is_empty(), "{:?}", fetched.borrow());
-    }
-
-    #[test]
-    fn pure_renames_render_r100_form() {
-        let blob = gardenbed_model::blob_id(b"same bytes\n");
-        let fetched = std::cell::RefCell::new(Vec::new());
-        let content_of = |id: gardenbed_model::Id| {
-            fetched.borrow_mut().push(id);
-            Err(ClientError::BlobHashMismatch(id))
-        };
-
-        // The basic R100 form (content never fetched).
-        let out = render_diff(
-            &[rename_entry(
-                "dst.txt",
-                "src.txt",
-                Some((blob, Mode::Regular)),
-                Some((blob, Mode::Regular)),
-            )],
-            &content_of,
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            "diff --git a/src.txt b/dst.txt\nsimilarity index 100%\n\
-             rename from src.txt\nrename to dst.txt\n"
-        );
-
-        // A move that also flips the mode: mode lines come before the
-        // similarity line, git's order.
-        let out = render_diff(
-            &[rename_entry(
-                "dst.sh",
-                "src.sh",
-                Some((blob, Mode::Regular)),
-                Some((blob, Mode::Exec)),
-            )],
-            &content_of,
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            "diff --git a/src.sh b/dst.sh\nold mode 100644\nnew mode 100755\n\
-             similarity index 100%\nrename from src.sh\nrename to dst.sh\n"
-        );
-
-        // A moved gitlink (pure move) renders the plain R100 form too —
-        // git does the same; the pointer did not change.
-        let sub = gitlink_id(0x77);
-        let out = render_diff(
-            &[rename_entry(
-                "vendor/new",
-                "vendor/old",
-                Some((sub, Mode::Gitlink)),
-                Some((sub, Mode::Gitlink)),
-            )],
-            &content_of,
-        )
-        .unwrap();
-        assert_eq!(
-            out,
-            "diff --git a/vendor/old b/vendor/new\nsimilarity index 100%\n\
-             rename from vendor/old\nrename to vendor/new\n"
-        );
-        assert!(fetched.borrow().is_empty());
-    }
-
-    #[test]
-    fn rename_without_source_path_is_refused() {
-        let blob = gardenbed_model::blob_id(b"x\n");
-        let mut e = rename_entry(
-            "dst",
-            "src",
-            Some((blob, Mode::Regular)),
-            Some((blob, Mode::Regular)),
-        );
-        e.src_path = None;
-        let err = render_diff(&[e], &|_| Ok(vec![])).unwrap_err();
-        assert!(matches!(err, ClientError::MalformedRpc(_)), "{err}");
     }
 
     // ---------------------------------------------------------- blame

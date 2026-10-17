@@ -550,38 +550,27 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     ))
 }
 
-/// `bed publish` — fast-forward a ref to the working copy's current changeset.
+/// `bed publish` — fast-forward `main` to the working copy's current changeset.
 ///
-/// `ref_name = None` publishes `main` (the classic form). A named ref is the
-/// lane-agent form: same compare-and-swap semantics — exactly one publisher
-/// wins a race, everyone else receives [`ClientError::PublishNotFastForward`]
-/// with the fix spelled out — plus the server's rewind guard: a
-/// non-descendant move is refused unless `force` is set. Success appends the
-/// published changeset to the heads stack; the working copy stays where it
-/// is — publishing publishes, it does not move.
-pub async fn publish(
-    state_dir: &Path,
-    ref_name: Option<&str>,
-    force: bool,
-) -> Result<String, ClientError> {
+/// The server enforces the ancestry precondition with a
+/// compare-and-swap: exactly one publisher wins a race, everyone else
+/// receives [`ClientError::PublishNotFastForward`] with the fix spelled out.
+/// Success appends the published changeset to the heads stack; the working copy
+/// stays where it is — publishing publishes, it does not move.
+pub async fn publish(state_dir: &Path) -> Result<String, ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "publish").await?;
-    let target = ref_name.unwrap_or(DEFAULT_REF);
 
-    match session
-        .client
-        .publish(&repo, current, ref_name, force)
-        .await
-    {
-        // The returned tip is the ref's value after the fast-forward —
+    match session.client.publish(&repo, current).await {
+        // The returned tip is `main`'s value after the fast-forward —
         // the changeset itself for a conforming server.
         Ok(_tip) => {
             bed.heads().append(current)?;
             Ok(format!(
-                "published {current} — `{target}` now points to it\n",
-                current = current.short()
+                "published {} — `main` now points to it\n",
+                current.short()
             ))
         }
         Err(status) if status.code() == Code::FailedPrecondition => {
@@ -590,7 +579,7 @@ pub async fn publish(
             // will say it, so the fix is one command away.
             let tip = session
                 .client
-                .get_ref(&repo, target)
+                .get_ref(&repo, DEFAULT_REF)
                 .await
                 .ok()
                 .flatten()
@@ -598,7 +587,6 @@ pub async fn publish(
                 .unwrap_or_default();
             Err(ClientError::PublishNotFastForward {
                 cs: current.short(),
-                r#ref: target.to_owned(),
                 tip,
             })
         }
@@ -688,14 +676,6 @@ fn log_entry_of(summary: &ChangesetSummary) -> LogEntry {
 ///   changesets, in every form. The header claims "first parent" only
 ///   when the older side really is the newer's parent; otherwise it
 ///   names both sides. Identical sides state that and render nothing.
-///
-/// Renames render git's `R100` form (v0.2.md D22): the scoped forms
-/// (one argument, or none on an otherwise-clean copy) read the
-/// changeset's recorded rename facts, and the two-argument form pairs a
-/// delete with a write carrying an identical blob — the same rule `bed
-/// commit` uses to record a rename. A moved-and-edited file (source
-/// and destination blobs differ) renders as a delete plus a write; no
-/// similarity score below 100% is ever claimed.
 pub async fn diff(
     state_dir: &Path,
     a: Option<&str>,
@@ -773,17 +753,8 @@ pub async fn diff(
         ));
     }
 
-    // The scoped forms diff a changeset against exactly its first parent
-    // — the delta base the recorded changes are defined against — so
-    // they can honor recorded rename facts directly (D22). The
-    // two-argument form spans arbitrary changesets and re-derives the
-    // rename pairing at render time from identical blobs.
-    let entries = if b.is_none() {
-        build_scoped_entries(&session, older, newer).await?
-    } else {
-        let changes = session.diff(older, newer, "diff").await?;
-        build_paired_entries(&session, older, newer, changes).await?
-    };
+    let changes = session.diff(older, newer, "diff").await?;
+    let entries = build_entries(&session, older, newer, changes).await?;
 
     // All blob contents the renderer will need are in the cache now (the
     // fetch above is cache-first); rendering reads them straight from the
@@ -854,7 +825,6 @@ async fn working_copy_diff(bed: &WorkingCopy, current: Id) -> Result<Option<Stri
             op: render::classify(Some(old_side), new_side),
             old: Some(old_side),
             new: new_side,
-            src_path: None,
         });
     }
     session.fetcher().blobs(&wanted).await?;
@@ -902,144 +872,11 @@ fn observe_working_bytes(root: &Path, rel: &str) -> Result<Option<(Vec<u8>, Mode
     Ok(Some((fs::read(&on_disk)?, mode)))
 }
 
-/// The file side of `path` under `cs`'s tree — `None` when the path named
-/// nothing (or a directory) there. Non-gitlink blobs join the want-list;
-/// the renderer never fetches gitlink ids (they carry no bytes).
-async fn file_side_at(
-    session: &Session,
-    cs: Id,
-    path: &str,
-    wanted: &mut HashSet<Id>,
-) -> Result<Option<render::DiffSide>, ClientError> {
-    match session.locate_entry(cs, path, "diff").await? {
-        Some(e) if e.kind == TreeKind::File => {
-            let blob = e.blob.ok_or(ClientError::BlobHashMismatch(cs))?;
-            if e.mode != Mode::Gitlink {
-                wanted.insert(blob);
-            }
-            Ok(Some(render::DiffSide { blob, mode: e.mode }))
-        }
-        _ => Ok(None),
-    }
-}
-
-/// Builds render entries for the scoped diff forms (`bed diff <cs>`, and
-/// the no-argument form on an otherwise-clean copy), where `newer` is
-/// diffed against exactly its first parent — the delta base its recorded
-/// changes are defined against. Recorded rename facts are honored: a
-/// rename whose recorded blob still matches the source path's blob in
-/// the parent renders git's `R100` form; a moved-and-edited file (the
-/// changeset also changed the content in flight) expands to a delete
-/// plus a write — the shape git prints below its similarity threshold.
-async fn build_scoped_entries(
-    session: &Session,
-    older: Id,
-    newer: Id,
-) -> Result<Vec<DiffEntry>, ClientError> {
-    let cs = session.get_changeset(newer, "diff").await?;
-    let mut entries: Vec<DiffEntry> = Vec::with_capacity(cs.changes.len());
-    let mut wanted: HashSet<Id> = HashSet::new();
-
-    for change in cs.changes {
-        let new_side = match change.blob {
-            // Delete changes never carry a blob (codec-guaranteed).
-            None if change.op == gardenbed_model::Op::Delete => None,
-            blob => {
-                let blob = blob.ok_or(ClientError::BlobHashMismatch(newer))?;
-                if change.mode != Mode::Gitlink {
-                    wanted.insert(blob);
-                }
-                Some(render::DiffSide {
-                    blob,
-                    mode: change.mode,
-                })
-            }
-        };
-        match change.op {
-            gardenbed_model::Op::Rename => {
-                let src = change.src_path.clone().ok_or_else(|| {
-                    ClientError::MalformedRpc(format!(
-                        "changeset {} records a rename of {} without a source path",
-                        newer.short(),
-                        change.path
-                    ))
-                })?;
-                let src_old = file_side_at(session, older, &src, &mut wanted).await?;
-                if let Some(old) = src_old
-                    && new_side.is_some_and(|n| n.blob == old.blob)
-                {
-                    entries.push(DiffEntry {
-                        path: change.path,
-                        op: render::DiffOp::Rename,
-                        old: src_old,
-                        new: new_side,
-                        src_path: Some(src),
-                    });
-                    continue;
-                }
-                // Moved and edited: no similarity below 100% is ever
-                // claimed — the move expands to a delete at the source
-                // path and a write at the destination.
-                let dst_old = file_side_at(session, older, &change.path, &mut wanted).await?;
-                entries.push(DiffEntry {
-                    path: src,
-                    op: render::DiffOp::Delete,
-                    old: src_old,
-                    new: None,
-                    src_path: None,
-                });
-                entries.push(DiffEntry {
-                    path: change.path,
-                    op: render::classify(dst_old, new_side),
-                    old: dst_old,
-                    new: new_side,
-                    src_path: None,
-                });
-            }
-            gardenbed_model::Op::Delete => {
-                let old_side = file_side_at(session, older, &change.path, &mut wanted).await?;
-                entries.push(DiffEntry {
-                    path: change.path,
-                    // `classify` cannot see a both-absent entry; a delete
-                    // is a delete however the old side resolved.
-                    op: render::DiffOp::Delete,
-                    old: old_side,
-                    new: None,
-                    src_path: None,
-                });
-            }
-            gardenbed_model::Op::Add | gardenbed_model::Op::Modify => {
-                // Adds are validated against the parent at creation; the
-                // old side of a modify comes from the parent tree.
-                let old_side = if change.op == gardenbed_model::Op::Add {
-                    None
-                } else {
-                    file_side_at(session, older, &change.path, &mut wanted).await?
-                };
-                entries.push(DiffEntry {
-                    path: change.path,
-                    op: render::classify(old_side, new_side),
-                    old: old_side,
-                    new: new_side,
-                    src_path: None,
-                });
-            }
-        }
-    }
-
-    // Renames sit at the destination path's slot (git prints them there);
-    // an expanded move puts its delete and write at their own slots.
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    session.fetcher().blobs(&wanted).await?;
-    Ok(entries)
-}
-
 /// Converts wire `ChangeMsg`s into render entries. The wire carries only
 /// the *new* side's blob id, so the old side is resolved by walking the
 /// `older` changeset's tree per path (cache-first; the shared trees cost
-/// nothing after the first walk). The server's tree diff carries no
-/// rename facts — `pair_renames` recovers them before rendering.
-async fn build_paired_entries(
+/// nothing after the first walk).
+async fn build_entries(
     session: &Session,
     older: Id,
     newer: Id,
@@ -1072,63 +909,29 @@ async fn build_paired_entries(
         // the flat per-path deletes ride alongside as their own changes.
         let old_side = match op {
             gardenbed_model::Op::Add => None,
-            _ => file_side_at(session, older, &path, &mut wanted).await?,
+            _ => match session.locate_entry(older, &path, "diff").await? {
+                Some(e) if e.kind == TreeKind::File => {
+                    let blob = e.blob.ok_or(ClientError::BlobHashMismatch(older))?;
+                    if e.mode != Mode::Gitlink {
+                        wanted.insert(blob);
+                    }
+                    Some(render::DiffSide { blob, mode: e.mode })
+                }
+                _ => None,
+            },
         };
         entries.push(DiffEntry {
             path,
             op: render::classify(old_side, new_side),
             old: old_side,
             new: new_side,
-            src_path: None,
         });
     }
-
-    pair_renames(&mut entries);
 
     // Fetch everything the renderer will read, cache-first, before any
     // output is produced.
     session.fetcher().blobs(&wanted).await?;
     Ok(entries)
-}
-
-/// Pairs delete + write entries carrying an identical blob into renames,
-/// in place — the same rule `bed commit` uses to record one. For each
-/// write (in path order) the first unconsumed delete of the same blob at
-/// a different path becomes its source; the paired entry keeps the
-/// write's position (git prints renames at the destination's slot) and
-/// the consumed delete is dropped. Modes may differ — git prints `old
-/// mode`/`new mode` inside an `R100` entry. A moved-and-edited file
-/// (blobs differ) keeps the delete + write shape.
-fn pair_renames(entries: &mut Vec<DiffEntry>) {
-    // Candidate sources — one-sided deletes — in path order.
-    let sources: Vec<usize> = (0..entries.len())
-        .filter(|&i| entries[i].old.is_some() && entries[i].new.is_none())
-        .collect();
-    let mut used = vec![false; sources.len()];
-    let mut drop = vec![false; entries.len()];
-    for w in 0..entries.len() {
-        let Some(new) = entries[w].new else { continue };
-        let Some(s) = (0..sources.len()).find(|&s| {
-            !used[s]
-                && sources[s] != w
-                && entries[sources[s]].path != entries[w].path
-                && entries[sources[s]].old.is_some_and(|o| o.blob == new.blob)
-        }) else {
-            continue;
-        };
-        used[s] = true;
-        let d = sources[s];
-        entries[w].op = render::DiffOp::Rename;
-        entries[w].src_path = Some(entries[d].path.clone());
-        entries[w].old = entries[d].old;
-        drop[d] = true;
-    }
-    *entries = entries
-        .drain(..)
-        .enumerate()
-        .filter(|(i, _)| !drop[*i])
-        .map(|(_, e)| e)
-        .collect();
 }
 
 /// `bed blame <path> [--cs id-or-ref]` — first-parent lineage blame of one
