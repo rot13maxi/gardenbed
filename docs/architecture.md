@@ -287,6 +287,44 @@ divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
   unpublished, unreadable, and reaped by the next rename into that shard.
 
+
+## 10. Horizontal scale-out
+
+The server tier scales horizontally by moving state off-box: metadata
+into PostgreSQL, objects into S3. Every replica is identical and
+stateless — no leader election, no sharding — because the v0.1
+invariants already carry the concurrency story: ref writes are CAS
+rows (exactly one replica wins a race) and object writes are immutable
+content-addressed puts (re-racing is the same write). The wire protocol
+is unchanged; `bed` still talks to one server address (a load balancer
+in front of N replicas is a deployment concern).
+
+```text
+bed ──gRPC── gardenbed-server replica 1 ─┐
+              gardenbed-server replica 2 ─┼── Postgres (metadata)
+              gardenbed-server replica N ─┘         │
+                                              S3 / MinIO (objects)
+```
+
+Backend selection is one `--storage <config.toml>` flag on `serve`,
+`import`, and `export` (env fallback: `GARDENBED_STORAGE`), selecting
+per-trait backends behind the unchanged `ObjectStore`/`MetadataStore`
+contracts:
+
+| trait | local (default, `--root`) | scale-out (`--storage`) |
+|---|---|---|
+| `ObjectStore` | filesystem at `<root>/objects` (`FsObjectStore`) | S3/MinIO (`S3ObjectStore`) |
+| `MetadataStore` | SQLite at `<root>/metadata.sqlite3` (`SqliteMetadataStore`) | PostgreSQL (`PostgresMetadataStore`) |
+
+The Postgres schema mirrors SQLite's one-to-one (bytea for BLOB), CAS is
+a single guarded `UPDATE ... WHERE` (no advisory locks), S3 writes are
+conditional puts with verify-on-conflict, and every read stays verified
+(length + SHA-256 against the addressed id). The design contract —
+decisions, schema, error semantics — is
+[scale-out-design.md](scale-out-design.md); the deployment artifact is
+`tools/scale/compose.yaml` (Postgres + MinIO + N replicas), with
+`demo/run-scaled.sh` proving cross-replica visibility end to end.
+
 ## Where the contracts live
 
 | contract | document |
@@ -298,3 +336,4 @@ divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
 | blame definition | v0.1.md D7 |
 | import mechanics (gitoxide, diff-tree, renames) | v0.1.md D6/D8 |
 | divergences from git | divergences.md (§10.2: zero *silent* divergences) |
+| scale-out backends + deployment | scale-out-design.md (D1–D7) |
