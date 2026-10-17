@@ -309,6 +309,30 @@ message RebaseResp {
   bytes id = 1;
 }
 
+// Server-side two-parent merge (v0.2.md D9-D11): merges `target`'s tree
+// into `cs_id`'s over their merge base and stores one changeset
+// `parents = [cs_id, target]` whose changes are the diff
+// `tree(cs_id) -> merged tree`. Semantic conflicts abort the RPC with
+// FAILED_PRECONDITION listing every conflicting path. When `target` is
+// already an ancestor of `cs_id`, the response is `up_to_date` with
+// `id = cs_id` and nothing is stored.
+message MergeReq {
+  string repo = 1;
+  bytes cs_id = 2;
+  bytes target = 3;
+  string message = 4;
+  // Author and committer identities (git-native seconds + tz offset in
+  // minutes), the same shape CreateChangeset carries.
+  IdentityMsg author = 5;
+  IdentityMsg committer = 6;
+}
+
+// The merge changeset's id, or the current id when `up_to_date`.
+message MergeResp {
+  bytes id = 1;
+  bool up_to_date = 2;
+}
+
 // Fast-forwards a ref to `cs_id`: asserts IsAncestor(current ref value,
 // cs_id), then CAS-moves the ref (v0.1.md D5). Violating the ancestry
 // precondition fails with FAILED_PRECONDITION.
@@ -415,6 +439,11 @@ service Gardenbed {
 
   // Fast-forward CAS of a ref to the given changeset (absent ref = "main").
   rpc Publish(PublishReq) returns (PublishResp);
+
+  // Server-side two-parent merge of `target` into `cs_id` (conflicts are
+  // FAILED_PRECONDITION errors listing every conflicting path; an
+  // already-merged target answers `up_to_date`).
+  rpc Merge(MergeReq) returns (MergeResp);
 
   // Per-repo request counters (debug/test infrastructure).
   rpc GetStats(GetStatsReq) returns (StatsResp);
