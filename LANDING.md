@@ -35,7 +35,13 @@ Cargo.lock regen, 27 genuine merge-span files); union spot-checks passed —
 server lib.rs carries M9+M10 two-parent merge with MergeConflict +
 no-common-ancestor refusal intact, commit.rs M19-adjacent change is only
 now_stamp visibility, M19 pair-guard lives in render.rs:270 verbatim,
-ops.rs has zero pair_renames references. PRE-STAGE APPROVED TO HOLD.
+ops.rs has zero pair_renames references. PRE-STAGE APPROVED TO HOLD — standing approval EXTENDED to the
+current tip 85ba66bd (p8 independently diffed: sole delta vs d6081ded is
+LANDING.md). Rule for the hold window: any further tip movement must be
+zero-code-delta docs-only on top, reported with a lineage note for p8's
+spot-verify; anything touching code, tests, or the union files restarts
+the extension. Publish from the current tip at ping time; report the
+fast-forward result id + lineage.
 
 Bed scratch import root: /tmp/gb-merge-rebase-bed (ref
 refs/heads/wip/merge-replay-a0ae00a). Live lane ref feat/merge = f19510ee
