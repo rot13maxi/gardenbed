@@ -58,7 +58,28 @@ tags, and the verification record for a release lives in
   offline from the treestate's materialized rows — a dead selection no
   longer reads like live coverage. Recording empty selections ahead of
   history is unchanged by design.
-
+- **No-argument `bed diff` now reads the working copy with the scanner's
+  metadata discipline** (`symlink_metadata`, never following): a
+  retargeted tracked symlink's new side is its link-target bytes — the
+  same bytes `commit` records, not the target file's content — so a
+  dangling link and a tracked file replaced by a directory both render
+  (the latter as a deletion, matching `status`) instead of exiting 1
+  ('No such file or directory' / 'Is a directory'). Also: a working
+  copy dirty only by untracked files no longer prints a header-only
+  empty working-copy diff — untracked files were never part of it, so
+  the diff falls back to the committed current-vs-parent diff (git
+  parity, `docs/cli.md`); empty diffs (identical sides, a root
+  changeset with no parent) now print their header too, stating the
+  fact (`— both sides are equal` / `— a root changeset has no parent`)
+  instead of printing nothing; and the two-argument header claims
+  "against its first parent" only when the older side really is the
+  newer's first parent — any other pair reads `diff of <older> against
+  <newer>` (regression tests in `crates/bed/tests/write_path.rs`:
+  `diff_retargeted_symlink_shows_link_target_bytes_not_target_content`,
+  `diff_dangling_symlink_renders_instead_of_failing`,
+  `diff_tracked_file_replaced_by_directory_renders_as_deletion`,
+  `diff_two_arg_header_names_both_sides_for_non_parent_pair`,
+  `diff_untracked_only_dirt_falls_back_to_committed_diff`).
 - **`gardenbed-server import` no longer silently rewinds refs** when an
   incremental import moves a ref to a tip that is not a descendant of
   the ref's current value (e.g. re-importing a git repository whose
@@ -73,6 +94,20 @@ tags, and the verification record for a release lives in
   `crates/git/tests/incremental.rs::backward_ref_move_is_refused_then_reported`,
   `crates/server/tests/import_rewind.rs::import_rewind_is_loud_and_off_by_default`.
 
+- **`gardenbed-server import` no longer partially moves refs on a
+  refused rewind**, and `--limit` no longer bypasses the rewind guard.
+  The refusal is now decided for every selected ref before any ref is
+  touched (two-phase): a multi-ref import where one ref would move
+  forward and another would rewind fails without moving the forward
+  ref either, and every offending ref is named in the single error.
+  Under `--limit` a non-descendant ref move is refused by default too —
+  the fell-off count is not computable there (slice re-rooting breaks
+  real ancestry), so the loss is reported as uncounted;
+  `--allow-rewind` still permits the move, reported in the import
+  report (`refs_rewound`) plus a loud stderr warning. Tests:
+  `crates/git/tests/incremental.rs::rewind_refusal_moves_no_refs_in_multi_ref_import`,
+  `crates/git/tests/incremental.rs::limit_import_refuses_rewind_by_default`.
+
 ### Changed
 
 - **`bed` honors `.gitignore` for untracked-file discovery**: `bed
@@ -80,8 +115,9 @@ tags, and the verification record for a release lives in
   copy (root plus one per directory walked) and hide matching untracked
   files — the dogfood gap where every cargo `target/` landed in status
   and rode into commits. Supported subset: blank lines, `#` comments,
-  trailing `/` (dir-only), `*` `?` `**` globs, and a leading `/` anchor.
-  Deliberately unsupported: `!` negation, character classes, and
+  trailing `/` (dir-only), `*` `?` `**` globs, a leading `/` anchor, and
+  bracket expressions (`[…]` character ranges like `*.[oa]` and POSIX
+  `[:class:]` forms). Deliberately unsupported: `!` negation and
   global excludes. Git semantics are kept where they matter: ignore
   never un-tracks (tracked files keep reporting changes, and tracked
   content defeats directory pruning), an ignored directory with no
@@ -89,8 +125,8 @@ tags, and the verification record for a release lives in
   stat), and untracked `.gitignore` files themselves still report.
   Matching uses `gix-glob` (already in the workspace lock via the
   `gardenbed-git` dependency). Verified against `git check-ignore`
-  behavior and by integration tests (`crates/bed/tests/gitignore.rs`)
-  against a real server process.
+  behavior (including bracket expressions) and by integration tests
+  (`crates/bed/tests/gitignore.rs`) against a real server process.
 
 - Use conventional commands: `commit`, `rebase`, `publish`, `sparse`, and
   `switch` replace `sow`, `graft`, `harvest`, `plot`, and `goto`. Old names
@@ -106,13 +142,16 @@ tags, and the verification record for a release lives in
   breaking pre-release interface and layout change; existing repositories
   and working copies need to be recreated using the current version.
 - No-argument `bed diff` is context-aware and always self-describing: a
-  dirty working copy diffs local bytes against the current changeset
-  (untracked files excluded, git parity; deleted files render as removal
-  to `/dev/null`), while a clean one keeps the current-changeset-vs-
-  first-parent diff. Both modes print a one-line header naming what is
+  working copy dirty by modified or deleted tracked files diffs local
+  bytes against the current changeset (untracked files excluded, git
+  parity, so untracked-only dirt falls back to the committed diff;
+  deleted files render as removal to `/dev/null`), while an otherwise
+  clean one keeps the current-changeset-vs-first-parent diff. Every
+  diff — empty ones included — prints a one-line header naming what is
   being diffed (`diff of working copy against <cs>` /
-  `diff of <cs> against its first parent`); explicit `bed diff A [B]`
-  still means changesets, now with the same header line.
+  `diff of <cs> against its first parent` / `diff of <a> against <b>`
+  for non-parent pairs); explicit `bed diff A [B]` still means
+  changesets, now with the same header line.
 
 
 ## [0.1.0] - 2026-10-16

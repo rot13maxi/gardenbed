@@ -48,7 +48,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `status` | show local changes under selected paths |
 | `file` | print one file's content at a changeset (or the current one) |
 | `log` | show changeset history, newest first |
-| `diff` | diff the working copy (when dirty) or two changesets; every diff prints a header naming its sides |
+| `diff` | diff the working copy (when dirty by modified/deleted tracked files) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
 | `publish` | fast-forward `main` to the current changeset |
@@ -210,17 +210,23 @@ bed log --cs master --limit 1
 Usage: bed diff [OPTIONS] [A] [B]
 ```
 
-With no arguments, `bed diff` is context-aware: a **dirty** working copy
-diffs the local bytes of every modified or deleted tracked file under
-the sparse selection against the current changeset (untracked files are
-not part of it — git parity; a deleted file renders as a removal to
-`/dev/null`); a **clean** working copy diffs the current changeset
-against its first parent. With arguments, both are always changesets:
-`A` is the older side; with `B` omitted, diffs `A` against its first
-parent. Both take a `<cs-or-ref>`.
+With no arguments, `bed diff` is context-aware: a working copy **dirty
+by modified or deleted tracked files** diffs their local bytes against
+the current changeset (untracked files are not part of it — git parity;
+a deleted file, or a tracked file replaced by a directory, renders as a
+removal to `/dev/null`; a tracked symlink's new side is its
+link-target bytes, what `commit` records, never the target's content —
+a dangling link diffs fine). A working copy clean, or dirty only by
+untracked files, diffs the current changeset against its first parent.
+With arguments, both are always changesets: `A` is the older side; with
+`B` omitted, diffs `A` against its first parent. Both take a
+`<cs-or-ref>`.
 
 Every diff prints a one-line header naming what is being diffed, so the
-two modes are distinguishable at a glance:
+modes are distinguishable at a glance — empty diffs included (identical
+sides state they are equal; a root changeset says it has no parent).
+The first-parent wording appears only when the older side really is the
+newer's first parent; any other pair names both sides:
 
 ```sh
 bed diff                     # working copy vs current changeset (dirty),
@@ -231,6 +237,7 @@ bed diff main master
 ```text
 diff of working copy against 57169571952de2bf
 diff of 57169571952de2bf against its first parent
+diff of 3af0c1d8e29b4a6d against 57169571952de2bf
 ```
 
 ### bed commit
@@ -400,14 +407,20 @@ force push rewrote the tip), the import:
 * **fails with a non-zero exit by default** when the move would actually
   lose changesets — the error names the ref, both tips, the number of
   changesets that would fall off, and the escape hatch. Nothing is
-  moved: the refusal happens before any ref is touched.
+  moved: every selected ref is validated first (two-phase), so a
+  multi-ref import whose later ref would rewind does not move its
+  earlier, forward-moving refs either, and every offending ref is named
+  in the error.
 * with `--allow-rewind`, performs the move (force-push parity: old
   objects and mapping rows remain, merely unreachable) and prints a
   loud multi-line `warning:` to stderr naming the ref, the old and new
   tip, and how many changesets may no longer be reachable from the ref.
 * counts the fell-off changesets exactly via a metadata-only BFS over
-  parent edges (no git or object reads); `--limit` imports report the
-  count as uncounted, because slice re-rooting breaks real ancestry.
+  parent edges (no git or object reads). `--limit` imports cannot
+  compute the count (slice re-rooting breaks real ancestry), so they
+  refuse **every** non-descendant ref move by default — reporting the
+  loss as uncounted in the error — and, under `--allow-rewind`, report
+  the count as uncounted in the rewind entry.
 
 Forward moves (the common incremental case) are silent, exactly as
 before. Rewinds that lose nothing (a moved-back tip that is an ancestor

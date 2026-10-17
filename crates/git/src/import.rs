@@ -214,6 +214,30 @@ pub fn import_from_path(
     }
 
     // ---- refs: compare-and-swap onto the fresh tips -------------------
+    // Two phases, so that a refusal moves NOTHING: phase 1 validates every
+    // selected ref (rewind detection included) and collects all would-be
+    // refusals; only if none exist does phase 2 perform the moves. Running
+    // the gate per-ref inside a single loop would leave refs sorted before
+    // the offending one already moved when the import aborts.
+    struct PlannedRef {
+        name: String,
+        current: Option<Id>,
+        target: Id,
+        rewind: Option<RefRewind>,
+    }
+    // One would-be refusal: a non-descendant ref move that `allow_rewind`
+    // does not permit. All of them are aggregated into a single error, so
+    // no offending ref is dropped from the report when an earlier one
+    // already tripped the gate.
+    struct Refusal {
+        name: String,
+        old: Id,
+        target: Id,
+        // `None` under `--limit` (slice re-rooting breaks real ancestry).
+        fell_off: Option<u64>,
+    }
+    let mut planned: Vec<PlannedRef> = Vec::with_capacity(selected.len());
+    let mut refusals: Vec<Refusal> = Vec::new();
     for (name, tip) in &selected {
         let Some(idx) = arena.index.get(tip) else {
             return Err(ImportError::Other(format!(
@@ -239,17 +263,20 @@ pub fn import_from_path(
         // ref moves backward (or sideways onto rewritten history) and the
         // operator must see it — published work can silently fall off the
         // ref otherwise. The move stays permitted with `allow_rewind`
-        // (force-push parity); without it, any rewind that would actually
-        // lose changesets fails the import before any ref is touched.
-        if let Some(old) = current
+        // (force-push parity); without it the import fails before any ref
+        // is touched. `--limit` imports refuse too (the count is not
+        // computable there, but refusing the non-descendant move itself is
+        // the safe default); full imports refuse only when changesets
+        // would actually be lost, so sideways moves onto shared history
+        // still only warn.
+        let rewind = if let Some(old) = current
             && !engine.is_ancestor(old, target)?
         {
             // Count what falls off: changesets reachable from the old
             // tip but not from the new one. Both sets come from the
             // metadata's own parent edges — no git reads, no object
             // reads — and each changeset row is fetched once (visited
-            // set), so the cost is O(new-reachable graph) sqlite row
-            // reads, only on the rewind path itself.
+            // set), only on the rewind path itself.
             let fell_off = if opts.limit.is_some() {
                 // Slice re-rooting stores out-of-slice parents as root
                 // changesets, so real ancestry is not recoverable from
@@ -258,31 +285,65 @@ pub fn import_from_path(
             } else {
                 Some(count_fell_off(metadata.as_ref(), old, target)?)
             };
-            if !opts.allow_rewind && fell_off.unwrap_or(0) > 0 {
-                return Err(ImportError::Ref {
+            if !opts.allow_rewind && (fell_off.is_none() || fell_off.unwrap_or(0) > 0) {
+                refusals.push(Refusal {
                     name: name.clone(),
-                    detail: format!(
-                        "import would move it backward from {} to {}, \
-                             losing {} changeset(s); re-run with --allow-rewind \
-                             to permit this",
-                        old.to_hex(),
-                        target.to_hex(),
-                        fell_off.unwrap_or(0)
-                    ),
+                    old,
+                    target,
+                    fell_off,
                 });
             }
-            report.refs_rewound.push(RefRewind {
+            Some(RefRewind {
                 name: name.clone(),
                 old_tip: old,
                 new_tip: target,
                 fell_off,
-            });
+            })
+        } else {
+            None
+        };
+        planned.push(PlannedRef {
+            name: name.clone(),
+            current,
+            target,
+            rewind,
+        });
+    }
+    if !refusals.is_empty() {
+        // The loss phrase per refusal: exact count for full imports,
+        // "uncounted" under `--limit`.
+        let loss = |r: &Refusal| match r.fell_off {
+            Some(n) => format!("losing {n} changeset(s)"),
+            None => "losing changesets (uncounted under --limit)".to_owned(),
+        };
+        let hatch = "re-run with --allow-rewind to permit this";
+        let moves = refusals
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}, backward from {} to {}, {}",
+                    r.name,
+                    r.old.to_hex(),
+                    r.target.to_hex(),
+                    loss(r)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ImportError::Ref {
+            name: refusals[0].name.clone(),
+            detail: format!("import would move refs backward: {moves}; {hatch}"),
+        });
+    }
+    for m in planned {
+        if let Some(rewind) = m.rewind {
+            report.refs_rewound.push(rewind);
         }
-        match metadata.cas_ref(name, current, target)? {
-            gardenbed_store::RefCas::Won { .. } => report.refs_updated.push((name.clone(), target)),
+        match metadata.cas_ref(&m.name, m.current, m.target)? {
+            gardenbed_store::RefCas::Won { .. } => report.refs_updated.push((m.name, m.target)),
             gardenbed_store::RefCas::Conflict { current } => {
                 return Err(ImportError::Ref {
-                    name: name.clone(),
+                    name: m.name,
                     detail: format!("lost a concurrent update: the ref now points at {current}"),
                 });
             }
@@ -298,9 +359,10 @@ pub fn import_from_path(
 
 /// How many changesets are reachable from `old` but not from `new` — the
 /// work that falls off a rewound ref. Both directions' ancestor sets are
-/// collected by plain BFS over the metadata's parent edges (changeset rows
-/// only; no objects, no git), each row fetched once. `new`'s walk skips
-/// subgraphs already known to be shared with `old`.
+/// collected by two independent plain BFS walks over the metadata's parent
+/// edges (changeset rows only; no objects, no git), each row fetched once
+/// per walk — the shared subgraph is fetched twice, once by each walk, so
+/// the cost is O(old-reachable + new-reachable) sqlite row reads.
 fn count_fell_off(
     metadata: &dyn gardenbed_store::MetadataStore,
     old: Id,
