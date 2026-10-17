@@ -26,9 +26,16 @@ c3911cb2, 5740ecd→13543454, f9d50bf→e325fcb, 4012150→a0ae00a). So the
 replayed stack imports as bed changesets descending from a0ae00a — the main
 publish becomes a plain fast-forward, no --force, no re-rebase at ping time.
 
-p8's re-check extension (pending, on the NEW tip id): verify new tip id +
-confirm the disjoint files (crates/web/*, e2e/*, docs/DOGFOOD.md) match
-main's versions exactly + spot-check one union file.
+p8's re-check extension COMPLETE — PASS (2026-10-17, verified read-only
+against the scratch root / 9419 clone): tip d6081ded confirmed, chain
+descends directly from a0ae00a (8 commits; plain fast-forward at publish
+time); tip-vs-main diff = 126 files with exactly the expected composition
+(fuzz corpus churn, web/e2e/DOGFOOD/store-web wholesale from main,
+Cargo.lock regen, 27 genuine merge-span files); union spot-checks passed —
+server lib.rs carries M9+M10 two-parent merge with MergeConflict +
+no-common-ancestor refusal intact, commit.rs M19-adjacent change is only
+now_stamp visibility, M19 pair-guard lives in render.rs:270 verbatim,
+ops.rs has zero pair_renames references. PRE-STAGE APPROVED TO HOLD.
 
 Bed scratch import root: /tmp/gb-merge-rebase-bed (ref
 refs/heads/wip/merge-replay-a0ae00a). Live lane ref feat/merge = f19510ee
@@ -46,11 +53,18 @@ refs/heads/wip/merge-replay-a0ae00a). Live lane ref feat/merge = f19510ee
 2. Import the replayed branch into the LIVE server (same import command as
    scratch, --ref refs/heads/wip/merge-replay-a0ae00a; the dogfood server on
    9418 owns the lane refs).
-3. Move the lane ref: DO NOT use `bed publish --ref` — FROZEN by p8
-   (regression at/under 17c9612f: ref name dropped server-side, can move
-   refs/heads/main instead of the lane ref). Route through wG:p9:
-   gardenbed-server import --ref refs/heads/feat/merge into the live root
-   (unaffected path), or wait for pE's fix + p8's clearance.
+3. Move the lane ref: `bed publish --ref feat/merge --force` from a clone
+   at the replayed tip (non-FF is the point; --force is the deliberate
+   form) — but ONLY after p8 clears the narrowed freeze. Freeze status
+   (2026-10-17, corrected): the 'regression' was a stale pre-fd29b3d probe
+   binary (proto3 unknown-field skipping: new client + old server = ref
+   dropped, main moved), NOT pE's code; live server verified clean. The
+   freeze stays only until pE lands two test shapes (new-lane row created +
+   main untouched; force+non-ancestor lane move + main untouched), then p8
+   clears it. If the ping arrives before clearance: route through wG:p9's
+   gardenbed-server import --ref path (fine throughout). Dogfood #13
+   (old-server+new-client --ref = silent main publish; restart servers
+   before using --ref) is pE's to file.
 4. bed publish (main, plain form) from the same tip — fast-forward over
    a0ae00a's descendants by construction. p8 re-checks before this step per
    the plan ("one focused landing re-check by me").
