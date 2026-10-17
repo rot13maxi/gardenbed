@@ -52,6 +52,19 @@ function currentRev() {
   return state.rev || "main";
 }
 
+/* session caches: files by (rev,path), changesets by id */
+const FILE_CACHE = {};
+function fetchFileCached(rev, path) {
+  const k = rev + "" + path;
+  if (!FILE_CACHE[k]) FILE_CACHE[k] = api("/api/file?" + qs({ cs: rev, path: path }));
+  return FILE_CACHE[k];
+}
+const CS_CACHE = {};
+function fetchChangesetCached(id) {
+  if (!CS_CACHE[id]) CS_CACHE[id] = api("/api/changeset?" + qs({ id: id }));
+  return CS_CACHE[id];
+}
+
 function loadRefs() {
   const sel = document.getElementById("ref-select");
   return api("/api/refs").then((data) => {
@@ -78,6 +91,8 @@ function loadRefs() {
       safeStorage("set", REF_KEY, state.rev);
       route();
     });
+    for (const r of state.refs) lastTips[r.name] = r.cs; // live-poll baseline
+    startLivePoll();
   }).catch(() => {
     sel.textContent = "";
     sel.appendChild(option("refs unavailable", ""));
@@ -382,6 +397,31 @@ function copyButton(getText, label) {
   return btn;
 }
 
+function flashBtn(btn, label, restore) {
+  const orig = btn.textContent;
+  btn.textContent = label;
+  setTimeout(() => { btn.textContent = restore || orig; }, 1200);
+}
+
+/** Copy a permalink to the current view. */
+function permalinkButton(title) {
+  const btn = el("button", {
+    class: "btn btn-sm permalink-btn", type: "button",
+    title: title || "copy link to this view",
+  }, "link");
+  btn.addEventListener("click", async () => {
+    try {
+      const href = typeof location !== "undefined" && location.href
+        ? String(location.href) : "#" + String(location.hash || "");
+      await copyText(href);
+      flashBtn(btn, "copied", "link");
+    } catch (_) {
+      flashBtn(btn, "copy failed", "link");
+    }
+  });
+  return btn;
+}
+
 const OP_META = {
   add:    { letter: "A", cls: "add",    label: "Added" },
   modify: { letter: "M", cls: "modify", label: "Modified" },
@@ -389,11 +429,17 @@ const OP_META = {
   rename: { letter: "R", cls: "rename", label: "Renamed" },
 };
 
-/** Hook-required change list, shared by changeset & compare views. */
-function changeList(changes, fileRev) {
+/**
+ * Hook-required change list, shared by changeset & compare views. Each row
+ * grows a diff expander; below the row sits a lazily-filled unified diff
+ * block (old = oldRev @ src_path|path, new = newRev @ path).
+ */
+function changeList(changes, newRev, oldRev) {
   const groups = { add: [], modify: [], delete: [], rename: [], other: [] };
   for (const c of changes || []) (groups[c.op] || groups.other).push(c);
   const wrap = el("div", { class: "change-list" });
+  const ctx = { newRev: newRev, oldRev: oldRev };
+  const jobs = [];
   const order = ["add", "modify", "delete", "rename", "other"];
   for (const op of order) {
     const list = groups[op];
@@ -402,6 +448,21 @@ function changeList(changes, fileRev) {
     wrap.appendChild(el("div", { class: "op-group-title" }, meta.label + " · " + list.length));
     for (const c of list) {
       const row = el("div", { class: "change-row", dataset: { op: c.op || "other" } });
+      let job = null;
+      if (c.mode !== "gitlink") {
+        const exp = el("button", {
+          class: "diff-expander", type: "button",
+          "aria-expanded": "false", "aria-label": "show diff",
+        }, "▸");
+        const block = el("div", { class: "diff-block", hidden: "" });
+        const metaEl = el("span", { class: "diff-meta mono" });
+        job = { exp: exp, block: block, meta: metaEl, change: c, loaded: false, loading: null, open: false, wantOpen: false };
+        exp.addEventListener("click", () => {
+          if (job.loaded) setDiffOpen(job, !job.open);
+          else loadDiff(job, ctx, false); // force-open after load
+        });
+        row.appendChild(exp);
+      }
       row.appendChild(el("span", { class: "change-badge " + meta.cls }, meta.letter));
       if (c.op === "rename" && c.src_path) {
         row.appendChild(el("span", { class: "change-path" },
@@ -414,14 +475,24 @@ function changeList(changes, fileRev) {
       if (c.mode && c.mode !== "regular") {
         row.appendChild(el("span", { class: "mode-chip" }, c.mode));
       }
+      if (job) {
+        row.appendChild(job.meta);
+        row.appendChild(el("span", { class: "spacer" }));
+      }
       if ((c.op === "add" || c.op === "modify" || c.op === "rename") &&
-          c.mode !== "gitlink" && fileRev) {
-        row.appendChild(el("a", { class: "view-file", href: fileHref(fileRev, c.path) }, "view file"));
+          c.mode !== "gitlink" && newRev) {
+        row.appendChild(el("a", { class: "view-file", href: fileHref(newRev, c.path) }, "view file"));
       }
       wrap.appendChild(row);
+      if (job) {
+        wrap.appendChild(job.block);
+        jobs.push(job);
+      }
     }
   }
   if (!wrap.firstChild) wrap.appendChild(emptyState("No changes", null, "this diff is empty"));
+  // eager load decides auto-expand (≤ DIFF_AUTO_MAX lines) vs collapsed
+  for (const job of jobs) loadDiff(job, ctx, true);
   return wrap;
 }
 
@@ -749,6 +820,478 @@ function buildAuthors(entries, top) {
       el("span", { class: "author-count mono" }, String(n))));
   }
   return wrap;
+}
+
+/* ---------- unified diff (myers, no deps) ---------- */
+
+const DIFF_AUTO_MAX = 80; // auto-expand diffs with at most this many lines
+
+/** Classic Myers diff over line arrays → [{type:'ctx'|'add'|'del', text}]. */
+function diffLines(aStr, bStr) {
+  const a = aStr ? String(aStr).split("\n") : [];
+  const b = bStr ? String(bStr).split("\n") : [];
+  const N = a.length, M = b.length;
+  if (!N && !M) return [];
+  const max = N + M, OFF = max;
+  let v = new Int32Array(2 * max + 1);
+  const trace = [];
+  let found = max;
+  outer: for (let d = 0; d <= max; d++) {
+    trace.push(v.slice());
+    for (let k = -d; k <= d; k += 2) {
+      let x = (k === -d || (k !== d && v[OFF + k - 1] < v[OFF + k + 1])) ? v[OFF + k + 1] : v[OFF + k - 1] + 1;
+      let y = x - k;
+      while (x < N && y < M && a[x] === b[y]) { x++; y++; }
+      v[OFF + k] = x;
+      if (x >= N && y >= M) { found = d; break outer; }
+    }
+  }
+  const ops = [];
+  let x = N, y = M;
+  for (let d = found; d > 0; d--) {
+    const vv = trace[d];
+    const k = x - y;
+    const prevK = (k === -d || (k !== d && vv[OFF + k - 1] < vv[OFF + k + 1])) ? k + 1 : k - 1;
+    const prevX = vv[OFF + prevK], prevY = prevX - prevK;
+    while (x > prevX && y > prevY) { ops.push({ type: "ctx", text: a[x - 1] }); x--; y--; }
+    if (x === prevX) { ops.push({ type: "add", text: b[y - 1] }); y--; }
+    else { ops.push({ type: "del", text: a[x - 1] }); x--; }
+  }
+  while (x > 0 && y > 0) { ops.push({ type: "ctx", text: a[x - 1] }); x--; y--; }
+  ops.reverse();
+  return ops;
+}
+
+/** Group ops into hunks with up to 3 context lines; longer runs collapse away. */
+function buildHunks(ops) {
+  const CTX = 3;
+  const keep = ops.map((op, i) => {
+    if (op.type !== "ctx") return true;
+    for (let j = Math.max(0, i - CTX); j <= Math.min(ops.length - 1, i + CTX); j++) {
+      if (ops[j].type !== "ctx") return true;
+    }
+    return false;
+  });
+  const hunks = [];
+  let on = 1, nn = 1, cur = null;
+  let ri = 0; // counts of kept items in current run
+  ops.forEach((op, i) => {
+    if (keep[i] && (i === 0 || !keep[i - 1])) {
+      cur = { oldStart: on, newStart: nn, oldLines: 0, newLines: 0, items: [] };
+      hunks.push(cur);
+      ri = 0;
+    }
+    if (keep[i] && cur) {
+      cur.items.push({ type: op.type, text: op.text, oldNo: op.type !== "add" ? on : 0, newNo: op.type !== "del" ? nn : 0 });
+      ri++;
+    }
+    if (keep[i] && cur) {
+      if (op.type !== "add") cur.oldLines++;
+      if (op.type !== "del") cur.newLines++;
+    }
+    if (op.type !== "add") on++;
+    if (op.type !== "del") nn++;
+  });
+  // git-style: single-line ranges show just the start
+  for (const h of hunks) {
+    h.header = "@@ -" + h.oldStart + "," + h.oldLines + " +" + h.newStart + "," + h.newLines + " @@";
+  }
+  return hunks;
+}
+
+/* diff job plumbing: one per change row */
+function setDiffOpen(job, open) {
+  job.open = open;
+  job.exp.setAttribute("aria-expanded", String(open));
+  job.exp.textContent = open ? "▾" : "▸";
+  if (open) job.block.removeAttribute("hidden");
+  else job.block.setAttribute("hidden", "");
+}
+
+function renderDiffNote(job, text) {
+  while (job.block.firstChild) job.block.removeChild(job.block.firstChild);
+  job.block.appendChild(el("div", { class: "diff-note" }, text));
+  job.noteOnly = true;
+}
+
+function renderDiffHunks(job, hunks) {
+  while (job.block.firstChild) job.block.removeChild(job.block.firstChild);
+  for (const h of hunks) {
+    job.block.appendChild(el("div", { class: "diff-hunk" }, h.header));
+    for (const it of h.items) {
+      const sign = it.type === "add" ? "+" : it.type === "del" ? "-" : " ";
+      job.block.appendChild(el("div", { class: "diff-line diff-" + it.type },
+        el("span", { class: "dn" }, it.oldNo ? String(it.oldNo) : ""),
+        el("span", { class: "dn" }, it.newNo ? String(it.newNo) : ""),
+        el("span", { class: "diff-sign" }, sign),
+        el("span", { class: "diff-text" }, it.text)));
+    }
+  }
+}
+
+async function loadDiff(job, ctx, auto) {
+  if (job.loading) { job.wantOpen = true; return job.loading; }
+  if (job.loaded) { if (!auto) setDiffOpen(job, !job.open); return Promise.resolve(); }
+  const c = job.change;
+  job.meta.textContent = "loading…";
+  job.loading = (async () => {
+    try {
+      const oldPath = c.op === "rename" && c.src_path ? c.src_path : c.path;
+      let of = null, nf = null;
+      const tasks = [];
+      if (ctx.oldRev && c.op !== "add") tasks.push(fetchFileCached(ctx.oldRev, oldPath).then((r) => { of = r; }));
+      if (c.op !== "delete") tasks.push(fetchFileCached(ctx.newRev, c.path).then((r) => { nf = r; }));
+      await Promise.all(tasks);
+      const unusable = (f) => f && (f.encoding !== "utf8" || f.truncated);
+      if (unusable(of) || unusable(nf)) {
+        renderDiffNote(job, "binary or too large to diff");
+      } else {
+        const a = of ? String(of.content || "") : "";
+        const b = nf ? String(nf.content || "") : "";
+        if (c.op === "rename" && a === b) {
+          renderDiffNote(job, "content unchanged — path only");
+        } else {
+          const ops = diffLines(a, b);
+          renderDiffHunks(job, buildHunks(ops));
+          job.lineCount = ops.length;
+          job.meta.textContent = job.lineCount + " line" + (job.lineCount === 1 ? "" : "s");
+        }
+      }
+      job.loaded = true;
+      const wantsOpen = auto
+        ? (job.lineCount === undefined ? true : job.lineCount <= DIFF_AUTO_MAX)
+        : !job.open;
+      setDiffOpen(job, wantsOpen);
+      if (job.lineCount === undefined) job.meta.textContent = "";
+    } catch (err) {
+      renderDiffNote(job, "could not load diff: " + (err && err.message ? err.message : err));
+      job.loaded = true;
+      job.meta.textContent = "";
+      setDiffOpen(job, true);
+    } finally {
+      job.loading = null;
+    }
+  })();
+  return job.loading;
+}
+
+/* ---------- live polling (tip watcher) ---------- */
+
+let liveTimer = null;
+let lastTips = {};
+let toastEl = null;
+let toastTimer = null;
+
+function hideToast() {
+  if (toastEl && toastEl.parentNode) toastEl.parentNode.removeChild(toastEl);
+  toastEl = null;
+  if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+}
+
+async function showLiveToast(ref, oldCs, newCs) {
+  let suffix = "";
+  try {
+    const log = await api("/api/log?" + qs({ cs: newCs, limit: 50 }));
+    let n = 0, found = false;
+    for (const e of log.entries || []) { if (e.id === oldCs) { found = true; break; } n++; }
+    if (found) suffix = " (+" + n + (n === 1 ? " changeset)" : " changesets)");
+  } catch (_) { /* count unavailable — ids alone tell the story */ }
+  if (!toastEl) {
+    toastEl = el("div", { id: "live-toast", role: "status" });
+    (document.body || document.documentElement).appendChild(toastEl);
+  } else {
+    while (toastEl.firstChild) toastEl.removeChild(toastEl.firstChild); // replace, reset timer
+  }
+  const refName = ref.name.replace(/^refs\/(heads\/)?/, "");
+  toastEl.appendChild(el("span", { class: "toast-text" },
+    refName + " moved: ",
+    el("span", { class: "mono" }, shortId(oldCs, 8)),
+    " → ",
+    el("span", { class: "mono" }, shortId(newCs, 8)),
+    suffix));
+  toastEl.appendChild(el("button", {
+    class: "btn btn-sm toast-refresh", type: "button",
+    onclick: () => { hideToast(); route(); },
+  }, "refresh"));
+  toastEl.appendChild(el("button", {
+    class: "btn btn-sm toast-close", type: "button", "aria-label": "dismiss",
+    onclick: hideToast,
+  }, "✕"));
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(hideToast, 12000);
+}
+
+async function pollTick() {
+  if (typeof document !== "undefined" && document.hidden) return; // paused while hidden
+  let data;
+  try { data = await api("/api/refs"); } catch (_) { return; }
+  const fresh = (data && data.refs) || [];
+  const hadBaseline = !!Object.keys(lastTips).length;
+  const prev = lastTips;
+  lastTips = {};
+  for (const r of fresh) lastTips[r.name] = r.cs;
+  const sel = document.getElementById("ref-select");
+  if (sel && state.refsLoaded) {
+    const known = new Set(fresh.map((r) => r.name));
+    state.refs = fresh;
+    while (sel.firstChild) sel.removeChild(sel.firstChild);
+    for (const r of fresh) sel.appendChild(option(r.name, r.name));
+    if (known.has(state.rev)) sel.value = state.rev;
+  }
+  if (!hadBaseline) return; // first poll after load only records the baseline
+  const moved = fresh.find((r) => r.name === state.rev && prev[r.name] && prev[r.name] !== r.cs);
+  if (moved) showLiveToast(moved, prev[moved.name], moved.cs);
+}
+
+function startLivePoll() {
+  if (typeof setInterval !== "undefined") liveTimer = setInterval(pollTick, 10000);
+  if (document.addEventListener) {
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) pollTick(); // catch up immediately on refocus
+    });
+  }
+}
+
+/* ---------- file finder (fuzzy) ---------- */
+
+let finderFiles = { rev: null, paths: null }; // cached per rev
+let overlayDepth = 0; // any modal open → global keys suppressed
+
+/** Subsequence score: contiguous runs > word starts (after / - _ .) > scattered. */
+function fuzzyScore(q, name) {
+  const ql = q.toLowerCase(), nl = name.toLowerCase();
+  let score = 0, qi2 = 0, last = -2, start = 0, first = -1;
+  const matched = new Array(name.length).fill(false);
+  for (let i = 0; i < nl.length && qi2 < ql.length;) {
+    if (nl[i] === ql[qi2]) {
+      matched[i] = true;
+      if (last === i - 1) score += 8; // contiguous run
+      else if (i > 0 && "/-_.".includes(name[i - 1])) score += 5; // word start
+      else score += 1;
+      if (first < 0) first = i;
+      last = i;
+      qi2++;
+      i++;
+    } else i++;
+  }
+  if (qi2 < ql.length) return null; // not a subsequence
+  score -= first * 0.05 + (name.length - ql.length) * 0.01; // early, short names win ties
+  void start;
+  return { score, matched };
+}
+
+function openFileFinder() {
+  if (overlayDepth) return;
+  const rev = currentRev();
+  overlayDepth++;
+  const prev = { focus: document.activeElement && document.activeElement.focus ? document.activeElement : null };
+
+  const input = el("input", {
+    id: "file-finder-input", class: "input", type: "text",
+    placeholder: "type to filter files at " + revName(rev) + "…",
+    "aria-label": "filter files",
+  });
+  const countEl = el("div", { class: "finder-count mono" }, "loading…");
+  const listEl = el("div", { class: "finder-list mono" });
+  const panel = el("div", {
+    id: "file-finder", role: "dialog", "aria-modal": "true",
+    "aria-labelledby": "file-finder-title", tabindex: "-1",
+  },
+    el("div", { class: "modal-head" },
+      el("h2", { id: "file-finder-title" }, "Find file"),
+      el("button", { class: "btn btn-sm modal-close", type: "button", "aria-label": "Close", onclick: () => close() }, "✕")),
+    input, countEl, listEl);
+  const backdrop = el("div", { class: "modal-backdrop" }, panel);
+
+  let idx = 0, rows = [];
+  const close = () => {
+    overlayDepth--;
+    if (document.removeEventListener) document.removeEventListener("keydown", onKey);
+    if (backdrop.parentNode) backdrop.parentNode.removeChild(backdrop);
+    if (prev.focus && prev.focus.focus) prev.focus.focus();
+  };
+  const selectIdx = (n) => {
+    idx = Math.max(0, Math.min(rows.length - 1, n));
+    rows.forEach((r, i2) => {
+      const kls = "finder-row" + (i2 === idx ? " kbd-selected" : "");
+      r.setAttribute("class", kls);
+    });
+  };
+  const render = (all, q) => {
+    while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+    rows = [];
+    let shown = all;
+    let scored = null;
+    if (q) {
+      scored = [];
+      for (const p of all) {
+        const s = fuzzyScore(q, p.path);
+        if (s) scored.push({ p, s });
+      }
+      scored.sort((a, b) => b.s.score - a.s.score);
+      shown = scored;
+    }
+    countEl.textContent = shown.length + " of " + all.length + " files";
+    for (const it of shown.slice(0, 50)) {
+      const p = scored ? it.p : it;
+      const a = el("a", { class: "finder-row", href: fileHref(rev, p.path) });
+      // highlight matched chars
+      if (scored) {
+        let buf = "", hl = false;
+        const pushSeg = (txt, isHl) => {
+          if (!txt) return;
+          a.appendChild(isHl ? el("b", {}, txt) : document.createTextNode(txt));
+        };
+        for (let i2 = 0; i2 < p.path.length; i2++) {
+          const m = it.s.matched[i2];
+          if (m !== hl) { pushSeg(buf, hl); buf = ""; hl = m; }
+          buf += p.path[i2];
+        }
+        pushSeg(buf, hl);
+      } else {
+        a.appendChild(document.createTextNode(p.path));
+      }
+      a.appendChild(el("span", { class: "finder-kind" }, p.kind));
+      a.addEventListener("click", () => close());
+      listEl.appendChild(a);
+      rows.push(a);
+    }
+    if (!shown.length) listEl.appendChild(el("div", { class: "finder-empty" }, "no matches"));
+    selectIdx(0);
+  };
+
+  const onKey = (ev) => {
+    if (ev.key === "Escape") { ev.preventDefault && ev.preventDefault(); close(); }
+    else if (ev.key === "ArrowDown") { ev.preventDefault && ev.preventDefault(); selectIdx(idx + 1); }
+    else if (ev.key === "ArrowUp") { ev.preventDefault && ev.preventDefault(); selectIdx(idx - 1); }
+    else if (ev.key === "Enter") {
+      const a = rows[idx];
+      if (a) { ev.preventDefault && ev.preventDefault(); location.hash = a.getAttribute("href"); close(); }
+    }
+  };
+  input.addEventListener("keydown", onKey);
+  if (document.addEventListener) document.addEventListener("keydown", onKey);
+  input.addEventListener("input", () => {
+    if (finderFiles.paths && finderFiles.rev === rev) render(finderFiles.paths, input.value.trim());
+  });
+
+  backdrop.addEventListener("click", (ev) => { if (ev.target === backdrop) close(); });
+  (document.body || document.documentElement).appendChild(backdrop);
+  if (input.focus) input.focus();
+
+  const ensure = finderFiles.rev === rev && finderFiles.paths
+    ? Promise.resolve(finderFiles.paths)
+    : api("/api/files?" + qs({ cs: rev, limit: 2000 })).then((d) => {
+        finderFiles = { rev: rev, paths: (d && d.paths) || [] };
+        return finderFiles.paths;
+      });
+  ensure.then((paths) => render(paths, input.value.trim()))
+    .catch((err) => {
+      countEl.textContent = "";
+      while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+      listEl.appendChild(el("div", { class: "finder-empty" }, "could not list files: " + (err && err.message ? err.message : err)));
+    });
+}
+
+/* ---------- keyboard navigation + help ---------- */
+
+let kbdSel = -1;
+
+function primaryRows() {
+  const root = app();
+  if (!root || !root.querySelectorAll) return [];
+  for (const sel of ["#search-results .search-line", ".tree-row", ".log-row", ".change-row"]) {
+    const rows = root.querySelectorAll(sel);
+    if (rows.length) return Array.prototype.slice.call(rows);
+  }
+  return [];
+}
+
+function moveKbdSel(dir, rows) {
+  if (!rows.length) return;
+  if (kbdSel < 0) kbdSel = 0; else kbdSel = Math.max(0, Math.min(rows.length - 1, kbdSel + dir));
+  rows.forEach((r, i) => {
+    const has = String(r.className || "").split(" ").includes("kbd-selected");
+    if (i === kbdSel && !has) {
+      r.setAttribute("class", (String(r.className || "") + " kbd-selected").trim());
+      if (r.scrollIntoView) r.scrollIntoView({ block: "nearest" });
+    } else if (i !== kbdSel && has) {
+      r.setAttribute("class",
+        String(r.className || "").split(" ").filter((c) => c && c !== "kbd-selected").join(" "));
+    }
+  });
+}
+
+function openKbdSel(rows) {
+  if (kbdSel < 0 || kbdSel >= rows.length) return;
+  const row = rows[kbdSel];
+  const links = row.querySelectorAll ? row.querySelectorAll("a") : [];
+  for (const a of links) {
+    const h = a.getAttribute && a.getAttribute("href");
+    if (h && h.charAt(0) === "#") { location.hash = h; return; }
+  }
+}
+
+let kbdHelpEl = null;
+function toggleKbdHelp() {
+  if (kbdHelpEl) {
+    overlayDepth--;
+    if (kbdHelpEl.parentNode) kbdHelpEl.parentNode.removeChild(kbdHelpEl);
+    kbdHelpEl = null;
+    return;
+  }
+  overlayDepth++;
+  const rows = [
+    ["j / k", "move selection down / up"],
+    ["Enter", "open selected row"],
+    ["t", "file finder… fuzzy filter at the selected ref"],
+    ["/", "focus the grep box"],
+    ["?", "this help"],
+    ["Esc", "close dialogs"],
+  ];
+  const table = el("div", { class: "kbd-table" });
+  for (const [k, d] of rows) {
+    table.appendChild(el("div", { class: "kbd-row" },
+      el("kbd", {}, k), el("span", {}, d)));
+  }
+  kbdHelpEl = el("div", { class: "modal-backdrop" },
+    el("div", { id: "kbd-help", role: "dialog", "aria-modal": "true", tabindex: "-1" },
+      el("div", { class: "modal-head" },
+        el("h2", null, "Keyboard shortcuts"),
+        el("button", { class: "btn btn-sm modal-close", type: "button", "aria-label": "Close", onclick: toggleKbdHelp }, "✕")),
+      table));
+  kbdHelpEl.addEventListener("click", (ev) => { if (ev.target === kbdHelpEl) toggleKbdHelp(); });
+  (document.body || document.documentElement).appendChild(kbdHelpEl);
+}
+
+function isFormTarget(t) {
+  if (!t) return false;
+  const tag = String(t.tagName || "").toUpperCase();
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!t.isContentEditable;
+}
+
+function onGlobalKey(ev) {
+  if (!ev) return;
+  if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
+  if (isFormTarget(ev.target)) return;
+  if (modalClose || overlayDepth) {
+    if (ev.key === "Escape" && kbdHelpEl) toggleKbdHelp();
+    return;
+  }
+  const rows = primaryRows();
+  switch (ev.key) {
+    case "j": moveKbdSel(1, rows); ev.preventDefault && ev.preventDefault(); break;
+    case "k": moveKbdSel(-1, rows); ev.preventDefault && ev.preventDefault(); break;
+    case "Enter": openKbdSel(rows); break;
+    case "t": openFileFinder(); break;
+    case "/": {
+      const gs = document.getElementById("global-search");
+      if (gs && gs.focus) { gs.focus(); ev.preventDefault && ev.preventDefault(); }
+      break;
+    }
+    case "?": toggleKbdHelp(); break;
+    default: return;
+  }
 }
 
 /* ---------- readme panel + minimal markdown renderer ----------
@@ -1196,7 +1739,8 @@ function viewChangeset(root, id) {
     const header = el("header", { id: "cs-header", class: "panel" });
     const idRow = el("div", { class: "cs-id-row" },
       el("span", { class: "cs-id" }, cs.id),
-      copyButton(() => cs.id, "copy id"));
+      copyButton(() => cs.id, "copy id"),
+      permalinkButton("copy link to this changeset"));
     idRow.id = "cs-header-row"; // keep #cs-header on the panel (hook)
     header.appendChild(idRow);
     header.appendChild(el("div", { class: "cs-message" }, cs.message || "(no message)"));
@@ -1245,7 +1789,7 @@ function viewChangeset(root, id) {
     const chPanel = el("section", { class: "panel" });
     chPanel.appendChild(el("h2", { class: "panel-title" },
       "Changes · " + ((cs.changes || []).length)));
-    chPanel.appendChild(changeList(cs.changes || [], cs.id));
+    chPanel.appendChild(changeList(cs.changes || [], cs.id, cs.parents && cs.parents[0]));
     root.appendChild(chPanel);
 
     if (cs.parents && cs.parents.length) {
@@ -1273,6 +1817,12 @@ function viewBrowse(root, rev, path) {
   api("/api/tree?" + qs({ cs: rev, path: path })).then((tree) => {
     clear(root);
     root.appendChild(el("h1", { class: "page-title" }, "Browse"));
+    root.appendChild(el("div", { class: "browse-actions" },
+      el("button", {
+        id: "file-finder-btn", class: "btn btn-sm", type: "button",
+        onclick: () => openFileFinder(),
+      }, "find file"),
+      el("span", { class: "hint" }, "or press t")));
     root.appendChild(breadcrumb(rev, path, false));
     const panel = el("section", { class: "panel", style: "padding:6px 8px" });
     const scroller = el("div", { class: "table-scroll" });
@@ -1332,6 +1882,7 @@ function viewFile(root, rev, path) {
     header.appendChild(el("span", { class: "file-size" }, humanSize(f.size)));
     header.appendChild(el("span", { class: "spacer" }));
     header.appendChild(copyButton(() => f.content, "copy content"));
+    header.appendChild(permalinkButton("copy link to this file view"));
     let blameBtn = null;
     if (f.encoding === "utf8") {
       blameBtn = el("button", { id: "blame-toggle", class: "btn btn-sm", type: "button",
@@ -1397,7 +1948,13 @@ function viewFile(root, rev, path) {
         blameOn = !blameOn;
         blameBtn.textContent = blameOn ? "hide blame" : "blame";
         blameBtn.setAttribute("aria-pressed", String(blameOn));
-        applyBlame(codeLines, blameOn ? blameData : null, lines.length);
+        if (blameOn) {
+          blameAgeMap(blameData).then((ages) => {
+            if (blameOn) applyBlame(codeLines, blameData, lines.length, ages);
+          });
+        } else {
+          applyBlame(codeLines, null, lines.length, null);
+        }
       });
     }
   }).catch((err) => {
@@ -1405,12 +1962,42 @@ function viewFile(root, rev, path) {
   });
 }
 
+/**
+ * Age heat for blame: rank the file's distinct changesets by committer time
+ * and interpolate hue 30 (oldest, warm brown) → 95 (newest, spring green).
+ * Missing/failed fetches simply fade out of `out`; callers fall back to the
+ * deterministic per-id hash color.
+ */
+async function blameAgeMap(data) {
+  const ids = [];
+  for (const r of (data && data.ranges) || []) if (r.cs && !ids.includes(r.cs)) ids.push(r.cs);
+  const info = {};
+  await Promise.all(ids.map((id) =>
+    fetchChangesetCached(id).then((cs) => { info[id] = cs; }).catch(() => {})));
+  const ranked = ids
+    .filter((id) => info[id])
+    .sort((a, b) => commitTime(info[a]) - commitTime(info[b]));
+  const out = {};
+  ranked.forEach((id, i) => {
+    const t = ranked.length > 1 ? i / (ranked.length - 1) : 1;
+    const who = info[id].committer || info[id].author || {};
+    out[id] = { hue: 30 + t * 65, name: who.name || "", date: civilTime(who) };
+  });
+  return out;
+}
+
+function commitTime(cs) {
+  const c = (cs && (cs.committer || cs.author)) || {};
+  return typeof c.time_secs === "number" ? c.time_secs : 0;
+}
+
 function wrap64(s) {
   return String(s || "").replace(/.{1,76}/g, (m) => m + "\n");
 }
 
-/** Paint or clear blame gutter blocks on #code-lines. */
-function applyBlame(codeLines, data, totalLines) {
+/** Paint or clear blame gutter blocks on #code-lines; ageMeta colors by
+ *  relative age in this file (see blameAgeMap), absent → per-id hash hue. */
+function applyBlame(codeLines, data, totalLines, ageMeta) {
   const rows = [];
   for (let i = 0; i < codeLines.children.length; i++) {
     const c = codeLines.children[i];
@@ -1432,17 +2019,23 @@ function applyBlame(codeLines, data, totalLines) {
   for (const range of data.ranges || []) {
     const lo = Math.max(1, range.lo || 1);
     const hi = Math.min(totalLines, Math.min(rows.length, range.hi || lo));
-    const hue = idHue(String(range.cs || ""));
+    const info = ageMeta && ageMeta[String(range.cs || "")];
+    const h = info ? Math.round(info.hue) : idHue(String(range.cs || ""));
     const short = String(range.cs || "").slice(0, 8);
+    const style = info
+      ? "background:hsl(" + h + ",40%,24%);border-left:3px solid hsl(" + h + ",55%,62%);color:#f0ead8"
+      : "background:hsl(" + h + ",30%,26%);border-left:3px solid hsl(" + h + ",45%,52%);color:#f0ead8";
+    const title = info
+      ? short + " · " + info.name + (info.date ? " · " + info.date : "") +
+        " — colored by relative age in this file"
+      : String(range.cs || short);
     for (let ln = lo; ln <= hi; ln++) {
       const g = rows[ln - 1] && rows[ln - 1].children[0];
       if (!g) continue;
       g.className = "gutter gutter-block";
       g.setAttribute("data-cs", short);
-      g.setAttribute("title", range.cs || short);
-      g.setAttribute("style",
-        "background:hsl(" + hue + ",30%,26%);" +
-        "border-left:3px solid hsl(" + hue + ",45%,52%);color:#f0ead8");
+      g.setAttribute("title", title);
+      g.setAttribute("style", style);
       while (g.firstChild) g.removeChild(g.firstChild);
       if (ln === lo) g.appendChild(document.createTextNode(short));
       const target = range.cs;
@@ -1503,10 +2096,72 @@ function viewCompare(root, query) {
       el("span", { title: d.b }, shortId(d.b, 8) + "…"),
       el("span", { class: "cmp-count" }, "  " + ((d.changes || []).length) + " changes")));
     const panel = el("section", { class: "panel" });
-    panel.appendChild(changeList(d.changes || [], d.b));
+    panel.appendChild(changeList(d.changes || [], d.b, d.a));
     results.appendChild(panel);
   }).catch((err) => {
     clear(results).appendChild(emptyState("Compare failed", String(err && err.message ? err.message : err)));
+  });
+}
+
+/** Wrap case-insensitive occurrences of q in <mark>, untrusted-safe. */
+function markMatches(node, text, q) {
+  const tl = String(text).toLowerCase(), ql = String(q).toLowerCase();
+  if (!ql) { node.textContent = String(text); return node; }
+  let i = 0, idx, marked = false;
+  while ((idx = tl.indexOf(ql, i)) >= 0) {
+    if (idx > i) node.appendChild(document.createTextNode(text.slice(i, idx)));
+    node.appendChild(el("mark", {}, text.slice(idx, idx + ql.length)));
+    i = idx + ql.length;
+    marked = true;
+  }
+  if (i < text.length) node.appendChild(document.createTextNode(text.slice(i)));
+  if (!marked && !i) node.textContent = String(text);
+  return node;
+}
+
+function viewSearch(root, query) {
+  const q0 = (query.get("q") || "").trim();
+  const rev = currentRev();
+  document.title = "gardenbed — grep " + q0;
+  setNav(null);
+  clear(root);
+  root.appendChild(el("h1", { class: "page-title" }, "Search"));
+  const results = el("div", { id: "search-results" });
+  root.appendChild(results);
+  if (!q0) {
+    results.appendChild(emptyState("Nothing to grep", null, "type in the grep box (or press /) and hit Enter"));
+    return;
+  }
+  results.appendChild(skeleton(6));
+  api("/api/search?" + qs({ cs: rev, q: q0, limit: 100 })).then((d) => {
+    clear(results);
+    const files = d.files || [];
+    results.appendChild(el("div", { class: "search-head" },
+      files.length + " file" + (files.length === 1 ? "" : "s") + " match ",
+      el("span", { class: "mono" }, "“" + q0 + "”"),
+      " at " + revName(rev) + " · " + shortId(d.cs || "", 8)));
+    if (d.truncated) {
+      results.appendChild(el("div", { class: "banner warn" }, "result set truncated — showing the server-capped first matches"));
+    }
+    if (!files.length) {
+      results.appendChild(emptyState("No matches", null, 'no matches for "' + q0 + '" — try a shorter substring'));
+      return;
+    }
+    for (const f of files) {
+      const matches = (f.matches || []).slice(0, 20);
+      const sf = el("div", { class: "search-file panel" },
+        el("div", { class: "search-file-head" },
+          el("a", { class: "mono", href: fileHref(rev, f.path) }, f.path),
+          el("span", { class: "search-count mono" }, matches.length + (matches.length === 1 ? " match" : " matches"))));
+      for (const m of matches) {
+        sf.appendChild(el("div", { class: "search-line" },
+          el("a", { class: "search-ln mono", href: fileHref(rev, f.path) }, String(m.line)),
+          markMatches(el("code", { class: "search-text" }), String(m.text == null ? "" : m.text), q0)));
+      }
+      results.appendChild(sf);
+    }
+  }).catch((err) => {
+    clear(results).appendChild(emptyState("Search failed", String(err && err.message ? err.message : err)));
   });
 }
 
@@ -1545,6 +2200,7 @@ function parseHash() {
 }
 
 function route() {
+  kbdSel = -1; // keyboard selection is per-page
   const root = app();
   const r = parseHash();
   const segs = r.segs;
@@ -1561,15 +2217,31 @@ function route() {
       return viewFile(root, segs[1] || "", segs.slice(2).join("/"));
     case "compare":
       return viewCompare(root, r.query);
+    case "search":
+      return viewSearch(root, r.query);
     default:
       return viewNotFound(root, r.path);
   }
 }
 
+/* Test/maintainer handle: intentional, stable, undocumented surface. */
+const __gb = { pollTick, diffLines, buildHunks, fuzzyScore };
+if (typeof window !== "undefined") window.__gb = __gb;
+
 function boot() {
   addEventListener("hashchange", route);
   const agentBtn = document.getElementById("agent-prompt-btn");
   if (agentBtn) agentBtn.addEventListener("click", openAgentModal);
+  const gs = document.getElementById("global-search");
+  if (gs) {
+    gs.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        const v = String(gs.value || "").trim();
+        if (v) { location.hash = "#/search?" + qs({ q: v }); ev.preventDefault && ev.preventDefault(); }
+      }
+    });
+  }
+  if (document.addEventListener) document.addEventListener("keydown", onGlobalKey);
   // Populate the ref selector, then render (selector load is non-blocking).
   loadRefs().then(route, route);
 }

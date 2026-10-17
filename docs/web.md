@@ -38,8 +38,17 @@ gardenbed-web --root /tmp/gardenbed-demo
 | `#/log` | History timeline with an SVG commit-graph lane column |
 | `#/changeset/<id>` | Changeset metadata, diffstat summary, grouped change list |
 | `#/browse/<rev>/<path>` | Tree listing with breadcrumbs; a README in the directory renders below as markdown (GitHub style) — client-side renderer, escaped end to end, relative links resolve to that revision's file views |
-| `#/file/<rev>/<path>` | File content with line numbers, blame toggle |
-| `#/compare?a=<rev>&b=<rev>` | Diff between two revspecs |
+| `#/file/<rev>/<path>` | File content with line numbers, blame toggle (age-heat gutters) |
+| `#/compare?a=<rev>&b=<rev>` | Diff between two revspecs, rows expand into unified patches |
+| `#/search?q=<q>` | Case-insensitive content grep across the tree at the selected ref |
+
+Changeset and compare rows expand into real unified diffs (client-side
+Myers over the old/new file contents fetched at their revisions).
+
+Keyboard: `t` file finder (fuzzy, at the selected ref), `/` focuses the
+grep box, `j`/`k` + Enter walk lists, `?` shows the help overlay. The UI
+polls `/api/refs` every 10 s and toasts when the selected ref moves, so
+a watcher sees agents landing work live.
 
 The **Use in agent** button (top bar) opens a dialog with a generated
 markdown prompt — repository facts (tip id, refs, root), connection

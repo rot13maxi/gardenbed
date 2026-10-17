@@ -498,6 +498,198 @@ async fn static_assets_are_embedded() {
     assert!(ctype.starts_with("text/css"));
 }
 
+#[tokio::test]
+async fn files_lists_all_paths_sorted_with_kinds() {
+    let (repo, [_, _, _, _, tip]) = fixture();
+    let app = gardenbed_web::router(repo);
+
+    let (status, json) = get_json(&app, "/api/files").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["cs"], tip.to_hex());
+    assert_eq!(json["truncated"], false);
+    let paths = json["paths"].as_array().unwrap();
+    let names: Vec<&str> = paths.iter().map(|p| p["path"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        [
+            "a.txt",
+            "big.txt",
+            "bin.dat",
+            "dir/moved.txt",
+            "link",
+            "run.sh"
+        ]
+    );
+    // No directories leak into the listing; symlinks keep their kind.
+    assert!(paths.iter().all(|p| p["kind"] != "directory"));
+    let link = paths.iter().find(|p| p["path"] == "link").unwrap();
+    assert_eq!(link["kind"], "symlink");
+
+    // Substring filter on the full path, case-insensitive.
+    for needle in ["moved", "MOVED"] {
+        let (status, json) = get_json(&app, &format!("/api/files?q={needle}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<&str> = json["paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["dir/moved.txt"]);
+    }
+
+    // Unknown revspec keeps the shared 404 contract.
+    let (status, _) = get_json(&app, "/api/files?cs=deadbeef").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A repo with 25 hitting lines in one file, a second hitting file, and
+/// a gitlink — for the search caps.
+fn fixture_many_hits() -> Repo {
+    let repo = Repo::new(Arc::new(MemoryStore::new()), Arc::new(MemoryStore::new()));
+    let mut inline = BTreeMap::new();
+    let hits: String = (0..25).map(|i| format!("hit on line {i}\n")).collect();
+    let hits_id = blob_id(hits.as_bytes());
+    let other_id = blob_id(b"a hit around here\n");
+    inline.insert(hits_id.to_hex(), hits.into_bytes());
+    inline.insert(other_id.to_hex(), b"a hit around here\n".to_vec());
+    // A gitlink's blob is an opaque upstream pointer, never stored.
+    let pointer = Id::from_bytes([7u8; 32]);
+    let mut changes = vec![
+        Change {
+            path: "hits.txt".to_owned(),
+            op: Op::Add,
+            blob: Some(hits_id),
+            src_path: None,
+            mode: Mode::Regular,
+        },
+        Change {
+            path: "other.txt".to_owned(),
+            op: Op::Add,
+            blob: Some(other_id),
+            src_path: None,
+            mode: Mode::Regular,
+        },
+        Change {
+            path: "sub".to_owned(),
+            op: Op::Add,
+            blob: Some(pointer),
+            src_path: None,
+            mode: Mode::Gitlink,
+        },
+    ];
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    let cs = Changeset {
+        parents: vec![],
+        changes,
+        message: "search fixture".to_owned(),
+        author: ident(9),
+        committer: ident(9),
+        signature: None,
+    };
+    let tip = repo.create_changeset(&cs, &inline).unwrap();
+    repo.cas_ref("main", None, tip).unwrap();
+    repo
+}
+
+#[tokio::test]
+async fn search_finds_line_matches_and_skips_binary() {
+    let (repo, [_, _, _, _, tip]) = fixture();
+    let app = gardenbed_web::router(repo);
+
+    // Known content, known line number; case-insensitive.
+    for needle in ["line3", "LINE3"] {
+        let (status, json) = get_json(&app, &format!("/api/search?q={needle}")).await;
+        assert_eq!(status, StatusCode::OK, "q={needle}");
+        assert_eq!(json["query"], needle);
+        assert_eq!(json["cs"], tip.to_hex());
+        let files = json["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["path"], "a.txt");
+        assert_eq!(files[0]["matches"][0]["line"], 3);
+        assert_eq!(files[0]["matches"][0]["text"], "line3");
+    }
+
+    // Matched lines are trimmed and hard-capped at 240 chars.
+    let (status, json) = get_json(&app, "/api/search?q=xxx").await;
+    assert_eq!(status, StatusCode::OK);
+    let big = json["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["path"] == "big.txt")
+        .expect("big.txt matches q=xxx");
+    assert_eq!(big["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(big["matches"][0]["text"].as_str().unwrap().len(), 240);
+
+    // The binary blob yields no file entry; the symlink is skipped even
+    // though its target text contains the query substring.
+    let (status, json) = get_json(&app, "/api/search?q=%01").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 0);
+    // q=nested hits dir/moved.txt's content; q=dir would hit the
+    // symlink's target text ("dir/moved.txt") if symlinks were searched.
+    let (status, json) = get_json(&app, "/api/search?q=nested").await;
+    assert_eq!(status, StatusCode::OK);
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "dir/moved.txt");
+    assert_eq!(files[0]["matches"][0]["line"], 1);
+    let (status, json) = get_json(&app, "/api/search?q=dir%2Fmoved").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 0);
+
+    // q required.
+    for uri in ["/api/search", "/api/search?q=", "/api/search?q=%20"] {
+        let (status, json) = get_json(&app, uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+        assert_eq!(json["error"], "empty query");
+    }
+}
+
+#[tokio::test]
+async fn search_honors_caps() {
+    let app = gardenbed_web::router(fixture_many_hits());
+
+    // Per-file cap: 25 hits in the blob, 20 reported, truncation flagged.
+    let (status, json) = get_json(&app, "/api/search?q=hit").await;
+    assert_eq!(status, StatusCode::OK);
+    let files = json["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2);
+    assert_eq!(files[0]["path"], "hits.txt");
+    assert_eq!(files[0]["matches"].as_array().unwrap().len(), 20);
+    assert_eq!(files[0]["matches"][0]["line"], 1);
+    assert_eq!(files[0]["matches"][19]["line"], 20);
+    assert_eq!(files[1]["path"], "other.txt");
+    assert_eq!(files[1]["matches"].as_array().unwrap().len(), 1);
+    assert_eq!(json["truncated"], true); // hits.txt had hits beyond the cap
+
+    // Gitlink entries land in /api/files but are never searched.
+    let (status, json) = get_json(&app, "/api/files").await;
+    assert_eq!(status, StatusCode::OK);
+    let sub = json["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["path"] == "sub")
+        .expect("gitlink listed");
+    assert_eq!(sub["kind"], "gitlink");
+
+    // File cap honored: limit=1 returns a single file. ("around" hits
+    // only other.txt; hits.txt would still be scanned but not reported
+    // past the cap.)
+    let (status, json) = get_json(&app, "/api/search?q=hit&limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 1);
+    assert_eq!(json["files"][0]["path"], "hits.txt");
+    assert_eq!(json["truncated"], true);
+
+    let (status, json) = get_json(&app, "/api/search?q=around&limit=1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["files"].as_array().unwrap().len(), 1);
+    assert_eq!(json["files"][0]["path"], "other.txt");
+}
+
 /// Reference base64 for the fixture's binary blob (kept local so the
 /// assertion pins the server's encoding against an independent
 /// implementation).
