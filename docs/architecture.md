@@ -204,7 +204,14 @@ All local state lives under `--state-dir` (default `./.bed`):
   A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
 - **Status** uses mtime/size as hints and hashes only suspects;
-  `--full-scan` forces the correctness path.
+  `--full-scan` forces the correctness path. Untracked discovery honors
+  `.gitignore` files read from the working copy (root plus one per walked
+  directory — `crates/bed/src/ignore.rs`): the git subset of blank lines,
+  comments, trailing `/`, `*` `?` `**`, and a leading `/` anchor, with
+  git's precedence that ignore never un-tracks. Ignored directories with
+  no tracked content are pruned from the walk (a cargo `target/` costs
+  one stat); `!` negation, character classes, and global excludes are
+  unsupported.
 - **Atomic checkout** stages complete files and symlinks before replacing
   working entries. When the selected state directory and destination are
   on different mounts, staging happens beside the destination so the final
@@ -240,7 +247,13 @@ All local state lives under `--state-dir` (default `./.bed`):
 4. **Mapped-frontier pruning**: commits whose git SHA is already mapped
    are skipped, and mapped history is not descended — sound because git
    ids are content-addressed. Re-importing an unchanged repository writes
-   zero objects; force pushes just move refs (CAS).
+   zero objects; force pushes just move refs (CAS). But a ref move whose
+   new tip is not a descendant of the ref's current value is never
+   silent: the default fails the import before touching the ref
+   (`--allow-rewind` opts in), and the move is always reported in the
+   import report with the count of changesets that fell off the ref
+   (metadata-only BFS over parent edges; `--limit` slices report the
+   count as uncounted).
 5. Each commit lands through `ingest_changeset`: changeset canonical
    bytes, `git_map` row, and derived-data rows in one sqlite transaction
    (byte-identical values to the eager write path — kill+resume is

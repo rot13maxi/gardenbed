@@ -34,6 +34,7 @@ pub fn bed(dir: &Path, args: &[&str]) -> (i32, String, String) {
         .current_dir(dir)
         .args(args)
         .env("NO_COLOR", "1")
+        .env_remove("GARDENBED_AUTHOR")
         .output()
         .expect("bed binary spawns");
     (
@@ -50,6 +51,7 @@ pub fn bed_raw(dir: &Path, args: &[&str]) -> (i32, Vec<u8>, Vec<u8>) {
         .current_dir(dir)
         .args(args)
         .env("NO_COLOR", "1")
+        .env_remove("GARDENBED_AUTHOR")
         .output()
         .expect("bed binary spawns");
     (out.status.code().unwrap_or(-1), out.stdout, out.stderr)
@@ -63,6 +65,7 @@ pub fn bed_async(dir: &Path, args: &[&str]) -> tokio::process::Child {
         .current_dir(dir)
         .args(args)
         .stdout(Stdio::piped())
+        .env_remove("GARDENBED_AUTHOR")
         .stderr(Stdio::piped())
         .spawn()
         .expect("bed binary spawns")

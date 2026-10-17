@@ -199,8 +199,22 @@ async fn run_sparse(cli: &Cli, command: &SparseCommand) -> Result<i32, ClientErr
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");
             } else {
+                // A selected prefix with no materialized rows matches
+                // nothing at the current changeset — say so, instead of
+                // letting a dead selection look like live coverage.
+                // (Offline like the rest of the command: the treestate's
+                // rows are the materialized truth.)
+                let materialized: std::collections::HashSet<String> =
+                    bed.treestate()?.all_paths()?.into_iter().collect();
                 for prefix in sparse {
-                    println!("{prefix}");
+                    let covered = materialized.iter().any(|path| {
+                        gardenbed::sparse::in_sparse(path, std::slice::from_ref(prefix))
+                    });
+                    if covered {
+                        println!("{prefix}");
+                    } else {
+                        println!("{prefix} (empty at this changeset)");
+                    }
                 }
             }
             Ok(0)
