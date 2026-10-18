@@ -98,6 +98,12 @@ every commit records it and reviewers filter by author.
   (failing in CI since before the daemon crate landed). Fix: the perf job now
   clones `git clone --bare https://github.com/BurntSushi/ripgrep` into that path
   rather than skipping the tests and weakening the import gate.
+  (c) `kernel_export_spot_check` (crates/git/tests/kernel_spot.rs) needs a
+  multi-GB kernel corpus store at `GARDENBED_KERNEL_GB` (dev-box fixture,
+  default `/home/user/.corpora/linux-gb`) — not cloneable in CI, and a
+  synthetic store would test nothing. Fix: the perf job skips it with
+  `--skip kernel_` (class prefix, so future kernel_* corpus tests are
+  covered); budgets and the corpus_ripgrep_* import gates still run.
 
 ## Backlog — product fixes from dogfood findings
 - **#11 product fix**: `export_to_path` should reset/checkout the target ref when the

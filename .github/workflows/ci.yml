@@ -97,7 +97,13 @@ jobs:
       - run: |
           mkdir -p /tmp/opencode
           git clone --bare https://github.com/BurntSushi/ripgrep /tmp/opencode/ripgrep.git
-      - run: cargo test --workspace --release -- --ignored
+      # kernel_export_spot_check (crates/git/tests/kernel_spot.rs) needs a
+      # multi-GB kernel corpus store at GARDENBED_KERNEL_GB (dev-box fixture,
+      # default /home/user/.corpora/linux-gb) that CI cannot clone; skip it.
+      # A synthetic store would test nothing — the value is the real kernel
+      # corpus shape. Perf budgets and the corpus_ripgrep_* import gates
+      # still run.
+      - run: cargo test --workspace --release -- --ignored --skip kernel_
 
   # ----------------------------------------------------- fuzz smoke (M8)
   fuzz-smoke:
