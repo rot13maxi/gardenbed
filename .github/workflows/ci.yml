@@ -65,6 +65,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The default suite includes the M8 chaos suite (10 RPC classes ×
       # 10 kill/restart cycles, SIGKILL + offline verification).
+      # Dogfood #12/#17 class: bed integration tests spawn binaries from
+      # sibling packages — server_bin()/daemon_bin() locate
+      # target/{debug,release}/gardenbed-{server,daemon} — but plain
+      # `cargo test --workspace` builds test binaries only, not the
+      # gardenbed-daemon bin. Build the bins first so the daemon tests
+      # (and the server staleness guard) have fresh binaries to find.
+      - run: cargo build --workspace --bins
       - run: cargo test --workspace
 
   # ------------------------------------------------- perf budgets (M4/M5)
@@ -80,6 +87,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # The budget tests build real fixtures (10k–1M files) and spawn real
       # processes; they are release-only and assert their budgets.
+      # The git corpus tests (corpus_ripgrep_*) need a local bare mirror of
+      # ripgrep at /tmp/opencode/ripgrep.git (crates/git/tests/corpus.rs
+      # hard-codes the path). It exists on the dev box but not on runners;
+      # the perf job un-ignores them with -- --ignored, so clone the mirror
+      # here — a bare clone of BurntSushi/ripgrep (bounded, tens of MB
+      # packed) rather than skipping the tests and weakening the import
+      # gate.
+      - run: |
+          mkdir -p /tmp/opencode
+          git clone --bare https://github.com/BurntSushi/ripgrep /tmp/opencode/ripgrep.git
       - run: cargo test --workspace --release -- --ignored
 
   # ----------------------------------------------------- fuzz smoke (M8)
