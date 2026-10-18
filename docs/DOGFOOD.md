@@ -83,6 +83,21 @@ every commit records it and reviewers filter by author.
   ways that look like code regressions (real case: `publish_ref_advances` failed
   identically on a rebased tree AND pristine main until `cargo build -p gardenbed-server`
   ran). Rebuild the server package before re-running bed tests after server changes.
+- **#17 — CI harness depends on binaries/fixtures the workflow never produces**:
+  two halves of the same class. (a) The ci.yml test job ran plain
+  `cargo test --workspace`, which builds test binaries but NOT the sibling
+  `gardenbed-daemon` bin target that `crates/bed/tests/common/mod.rs::daemon_bin()`
+  locates in `target/{debug,release}` — 4 bed tests
+  (`daemon_cache_hit_respects_repo_scope`, `token_works_through_daemon`,
+  `daemon_streams_blob_over_4mib`, `daemon_cache_hit_still_requires_token`)
+  panicked with "gardenbed-daemon binary not found" on every run since ab012877
+  landed the daemon crate. Same shape as the deploy-side #17 (p9's package list).
+  Fix: the test job now runs `cargo build --workspace --bins` first.
+  (b) The perf job's `-- --ignored` un-ignores the `corpus_ripgrep_*` git tests,
+  which hard-code a dev-box-only bare mirror at `/tmp/opencode/ripgrep.git`
+  (failing in CI since before the daemon crate landed). Fix: the perf job now
+  clones `git clone --bare https://github.com/BurntSushi/ripgrep` into that path
+  rather than skipping the tests and weakening the import gate.
 
 ## Backlog — product fixes from dogfood findings
 - **#11 product fix**: `export_to_path` should reset/checkout the target ref when the
