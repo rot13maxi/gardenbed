@@ -77,6 +77,7 @@ fn mapped_legacy_nonfirst_parent_and_forged_tree_cache_do_not_grant_certificatio
             &[],
             None,
             None,
+            None,
         )
         .unwrap();
     let invalid = cs(

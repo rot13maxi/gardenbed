@@ -33,7 +33,9 @@ use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
 
+pub mod gc;
 pub mod repos;
+
 /// The build fingerprint: a SHA-256 over `crates/server/src/**` file
 /// contents at build time (`build.rs`). The test harness compares it
 /// against the same digest computed over the *current* sources to catch a
@@ -327,8 +329,91 @@ impl Repo {
         let rows = self
             .engine
             .derived_rows_for_validated_tree(cs_id, cs, root)?;
+        // The last-chance re-check runs inside the commit transaction:
+        // between the `has()` sweep above and this point, a concurrent
+        // force-mode gc may have unlinked a referenced object (it saw it
+        // as an unreferenced orphan at mark time — including a blob this
+        // call just wrote via put_blob, or a derived tree the replay
+        // wrote). Verifying under the write lock is indivisible against
+        // gc's generation-check-plus-unlink step, so either the row
+        // commits only with all referenced objects present, or the
+        // commit fails naming the object and the client retries (the V4b
+        // contract).
+        //
+        // The required set is the blob ids plus the ROOT'S FULL TREE
+        // CLOSURE, not just the root id: the derivation materializes
+        // intermediate tree objects (one per changed directory, plus one
+        // per uncached ancestor replayed), and a multi-chunk sweep can
+        // unlink an intermediate tree in an earlier chunk while the root
+        // survives in a later one — a writer committing between the
+        // chunks would pass a root-only check and land a changeset with
+        // a missing subtree. Walking the closure under the write lock is
+        // the same completeness argument as gc's own mark (round-2
+        // review, P2-1). The walk costs one `get_tree` per distinct
+        // subtree of the new root — bounded by the derivation's own
+        // working set, deduped by the seen set.
+        let required: Vec<Id> = resolved.keys().copied().collect();
+        let objects = &self.objects;
+        let verify = move || {
+            // Blobs: plain existence checks. Never feed a blob id to
+            // get_tree — a blob's file holds its envelope, whose bytes
+            // hash to neither the blob id nor a tree id (get_tree would
+            // misread it as a corrupt tree).
+            for id in &required {
+                if !objects.has(*id)? {
+                    let key = id.to_hex();
+                    return Err(StoreError::Invalid(format!(
+                        "object {key} was collected by a concurrent gc; \
+                         re-upload and retry"
+                    )));
+                }
+            }
+            // The root's tree closure: one get_tree per distinct subtree,
+            // expanded breadth/depth-first with push-time dedup (the same
+            // shape as gc's own mark walk).
+            let mut queue: Vec<Id> = root.into_iter().collect();
+            let mut seen: std::collections::HashSet<Id> = queue.iter().copied().collect();
+            while let Some(id) = queue.pop() {
+                let Some(bytes) = objects.get_tree(id)? else {
+                    let key = id.to_hex();
+                    return Err(StoreError::Invalid(format!(
+                        "tree {key} was collected by a concurrent gc; \
+                         re-upload and retry"
+                    )));
+                };
+                let tree = gardenbed_model::Tree::decode(&bytes)
+                    .map_err(|e| StoreError::Corrupt(format!("tree {id} does not decode: {e}")))?;
+                for entry in &tree.entries {
+                    match entry.kind {
+                        gardenbed_model::TreeKind::File => {
+                            let blob = entry.blob.expect("file entry carries a blob");
+                            // Gitlinks are opaque padded upstream SHAs,
+                            // never object files — exempt, exactly like
+                            // the changes-level filter above.
+                            if entry.mode == gardenbed_model::Mode::Gitlink {
+                                continue;
+                            }
+                            if !objects.has(blob)? {
+                                let key = blob.to_hex();
+                                return Err(StoreError::Invalid(format!(
+                                    "object {key} was collected by a concurrent gc; \
+                                     re-upload and retry"
+                                )));
+                            }
+                        }
+                        gardenbed_model::TreeKind::Dir => {
+                            let child = entry.tree.expect("dir entry carries a tree");
+                            if seen.insert(child) {
+                                queue.push(child);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
         self.metadata
-            .put_validated_changeset(cs, root, &rows, None, None)?;
+            .put_validated_changeset(cs, root, &rows, None, None, Some(&verify))?;
         Ok(cs_id)
     }
 
@@ -1690,8 +1775,10 @@ mod revspec_tests {
             rows: &[gardenbed_store::DerivedRow],
             git: Option<&str>,
             raw: Option<&[u8]>,
+            _verify: Option<&dyn Fn() -> Result<(), StoreError>>,
         ) -> Result<Id, StoreError> {
-            self.inner.put_validated_changeset(cs, root, rows, git, raw)
+            self.inner
+                .put_validated_changeset(cs, root, rows, git, raw, None)
         }
         fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
             self.inner.recent_changesets(limit)

@@ -382,8 +382,16 @@ impl Engine {
                 continue;
             }
             let root = self.validated_tree_for_new(&cs)?;
+            // An EXPLICIT no-op verify (round-2 review, P3): certify
+            // history re-certifies already-committed rows whose objects
+            // the gc mark already sees live (they are reachable from a
+            // certified changeset), so there is nothing to re-check — but
+            // passing the no-op makes that a visible decision at the call
+            // site instead of a silent `None` skip a future caller could
+            // copy without justification.
+            let no_op = || Ok(());
             self.metadata
-                .put_validated_changeset(&cs, root, &[], None, None)?;
+                .put_validated_changeset(&cs, root, &[], None, None, Some(&no_op))?;
         }
         Ok(())
     }

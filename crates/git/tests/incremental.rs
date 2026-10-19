@@ -152,7 +152,7 @@ fn publish_ahead(garden: &std::path::Path, refname: &str, parent: Id) -> Id {
         .derived_rows_for_validated_tree(cs_id, &cs, root)
         .expect("derived rows");
     metadata
-        .put_validated_changeset(&cs, root, &rows, None, None)
+        .put_validated_changeset(&cs, root, &rows, None, None, None)
         .expect("put changeset");
     let won = metadata.cas_ref(refname, Some(parent), cs_id).expect("cas");
     assert!(matches!(won, gardenbed_store::RefCas::Won { .. }));

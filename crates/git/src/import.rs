@@ -36,7 +36,7 @@ use sha2::Sha256;
 
 use gardenbed_derive::Engine;
 use gardenbed_model::{Change, Changeset, Id, Mode, Op};
-use gardenbed_store::{MetadataStore, ObjectStore};
+use gardenbed_store::{MetadataStore, ObjectStore, StoreError};
 
 use crate::counting::CountingObjects;
 use crate::difftree::{DIFF_BATCH, DiffRecord, DiffStatus, run_batch};
@@ -221,7 +221,97 @@ pub fn import_from_path(
             }
             let root = engine.validated_tree_for_new(&cs)?;
             let rows = engine.derived_rows_for_validated_tree(cs_id, &cs, root)?;
-            metadata.put_validated_changeset(&cs, root, &rows, Some(&sha_hex), raw_capture)?;
+            // Same last-chance re-check as the server's CreateChangeset:
+            // the import holds repo.lock only shared, so a --force gc can
+            // sweep concurrently and unlink a mirrored blob between the
+            // mirror above and this row's commit. The in-transaction
+            // verify is indivisible against gc's write lock, so the row
+            // either lands with its objects present or the import errors
+            // and the next import re-mirrors it (imports are resumable).
+            // Gitlink ids are padded upstream SHAs, never objects files,
+            // so they are exempt.
+            //
+            // The required set is the blob ids plus the root's full tree
+            // closure (round-2 review, P2-1): the replay materializes
+            // intermediate tree objects, and a multi-chunk sweep could
+            // unlink one in an earlier chunk while the root survives in a
+            // later one, leaving the committed changeset with a missing
+            // subtree. Same walk as the server's verify, over the
+            // counting wrapper (plain has()/get_tree() passthrough).
+            let referenced: Vec<Id> = cs
+                .changes
+                .iter()
+                .filter(|c| c.mode != Mode::Gitlink)
+                .filter_map(|c| c.blob)
+                .collect();
+            let verify_objects = counting.clone();
+            let verify = move || {
+                // Blobs: plain existence checks (a blob id must never
+                // reach get_tree — its envelope bytes do not hash to a
+                // tree id, so get_tree would misread it as corrupt).
+                for blob in &referenced {
+                    if !verify_objects.has(*blob)? {
+                        let key = blob.to_hex();
+                        return Err(StoreError::Invalid(format!(
+                            "object {key} was collected by a concurrent gc; \
+                             the next import re-mirrors it"
+                        )));
+                    }
+                }
+                // The root's tree closure (P2-1): every intermediate
+                // tree is verified present under the write lock, so a
+                // multi-chunk sweep cannot leave a committed changeset
+                // with a missing subtree.
+                let mut queue: Vec<Id> = root.into_iter().collect();
+                let mut seen: HashSet<Id> = queue.iter().copied().collect();
+                while let Some(id) = queue.pop() {
+                    let Some(bytes) = verify_objects.get_tree(id)? else {
+                        let key = id.to_hex();
+                        return Err(StoreError::Invalid(format!(
+                            "tree {key} was collected by a concurrent gc; \
+                             the next import re-mirrors it"
+                        )));
+                    };
+                    let tree = gardenbed_model::Tree::decode(&bytes).map_err(|e| {
+                        StoreError::Corrupt(format!("tree {id} does not decode: {e}"))
+                    })?;
+                    for entry in &tree.entries {
+                        match entry.kind {
+                            gardenbed_model::TreeKind::File => {
+                                let blob = entry.blob.expect("file entry carries a blob");
+                                // Gitlinks are opaque padded upstream
+                                // SHAs, never object files — exempt,
+                                // exactly like the changes-level filter.
+                                if entry.mode == Mode::Gitlink {
+                                    continue;
+                                }
+                                if !verify_objects.has(blob)? {
+                                    let key = blob.to_hex();
+                                    return Err(StoreError::Invalid(format!(
+                                        "object {key} was collected by a concurrent gc; \
+                                         the next import re-mirrors it"
+                                    )));
+                                }
+                            }
+                            gardenbed_model::TreeKind::Dir => {
+                                let child = entry.tree.expect("dir entry carries a tree");
+                                if seen.insert(child) {
+                                    queue.push(child);
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            };
+            metadata.put_validated_changeset(
+                &cs,
+                root,
+                &rows,
+                Some(&sha_hex),
+                raw_capture,
+                Some(&verify),
+            )?;
             arena.nodes[*idx as usize].cs = Some(cs_id);
             report.commits_new += 1;
             if report.commits_new % 25_000 == 0 {

@@ -630,6 +630,37 @@ gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed \
 `demo/run-v0.1.sh` runs the same import against the deterministic demo
 corpus (`$CORPUS` → `$SERVER_ROOT`).
 
+### gardenbed-server gc
+
+```text
+Usage: gardenbed-server gc [OPTIONS] --root <ROOT>
+```
+
+Garbage-collects unreachable objects (v0.2.md §7): a mark over the
+metadata (refs, every stored changeset row, certificates, derived trees —
+closed over parents, blob refs, and tree payloads), then one sweep of the
+object shards unlinking what is unreachable and older than `--min-age`.
+Stale `.tmp-*` staging files are reaped under the same gate.
+
+| flag | meaning |
+|---|---|
+| `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
+| `--dry-run` | report what would be collected; delete nothing |
+| `--force` | run live without the exclusive lock (the sweep unlinks under the metadata write lock and aborts if an ingest lands mid-run) |
+| `--min-age <SECONDS>` | minimum age of collectible objects, default 86400 (24 h) |
+
+```sh
+gardenbed-server gc --root /tmp/gardenbed-repo
+# gc: 812 object(s) scanned, 800 live, 4 blob(s) and 8 tree(s) deleted, \
+# 1 tmp file(s) reaped, 262144 byte(s) reclaimed [mark 0.012s, sweep 0.004s]
+```
+
+Offline by default: the server holds a shared `flock` on
+`<root>/repo.lock` (serve's root mode holds one per open repository
+handle, so repositories created after startup are covered too), and gc
+wants it exclusive — running gc against a live server fails with exit
+code 1 and the message to stop the server or pass `--force`.
+
 ### gardenbed-server export
 
 ```text

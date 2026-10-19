@@ -481,7 +481,74 @@ Unrelated histories (no merge base) fail naming the operation.
   checksum sweep + `integrity_check` + derived rebuild determinism —
   docs/release-0.1.md). The object store checksum sweep deliberately skips
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
-  unpublished, unreadable, and reaped by the next rename into that shard.
+  unpublished and unreadable; the GC's tmp reaper (§10.5) deletes those
+  past `--min-age`.
+
+## 10.5. Object-store lifecycle (M13)
+
+`gardenbed-server gc` reclaims unreachable object files and stale
+`.tmp-*` staging files. **Mark**: a pure function of SQLite state — every
+ref tip, every stored changeset row (D14: rows and git-mapping rows are
+never collected in v0.2, so each row's blob references stay live), every
+certificate root tree, every `derived(kind='tree')` id, closed over
+parents, non-gitlink blob refs, and tree payloads. The live set
+materializes into a SQLite temp table (`gc_live`) on a dedicated
+connection, so RSS stays bounded at ten-million-object scale.
+
+**Sweep**: one walk over the 256 shard directories collects size, mtime,
+and a one-byte magic per file; a file is deletable when the mark proves
+it unreachable *and* its mtime is older than `--min-age` (default 24 h —
+the young-orphan grace). `.tmp-*` files are reaped under the same
+min-age gate. Deletion is a plain `unlink`: each is independent, so
+SIGKILL at any point leaves a sound store and the next gc converges
+(force mode wraps its unlinks in metadata transactions — see
+Locking below). `--dry-run` reports without deleting. `put_blob` refreshes
+the mtime of an already-stored identical blob, so a
+re-uploaded-but-not-yet-referenced blob restarts its grace period.
+
+**Locking**: `serve` and `import` hold a shared `flock` on
+`<root>/repo.lock` for their duration; root-mode `serve` additionally
+acquires the same shared lock per repository handle in `open_handle`
+(covering repositories created *after* startup — a single Log/PutBlob
+request opens the handle and holds the lock until LRU eviction drops
+it). `gc` takes the lock exclusive (non-blocking) — the default stance
+is offline-first, so gc against a running server or import fails with
+an actionable message. `--force` skips the lock and runs live under a
+two-sided transactional handshake on the metadata write lock (the
+`BEGIN IMMEDIATE` lock every changeset commit already takes):
+
+* **gc side**: the sweep unlinks in chunks, and each chunk's ingest
+  watermark re-check (changeset + ref row counts — a changeset that
+  landed after the mark may reference an object the mark classified as
+  an orphan, since `CreateChangeset` accepts blobs already on disk
+  without refreshing their mtime) happens *inside* the same
+  `BEGIN IMMEDIATE` transaction as that chunk's unlinks. A row cannot
+  land in the check→unlink gap: it either committed before the chunk
+  (the check sees it; the chunk is never entered and gc aborts with
+  zero unlinks after the abort point) or it waits on the lock and the
+  next chunk's check sees it.
+* **writer side**: `CreateChangeset` (and git import) re-verify, inside
+  the commit transaction under the same write lock, that every
+  referenced blob *and every tree in the new root's closure* is still
+  present — one `get_tree` per distinct subtree of the new root (the
+  derivation may reuse existing tree ids without refreshing their
+  mtime — e.g. a deterministic replay of an already-derived changeset
+  re-links the same orphaned subtrees — so a root-only check could
+  bless a changeset whose intermediate trees a multi-chunk sweep had
+  already unlinked). Gitlink entries are exempt (padded upstream SHAs,
+  never object files). If gc unlinked first, the commit fails naming
+  the missing object and the client re-uploads and retries; if the row
+  commits first, gc's in-transaction check sees the ingest and aborts.
+  Either order leaves the invariant standing: an acknowledged changeset
+  always has its full closure on disk.
+
+Unlinks before an abort stand (each was dead at a watermark that was
+still clean, committed chunk by chunk); the rest stay for the next run,
+and the report counts only the chunks that actually committed.
+`flock` has no FIFO fairness, so sustained short-lived shared holders
+could starve a single exclusive attempt; the gc CLI retries with
+exponential backoff for up to 60 s before failing with the actionable
+message.
 
 ## 11. Horizontal scale-out
 

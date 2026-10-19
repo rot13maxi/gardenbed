@@ -8,6 +8,9 @@ license.workspace = true
 gardenbed-model.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+# The fs store's mtime refresh on identical re-upload (gc young-orphan
+# grace) uses utimensat via rustix.
+rustix = { version = "1", features = ["fs"] }
 thiserror = "2"
 zstd = "0.13"
 

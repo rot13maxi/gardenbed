@@ -25,6 +25,9 @@ gardenbed-derive = { path = "../derive" }
 gardenbed-git = { path = "../git" }
 gardenbed-protocol = { path = "../protocol" }
 log = "0.4"
+# The gc mark walks metadata sqlite directly (read-only, and read-write
+# for the in-transaction unlink sweep).
+rusqlite = { version = "0.32", features = ["bundled"] }
 prost = "0.14"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
