@@ -111,6 +111,41 @@ every commit records it and reviewers filter by author.
   Fix: the perf job adds `--skip fastcdc_table_child_entry`; the parent
   (the real coverage) runs in the regular test job.
 
+## Dogfood findings continued (2026-10-18/19; reconstructed after /tmp loss)
+- **#13 — Protocol skew across server/client generations**: an OLD server binary
+  (pre-`fd29b3d`, when `PublishReq` gained `ref`/`force`) plus a NEW `bed` makes
+  `bed publish --ref <lane>` silently publish to `refs/heads/main`: proto3 unknown-field
+  skipping means the old server drops the new field. Upgrade note: restart servers
+  before using `--ref`. (Fixed-side tests: ref-row pins landed 2026-10-17.)
+- **#14 — v02-export findings (M17/M18)**: full-corpus kernel export needs ~6 GB RSS +
+  40 GB disk (OOM-killed 4× on the shared box; retry with a free-memory guard);
+  limit-slice boundary export refusal is by design (verified live); tmpfs import 907 c/s
+  vs disk 7 c/s; import prints its report line ONLY on success — a missing line means
+  failure, and piping import/export through exit-swallowing filters (tail, &&-chains)
+  loses failures silently.
+- **#15 — Landing gates and main-red policy**: p5's multi-repo landing shipped 6 red
+  test sites (write_path:1354; read_path:772/919/999; switch_prune ×2 — all the
+  'default vs garden' repository-name signature). Rules: (1) landing gates MUST include
+  `cargo test -p gardenbed` whenever the span touches `crates/bed` sources;
+  (1b) full-suite gates run `--no-fail-fast` (fail-fast masked 3 of 4 reds);
+  (2) main-level reds are fixed ON MAIN by the lane that finds them (or the coordinator
+  as fix-secretary) — never carried by the next lander.
+- **#16 — Test-infra: await_counters poll cap saturates under heavy I/O**: bed
+  resumability suite flaked once under a ~500 GB kernel-corpus read storm (box in
+  D-state); two reruns green under same load. Raise poll caps or serialize heavy
+  fixtures if CI runs concurrent heavy suites. (Companion: the 9418 outage in the same
+  window shared the machine-load root; watchdog restarted, no data affected.)
+- **#17 (deploy half) — Deploy package lists must be workspace-wide**: the scion-gaps
+  landing added `gardenbed-daemon`, which the enumerated deploy list
+  (`-p gardenbed -p gardenbed-server -p gardenbed-web`) missed — first canary RED
+  (14 bed failures, binary-not-found). Redeploy now builds `--workspace --bins`.
+- **#18 — Near-miss: landing infrastructure under /tmp is cleanup-vulnerable**:
+  `/tmp/bed-land` was deleted by /tmp cleanup MID-CHAIN (CI-repair landing); only the
+  completed server-side import saved it. Landing checkout now lives at
+  `/home/user/bed-land` (stable path). Rule: chain infrastructure lives outside /tmp.
+  (This registry's /tmp working copy was lost in the same cleanup — durable home is
+  this file; entries #13–#18 reconstructed 2026-10-19.)
+
 ## Backlog — product fixes from dogfood findings
 - **#11 product fix**: `export_to_path` should reset/checkout the target ref when the
   destination is a non-bare repo (or refuse/warn on non-bare targets). Owner: unassigned.
