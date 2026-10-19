@@ -1,4 +1,4 @@
-# gardenbed architecture — v0.1 + the v0.2 wave
+# gardenbed architecture — v0.1
 
 Gardenbed has a central repository server, a sparse working-copy client,
 and an MCP service. The server stores immutable content-addressed objects
@@ -30,8 +30,7 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 
 `crates/protocol/proto/gardenbed.proto` — with
 [docs/canonical-encoding.md](canonical-encoding.md), it *is* the published
-protocol (D4). The tonic service `Gardenbed` exposes 18 RPCs (v0.1's 17
-plus `Merge`); every
+protocol (D4). The tonic service `Gardenbed` exposes 17 RPCs; every
 request carries `repo` — the field selects the repository it applies to
 (wire format from day one, v0.1.md §1; load-bearing since multi-repo
 serving, v0.2.md §5).
@@ -42,7 +41,7 @@ serving, v0.2.md §5).
 | changesets | `GetChangeset`, `PutBlob` (client-stream), `CreateChangeset` | blob bytes move **only** through `PutBlob` (> 1 MiB, header frame first) or `CreateChangeset.inline_blobs` (≤ 1 MiB) |
 | graph + queries | `MergeBase`, `IsAncestor`, `Diff` (stream), `Log` (stream), `Blame` (stream) | blob content never rides on Diff/Log |
 | refs | `ListRefs`, `GetRef`, `CasRef` | `GetRef` doubles as the shared revspec resolver (see §2) |
-| write ops | `Rebase`, `Publish`, `Merge` | server-side replay, fast-forward CAS, two-parent merge (§9) |
+| write ops | `Rebase`, `Publish` | server-side replay and fast-forward CAS |
 | debug | `GetStats` | per-repo request counters (e.g. the zero-duplicate-fetch proofs) |
 
 Wire conventions mirrored from the canonical encoding: `Op`/`Mode`
@@ -181,13 +180,11 @@ identical state (verified in M6 and re-verified after every chaos kill).
 
 ## 4. Object storage
 
-Under the server root, each repository's object store lives at
-`<root>/<repo>/objects` (a legacy v0.1 root: `<root>/objects`, serving as
-`default`), and
+Under the server root, the object store lives at `<root>/objects`, and
 `FsObjectStore` shards it two levels deep:
 
 ```text
-<root>/<repo>/objects/<2 hex>/<62 hex>
+<root>/objects/<2 hex>/<62 hex>
 ```
 
 - **Blobs** are stored under `SHA-256(raw content)` in one of two
@@ -255,14 +252,6 @@ All local state lives under `--state-dir` (default `./.bed`):
   content budget; heavier blobs and overflow stream via `PutBlob` first.
   A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
-- **Offline commit queue** (v0.2 M15): when the server is unreachable at
-  connect time, `bed commit` completes locally — the changeset is built and
-  content-addressed from the model, changed blobs are staged into
-  `.bed/objects`, and `pending`/`pending_files` rows in `index.sqlite3`
-  record what `bed sync` later replays oldest-first as an idempotent
-  re-upload of content-addressed facts (v0.2.md §6). `switch`, `rebase`,
-  and `publish` refuse while the queue is non-empty; `status` prints the
-  pending count.
 - **Status** uses mtime/size as hints and hashes only suspects;
   `--full-scan` forces the correctness path. Untracked discovery honors
   `.gitignore` files read from the working copy (root plus one per walked
@@ -415,7 +404,7 @@ bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
   `.bed/objects`, write-through after each upstream fetch) —
   cross-working-copy dedup falls out of content addressing.
 - **Write RPCs are peer-uid-gated**: `SO_PEERCRED` is checked before
-  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`/`Merge`; any uid other
+  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`; any uid other
   than the daemon's owner is refused.
 - **Sidecar**: `Ping`, and `Register(state_dir) → generation counter` —
   a recursive watch on the working-copy root (excluding `.bed` and
@@ -492,7 +481,81 @@ Unrelated histories (no merge base) fail naming the operation.
   checksum sweep + `integrity_check` + derived rebuild determinism —
   docs/release-0.1.md). The object store checksum sweep deliberately skips
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
-  unpublished, unreadable, and reaped by the next rename into that shard.
+  unpublished and unreadable; the GC's tmp reaper (§10.5) deletes those
+  past `--min-age`.
+
+## 10.5. Object-store lifecycle (M13)
+
+`gardenbed-server gc` reclaims unreachable object files and stale
+`.tmp-*` staging files. **Mark**: a pure function of SQLite state — every
+ref tip, every stored changeset row (D14: rows and git-mapping rows are
+never collected in v0.2, so each row's blob references stay live), every
+certificate root tree, every `derived(kind='tree')` id, closed over
+parents, non-gitlink blob refs, and tree payloads. The live set
+materializes into a SQLite temp table (`gc_live`) on a dedicated
+connection, so RSS stays bounded at ten-million-object scale.
+
+**Sweep**: one walk over the 256 shard directories collects size, mtime,
+and a one-byte magic per file; a file is deletable when the mark proves
+it unreachable *and* its mtime is older than `--min-age` (default 24 h —
+the young-orphan grace). `.tmp-*` files are reaped under the same
+min-age gate. Deletion is a plain `unlink`: each is independent, so
+SIGKILL at any point leaves a sound store and the next gc converges
+(force mode wraps its unlinks in metadata transactions — see
+Locking below). `--dry-run` reports without deleting. `put_blob` refreshes
+the mtime of an already-stored identical blob, so a
+re-uploaded-but-not-yet-referenced blob restarts its grace period.
+
+**Locking**: `serve` and `import` hold a shared `flock` on
+`<root>/repo.lock` for their duration; root-mode `serve` additionally
+acquires the same shared lock per repository handle in `open_handle`
+(covering repositories created *after* startup — a single Log/PutBlob
+request opens the handle and holds the lock until LRU eviction drops
+it). `gc` takes the lock exclusive (non-blocking) — the default stance
+is offline-first, so gc against a running server or import fails with
+an actionable message. `--force` skips the lock and runs live under a
+two-sided transactional handshake on the metadata write lock (the
+`BEGIN IMMEDIATE` lock every changeset commit already takes):
+
+* **gc side**: the sweep unlinks in chunks, and each chunk's ingest
+  watermark re-check (changeset + ref row counts — a changeset that
+  landed after the mark may reference an object the mark classified as
+  an orphan, since `CreateChangeset` accepts blobs already on disk
+  without refreshing their mtime) happens *inside* the same
+  `BEGIN IMMEDIATE` transaction as that chunk's unlinks. A row cannot
+  land in the check→unlink gap: it either committed before the chunk
+  (the check sees it; the chunk is never entered and gc aborts with
+  zero unlinks after the abort point) or it waits on the lock and the
+  next chunk's check sees it.
+* **writer side**: `CreateChangeset` (and git import) re-verify, inside
+  the commit transaction under the same write lock, that every
+  referenced blob *and every tree the derivation stored* — its write
+  set, idempotent re-puts included — is still present, with plain
+  existence checks (no decoding; blobs and trees share one path shape
+  per content hash). The write set is the complete race surface: a
+  tree in the new root's closure that the derivation did not store is
+  an untouched subtree of an already-certified row, and the mark
+  closes over every row's tree payloads, so gc never sees it as an
+  orphan. The deterministic-replay shape stays covered — the replay
+  re-put exactly those subtrees (`put_tree` is idempotent and does not
+  refresh mtime, so a root-only check could still bless a changeset
+  whose intermediates a multi-chunk sweep had unlinked); the write set
+  names those intermediates. Verifying it keeps the check O(touched
+  directories), so commit latency stays independent of repository
+  size. Gitlink entries are exempt at the changes level (padded
+  upstream SHAs, never object files). If gc unlinked first, the commit
+  fails naming the missing object and the client re-uploads and
+  retries; if the row commits first, gc's in-transaction check sees
+  the ingest and aborts. Either order leaves the invariant standing:
+  an acknowledged changeset always has its full closure on disk.
+
+Unlinks before an abort stand (each was dead at a watermark that was
+still clean, committed chunk by chunk); the rest stay for the next run,
+and the report counts only the chunks that actually committed.
+`flock` has no FIFO fairness, so sustained short-lived shared holders
+could starve a single exclusive attempt; the gc CLI retries with
+exponential backoff for up to 60 s before failing with the actionable
+message.
 
 ## 11. Horizontal scale-out
 
@@ -543,5 +606,3 @@ decisions, schema, error semantics — is
 | import mechanics (gitoxide, diff-tree, renames) | v0.1.md D6/D8 |
 | divergences from git | divergences.md (§10.2: zero *silent* divergences) |
 | scale-out backends + deployment | scale-out-design.md (D1–D7) |
-| v0.2 scope + decisions (merge, multi-repo, chunking, daemon, offline queue, GC) | v0.2.md |
-| daemon lifecycle, socket, cache, sidecar | daemon.md |

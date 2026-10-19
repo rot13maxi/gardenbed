@@ -336,6 +336,21 @@ impl Engine {
     /// with `MetadataStore::put_validated_changeset` after derived rows are
     /// prepared with `derived_rows_for_validated_tree`.
     pub fn validated_tree_for_new(&self, cs: &Changeset) -> Result<Option<Id>, StoreError> {
+        Ok(self.validated_tree_for_new_with_writes(cs)?.0)
+    }
+
+    /// [`validated_tree_for_new`] plus the derivation's write set (every
+    /// tree id the replay stored, idempotent re-puts included). The commit
+    /// handshake re-verifies exactly this set under the write transaction:
+    /// objects the derivation did not touch are reachable from already
+    /// certified rows, which the gc mark never collects (V1: mark ==
+    /// brute-force closure; D14: rows are never collected), so the write
+    /// set is the complete race surface — at O(touched directories), not
+    /// O(repository size).
+    pub fn validated_tree_for_new_with_writes(
+        &self,
+        cs: &Changeset,
+    ) -> Result<(Option<Id>, Vec<Id>), StoreError> {
         gardenbed_model::codec::validate_changeset(cs, true).map_err(codec_err)?;
         let mut base = None;
         for (index, parent) in cs.parents.iter().enumerate() {
@@ -357,7 +372,7 @@ impl Engine {
                 )));
             }
         }
-        self.apply_changeset_to_tree(base, cs)
+        apply::apply_changeset_with_writes(&*self.objects, base, cs)
     }
 
     /// Validate legacy history bottom-up until durable v1 certificates form
@@ -382,8 +397,16 @@ impl Engine {
                 continue;
             }
             let root = self.validated_tree_for_new(&cs)?;
+            // An EXPLICIT no-op verify (round-2 review, P3): certify
+            // history re-certifies already-committed rows whose objects
+            // the gc mark already sees live (they are reachable from a
+            // certified changeset), so there is nothing to re-check — but
+            // passing the no-op makes that a visible decision at the call
+            // site instead of a silent `None` skip a future caller could
+            // copy without justification.
+            let no_op = || Ok(());
             self.metadata
-                .put_validated_changeset(&cs, root, &[], None, None)?;
+                .put_validated_changeset(&cs, root, &[], None, None, Some(&no_op))?;
         }
         Ok(())
     }

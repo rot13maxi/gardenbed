@@ -187,6 +187,16 @@ pub trait MetadataStore: Send + Sync {
     /// `None` stores no raw row (a previously captured row is kept —
     /// re-certification is idempotent, and dropping bytes on a re-put would
     /// silently regress fidelity).
+    ///
+    /// `verify` runs inside the store's write transaction, immediately
+    /// before the rows land: it is the changeset's last-chance object
+    /// re-check, and running it under the write lock makes it indivisible
+    /// against a concurrent gc sweep (which holds the same lock for its
+    /// generation-check-plus-unlink step). Production callers pass `Some`
+    /// (the gc handshake); `None` skips the check and is reserved for
+    /// test shims — a justified no-op (e.g. re-certifying already-live
+    /// rows) passes an explicit `Some(&|| Ok(()))` so the decision is
+    /// visible at the call site (round-2 review, P3).
     fn put_validated_changeset(
         &self,
         _cs: &Changeset,
@@ -194,6 +204,7 @@ pub trait MetadataStore: Send + Sync {
         _derived: &[DerivedRow],
         _git_sha_hex: Option<&str>,
         _raw_commit: Option<&[u8]>,
+        _verify: Option<&dyn Fn() -> Result<(), StoreError>>,
     ) -> Result<Id, StoreError> {
         Err(StoreError::Db(
             "validation certificates are unsupported by this metadata store".into(),

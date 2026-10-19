@@ -1,9 +1,9 @@
 # gardenbed CLI reference
 
-Generated from the real `--help` output of the current binaries
-(`bed`, `gardenbed-server`, `gardenbed-daemon`, `gardenbed-mcp`); every
-example is a verified invocation from `demo/run-v0.1.sh`,
-[docs/quickstart.md](quickstart.md), or the recorded demo run.
+Generated from the real `--help` output of the v0.1.0 binaries (`bed`,
+`gardenbed-server`, `gardenbed-mcp`); every example is a verified
+invocation from `demo/run-v0.1.sh`, [docs/quickstart.md](quickstart.md),
+or the recorded demo run.
 
 ## Conventions
 
@@ -53,7 +53,6 @@ Usage: bed [OPTIONS] <COMMAND>
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
 | `merge` | merge a changeset or ref into the current changeset (server-side two-parent merge) |
 | `publish` | fast-forward a ref (default `main`) to the current changeset |
-| `sync` | upload queued offline commits to the server |
 | `mount` | mount the current changeset as a read-only FUSE filesystem |
 | `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
@@ -631,6 +630,37 @@ gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed \
 `demo/run-v0.1.sh` runs the same import against the deterministic demo
 corpus (`$CORPUS` → `$SERVER_ROOT`).
 
+### gardenbed-server gc
+
+```text
+Usage: gardenbed-server gc [OPTIONS] --root <ROOT>
+```
+
+Garbage-collects unreachable objects (v0.2.md §7): a mark over the
+metadata (refs, every stored changeset row, certificates, derived trees —
+closed over parents, blob refs, and tree payloads), then one sweep of the
+object shards unlinking what is unreachable and older than `--min-age`.
+Stale `.tmp-*` staging files are reaped under the same gate.
+
+| flag | meaning |
+|---|---|
+| `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
+| `--dry-run` | report what would be collected; delete nothing |
+| `--force` | run live without the exclusive lock (the sweep unlinks under the metadata write lock and aborts if an ingest lands mid-run) |
+| `--min-age <SECONDS>` | minimum age of collectible objects, default 86400 (24 h) |
+
+```sh
+gardenbed-server gc --root /tmp/gardenbed-repo
+# gc: 812 object(s) scanned, 800 live, 4 blob(s) and 8 tree(s) deleted, \
+# 1 tmp file(s) reaped, 262144 byte(s) reclaimed [mark 0.012s, sweep 0.004s]
+```
+
+Offline by default: the server holds a shared `flock` on
+`<root>/repo.lock` (serve's root mode holds one per open repository
+handle, so repositories created after startup are covered too), and gc
+wants it exclusive — running gc against a live server fails with exit
+code 1 and the message to stop the server or pass `--force`.
+
 ### gardenbed-server export
 
 ```text
@@ -658,37 +688,6 @@ gardenbed-server export --root /tmp/gardenbed --repo myrepo --into /tmp/export.g
 # 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
 git -C /tmp/export.git fsck --strict   # clean
 ```
-
-## gardenbed-daemon
-
-```text
-gardenbed local daemon (shared cache + watchers)
-
-Usage: gardenbed-daemon <COMMAND>
-```
-
-One subcommand, `serve`. Full lifecycle, socket and cache rules, and the
-sidecar contract: [docs/daemon.md](daemon.md).
-
-```text
-Usage: gardenbed-daemon serve [OPTIONS] --upstream <UPSTREAM>
-```
-
-| flag | meaning |
-|---|---|
-| `--upstream <UPSTREAM>` (required) | the upstream gardenbed server endpoint (`http://host:port`); every forwarded RPC goes there, `repo` fields ride untouched |
-| `--socket <SOCKET>` | override the socket path (default: `$XDG_RUNTIME_DIR/gardenbed/daemon.sock`; honors `GARDENBED_DAEMON` the same way `bed` does) |
-| `--cache <CACHE>` | override the shared object cache root (default: `$XDG_CACHE_HOME/gardenbed`) |
-
-```sh
-gardenbed-daemon serve --upstream http://127.0.0.1:9418
-# listening on /run/user/1000/gardenbed/daemon.sock
-```
-
-`bed` probes the socket daemon-first and falls back to the embedded
-endpoint when the daemon is absent or dead (fetch RPCs retry once on
-daemon death; writes never blindly retried) —
-[docs/architecture.md](architecture.md) §8.5.
 
 ## gardenbed-mcp
 

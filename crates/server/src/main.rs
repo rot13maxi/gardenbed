@@ -186,6 +186,24 @@ enum Command {
         #[arg(long)]
         into: String,
     },
+    /// Garbage-collect unreachable objects (v0.2.md §7).
+    Gc {
+        /// Gardenbed repository directory (holds `objects/` and
+        /// `metadata.sqlite3`).
+        #[arg(long)]
+        root: PathBuf,
+        /// Report what would be collected; delete nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Run live (no exclusive lock); the sweep aborts if an ingest
+        /// lands mid-sweep. Default is offline: fail if the server (or
+        /// another gc) holds the lock.
+        #[arg(long)]
+        force: bool,
+        /// Minimum age (seconds) of collectible objects; default 86400.
+        #[arg(long)]
+        min_age: Option<u64>,
+    },
 }
 
 #[tokio::main]
@@ -320,6 +338,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Ok(())
         }
+        Some(Command::Gc {
+            root,
+            dry_run,
+            force,
+            min_age,
+        }) => {
+            let code = run_gc(&root, dry_run, force, min_age);
+            if code != 0 {
+                std::process::exit(code);
+            }
+            Ok(())
+        }
         None => serve(args.addr, args.root, args.storage, args.max_repos, None).await,
     }
 }
@@ -431,6 +461,13 @@ fn run_import(
         gardenbed_server::repos::RepoSet::new(root, gardenbed_server::repos::DEFAULT_MAX_REPOS);
     let dir = set.repo_dir_for(name)?;
     Repo::validate_layout(&dir)?;
+    // An import mutates the object store and metadata in the same way a
+    // running server does. Hold the shared repo.lock for its duration so
+    // an offline gc cannot interleave: gc's exclusive (non-blocking)
+    // acquisition refuses to start while this import runs, and this
+    // import refuses to start while gc holds the lock — the same
+    // contract serve already honors.
+    let _lock = gardenbed_server::gc::lock_shared_blocking(&dir)?;
     let objects = Arc::new(FsObjectStore::open(&dir)?);
     let metadata = Arc::new(SqliteMetadataStore::open(&dir.join("metadata.sqlite3"))?);
     let engine = gardenbed_derive::Engine::new(objects.clone(), metadata.clone());
@@ -481,6 +518,69 @@ fn run_move(root: &Path, from: &str, into: &str) -> Result<(), Box<dyn std::erro
         to_dir.display()
     );
     Ok(())
+}
+
+/// One-shot garbage collection over the repository under `root`.
+/// Exit code 0 on success (including an aborted --force sweep), 1 on
+/// lock contention, 2 on usage/IO errors.
+fn run_gc(root: &Path, dry_run: bool, force: bool, min_age: Option<u64>) -> i32 {
+    use gardenbed_server::gc;
+
+    let opts = gc::Options {
+        dry_run,
+        force,
+        min_age: std::time::Duration::from_secs(min_age.unwrap_or(86_400)),
+    };
+    if dry_run || force {
+        // Dry run never mutates, force runs live by design: no lock.
+        return match gc::run(root, opts, None) {
+            Ok(report) => {
+                println!("{report}");
+                0
+            }
+            Err(e) => {
+                eprintln!("error: gc failed: {e}");
+                1
+            }
+        };
+    }
+    // Offline mode: exclusive lock, non-blocking, with a bounded backoff.
+    // Linux flock has no FIFO fairness, so steady short-lived serve churn
+    // (each import now holds the shared lock too) could starve a single
+    // non-blocking attempt forever. Retry with exponential backoff up to
+    // a total of ~60s, then fail with the actionable message.
+    let mut backoff = std::time::Duration::from_millis(100);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let lock = loop {
+        match gc::lock_exclusive(root) {
+            Ok(lock) => break lock,
+            Err(gc::LockError::Held) => {
+                if std::time::Instant::now() + backoff >= deadline {
+                    eprintln!(
+                        "error: repository is in use (repo.lock is held); stop the server \
+                         or run with --force for live gc"
+                    );
+                    return 1;
+                }
+                std::thread::sleep(backoff);
+                backoff *= 2;
+            }
+            Err(e) => {
+                eprintln!("error: cannot lock {}: {e}", root.display());
+                return 1;
+            }
+        }
+    };
+    match gc::run(root, opts, Some(&lock)) {
+        Ok(report) => {
+            println!("{report}");
+            0
+        }
+        Err(e) => {
+            eprintln!("error: gc failed: {e}");
+            1
+        }
+    }
 }
 
 /// One-shot scaled-mode import (`--storage`): the repository named by the
@@ -620,10 +720,10 @@ async fn serve(
             None
         }
     };
-    let set: Arc<gardenbed_server::repos::RepoSet> = match selection {
+    let set: Arc<gardenbed_server::repos::RepoSet> = match &selection {
         StorageSelection::Root(root) => {
-            let set = Arc::new(gardenbed_server::repos::RepoSet::new(&root, max_repos));
-            if gardenbed_server::repos::RepoSet::is_legacy_root(&root) {
+            let set = Arc::new(gardenbed_server::repos::RepoSet::new(root, max_repos));
+            if gardenbed_server::repos::RepoSet::is_legacy_root(root) {
                 log::info!(
                     "v0.1 root detected: serving {} as repository `default`",
                     root.display()
@@ -644,7 +744,7 @@ async fn serve(
         StorageSelection::Config(path) => {
             // Scaled mode: one repository over off-box stores; the request's
             // `repo` name is a label (per-name counters), not a directory.
-            let (objects, metadata) = gardenbed_store::StorageConfig::from_path(&path)?.open()?;
+            let (objects, metadata) = gardenbed_store::StorageConfig::from_path(path)?.open()?;
             let repo = Arc::new(Repo::open_stores(objects, metadata));
             log::info!(
                 "repository opened storage={:?} (single mode; any valid repo name serves)",
@@ -652,6 +752,27 @@ async fn serve(
             );
             Arc::new(gardenbed_server::repos::RepoSet::single(repo))
         }
+    };
+
+    // Shared hold on each served repository's repo.lock for the whole
+    // serving lifetime: a GC's exclusive (offline) lock can then never be
+    // taken while the server runs (v0.2.md §7). Blocking acquire: a GC in
+    // flight is finite. Scaled mode has no root directory to lock.
+    let _repo_locks = match &selection {
+        StorageSelection::Root(_) => {
+            let mut locks = Vec::new();
+            for name in set.served_names() {
+                let dir = set.repo_dir(&name);
+                locks.push(
+                    gardenbed_server::gc::lock_shared_blocking(&dir).map_err(|e| {
+                        eprintln!("error: cannot lock {} (repo.lock): {e}", dir.display());
+                        e
+                    })?,
+                );
+            }
+            locks
+        }
+        StorageSelection::Config(_) => Vec::new(),
     };
 
     let addr: SocketAddr = addr_arg

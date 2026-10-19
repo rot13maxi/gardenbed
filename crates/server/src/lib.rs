@@ -33,7 +33,9 @@ use gardenbed_store::{
     FsObjectStore, MetadataStore, ObjectStore, RefCas, SqliteMetadataStore, StoreError,
 };
 
+pub mod gc;
 pub mod repos;
+
 /// The build fingerprint: a SHA-256 over `crates/server/src/**` file
 /// contents at build time (`build.rs`). The test harness compares it
 /// against the same digest computed over the *current* sources to catch a
@@ -321,14 +323,59 @@ impl Repo {
 
         // Derive against the parents before making the changeset visible.
         // Failed semantic validation may leave unreferenced immutable objects,
-        // but never a changeset that a caller can subsequently publish.
+        // but never a changeset a caller can subsequently publish.
         let cs_id = cs.id()?;
-        let root = self.engine.validated_tree_for_new(cs)?;
+        let (root, written_trees) = self.engine.validated_tree_for_new_with_writes(cs)?;
         let rows = self
             .engine
             .derived_rows_for_validated_tree(cs_id, cs, root)?;
+        // The last-chance re-check runs inside the commit transaction:
+        // between the `has()` sweep above and this point, a concurrent
+        // force-mode gc may have unlinked a referenced object (it saw it
+        // as an unreferenced orphan at mark time — including a blob this
+        // call just wrote via put_blob, or a tree the replay just wrote
+        // or re-linked). Verifying under the write lock is indivisible
+        // against gc's generation-check-plus-unlink step, so either the
+        // row commits only with all referenced objects present, or the
+        // commit fails naming the object and the client retries (the V4b
+        // contract).
+        //
+        // The required set is the blob ids plus the DERIVATION'S WRITE
+        // SET — every tree id the replay stored, idempotent re-puts
+        // included (round-2 P2-1; round-4 redesign for commit
+        // size-independence). This is the complete race surface:
+        // anything in the new root's closure that the derivation did NOT
+        // store is an untouched subtree reachable from an already
+        // certified row, and the gc mark never collects reachable
+        // objects (V1: mark == brute-force closure; D14: rows are never
+        // collected). The multi-chunk hazard the walk closed — a sweep
+        // unlinking an intermediate tree in an earlier chunk while the
+        // root survives — only bites trees the replay itself put (an
+        // orphan at mark time is exactly an unwritten-this-run tree that
+        // HAS a row only after the commit; the write set enumerates
+        // precisely those, at O(touched directories) instead of
+        // O(closure), which keeps commit cost independent of repository
+        // size — the p50 regression the canary caught).
+        let mut required: Vec<Id> = resolved.keys().copied().collect();
+        required.extend(written_trees.iter().copied());
+        let objects = &self.objects;
+        let verify = move || {
+            // Plain existence checks. Blob files and tree files are both
+            // addressed by their content hash at one path shape, so has()
+            // covers both kinds; no decoding needed here.
+            for id in &required {
+                if !objects.has(*id)? {
+                    let key = id.to_hex();
+                    return Err(StoreError::Invalid(format!(
+                        "object {key} was collected by a concurrent gc; \
+                         re-upload and retry"
+                    )));
+                }
+            }
+            Ok(())
+        };
         self.metadata
-            .put_validated_changeset(cs, root, &rows, None, None)?;
+            .put_validated_changeset(cs, root, &rows, None, None, Some(&verify))?;
         Ok(cs_id)
     }
 
@@ -1690,8 +1737,10 @@ mod revspec_tests {
             rows: &[gardenbed_store::DerivedRow],
             git: Option<&str>,
             raw: Option<&[u8]>,
+            _verify: Option<&dyn Fn() -> Result<(), StoreError>>,
         ) -> Result<Id, StoreError> {
-            self.inner.put_validated_changeset(cs, root, rows, git, raw)
+            self.inner
+                .put_validated_changeset(cs, root, rows, git, raw, None)
         }
         fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
             self.inner.recent_changesets(limit)

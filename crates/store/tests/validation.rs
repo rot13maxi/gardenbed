@@ -32,18 +32,18 @@ fn certificate_contract(store: &dyn MetadataStore) {
     let child_id = child.id().unwrap();
     assert!(
         store
-            .put_validated_changeset(&child, None, &[], None, None)
+            .put_validated_changeset(&child, None, &[], None, None, None)
             .is_err()
     );
     assert!(store.get_changeset(child_id).unwrap().is_none());
     store
-        .put_validated_changeset(&root, None, &[], None, None)
+        .put_validated_changeset(&root, None, &[], None, None, None)
         .unwrap();
     assert_eq!(store.validation_tree(id).unwrap(), Some(None));
     // Certificate root is immutable even when the canonical bytes match.
     assert!(
         store
-            .put_validated_changeset(&root, Some(Id::from_bytes([3; 32])), &[], None, None)
+            .put_validated_changeset(&root, Some(Id::from_bytes([3; 32])), &[], None, None, None)
             .is_err()
     );
     assert_eq!(store.validation_tree(id).unwrap(), Some(None));
@@ -56,14 +56,14 @@ fn certificate_contract(store: &dyn MetadataStore) {
     }];
     assert!(
         store
-            .put_validated_changeset(&child, None, &bad_rows, Some(git), None)
+            .put_validated_changeset(&child, None, &bad_rows, Some(git), None, None)
             .is_err()
     );
     assert!(store.get_changeset(child_id).unwrap().is_none());
     assert_eq!(store.cs_for_git(git).unwrap(), None);
     assert_eq!(store.validation_tree(child_id).unwrap(), None);
     store
-        .put_validated_changeset(&child, None, &[], Some(git), None)
+        .put_validated_changeset(&child, None, &[], Some(git), None, None)
         .unwrap();
     assert_eq!(store.validation_tree(child_id).unwrap(), Some(None));
     assert_eq!(store.cs_for_git(git).unwrap(), Some(child_id));
@@ -74,7 +74,7 @@ fn certificate_contract(store: &dyn MetadataStore) {
     let merge = cs(vec![id, legacy_id], "merge");
     assert!(
         store
-            .put_validated_changeset(&merge, None, &[], None, None)
+            .put_validated_changeset(&merge, None, &[], None, None, None)
             .is_err()
     );
     assert!(store.get_changeset(merge.id().unwrap()).unwrap().is_none());
@@ -125,7 +125,7 @@ fn sqlite_certificate_failure_rolls_back_the_entire_ingest() {
     }];
     assert!(
         store
-            .put_validated_changeset(&root, None, &rows, Some(git), None)
+            .put_validated_changeset(&root, None, &rows, Some(git), None, None)
             .is_err()
     );
     assert!(store.get_changeset(id).unwrap().is_none());
@@ -136,7 +136,7 @@ fn sqlite_certificate_failure_rolls_back_the_entire_ingest() {
         .execute_batch("DROP TRIGGER abort_validation")
         .unwrap();
     store
-        .put_validated_changeset(&root, None, &rows, Some(git), None)
+        .put_validated_changeset(&root, None, &rows, Some(git), None, None)
         .unwrap();
     assert_eq!(store.validation_tree(id).unwrap(), Some(None));
 }
