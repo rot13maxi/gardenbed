@@ -182,6 +182,7 @@ how they fit together.
 
 - [Canonical object encoding](docs/canonical-encoding.md)
 - [Durable publication validation](docs/validation.md)
+- [Landing-chain operations](docs/OPERATIONS.md)
 - [Design and verification plan](docs/v0.1.md)
 - [Changelog](CHANGELOG.md)
 

@@ -29,6 +29,25 @@
 //! state whether present or absent (v0.2.md D18/D19), and `bed` falls back
 //! to its embedded client whenever the socket is gone.
 
+/// The build fingerprint: a SHA-256 over `crates/daemon/src/**` file
+/// contents at build time (`build.rs`). The test harness compares it
+/// against the same digest computed over the *current* sources to catch a
+/// binary built from different tree state — mtime checks are blind to
+/// that (`bed switch` materializes sources with commit-time mtimes;
+/// dogfood finding #12's core). Mirrors `gardenbed_server::SRC_DIGEST`.
+pub const SRC_DIGEST: &str = env!("GARDENBED_DAEMON_SRC_DIGEST");
+
+/// The fingerprint carried *inside the binary's bytes*: `GARDENBED_DAEMON_
+/// SRC_DIGEST:<hex>`. [`SRC_DIGEST`] is linked into any crate that reads
+/// it (including the test binary), so it cannot prove which tree the
+/// *located* `gardenbed-daemon` file was built from. This marker is kept
+/// in the binary's rodata (referenced from `main`), where the harness
+/// greps for it — a binary built from another tree carries another hex.
+pub const SRC_DIGEST_MARKER: &str = concat!(
+    "GARDENBED_DAEMON_SRC_DIGEST:",
+    env!("GARDENBED_DAEMON_SRC_DIGEST")
+);
+
 pub mod paths;
 pub mod proxy;
 pub mod sidecar;

@@ -6,6 +6,10 @@
 //!   moves and planted orphans) is ingested; the mark's live set must equal
 //!   an independent brute-force walk (refs → parent closure → blob refs →
 //!   tree closure), and gc must delete zero live objects.
+//! * **V1b batch boundaries**: a synthetic history wider than the mark's
+//!   write batches (>4096 live ids, one >4096-entry tree) is checked
+//!   against the same oracle, so a dropped id at a `gc_live` /
+//!   `gc_expanded` flush boundary cannot pass.
 //! * **V2 collection semantics**: one unreferenced blob and one stale
 //!   `.tmp-*` file per shard are collected exactly; young orphans survive
 //!   the default min-age; a second gc deletes zero (convergence).
@@ -22,7 +26,7 @@ use std::str::FromStr as _;
 use std::time::Duration;
 
 use gardenbed_harness::{GenOptions, generate};
-use gardenbed_model::{Changeset, Id, Mode, TreeKind, blob_id};
+use gardenbed_model::{Changeset, Id, Mode, Tree, TreeEntry, TreeKind, blob_id};
 use gardenbed_protocol::client::GardenbedClient;
 use gardenbed_server::Repo;
 use gardenbed_store::ObjectStore as _;
@@ -422,6 +426,165 @@ async fn v1_mark_matches_brute_force_walk() {
             .expect("blob present");
         assert_eq!(&got, want, "sampled blob {id} byte-exact after gc");
     }
+}
+
+// ------------------------------------------------------------------ V1b
+
+/// V1b: the mark's write-batch boundaries are exercised, and dropping the
+/// id that triggers a flush is caught.
+///
+/// The mark batches both its `gc_live` inserts and its `gc_expanded`
+/// claims at [`gardenbed_server::gc::WRITE_BATCH`]. The V1 fixture reaches
+/// only ~3.5k live ids with a widest tree of ~50 entries, so neither flush
+/// path executes there: mutating the buffer to drop the boundary id (the
+/// id pushed when the buffer fills) left the whole suite green (gc 6/6,
+/// gc_repos 1/1, gc_chaos 4/4) while `gc --dry-run` reported one live
+/// object short — a reachable object marked dead.
+///
+/// The fixture is built directly from the metadata and object stores, and
+/// that is deliberate. The mark is documented as a pure function of SQLite
+/// state, so a test may construct that state; doing so buys the property
+/// that makes this guard total: **every id the walk pushes has
+/// multiplicity one**. In an ingested history each blob is pushed twice —
+/// once by the changeset's blob refs and again by the tree entry that
+/// names it — so a dropped id fails the oracle only when the boundary
+/// happens to land on a tree id. That is a parity property of the fixture
+/// which one extra seed push in the product, or any change to the batch
+/// bound, silently destroys (measured: with a copied 4096 test constant
+/// and the real bound raised to 8192 or 16384, the drop mutation stayed
+/// green). Here the changeset side pushes nothing: one
+/// `derived(kind='tree')` row seeds the closure, and each tree/blob is
+/// named exactly once, so a dropped id is always observable.
+///
+/// * The root tree is `DIRS = 2 * WRITE_BATCH + 1` Dir entries wide —
+///   sized from the real constant, never a copied literal — so the claim
+///   buffer fills and flushes *inside* a single tree's entry loop,
+///   `2 * WRITE_BATCH + 1` claims against a `WRITE_BATCH` bound. At the
+///   current bound that is 8193 entries.
+/// * The live buffer sees `2 * DIRS + 1` pushes (the root tree id, then
+///   each child's blob followed by its own tree id), so it flushes
+///   repeatedly: `4 * WRITE_BATCH + 3` ids at any bound. At the current
+///   bound that is 16387 on-disk ids.
+///
+/// The assertion is the V1 oracle (mark == independent brute-force walk)
+/// plus the gc report's live count, so a lost boundary id — which marks a
+/// reachable object dead and would let the sweep unlink it — fails here.
+#[tokio::test]
+async fn v1b_batch_boundaries_mark_exactly() {
+    // Sized from the real bound, never a copy of it.
+    const DIRS: usize = 2 * gardenbed_server::gc::WRITE_BATCH + 1;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    // Opens the repository: schema tables, object store, fresh metadata.
+    let repo = Repo::open(root).expect("repo opens");
+    let objects = repo.objects_handle();
+
+    // One unique blob per directory, each named by exactly one tree entry.
+    let mut blobs = Vec::with_capacity(DIRS);
+    for d in 0..DIRS {
+        let content = format!("boundary blob {d}").into_bytes();
+        blobs.push(objects.put_blob(&content).expect("blob stored"));
+    }
+    // Child trees: one file entry each.
+    let mut children = Vec::with_capacity(DIRS);
+    for blob in &blobs {
+        let tree = Tree {
+            entries: vec![TreeEntry {
+                name: "f".into(),
+                kind: TreeKind::File,
+                mode: Mode::Regular,
+                blob: Some(*blob),
+                tree: None,
+            }],
+        };
+        let bytes = tree.canonical_bytes().expect("child tree encodes");
+        let id = tree.id().expect("child tree id");
+        objects.put_tree(id, &bytes).expect("child tree stored");
+        children.push(id);
+    }
+    // Root tree: one Dir entry per child (the codec sorts canonically).
+    let root_tree = Tree {
+        entries: children
+            .iter()
+            .enumerate()
+            .map(|(d, child)| TreeEntry {
+                name: format!("d{d:04}"),
+                kind: TreeKind::Dir,
+                mode: Mode::Regular,
+                blob: None,
+                tree: Some(*child),
+            })
+            .collect(),
+    };
+    let root_bytes = root_tree.canonical_bytes().expect("root tree encodes");
+    let root_id = root_tree.id().expect("root tree id");
+    objects
+        .put_tree(root_id, &root_bytes)
+        .expect("root tree stored");
+
+    // The mark's seed: one `derived(kind='tree')` row. The `cs` key is
+    // opaque to the mark (it reads only `bytes`); a synthetic key keeps
+    // the row from posing as any changeset's cache entry.
+    {
+        let conn =
+            rusqlite::Connection::open(root.join("metadata.sqlite3")).expect("metadata opens");
+        conn.execute(
+            "INSERT INTO derived(kind, cs, bytes) VALUES('tree', ?1, ?2)",
+            rusqlite::params![blob_id(b"v1b seed key").as_bytes(), root_id.as_bytes()],
+        )
+        .expect("derived seed row");
+    }
+
+    // Fixture shape guard: both flush conditions must be reachable. If a
+    // future edit shrinks this fixture, the test must say so rather than
+    // silently stop covering the boundaries. (DIRS derives from the real
+    // bound, so these check the shape that derivation produces.)
+    let top = objects
+        .get_tree(root_id)
+        .expect("root tree reads")
+        .expect("tree exists");
+    let top = Tree::decode(&top).expect("root tree decodes");
+    assert_eq!(
+        top.entries.len(),
+        DIRS,
+        "the root tree must hold one Dir entry per fixture directory"
+    );
+    assert!(
+        top.entries.len() > 2 * gardenbed_server::gc::WRITE_BATCH,
+        "fixture must be wider than two claim batches: {} entries",
+        top.entries.len()
+    );
+    let on_disk = disk_ids(root);
+    assert_eq!(
+        on_disk.len(),
+        2 * DIRS + 1,
+        "one root tree + one tree and one blob per directory"
+    );
+
+    // The oracle: mark == brute-force reachability over the on-disk set.
+    let mark = mark_live(root);
+    let oracle = brute_force_live_on_disk(root);
+    assert_eq!(
+        mark, oracle,
+        "mark live set must equal the brute-force walk"
+    );
+
+    // And the sweep agrees: every on-disk object is live, so a min-age-0
+    // dry run reports all of them live and deletes nothing. A dropped
+    // boundary id shows up here as a live count one short plus a
+    // (would-be) deletion.
+    let (code, out, err) = gc_cli(root, &["--dry-run", "--min-age", "0"]);
+    assert_eq!(code, 0, "dry-run exits 0; stderr: {err}");
+    assert!(
+        out.contains(&format!("{} live", on_disk.len())),
+        "every on-disk object is live ({} expected): {out}",
+        on_disk.len()
+    );
+    assert!(
+        out.contains("0 blob(s) and 0 tree(s) deleted"),
+        "no live object may be a deletion candidate: {out}"
+    );
 }
 
 // ------------------------------------------------------------------- V2

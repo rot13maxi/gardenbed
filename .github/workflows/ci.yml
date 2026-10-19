@@ -1,12 +1,16 @@
-# The v0.1 CI gate (docs/v0.1.md §9).
+# The v0.1/v0.2 CI gate (docs/v0.1.md §9, docs/v0.2.md §0).
 #
 # Every push/PR runs the whole verification matrix in parallel jobs; the
-# expensive ones (release perf budgets, fuzz smoke, the north-star demo)
+# expensive ones (release perf budgets, fuzz smoke, the north-star demos)
 # are the same commands the release checklist runs locally
 # (docs/release-0.1.md). Budgets assume the GitHub ubuntu runners: tmpfs
 # exists (/dev/shm) and the perf fixtures prefer it, exactly as they do
 # locally; the fsync toggle is never set in CI — durability is under test,
 # and tmpfs keeps fsync cheap without turning it off.
+#
+# A second, NIGHTLY (schedule + workflow_dispatch) job holds the release
+# canary: the release-mode crash and timing bars plus the v0.2 acceptance
+# demo. It is deliberately not on the push path — see its comment block.
 
 name: ci
 
@@ -14,9 +18,17 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The release canary (dogfood #19) runs nightly and on demand only:
+  # `schedule` fires on the default branch (main), which is exactly where
+  # the release bar is meaningful, and it never adds latency to a push.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The event name keeps the nightly canary out of the push/PR group: a
+  # scheduled run must never cancel (or be cancelled by) a push gate.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -27,6 +39,7 @@ env:
 jobs:
   # ---------------------------------------------------------------- style
   fmt:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: fmt
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -40,6 +53,7 @@ jobs:
 
   # ---------------------------------------------------------------- lint
   clippy:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: clippy (-D warnings)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -54,6 +68,7 @@ jobs:
 
   # --------------------------------------------------------------- tests
   test:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: test (--workspace)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -76,6 +91,7 @@ jobs:
 
   # ------------------------------------------------- perf budgets (M4/M5)
   perf:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: perf budgets (release --ignored)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -113,6 +129,7 @@ jobs:
 
   # ----------------------------------------------------- fuzz smoke (M8)
   fuzz-smoke:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: fuzz smoke (30 s/target)
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -139,6 +156,7 @@ jobs:
 
   # ------------------------------------------------- north-star demo (§0)
   demo:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     name: demo (run-v0.1.sh)
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -152,3 +170,59 @@ jobs:
       # requires both. The synthetic corpus (50k commits) stands in for
       # §0's pinned 1 GB history — the demo's documented deviation.
       - run: demo/run-v0.1.sh
+
+  # ------------------------------------------ release canary (dogfood #19)
+  #
+  # Dogfood #19 (docs/DOGFOOD.md): debug-green is not evidence for
+  # release-mode timing classes. The M13 gc landing passed every debug
+  # gate and the review, then the release canary through the deployed
+  # pair caught a release-only gc_chaos red and a size-dependent commit
+  # p50 regression — both invisible in debug. The rule that came out of
+  # it: the release canary is a first-class gate, not a formality.
+  #
+  # It is NIGHTLY (and workflow_dispatch) rather than per-push on
+  # purpose: it costs minutes of release rebuild plus a 1M-file fixture,
+  # and its signal is about the tree state of `main`, not about any one
+  # PR. `schedule` only ever runs on the default branch, so the job is
+  # written to be meaningful there — it asserts the bars the release
+  # checklist demands of main itself, with no PR-specific assumptions.
+  #
+  # The two suites are invoked with their exact release-mode forms:
+  #   * gc_chaos (crates/server/tests/gc_chaos.rs): SIGKILL mid-gc and
+  #     live --force gc under load; needs no fixtures or env (the binary
+  #     comes from CARGO_BIN_EXE, sqlite is in-process);
+  #   * the p50 size-independence budget (crates/bed/tests/perf.rs), an
+  #     #[ignore]d release-only test: 10k vs 1M files, within 2x;
+  #   * demo/run-v0.2.sh: the §0 acceptance test, which is the
+  #     clean-container evidence docs/v0.2.md §0 promises. It builds its
+  #     own release binaries.
+  #
+  # No ripgrep mirror and no kernel corpus: neither bar needs them.
+  release-canary:
+    name: release canary (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@v2
+      # Release binaries first: the bed test harness locates
+      # target/release/gardenbed-{server,daemon} for the tests that spawn
+      # them (dogfood #12/#17), and the demo's own build step then has
+      # nothing left to compile.
+      - run: cargo build --workspace --bins --release
+      # Release-mode crash safety (timeout sized from a ~2 min local run).
+      - name: gc chaos (release)
+        timeout-minutes: 20
+        run: cargo test -p gardenbed-server --release --test gc_chaos
+      # The size-independence bar (dogfood #19's second red).
+      - name: commit p50 size independence (release)
+        timeout-minutes: 30
+        run: cargo test -p gardenbed --release --test perf commit_p50_is_size_independent_10k_vs_1m -- --ignored --nocapture
+      # The §0 acceptance test: clean-container evidence for the doc.
+      - name: v0.2 acceptance demo
+        timeout-minutes: 30
+        run: demo/run-v0.2.sh

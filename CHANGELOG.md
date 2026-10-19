@@ -138,6 +138,26 @@ tags, and the verification record for a release lives in
 
 ### Changed
 
+- **gc mark: batched temp-table writes (backlog C1/C2)**. On the 10.36M-object
+  kernel corpus the mark opened one SQLite transaction per `insert_live` call
+  (once per tree, once per file entry, once per parent/blob chunk per
+  changeset) and one statement per claimed tree id — tens of millions of
+  transactions. Those transactions are temp-database only (nothing touches
+  `metadata.sqlite3` or its WAL), but each still costs a journal
+  create/delete cycle plus a commit: the bulk of the ~3 h mark. `gc_live`
+  ids now accumulate in a 4096-id buffer committed in one transaction per
+  batch, and tree-closure claims likewise accumulate in a 4096-id buffer
+  published in bounded batches — flushed mid-tree when a single tree is
+  wide enough (one may hold up to 2^20 entries), otherwise spanning trees —
+  through a temp batch table plus one `INSERT OR IGNORE ... RETURNING`
+  (the returned rows are exactly the newly claimed children to enqueue,
+  preserving the push-time claim invariant and the distinct-tree queue
+  bound). The mark set is unchanged (D14, V1 oracle unmodified; the new
+  V1b fixture crosses both batch boundaries and fails if a boundary id is
+  dropped). Crash semantics are unchanged and now structural: every mark
+  row lives in the mark connection's `temp` schema, so nothing survives the
+  connection, and the sweep still starts only after the complete build,
+  with every buffer flushed.
 - `gardenbed-server --root` takes the server root (one subdirectory per
   repository) rather than a single repository directory. A root laid out
   the v0.1 way (stores at the top level) keeps serving unchanged as the
@@ -160,6 +180,43 @@ tags, and the verification record for a release lives in
 
 ### Fixed
 
+- **`bed rebase` / `bed rebase --stack` recognize already-landed twins**
+  (dogfood finding #23). When a lane's content was landed on `main` by
+  hand as a NEW changeset — tree-equal and same-message, but a different
+  id with no ancestry link — replaying the lane used to hit the server's
+  own-content check (`"<path>" was changed or deleted`) and refuse a
+  perfectly legitimate re-union; operators hand-unioned again instead.
+  Both forms now walk the new parent's span above the merge base and
+  match on **exactly** the message string and the post-image root tree.
+  A match is treated as already applied: the element is not replayed,
+  every resolution is printed with the skipped element and its twin, the
+  last twinned element subsumes the prefix (its tree is the cumulative
+  lane state) and only the suffix replays, onto the new parent's current
+  tip. A whole-stack match replays nothing, prints `stack already
+  applied`, and moves the working copy to the new parent — a follow-up
+  `bed publish` is then a fast-forward no-op. A twin whose paths `main`
+  rewrote or reverted afterwards is not skipped (the element replays and
+  the ordinary conflict rule decides), partial file overlap stays a hard
+  conflict, and same-message/different-tree stays a hard conflict. The
+  scan visits exactly `ancestors(new parent) \ ancestors(merge base)` —
+  frontier parents below the base are pruned with `IsAncestor`, so a
+  merge-carrying `main` cannot burn the budget on ancient history — costs
+  one `GetChangeset` per span changeset plus a `RootTree` per message
+  match, an `IsAncestor` per matched candidate and a `Diff` per twin
+  candidate, and is capped at 4096 span changesets
+  (`GARDENBED_TWIN_SCAN_CAP` overrides it for tests); the cap note is
+  printed on stderr as soon as truncation is observed, so it is present
+  even when the cap-induced miss becomes the ordinary conflict — but only
+  while the run still has something to replay, so a twin that was found
+  and applied (or a fully resolved stack) raises no false alarm. Both
+  forms answer `already up to date` when the current changeset is an
+  ancestor of the new parent (the stack form previously indexed an empty
+  chain; the single form stored a redundant replay). A stale candidate
+  that the prefix skip subsumes is reported as subsumed, never as
+  replayed. Regression tests:
+  `crates/bed/tests/write_path.rs` (twin, whole-stack + no-op publish,
+  prefix twin, reverted twin, same-message/different-tree refusal,
+  single rebase, already-up-to-date).
 - **gc round 4: two landing reds fixed — v3 chaos red and the commit-p50
   size regression** (M13, v0.2.md): (1) the gc_chaos v3 red was the
   test's own replant: it lived inside `debug_assert_eq!(repo.put_blob(
