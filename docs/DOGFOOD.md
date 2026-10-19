@@ -149,8 +149,7 @@ every commit records it and reviewers filter by author.
   landing (2026-10-19) passed every debug gate (bed 226/0, store+server 140/0, gc 11/0)
   but the RELEASE canary through the deployed pair caught two reds the debug gates and
   the round-3 review both missed: (a) gc_chaos `v3_sigkill_mid_gc_leaves_sound_store`
-  failed deterministically in release only (8/8; debug 11/0; an eprintln between
-  `put_blob` and `backdate` made it pass — a timing race), and (b) the CI perf job's
+  failed deterministically in release only (8/8; debug 11/0), and (b) the CI perf job's
   `commit_p50_is_size_independent_10k_vs_1m` regressed (1M p50 2.9s vs 10k 56.1ms —
   a per-commit cost proportional to repo size, the signature of the handshake's
   closure walk inside the commit write transaction). Main was reverted to 33a7c799
@@ -159,6 +158,20 @@ every commit records it and reviewers filter by author.
   for timing-sensitive code MUST include the release-mode run of the affected suites;
   review signoff on debug-green alone is insufficient for timing classes.
   Evidence: /home/user/gc-red-evidence/gc-strace{2,3}.txt.
+  **Correction (same day, follow-up diagnosis)**: red (a) was re-attributed — the v3
+  test's bug, not gc's. The orphan replant lived inside `debug_assert_eq!`, which does
+  NOT evaluate its operands in release builds, so the replant never ran after the
+  prime gc correctly deleted the orphans; the subsequent `backdate` then failed on the
+  (correctly) absent file. The strace "zero unlinkat" reading was a filter artifact:
+  Rust `fs::remove_file` issues plain `unlink` (syscall 87), invisible to an
+  `unlinkat`-filtered trace; reproduced independently by two agents with `rustc -O`
+  strace experiments. gc was correct and its report accurate. Red (b) was real and
+  forced the write-set redesign. The #19 rule stands and strengthens: the release
+  canary caught a real release-only red (the p50 regression) AND exposed the
+  debug_assert-in-release pitfall — two distinct failure classes that debug gates are
+  structurally blind to. (Lanes must never gate timing- or assert-sensitive code on
+  debug builds alone; also: `debug_assert_eq!` hides *side effects*, not just
+  assertions — evaluate required effects before it.)
 
 ## Backlog — product fixes from dogfood findings
 - **#11 product fix**: `export_to_path` should reset/checkout the target ref when the
