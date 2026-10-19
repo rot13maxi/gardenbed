@@ -140,8 +140,10 @@ server-side replay and merge, a read-only FUSE mount of any changeset,
 an optional local caching daemon, optional token auth with
 per-repository roles, and Git import/export.
 
-Writes require a connection to the server. There is no garbage
-collection or offline commit queue yet; authentication is optional
+Writes need a connection to the server, except `bed commit`, which
+queues locally when the server is unreachable and replays with
+`bed sync`. Garbage collection of unreferenced objects is not on main
+yet (in review). Authentication is optional
 (`gardenbed-server serve --auth auth.toml`; without it the server is
 open). Blame follows first-parent history and renames; copy detection
 is exact-blob only. Git roundtrips preserve commit IDs for supported

@@ -1,9 +1,9 @@
 # gardenbed CLI reference
 
-Generated from the real `--help` output of the v0.1.0 binaries (`bed`,
-`gardenbed-server`, `gardenbed-mcp`); every example is a verified
-invocation from `demo/run-v0.1.sh`, [docs/quickstart.md](quickstart.md),
-or the recorded demo run.
+Generated from the real `--help` output of the current binaries
+(`bed`, `gardenbed-server`, `gardenbed-daemon`, `gardenbed-mcp`); every
+example is a verified invocation from `demo/run-v0.1.sh`,
+[docs/quickstart.md](quickstart.md), or the recorded demo run.
 
 ## Conventions
 
@@ -53,6 +53,7 @@ Usage: bed [OPTIONS] <COMMAND>
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
 | `merge` | merge a changeset or ref into the current changeset (server-side two-parent merge) |
 | `publish` | fast-forward a ref (default `main`) to the current changeset |
+| `sync` | upload queued offline commits to the server |
 | `mount` | mount the current changeset as a read-only FUSE filesystem |
 | `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
@@ -657,6 +658,37 @@ gardenbed-server export --root /tmp/gardenbed --repo myrepo --into /tmp/export.g
 # 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
 git -C /tmp/export.git fsck --strict   # clean
 ```
+
+## gardenbed-daemon
+
+```text
+gardenbed local daemon (shared cache + watchers)
+
+Usage: gardenbed-daemon <COMMAND>
+```
+
+One subcommand, `serve`. Full lifecycle, socket and cache rules, and the
+sidecar contract: [docs/daemon.md](daemon.md).
+
+```text
+Usage: gardenbed-daemon serve [OPTIONS] --upstream <UPSTREAM>
+```
+
+| flag | meaning |
+|---|---|
+| `--upstream <UPSTREAM>` (required) | the upstream gardenbed server endpoint (`http://host:port`); every forwarded RPC goes there, `repo` fields ride untouched |
+| `--socket <SOCKET>` | override the socket path (default: `$XDG_RUNTIME_DIR/gardenbed/daemon.sock`; honors `GARDENBED_DAEMON` the same way `bed` does) |
+| `--cache <CACHE>` | override the shared object cache root (default: `$XDG_CACHE_HOME/gardenbed`) |
+
+```sh
+gardenbed-daemon serve --upstream http://127.0.0.1:9418
+# listening on /run/user/1000/gardenbed/daemon.sock
+```
+
+`bed` probes the socket daemon-first and falls back to the embedded
+endpoint when the daemon is absent or dead (fetch RPCs retry once on
+daemon death; writes never blindly retried) —
+[docs/architecture.md](architecture.md) §8.5.
 
 ## gardenbed-mcp
 

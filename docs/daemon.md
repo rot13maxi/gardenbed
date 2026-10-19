@@ -63,10 +63,10 @@ The socket's directory is mode 0700 — only the owner's uid may connect.
 - **unset** — the default path is probed.
 
 The shared cache uses the same store format and sharding as `.bed/objects`
-(GBLO1 envelope, 2-level shard, hash-verified on read and write), so a
-warm second working copy's fetch is answered from the cache and never
-reaches the server — cross-working-copy dedup falls out of content
-addressing, not out of a cache-invalidation protocol.
+(GBLO1/GBLO2 envelope selection by size, 2-level shard, hash-verified on
+read and write), so a warm second working copy's fetch is answered from the
+cache and never reaches the server — cross-working-copy dedup falls out of
+content addressing, not out of a cache-invalidation protocol.
 
 ## What the daemon serves
 
@@ -76,14 +76,20 @@ forwarded verbatim to the upstream — including a client's `authorization`
 metadata (an authed upstream sees the same bearer token `bed` sent) — with
 two divergences:
 
-- **`GetTree`/`GetBlob` are cache-first**: answered from the shared
-  object store when present, else fetched upstream once and written
-  through. Concurrent requests for the same id collapse into one fetch.
+- **`GetTree`/`GetBlob` are cache-first, but auth-checked on hits**: answered
+  from the shared object store when present — after one upstream
+  authorization probe (a repo-scoped, `authorize()`-gated read forwarded
+  with the caller's credentials, so the server, not the cache, decides who
+  may read) — else fetched upstream once and written through. Concurrent
+  requests for the same id collapse into one fetch; a denied probe denies
+  the hit. Cached blobs stream back to the caller in 64 KiB chunks
+  (matching the server's stream shape; tonic's 4 MiB per-message decode
+  limit would fail a blob-sized single chunk).
 - **Write RPCs are peer-uid-gated**: before serving `PutBlob`,
-  `CreateChangeset`, `CasRef`, `Rebase`, or `Publish`, the daemon checks
-  the unix-socket peer's credentials (`SO_PEERCRED`) and refuses any uid
-  other than its owner's. Read RPCs stay open to any local peer (the
-  0700 directory is the first lock; this is the second).
+  `CreateChangeset`, `CasRef`, `Rebase`, `Publish`, or `Merge`, the daemon
+  checks the unix-socket peer's credentials (`SO_PEERCRED`) and refuses
+  any uid other than its owner's. Read RPCs stay open to any local peer
+  (the 0700 directory is the first lock; this is the second).
 
 A small **sidecar service** rides the same socket:
 

@@ -1,4 +1,4 @@
-# gardenbed architecture — v0.1
+# gardenbed architecture — v0.1 + the v0.2 wave
 
 Gardenbed has a central repository server, a sparse working-copy client,
 and an MCP service. The server stores immutable content-addressed objects
@@ -30,7 +30,8 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 
 `crates/protocol/proto/gardenbed.proto` — with
 [docs/canonical-encoding.md](canonical-encoding.md), it *is* the published
-protocol (D4). The tonic service `Gardenbed` exposes 17 RPCs; every
+protocol (D4). The tonic service `Gardenbed` exposes 18 RPCs (v0.1's 17
+plus `Merge`); every
 request carries `repo` — the field selects the repository it applies to
 (wire format from day one, v0.1.md §1; load-bearing since multi-repo
 serving, v0.2.md §5).
@@ -41,7 +42,7 @@ serving, v0.2.md §5).
 | changesets | `GetChangeset`, `PutBlob` (client-stream), `CreateChangeset` | blob bytes move **only** through `PutBlob` (> 1 MiB, header frame first) or `CreateChangeset.inline_blobs` (≤ 1 MiB) |
 | graph + queries | `MergeBase`, `IsAncestor`, `Diff` (stream), `Log` (stream), `Blame` (stream) | blob content never rides on Diff/Log |
 | refs | `ListRefs`, `GetRef`, `CasRef` | `GetRef` doubles as the shared revspec resolver (see §2) |
-| write ops | `Rebase`, `Publish` | server-side replay and fast-forward CAS |
+| write ops | `Rebase`, `Publish`, `Merge` | server-side replay, fast-forward CAS, two-parent merge (§9) |
 | debug | `GetStats` | per-repo request counters (e.g. the zero-duplicate-fetch proofs) |
 
 Wire conventions mirrored from the canonical encoding: `Op`/`Mode`
@@ -180,11 +181,13 @@ identical state (verified in M6 and re-verified after every chaos kill).
 
 ## 4. Object storage
 
-Under the server root, the object store lives at `<root>/objects`, and
+Under the server root, each repository's object store lives at
+`<root>/<repo>/objects` (a legacy v0.1 root: `<root>/objects`, serving as
+`default`), and
 `FsObjectStore` shards it two levels deep:
 
 ```text
-<root>/objects/<2 hex>/<62 hex>
+<root>/<repo>/objects/<2 hex>/<62 hex>
 ```
 
 - **Blobs** are stored under `SHA-256(raw content)` in one of two
@@ -252,6 +255,14 @@ All local state lives under `--state-dir` (default `./.bed`):
   content budget; heavier blobs and overflow stream via `PutBlob` first.
   A SIGKILL between the two leaves orphaned blobs that
   are unreferenced and harmless; the retry just re-uploads (M5.5).
+- **Offline commit queue** (v0.2 M15): when the server is unreachable at
+  connect time, `bed commit` completes locally — the changeset is built and
+  content-addressed from the model, changed blobs are staged into
+  `.bed/objects`, and `pending`/`pending_files` rows in `index.sqlite3`
+  record what `bed sync` later replays oldest-first as an idempotent
+  re-upload of content-addressed facts (v0.2.md §6). `switch`, `rebase`,
+  and `publish` refuse while the queue is non-empty; `status` prints the
+  pending count.
 - **Status** uses mtime/size as hints and hashes only suspects;
   `--full-scan` forces the correctness path. Untracked discovery honors
   `.gitignore` files read from the working copy (root plus one per walked
@@ -404,7 +415,7 @@ bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
   `.bed/objects`, write-through after each upstream fetch) —
   cross-working-copy dedup falls out of content addressing.
 - **Write RPCs are peer-uid-gated**: `SO_PEERCRED` is checked before
-  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`; any uid other
+  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`/`Merge`; any uid other
   than the daemon's owner is refused.
 - **Sidecar**: `Ping`, and `Register(state_dir) → generation counter` —
   a recursive watch on the working-copy root (excluding `.bed` and
@@ -532,3 +543,5 @@ decisions, schema, error semantics — is
 | import mechanics (gitoxide, diff-tree, renames) | v0.1.md D6/D8 |
 | divergences from git | divergences.md (§10.2: zero *silent* divergences) |
 | scale-out backends + deployment | scale-out-design.md (D1–D7) |
+| v0.2 scope + decisions (merge, multi-repo, chunking, daemon, offline queue, GC) | v0.2.md |
+| daemon lifecycle, socket, cache, sidecar | daemon.md |

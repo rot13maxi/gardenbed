@@ -10,6 +10,22 @@ tags, and the verification record for a release lives in
 ### Added
 
 
+- **Offline commit queue** (v0.2.md §6, M15): when the server is
+  unreachable at connect time — and only then; a server that answers,
+  even to refuse, is online — `bed commit` completes locally: the
+  changeset is built and content-addressed from the model, every changed
+  blob is staged into `.bed/objects`, and `pending`/`pending_files`
+  rows in `index.sqlite3` (created `IF NOT EXISTS`, so v0.1 files load
+  unchanged) record the replay. The working copy moves exactly as an
+  online commit's would. `bed sync` drains the queue oldest-first as an
+  idempotent re-upload of content-addressed facts — a crash mid-sync
+  costs a re-upload, never a divergence — then replays each offline
+  commit's state move. `switch`, `rebase`, and `publish` refuse while
+  commits are pending (naming `bed sync` and the count); `status`
+  prints the pending line offline. Airplane-test coverage in
+  `crates/bed/tests/offline.rs` (chained commits, SIGKILL in both
+  crash windows, replay idempotence, offline refusals).
+
 - **Blob chunking (GBLO2)** (v0.2.md §7, M14): blobs above 1 MiB are
   stored in a new content-defined chunked envelope — `"GBLO2"` magic ·
   `raw_len: u64` LE · `chunk_count: u32` LE · per-chunk
@@ -143,6 +159,44 @@ tags, and the verification record for a release lives in
 
 
 ### Fixed
+
+- **Two merge mismerges fixed** (round-1 review, exposed by the merge-core
+  salvage): the derive walk treated a `None` root tree as a "deleted
+  subtree" instead of the empty root, spurious-conflicting theirs'
+  root-level adds after ours emptied the root (git merges clean);
+  and the adopt-theirs arm fell through to `take()`, whose blob expect
+  panicked when theirs added a directory where base and ours had
+  nothing. Pinned by
+  `deleted_directory_untouched_inside_lands` and
+  `added_directory_arrives_wholesale`
+  (`crates/derive/tests/merge.rs`). Plus four hardening items: the
+  `MergeConflict` client error carries the promised next-step hint, and
+  `bed merge` pre-checks working-copy cleanliness with the same offline
+  scan `bed status` runs — a dirty-copy refusal can no longer leave a
+  stored merge behind (pinned by
+  `bed_merge_refuses_dirty_working_copy_without_storing`,
+  `crates/bed/tests/merge.rs`).
+- **Daemon review fixes**: cache hits on `GetTree`/`GetBlob` consult
+  upstream auth before answering (an anonymous or wrong-repo-scope peer
+  could previously read any object a warm cache held, while the same
+  request direct to the server got `PERMISSION_DENIED`; the probe is one
+  repo-scoped, `authorize()`-gated read forwarded with the caller's
+  credentials); cached blobs re-chunk at 64 KiB matching the server's
+  stream shape (a blob-sized single chunk failed tonic's 4 MiB
+  per-message decode limit for every blob over 4 MiB); the mount's
+  failed readiness probe no longer leaks a live FUSE mount and its
+  serving thread, `reply_with` answers `EIO` instead of panicking during
+  teardown races, and the sidecar watcher fails open — errors and
+  inotify queue-overflow events bump the generation, so a stale "clean"
+  over modified files is forbidden.
+- **Perf corpus clone-URLs serve `/garden`** (dogfood #15 Rule 2):
+  `crates/bed/tests/perf.rs` clone sites name the repository in the URL
+  path, reduced to one span.
+- **CI repair for the v0.2 wave**: the test job builds the workspace
+  binaries before running (protocol-dependent tests failed on a stale
+  binary otherwise); the perf corpus clones a local ripgrep mirror; and
+  the dev-box-only `kernel_export_spot_check` and the child-entry-point
+  `fastcdc_table_child_entry` are skipped in the perf job.
 
 - **Test harness refuses a stale `gardenbed-server` binary** (dogfood
   findings #12 and #13): `crates/bed/tests/common/mod.rs::server_bin()`
