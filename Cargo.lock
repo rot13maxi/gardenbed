@@ -1091,6 +1091,9 @@ dependencies = [
  "gardenbed-protocol",
  "gardenbed-server",
  "gardenbed-store",
+ "libc",
+ "parking_lot",
+ "serde_json",
  "tempfile",
  "tokio",
 ]

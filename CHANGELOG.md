@@ -9,13 +9,19 @@ tags, and the verification record for a release lives in
 
 ### Added
 
-- **The pre-rename storage layout opens in place.** A root holding
-  `seedbed.sqlite3` + `loam/objects` is the same store format under the
-  historical directory names (identical schema, identical object
-  envelopes), so `Repo::open` resolves it instead of refusing it — the
-  1.48M-commit kernel store now serves directly. A root with neither
-  layout but with foreign content is still refused rather than
-  silently initialized as an empty repository beside the user's data.
+- **`gardenbed-ab suite`: a repeatable Gardenbed-vs-Git benchmark**.
+  `gardenbed-ab suite --source <repo> --out <dir>` slices the newest N
+  commits with a **real root** (a graft at the cut point, so the slice is
+  complete history both systems accept), builds a byte-identical Git
+  fixture and Gardenbed store, starts both servers on free ports, and
+  runs six scenarios: `provision`, `query`, `history`, `refresh`
+  (small + large selection), `land`, `contend`. One command, no manual
+  server wrangling, no state carried between runs (`--out` must be
+  empty). `gardenbed-ab fixture` builds the pair alone and prints the
+  URLs. `bed`/`gardenbed-server` resolve to siblings of the harness
+  binary (with `$BED_BIN`/`$BED_SERVER_BIN` overrides) and every run
+  prints them — benchmarking a stale installed `bed` from PATH produced a
+  141 ms number where the rebuilt binary measured 10 ms.
 
 - **Checkout updates cost the change, not the selection.** `bed switch`
   (and `rebase`/`merge`, which move the working copy the same way)
@@ -34,6 +40,31 @@ tags, and the verification record for a release lives in
   covered: a verified row that no longer matches is read and refused, an
   unverified row is always read, and a skipped path is never rewritten.
 
+- **The pre-rename storage layout opens in place.** A root holding
+  `seedbed.sqlite3` + `loam/objects` is the same store format under the
+  historical directory names (identical schema, identical object
+  envelopes), so `Repo::open` resolves it instead of refusing it — the
+  1.48M-commit kernel store now serves directly. A root with neither
+  layout but with foreign content is still refused rather than
+  silently initialized as an empty repository beside the user's data.
+
+- **`gardenbed-ab`: a paired Gardenbed-vs-Git benchmark harness**
+  (`crates/bench/src/bin/ab.rs`). Six scenarios — `provision`, `query`,
+  `land`, `contend`, `refresh`, `history` — run both systems against one
+  history and record wall/CPU/max-RSS per process (`wait4(2)`), network
+  bytes in both directions (a transparent TCP relay), and worker disk.
+  Git is measured in three honest configurations: `git-partial`
+  (blobless + sparse), `git-full`, and `git-worktree` (a shared clone
+  with per-worker worktrees — the realistic "many agents on one host"
+  setup, and the baseline any disk claim must beat). The harness
+  **fails** a `git-partial` run when the server ignored `--filter`, and
+  refuses to start with under 2 GiB free, because both cases silently
+  produce flattering nonsense. Query results are checked for equivalence
+  against a reference copy. See [docs/benchmarking.md](docs/benchmarking.md)
+  for the dimension map,
+  the methodology traps (Nagle stalls in a relay; `git daemon` ignoring
+  filters; local-path clones ignoring filters; a stale `bed` on PATH),
+  and the recorded results.
 
 - **Offline commit queue** (v0.2.md §6, M15): when the server is
   unreachable at connect time — and only then; a server that answers,

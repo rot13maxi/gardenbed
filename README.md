@@ -23,6 +23,56 @@ commit, and integration workflows. Gardenbed is built around three ideas:
 - **Make repository operations available as APIs.** The CLI uses gRPC;
   an MCP server exposes read operations for agents without a working copy.
 
+## Measured against Git
+
+Numbers below are from `gardenbed-ab`, a paired harness that runs both
+systems against **the same history** and records wall time, CPU, peak RSS,
+network bytes, and disk. The first block is a synthetic 20k-commit
+fixture; the other two are the real Linux kernel history (1,485,163
+commits, 96,080 files), each worker taking `drivers/net` (6,900 files).
+Both used a local server, tmpfs workspace where available, and fsync on.
+
+|  | Gardenbed | `git clone --filter=blob:none` + sparse | full clone | `git worktree` ×8 |
+|---|---:|---:|---:|---:|
+| **20k commits, 8 workers** | | | | |
+| total wall | **2.0 s** | 24.9 s | 69.4 s | 8.9 s |
+| network received | **4 MiB** | 265 MiB | 317 MiB | 40 MiB |
+| disk | 205 MiB | 386 MiB | 446 MiB | **146 MiB** |
+| **1.48M commits, 1 worker** | | | | |
+| total wall | **32.6 s** | 177 s | 381 s | — |
+| network received | **146 MiB** | 1,818 MiB | 7,949 MiB | — |
+| disk | **215 MiB** | 2,254 MiB | 6,731 MiB | — |
+| **1.48M commits, 4 workers** | | | | |
+| total wall | **96 s** | 697 s | — | 377 s |
+| network received | **585 MiB** | 7,273 MiB | — | 6,131 MiB |
+
+The gap is not a faster transfer: it is that a Git worker must hold
+history before it can answer, so its cost scales with the repository. A
+Gardenbed worker fetches the files it selected and a ref, so its cost
+scales with the selection.
+
+`git worktree` is the baseline that matters on one machine, and it is the
+strongest competitor: at 20k commits it is within ~4.5× of Gardenbed and
+uses *less* disk, because worktrees share one object store. What it
+cannot avoid is having the whole history on the machine: at kernel size
+four worktree workers still transferred 6.1 GiB between them (1.5 GiB
+per worker) where four Gardenbed workers transferred 585 MiB total.
+
+Queries, same kernel history (`drivers/net/Kconfig`):
+
+|  | Gardenbed | Git (local) |
+|---|---:|---:|
+| `blame` (whole file) | **0.10 s** | 0.85 s |
+| file contents | ~0.01 s | ~0.01 s |
+| `log -n 50` | ~0.01 s | ~0.01 s |
+
+One honest caveat: once a worker is warm, `log` and file reads are a wash
+— process startup dominates on both sides. Gardenbed's claim is about the
+cost of *a worker*, not about beating Git at every command.
+See [docs/benchmarking.md](docs/benchmarking.md) for the dimension map,
+the methodology (including the ways a benchmark like this lies), and how
+to reproduce a run with `gardenbed-ab suite`.
+
 The server owns the repository. Creating a changeset stores it there
 immediately; publishing it to `main` is a separate operation. There is no
 push step between client and server.
