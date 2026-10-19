@@ -36,7 +36,7 @@ use sha2::Sha256;
 
 use gardenbed_derive::Engine;
 use gardenbed_model::{Change, Changeset, Id, Mode, Op};
-use gardenbed_store::{MetadataStore, ObjectStore};
+use gardenbed_store::{MetadataStore, ObjectStore, StoreError};
 
 use crate::counting::CountingObjects;
 use crate::difftree::{DIFF_BATCH, DiffRecord, DiffStatus, run_batch};
@@ -219,9 +219,57 @@ pub fn import_from_path(
             for parent in &cs.parents {
                 engine.certify_history(*parent)?;
             }
-            let root = engine.validated_tree_for_new(&cs)?;
+            let (root, written_trees) = engine.validated_tree_for_new_with_writes(&cs)?;
             let rows = engine.derived_rows_for_validated_tree(cs_id, &cs, root)?;
-            metadata.put_validated_changeset(&cs, root, &rows, Some(&sha_hex), raw_capture)?;
+            // Same last-chance re-check as the server's CreateChangeset:
+            // the import holds repo.lock only shared, so a --force gc can
+            // sweep concurrently and unlink a mirrored blob between the
+            // mirror above and this row's commit. The in-transaction
+            // verify is indivisible against gc's write lock, so the row
+            // either lands with its objects present or the import errors
+            // and the next import re-mirrors it (imports are resumable).
+            // Gitlink ids are padded upstream SHAs, never objects files,
+            // so they are exempt.
+            //
+            // The required set is the blob ids plus the DERIVATION'S
+            // WRITE SET — every tree id the replay stored, idempotent
+            // re-puts included (round-2 P2-1; round-4 redesign for
+            // commit size-independence, same as the server side). Trees
+            // the replay did not store are untouched subtrees reachable
+            // from certified rows, which the gc mark never collects (V1,
+            // D14); the write set enumerates exactly the race surface at
+            // O(touched directories).
+            let mut required: Vec<Id> = cs
+                .changes
+                .iter()
+                .filter(|c| c.mode != Mode::Gitlink)
+                .filter_map(|c| c.blob)
+                .collect();
+            required.extend(written_trees.iter().copied());
+            let verify_objects = counting.clone();
+            let verify = move || {
+                // Plain existence checks for blobs and replayed trees
+                // alike: one path shape per content hash, has() covers
+                // both kinds.
+                for id in &required {
+                    if !verify_objects.has(*id)? {
+                        let key = id.to_hex();
+                        return Err(StoreError::Invalid(format!(
+                            "object {key} was collected by a concurrent gc; \
+                             the next import re-mirrors it"
+                        )));
+                    }
+                }
+                Ok(())
+            };
+            metadata.put_validated_changeset(
+                &cs,
+                root,
+                &rows,
+                Some(&sha_hex),
+                raw_capture,
+                Some(&verify),
+            )?;
             arena.nodes[*idx as usize].cs = Some(cs_id);
             report.commits_new += 1;
             if report.commits_new % 25_000 == 0 {

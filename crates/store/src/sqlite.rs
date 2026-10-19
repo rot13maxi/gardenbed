@@ -196,6 +196,7 @@ impl SqliteMetadataStore {
 }
 
 impl SqliteMetadataStore {
+    #[allow(clippy::too_many_arguments)]
     fn write_changeset(
         &self,
         canonical: &[u8],
@@ -203,6 +204,7 @@ impl SqliteMetadataStore {
         derived: &[crate::traits::DerivedRow],
         validated_tree: Option<Option<Id>>,
         raw_commit: Option<&[u8]>,
+        verify: Option<&dyn Fn() -> Result<(), StoreError>>,
     ) -> Result<Id, StoreError> {
         use sha2::Digest;
         let sha = git_sha_hex.map(normalize_git_sha).transpose()?;
@@ -352,6 +354,13 @@ impl SqliteMetadataStore {
                         .map_err(db_err)?;
                     }
                 }
+            }
+            // The last-chance object re-check runs under the write lock,
+            // inside this transaction: indivisible against a concurrent
+            // gc sweep's generation-check-plus-unlink step (which takes
+            // the same lock). A failure rolls the whole commit back.
+            if let Some(verify) = verify {
+                verify()?;
             }
             Ok(())
         })?;
@@ -630,7 +639,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         git_sha_hex: &str,
         derived: &[crate::traits::DerivedRow],
     ) -> Result<Id, StoreError> {
-        self.write_changeset(canonical, Some(git_sha_hex), derived, None, None)
+        self.write_changeset(canonical, Some(git_sha_hex), derived, None, None, None)
     }
 
     fn validation_tree(&self, cs: Id) -> Result<Option<Option<Id>>, StoreError> {
@@ -681,6 +690,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         derived: &[crate::traits::DerivedRow],
         git_sha_hex: Option<&str>,
         raw_commit: Option<&[u8]>,
+        verify: Option<&dyn Fn() -> Result<(), StoreError>>,
     ) -> Result<Id, StoreError> {
         let canonical = cs
             .canonical_bytes()
@@ -691,6 +701,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             derived,
             Some(root_tree),
             raw_commit,
+            verify,
         )
     }
 }

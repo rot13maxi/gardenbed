@@ -235,13 +235,21 @@ pub enum RepoResolveError {
 /// One lazily opened repository: the [`Repo`] plus the bookkeeping the
 /// [`RepoSet`] eviction needs — a use counter (handles currently resolving
 /// requests; only zero-use handles are evictable) and a monotonic clock
-/// stamp for LRU ordering.
+/// stamp for LRU ordering — and the shared `repo.lock` hold (root mode)
+/// that keeps offline gc out for the handle's lifetime (round-2 review,
+/// P2-2: a repository created after `serve` started is served through
+/// this handle; the lock must ride the handle, not the startup snapshot,
+/// and LRU eviction drops it naturally).
 pub struct RepoHandle {
     repo: Arc<Repo>,
     uses: AtomicU64,
     last_used: AtomicU64,
+    /// The shared flock on `<dir>/repo.lock`, held while this handle is
+    /// open. `None` in single mode (no directory to lock). Never read:
+    /// the `File`'s drop releases the lock, which is the point.
+    #[allow(dead_code)]
+    repo_lock: Option<File>,
 }
-
 impl RepoHandle {
     /// The repository service (stores + engine + counters).
     pub fn repo(&self) -> &Arc<Repo> {
@@ -575,6 +583,18 @@ impl RepoSet {
                 name: name.to_owned(),
                 source,
             })?;
+            // The shared repo.lock rides the handle (P2-2): acquired
+            // inside the open gate so exactly one opener takes it, held
+            // until eviction/reopen drops the last Arc. Blocking acquire —
+            // an offline gc in flight is finite.
+            let repo_lock =
+                crate::gc::lock_shared_blocking(&dir).map_err(|source| RepoResolveError::Open {
+                    name: name.to_owned(),
+                    source: ServerError::Invalid(format!(
+                        "cannot lock {} (repo.lock): {source}",
+                        dir.display()
+                    )),
+                })?;
             // Counters are per-name and cumulative: a repository evicted
             // earlier keeps its counts when it reopens.
             if let Ok(parked) = self.counters.lock()
@@ -586,6 +606,7 @@ impl RepoSet {
                 repo: Arc::new(repo),
                 uses: AtomicU64::new(1),
                 last_used: AtomicU64::new(0),
+                repo_lock: Some(repo_lock),
             });
             if let Ok(mut parked) = self.counters.lock() {
                 parked.insert(name.to_owned(), handle.counters().clone());
@@ -631,6 +652,9 @@ impl RepoSet {
             repo,
             uses: AtomicU64::new(1),
             last_used: AtomicU64::new(0),
+            // Single mode: no directory, no repo.lock (the same stance
+            // as serve's startup snapshot for Config selections).
+            repo_lock: None,
         });
         if let Ok(mut parked) = self.counters.lock() {
             parked.insert(name.to_owned(), handle.counters().clone());

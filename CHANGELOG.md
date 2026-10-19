@@ -160,6 +160,31 @@ tags, and the verification record for a release lives in
 
 ### Fixed
 
+- **gc round 4: two landing reds fixed — v3 chaos red and the commit-p50
+  size regression** (M13, v0.2.md): (1) the gc_chaos v3 red was the
+  test's own replant: it lived inside `debug_assert_eq!(repo.put_blob(
+  ...), *id)`, and `debug_assert_eq!` does not evaluate its operands in
+  release builds, so the priming gc's 40 orphan deletions (all correct;
+  visible as plain `unlink` syscalls the strace filter did not capture,
+  which read as "zero unlinkat") were never undone and the next
+  iteration's backdate ENOENT'd. The replant is now a plain
+  `expect` + `assert_eq!`. gc itself was sound. (2) The round-3
+  commit-transaction verify walked the new root's full tree closure
+  (one `get_tree` per distinct subtree) — O(repository size) per
+  commit: 1M-file commits p50'd 2.9s vs 10k's 56ms (ratio ~51 vs
+  budget 2). The writer-side handshake now verifies the derivation's
+  write set instead (every tree the replay stored, idempotent re-puts
+  included) via flat `has()` checks — O(touched directories). Complete
+  by V1/D14: trees the replay did not store are untouched subtrees of
+  certified rows, which the gc mark never collects; the raced trees are
+  exactly the replay's `put_tree` set (the P2-1 deterministic-replay
+  orphan shape). Both server `CreateChangeset` and git import share the
+  new `validated_tree_for_new_with_writes`. p50 after: 26.9ms vs
+  25.9ms, ratio 1.04. Mutation re-evidence: verify gutted to no-op →
+  `p2_1_missing_intermediate_tree_fails_the_commit` red; restored →
+  green. Release gc_chaos 4/4 (the round-3 gap: v3 was debug-green /
+  release-red and debug-only gates missed it).
+
 - **Two merge mismerges fixed** (round-1 review, exposed by the merge-core
   salvage): the derive walk treated a `None` root tree as a "deleted
   subtree" instead of the empty root, spurious-conflicting theirs'

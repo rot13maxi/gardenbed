@@ -207,7 +207,13 @@ impl crate::traits::ObjectStore for FsObjectStore {
         // what distinguishes the two.
         if let Some(raw) = read_file_bounded(&path)? {
             match parse_envelope(&raw) {
-                Ok(existing) if existing == content => return Ok(id),
+                Ok(existing) if existing == content => {
+                    // Identical content already stored. Refresh mtime so a
+                    // concurrent GC's young-orphan grace restarts on
+                    // re-upload (v0.2.md §7: an upload is a use).
+                    touch_mtime(&path)?;
+                    return Ok(id);
+                }
                 Ok(_) => return Err(StoreError::ImmutabilityViolation(id)),
                 Err(_) => {}
             }
@@ -505,6 +511,27 @@ fn read_file_bounded(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
 /// fsyncs a directory so entries created/renamed inside it are durable.
 fn fsync_dir(dir: &Path) -> Result<(), StoreError> {
     File::open(dir).and_then(|d| d.sync_all()).map_err(io_err)
+}
+
+/// Sets a path's mtime (and atime) to now without opening it for write —
+/// the GC young-orphan grace restarts on re-upload of identical content.
+fn touch_mtime(path: &Path) -> Result<(), StoreError> {
+    rustix::fs::utimensat(
+        rustix::fs::CWD,
+        path,
+        &rustix::fs::Timestamps {
+            last_access: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_NOW,
+            },
+            last_modification: rustix::fs::Timespec {
+                tv_sec: 0,
+                tv_nsec: rustix::fs::UTIME_NOW,
+            },
+        },
+        rustix::fs::AtFlags::empty(),
+    )
+    .map_err(|e| StoreError::Io(e.to_string()))
 }
 
 fn io_err(e: std::io::Error) -> StoreError {

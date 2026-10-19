@@ -260,6 +260,7 @@ impl MetadataStore for MemoryStore {
         derived: &[crate::traits::DerivedRow],
         git_sha_hex: Option<&str>,
         raw_commit: Option<&[u8]>,
+        _verify: Option<&dyn Fn() -> Result<(), StoreError>>,
     ) -> Result<Id, StoreError> {
         let canonical = cs
             .canonical_bytes()
