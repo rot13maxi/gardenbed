@@ -145,6 +145,20 @@ every commit records it and reviewers filter by author.
   `/home/user/bed-land` (stable path). Rule: chain infrastructure lives outside /tmp.
   (This registry's /tmp working copy was lost in the same cleanup — durable home is
   this file; entries #13–#18 reconstructed 2026-10-19.)
+- **#19 — Debug-green is not evidence for release-mode timing classes**: the M13 gc
+  landing (2026-10-19) passed every debug gate (bed 226/0, store+server 140/0, gc 11/0)
+  but the RELEASE canary through the deployed pair caught two reds the debug gates and
+  the round-3 review both missed: (a) gc_chaos `v3_sigkill_mid_gc_leaves_sound_store`
+  failed deterministically in release only (8/8; debug 11/0; an eprintln between
+  `put_blob` and `backdate` made it pass — a timing race), and (b) the CI perf job's
+  `commit_p50_is_size_independent_10k_vs_1m` regressed (1M p50 2.9s vs 10k 56.1ms —
+  a per-commit cost proportional to repo size, the signature of the handshake's
+  closure walk inside the commit write transaction). Main was reverted to 33a7c799
+  (ruling: two independent reds attributable to the lane's span). **Rule**: the release
+  canary through the deployed pair is a first-class gate, not a formality — lane gates
+  for timing-sensitive code MUST include the release-mode run of the affected suites;
+  review signoff on debug-green alone is insufficient for timing classes.
+  Evidence: /home/user/gc-red-evidence/gc-strace{2,3}.txt.
 
 ## Backlog — product fixes from dogfood findings
 - **#11 product fix**: `export_to_path` should reset/checkout the target ref when the
