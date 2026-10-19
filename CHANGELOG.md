@@ -9,6 +9,23 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- **Checkout updates cost the change, not the selection.** `bed switch`
+  (and `rebase`/`merge`, which move the working copy the same way)
+  re-verified the entire sparse selection: two read-and-hash passes over
+  every selected file plus one SQLite lookup and one upsert per file. On
+  a 3,222-file selection a warm `switch` cost ~140 ms and ~16k
+  `statx`/32k `fcntl` calls. Three changes:
+  `CheckoutFs::entry_verified` settles a path from `stat` alone when its
+  `HINT_VERIFIED` row still matches on size, mtime, and mode (the same
+  trust `bed status` already extends to hints); `sync_sparse` skips paths
+  whose target already equals their verified row entirely (nothing to
+  write, nothing that could be refused); and `Treestate::all_entries` /
+  `upsert_all` / `remove_all` replace the per-path query and statement
+  round-trips. Result: **19.5 ms** at 3,222 files and **5.1 ms** at 10 on
+  the same fixture (Git: 170 ms and 149 ms). Safety is unchanged and
+  covered: a verified row that no longer matches is read and refused, an
+  unverified row is always read, and a skipped path is never rewritten.
+
 
 - **Offline commit queue** (v0.2.md §6, M15): when the server is
   unreachable at connect time — and only then; a server that answers,
