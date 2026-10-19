@@ -156,13 +156,18 @@ See [MCP setup and tool schemas](mcp.md) for client configuration.
 
 ## Offline behavior and troubleshooting
 
-`status`, `sparse list`, and `sparse remove` work offline. Commands that query
-history, fetch files, or write to the repository require the server.
+`status`, `sparse list`, and `sparse remove` work offline. Commands that
+query history or fetch files require the server. `commit` also completes
+offline when the server is unreachable at connect time: the changeset is
+built and content-addressed locally and queued; `bed sync` uploads the
+queue when the server returns (`switch`, `rebase`, and `publish` refuse
+while commits are pending).
 
 | Problem | Next step |
 |---|---|
 | No local state | Run `bed clone`, or select existing state with `--state-dir` |
 | Cannot reach the server | Start `gardenbed-server` and check its address |
+| Commits queued offline | Run `bed sync` once the server is reachable |
 | Clone finds no default ref | Pass `--ref` with an existing branch name |
 | Changeset prefix is ambiguous | Use more hex characters |
 | Checkout would overwrite local work | Commit or move that work aside |
