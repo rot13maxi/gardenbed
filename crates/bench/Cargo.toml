@@ -17,6 +17,9 @@ gardenbed-server = { path = "../server" }
 # benches measure are library functions the `bed` binary itself calls.
 gardenbed = { path = "../bed" }
 tempfile = "3"
+parking_lot = "0.12.5"
+libc = "0.2"
+serde_json = "1"
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
     "sync",
@@ -32,6 +35,10 @@ tokio = { version = "1", default-features = false, features = [
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }
+
+[[bin]]
+name = "gardenbed-ab"
+path = "src/bin/ab.rs"
 
 [[bin]]
 name = "gen-demo-corpus"
