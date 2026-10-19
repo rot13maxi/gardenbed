@@ -200,23 +200,103 @@ impl std::fmt::Debug for Repo {
     }
 }
 
+/// Where a repository's stores live inside `root`.
+///
+/// The current layout is `<root>/objects` + `<root>/metadata.sqlite3`.
+/// The pre-rename layout is `<root>/loam/objects` +
+/// `<root>/seedbed.sqlite3`; the formats are identical (same schema, same
+/// envelopes), so the historical names are resolved rather than refused.
+struct Layout {
+    /// Root passed to `FsObjectStore::open` (it appends `objects/`).
+    objects: std::path::PathBuf,
+    /// The metadata database file.
+    metadata: std::path::PathBuf,
+    _private: (),
+}
+
+fn resolve_layout(root: &Path) -> Layout {
+    // The pre-rename layout wins only when it is actually present: an empty
+    // or fresh root must initialize as the current layout.
+    let pre_rename =
+        root.join("seedbed.sqlite3").is_file() || root.join("loam").join("objects").is_dir();
+    let current = !pre_rename || root.join("metadata.sqlite3").is_file();
+    if current {
+        Layout {
+            objects: root.to_path_buf(),
+            metadata: root.join("metadata.sqlite3"),
+            _private: (),
+        }
+    } else {
+        Layout {
+            objects: root.join("loam"),
+            metadata: root.join("seedbed.sqlite3"),
+            _private: (),
+        }
+    }
+}
+
 impl Repo {
     /// Opens (creating if needed) the repository rooted at `root`:
     /// `<root>/objects/` holds the content-addressed object store and
     /// `<root>/metadata.sqlite3` the metadata database. Idempotent.
+    ///
+    /// The pre-rename on-disk layout is accepted in place: a root holding
+    /// `seedbed.sqlite3` and `loam/objects` is the same stores under the
+    /// historical directory names (identical schema, identical object
+    /// envelopes), so it opens as an ordinary repository. See
+    /// [`resolve_layout`].
     pub fn open(root: &Path) -> Result<Self, ServerError> {
         Self::validate_layout(root)?;
-        let objects = Arc::new(FsObjectStore::open(root)?);
-        let metadata = Arc::new(SqliteMetadataStore::open(&root.join("metadata.sqlite3"))?);
+        let layout = resolve_layout(root);
+        if !root.join("metadata.sqlite3").exists()
+            && layout
+                .metadata
+                .file_name()
+                .is_some_and(|n| n == "seedbed.sqlite3")
+        {
+            log::info!(
+                "opening pre-rename storage layout at {} (seedbed.sqlite3 + loam/objects)",
+                root.display()
+            );
+        }
+        let objects = Arc::new(FsObjectStore::open(&layout.objects)?);
+        let metadata = Arc::new(SqliteMetadataStore::open(&layout.metadata)?);
         Ok(Self::new(objects, metadata))
     }
 
-    /// Refuse obsolete layouts instead of silently opening an empty repository.
+    /// Refuse a root that names neither layout, instead of silently creating
+    /// an empty repository beside real data.
     pub fn validate_layout(root: &Path) -> Result<(), ServerError> {
-        if root.join("seedbed.sqlite3").exists() && !root.join("metadata.sqlite3").exists() {
-            return Err(ServerError::Invalid(
-                "repository uses an obsolete storage layout; export it with the previous version and import into a new directory".into(),
-            ));
+        // An empty or partially created root is fine: `open` initializes it.
+        let has_current = root.join("metadata.sqlite3").is_file() || root.join("objects").is_dir();
+        let has_pre_rename =
+            root.join("seedbed.sqlite3").is_file() || root.join("loam").join("objects").is_dir();
+        if !has_current && !has_pre_rename && root.is_dir() {
+            // Directories the server owns (locks, mirrors, tmp) do not make
+            // this a repository; anything else means the caller pointed at
+            // the wrong path and would silently get an empty history.
+            let foreign: Vec<String> = std::fs::read_dir(root)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .filter(|name| {
+                            !matches!(
+                                name.as_str(),
+                                "gardenbed.lock" | "repo.lock" | "git-mirror.git" | "tmp"
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !foreign.is_empty() {
+                return Err(ServerError::Invalid(format!(
+                    "{} holds neither metadata.sqlite3 + objects/ nor the pre-rename \
+                     seedbed.sqlite3 + loam/objects — refusing to create an empty repository \
+                     beside existing data",
+                    root.display()
+                )));
+            }
         }
         Ok(())
     }

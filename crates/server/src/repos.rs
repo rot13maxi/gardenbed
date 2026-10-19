@@ -374,11 +374,15 @@ impl RepoSet {
         self.max_repos
     }
 
-    /// True if `root` is a v0.1 layout (`metadata.sqlite3` or `objects/` at
-    /// the top level) rather than a multi-repo root. Such a root serves
-    /// unchanged as repository [`DEFAULT_REPO`].
+    /// True if `root` itself holds one repository's stores
+    /// (`metadata.sqlite3`/`objects/`, or the pre-rename
+    /// `seedbed.sqlite3`/`loam/objects/`) rather than being a multi-repo
+    /// root. Such a root serves as repository [`DEFAULT_REPO`].
     pub fn is_legacy_root(root: &Path) -> bool {
-        root.join("metadata.sqlite3").is_file() || root.join("objects").is_dir()
+        root.join("metadata.sqlite3").is_file()
+            || root.join("objects").is_dir()
+            || root.join("seedbed.sqlite3").is_file()
+            || root.join("loam").join("objects").is_dir()
     }
 
     /// The directory of repository `name` (`root/name`; the legacy root
@@ -408,6 +412,13 @@ impl RepoSet {
         let RepoSetMode::Root(root) = &self.mode else {
             unreachable!("checked above")
         };
+        // A root that itself holds a repository is a single-repository root
+        // (the pre-multi-repo layout). Its subdirectories are storage
+        // internals — `objects/`, or `loam/objects/` — never sibling
+        // repositories, so subdirectory scanning must not run.
+        if Self::is_legacy_root(root) {
+            return vec![DEFAULT_REPO.to_owned()];
+        }
         let mut names: Vec<String> = std::fs::read_dir(root)
             .map(|entries| {
                 entries
@@ -423,15 +434,15 @@ impl RepoSet {
             })
             .unwrap_or_default();
         names.sort();
-        if Self::is_legacy_root(root) && !names.contains(&DEFAULT_REPO.to_owned()) {
-            names.push(DEFAULT_REPO.to_owned());
-        }
         names
     }
 
     /// Does `dir` hold a repository (either store present)?
     fn is_repo_dir(dir: &Path) -> bool {
-        dir.join("metadata.sqlite3").is_file() || dir.join("objects").is_dir()
+        dir.join("metadata.sqlite3").is_file()
+            || dir.join("objects").is_dir()
+            || dir.join("seedbed.sqlite3").is_file()
+            || dir.join("loam").join("objects").is_dir()
     }
 
     /// The names currently held open (for logs and tests).

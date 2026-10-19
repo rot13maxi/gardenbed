@@ -9,6 +9,14 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- **The pre-rename storage layout opens in place.** A root holding
+  `seedbed.sqlite3` + `loam/objects` is the same store format under the
+  historical directory names (identical schema, identical object
+  envelopes), so `Repo::open` resolves it instead of refusing it — the
+  1.48M-commit kernel store now serves directly. A root with neither
+  layout but with foreign content is still refused rather than
+  silently initialized as an empty repository beside the user's data.
+
 - **Checkout updates cost the change, not the selection.** `bed switch`
   (and `rebase`/`merge`, which move the working copy the same way)
   re-verified the entire sparse selection: two read-and-hash passes over
