@@ -104,6 +104,12 @@ every commit records it and reviewers filter by author.
   synthetic store would test nothing. Fix: the perf job skips it with
   `--skip kernel_` (class prefix, so future kernel_* corpus tests are
   covered); budgets and the corpus_ripgrep_* import gates still run.
+  (d) `-- --ignored` also un-ignores #[ignore]d *child entry points*:
+  `fastcdc_table_child_entry` (crates/store/tests/gblo2.rs) is driven by
+  its non-ignored parent `fastcdc_table_identical_across_processes` via
+  GBLO2_CHILD_* env vars; run directly it panics on the missing env.
+  Fix: the perf job adds `--skip fastcdc_table_child_entry`; the parent
+  (the real coverage) runs in the regular test job.
 
 ## Backlog — product fixes from dogfood findings
 - **#11 product fix**: `export_to_path` should reset/checkout the target ref when the

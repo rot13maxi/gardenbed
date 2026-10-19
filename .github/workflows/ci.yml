@@ -103,7 +103,13 @@ jobs:
       # A synthetic store would test nothing — the value is the real kernel
       # corpus shape. Perf budgets and the corpus_ripgrep_* import gates
       # still run.
-      - run: cargo test --workspace --release -- --ignored --skip kernel_
+      # fastcdc_table_child_entry (crates/store/tests/gblo2.rs) is the
+      # #[ignore]d child entry point that the parent test
+      # fastcdc_table_identical_across_processes drives via env vars
+      # (GBLO2_CHILD_*) — running it directly under -- --ignored just
+      # panics on the missing env. Skip the entry point; the parent (and
+      # its real coverage) runs in the regular test job.
+      - run: cargo test --workspace --release -- --ignored --skip kernel_ --skip fastcdc_table_child_entry
 
   # ----------------------------------------------------- fuzz smoke (M8)
   fuzz-smoke:
