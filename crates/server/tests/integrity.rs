@@ -533,15 +533,63 @@ fn eager_rebuild_restores_certificate_backed_derived_tree_rows() {
 }
 
 #[test]
-fn obsolete_layout_is_rejected_without_creating_an_empty_repository() {
+fn pre_rename_layout_opens_in_place() {
+    // `seedbed.sqlite3` + `loam/objects` is the same store format under the
+    // historical directory names: it must open, not be refused.
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
+
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("seedbed.sqlite3"), b"old metadata").unwrap();
+    let loam = dir.path().join("loam");
+    std::fs::create_dir_all(loam.join("objects")).unwrap();
+    let seedbed = dir.path().join("seedbed.sqlite3");
+    // Create a real (empty) store at the historical paths, then write one
+    // changeset into it through the ordinary stores.
+    let objects = std::sync::Arc::new(FsObjectStore::open(&loam).unwrap());
+    let metadata = std::sync::Arc::new(SqliteMetadataStore::open(&seedbed).unwrap());
+    let repo = Repo::new(objects, metadata);
+    let head = commit(&repo, &changeset(vec![], vec![], "pre-rename seed"));
+    repo.cas_ref("main", None, head).unwrap();
+    drop(repo);
+
+    // Reopening by root must find the same repository.
+    let reopened = Repo::open(dir.path()).expect("pre-rename layout opens");
+    assert_eq!(
+        reopened.get_ref("main").unwrap(),
+        Some(head),
+        "the seed written under the old paths must be visible"
+    );
+    // Opening must not migrate files or create a second, empty store.
+    assert!(!dir.path().join("metadata.sqlite3").exists());
+    assert!(!dir.path().join("objects").exists());
+    assert!(seedbed.exists());
+}
+
+#[test]
+fn a_root_with_foreign_content_is_refused_instead_of_silently_empty() {
+    // A wrong `--root` must not produce an empty repository beside the
+    // user's data: that reads as "all history vanished".
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Makefile"), b"not a repository").unwrap();
     let error = Repo::open(dir.path()).unwrap_err();
-    assert!(error.to_string().contains("obsolete storage layout"));
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to create an empty repository"),
+        "unexpected error: {error}"
+    );
     assert!(!dir.path().join("metadata.sqlite3").exists());
     assert!(!dir.path().join("objects").exists());
     assert_eq!(
-        std::fs::read(dir.path().join("seedbed.sqlite3")).unwrap(),
-        b"old metadata"
+        std::fs::read(dir.path().join("Makefile")).unwrap(),
+        b"not a repository"
     );
+}
+
+#[test]
+fn an_empty_root_still_initializes_as_the_current_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repo::open(dir.path()).unwrap();
+    assert!(dir.path().join("metadata.sqlite3").exists());
+    assert!(dir.path().join("objects").is_dir());
+    assert!(repo.get_ref("main").unwrap().is_none());
 }
