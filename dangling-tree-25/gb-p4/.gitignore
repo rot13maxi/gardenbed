@@ -1,0 +1,8 @@
+/target
+*.sqlite3*
+*.sqlite-shm
+*.sqlite-wal
+.DS_Store
+fuzz/target/
+fuzz/artifacts/
+__pycache__/

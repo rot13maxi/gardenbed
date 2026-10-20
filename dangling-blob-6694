@@ -1,0 +1,31 @@
+use std::sync::Arc;
+use gardenbed_derive::Engine;
+use gardenbed_model::*;
+use gardenbed_store::{MemoryStore, MetadataStore as _, ObjectStore as _};
+
+fn ident(t: &str) -> Identity { Identity { name: t.into(), email: "t@t".into(), time_secs: 1, tz_min: 0 } }
+
+#[test]
+fn dbg3() {
+    let store = Arc::new(MemoryStore::new());
+    let engine = Engine::new(store.clone(), store.clone());
+    for c in [b"1\n2\n3\n4\n5\n".as_ref(), b"A\n2\n3\n4\n5\n".as_ref(), b"1\n2\n3\n4\nE\n".as_ref(), b"k\n".as_ref()] {
+        store.put_blob(c).unwrap();
+    }
+    let mk = |parents: Vec<Id>, changes: Vec<Change>, m: &str| {
+        let cs = Changeset { parents, changes, message: m.into(), author: ident(m), committer: ident(m), signature: None };
+        store.put_changeset(&cs).unwrap()
+    };
+    let add = |p: &str, c: &[u8], m: Mode| Change { path: p.into(), op: Op::Add, blob: Some(blob_id(c)), src_path: None, mode: m };
+    let mod_ = |p: &str, c: &[u8], m: Mode| Change { path: p.into(), op: Op::Modify, blob: Some(blob_id(c)), src_path: None, mode: m };
+    let root = mk(vec![], vec![], "root");
+    let base = mk(vec![root], vec![add("f", b"1\n2\n3\n4\n5\n", Mode::Regular), add("keep", b"k\n", Mode::Regular)], "base");
+    let ours = mk(vec![base], vec![mod_("f", b"A\n2\n3\n4\n5\n", Mode::Regular)], "ours");
+    let theirs = mk(vec![base], vec![mod_("f", b"1\n2\n3\n4\nE\n", Mode::Regular)], "theirs");
+    println!("base_tree={:?} ours_tree={:?} theirs_tree={:?}", engine.derive_tree(base).unwrap(), engine.derive_tree(ours).unwrap(), engine.derive_tree(theirs).unwrap());
+    println!("base_tree == ours_tree? {:?}", engine.derive_tree(base).unwrap() == engine.derive_tree(ours).unwrap());
+    match engine.merge_changesets(ours, theirs).unwrap() {
+        gardenbed_derive::MergeOutcome::Merged { changes, .. } => println!("Merged: {changes:?}"),
+        gardenbed_derive::MergeOutcome::Conflicted { conflicts } => println!("Conflicted: {conflicts:?}"),
+    }
+}

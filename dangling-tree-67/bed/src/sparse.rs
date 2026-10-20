@@ -1,0 +1,219 @@
+//! Sparse semantics — the sparse selection checkout path prefixes this working copy materializes.
+//!
+//! Sparse entries are *path prefixes*, never globs: `"src"`, `"src/lib"`, or
+//! an exact file like `"Cargo.toml"`. Matching is component-boundary aware
+//! — the prefix `"src"` matches `"src/a.rs"` but not `"srcfoo/a.rs"` — and
+//! the whole repository can be selected with the root prefix `"."`.
+
+use crate::error::ClientError;
+
+/// Normalizes a sparse prefix as typed on the command line or read from a
+/// hand-edited config.
+///
+/// Trims whitespace and trailing slashes, rejects absolute paths, `..`
+/// escapes, empty components, and embedded `.`/`..` parts. The root of the
+/// garden is spelled `.` (a bare `/` normalizes to `.` too, since repo
+/// paths are always repo-relative).
+///
+/// Returns the normalized prefix (e.g. `"src/"` → `"src"`).
+pub fn normalize_prefix(raw: &str) -> Result<String, ClientError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ClientError::SparsePrefix {
+            raw: raw.to_owned(),
+            reason: "it is empty".into(),
+        });
+    }
+
+    let mut prefix = trimmed.to_owned();
+    while prefix.ends_with('/') {
+        prefix.pop();
+    }
+    // A lone "/" (or a path that collapses to one) covers the whole repository;
+    // the repo-side spelling for that is ".".
+    if prefix.is_empty() || prefix == "." {
+        return Ok(".".to_owned());
+    }
+
+    if prefix.starts_with('/') {
+        return Err(ClientError::SparsePrefix {
+            raw: raw.to_owned(),
+            reason: "paths in the selected paths are repo-relative, not absolute".into(),
+        });
+    }
+    for comp in prefix.split('/') {
+        if comp.is_empty() {
+            return Err(ClientError::SparsePrefix {
+                raw: raw.to_owned(),
+                reason: "empty path component (double slash)".into(),
+            });
+        }
+        if comp == "." {
+            return Err(ClientError::SparsePrefix {
+                raw: raw.to_owned(),
+                reason: "use '.' alone for the whole repository, not inside a prefix".into(),
+            });
+        }
+        if comp == ".." {
+            return Err(ClientError::SparsePrefix {
+                raw: raw.to_owned(),
+                reason: "prefixes must stay inside the repository (no '..')".into(),
+            });
+        }
+    }
+    Ok(prefix)
+}
+
+/// Is `path` inside the sparse selection?
+///
+/// Component-boundary aware: prefix `"src"` matches `"src/a.rs"` and the
+/// path `"src"` itself, but never `"srcfoo/a.rs"`. An exact-file prefix
+/// (`"Cargo.toml"`) matches only that path. The root prefixes `.` (or an
+/// empty string, from a hand-edited config) match everything.
+pub fn in_sparse(path: &str, sparse: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    for prefix in sparse {
+        let prefix = prefix.trim_end_matches('/');
+        if prefix.is_empty() || prefix == "." {
+            return true;
+        }
+        if path == prefix || path.starts_with(&format!("{prefix}/")) {
+            return true;
+        }
+        // Note the boundary above: a bare `starts_with(prefix)` would
+        // wrongly pull "srcfoo/a.rs" under the "src" prefix.
+    }
+    false
+}
+
+/// Might files under the relative directory `dir` fall inside the sparse selection?
+///
+/// The pruning predicate for the [`crate::status`] walk: descend into `dir`
+/// only when some prefix lives inside it, equals it, or contains it. An
+/// empty `dir` is the working-copy root — always descend.
+pub fn dir_may_hold_selected(dir: &str, sparse: &[String]) -> bool {
+    if dir.is_empty() {
+        return true;
+    }
+    for prefix in sparse {
+        let prefix = prefix.trim_end_matches('/');
+        if prefix.is_empty() || prefix == "." {
+            return true;
+        }
+        if dir == prefix
+            || dir.starts_with(&format!("{prefix}/"))
+            || prefix.starts_with(&format!("{dir}/"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sparse(entries: &[&str]) -> Vec<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn component_boundaries_are_respected() {
+        let p = sparse(&["src"]);
+        assert!(in_sparse("src/a.rs", &p));
+        assert!(in_sparse("src", &p));
+        assert!(in_sparse("src/deep/nested/x.rs", &p));
+        // The whole point: no partial-component matches.
+        assert!(!in_sparse("srcfoo/a.rs", &p));
+        assert!(!in_sparse("src-latest/a.rs", &p));
+    }
+
+    #[test]
+    fn exact_file_prefixes_match_only_themselves() {
+        let p = sparse(&["Cargo.toml"]);
+        assert!(in_sparse("Cargo.toml", &p));
+        assert!(!in_sparse("Cargo.toml.bak", &p));
+        assert!(!in_sparse("sub/Cargo.toml", &p));
+
+        let p = sparse(&["src/main.rs"]);
+        assert!(in_sparse("src/main.rs", &p));
+        // Component boundary again: "src/main" must not swallow "src/main.rs".
+        assert!(!in_sparse("src/main.rs", &sparse(&["src/main"])));
+    }
+
+    #[test]
+    fn nested_prefixes() {
+        let p = sparse(&["src/lib"]);
+        assert!(in_sparse("src/lib/x.rs", &p));
+        assert!(!in_sparse("src/libfoo/x.rs", &p));
+        assert!(!in_sparse("src/other/x.rs", &p));
+        assert!(!in_sparse("src/lib.rs", &p));
+    }
+
+    #[test]
+    fn root_prefix_matches_everything() {
+        let p = sparse(&["."]);
+        assert!(in_sparse("src/a.rs", &p));
+        assert!(in_sparse("Cargo.toml", &p));
+        assert!(in_sparse("a/b/c/d/e", &p));
+        // An empty prefix (hand-edited config) behaves as the root too.
+        assert!(in_sparse("src/a.rs", &sparse(&[""])));
+    }
+
+    #[test]
+    fn empty_sparse_matches_nothing() {
+        assert!(!in_sparse("src/a.rs", &[]));
+    }
+
+    #[test]
+    fn any_prefix_matches() {
+        let p = sparse(&["docs", "src"]);
+        assert!(in_sparse("docs/x.md", &p));
+        assert!(in_sparse("src/a.rs", &p));
+        assert!(!in_sparse("tests/x.rs", &p));
+    }
+
+    #[test]
+    fn trailing_slashes_are_tolerated_in_config() {
+        let p = sparse(&["src/"]);
+        assert!(in_sparse("src/a.rs", &p));
+        assert!(!in_sparse("srcfoo/a.rs", &p));
+    }
+
+    #[test]
+    fn normalize_trims_and_rejects_escapes() {
+        assert_eq!(normalize_prefix("src/").unwrap(), "src");
+        assert_eq!(normalize_prefix("  src/lib/  ").unwrap(), "src/lib");
+        assert_eq!(normalize_prefix(".").unwrap(), ".");
+        assert_eq!(normalize_prefix("/").unwrap(), ".");
+        assert!(normalize_prefix("").is_err());
+        assert!(normalize_prefix("   ").is_err());
+        assert!(normalize_prefix("/abs").is_err());
+        assert!(normalize_prefix("../escape").is_err());
+        assert!(normalize_prefix("a//b").is_err());
+        assert!(normalize_prefix("a/./b").is_err());
+        assert!(normalize_prefix("a/../b").is_err());
+    }
+
+    #[test]
+    fn walk_pruning_never_skips_a_selected_file() {
+        let p = sparse(&["src/lib/x.rs"]);
+        assert!(dir_may_hold_selected("", &p));
+        assert!(dir_may_hold_selected("src", &p));
+        assert!(dir_may_hold_selected("src/lib", &p));
+        assert!(!dir_may_hold_selected("src/other", &p));
+        assert!(!dir_may_hold_selected("docs", &p));
+
+        let p = sparse(&["src"]);
+        assert!(dir_may_hold_selected("src", &p));
+        assert!(dir_may_hold_selected("src/deep", &p));
+        assert!(!dir_may_hold_selected("srcfoo", &p));
+
+        // Root prefix descends everywhere; empty sparse descends nowhere.
+        assert!(dir_may_hold_selected("a/b", &sparse(&["."])));
+        assert!(!dir_may_hold_selected("a/b", &[]));
+    }
+}

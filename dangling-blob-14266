@@ -1,0 +1,61 @@
+mod common;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use gardenbed_derive::Engine;
+use gardenbed_model::*;
+use gardenbed_store::{MemoryStore, MetadataStore as _, ObjectStore as _};
+
+type Snap = BTreeMap<String, (Mode, Vec<u8>)>;
+fn snap(pairs: &[(&str, Mode, &[u8])]) -> Snap {
+    pairs.iter().map(|(p, m, c)| ((*p).to_owned(), (*m, c.to_vec()))).collect()
+}
+fn ident(tag: &str) -> Identity {
+    Identity { name: format!("Merge {tag}"), email: "m@bed.example".into(), time_secs: 1_700_000_000, tz_min: 0 }
+}
+fn delta(from: &Snap, to: &Snap) -> Vec<Change> {
+    let mut out = Vec::new();
+    for (path, (mode, content)) in to {
+        match from.get(path) {
+            None => out.push(Change { path: path.clone(), op: Op::Add, blob: Some(blob_id(content)), src_path: None, mode: *mode }),
+            Some((m, c)) if m != mode || c != content => out.push(Change { path: path.clone(), op: Op::Modify, blob: Some(blob_id(content)), src_path: None, mode: *mode }),
+            _ => {}
+        }
+    }
+    for path in from.keys() {
+        if !to.contains_key(path) {
+            out.push(Change { path: path.clone(), op: Op::Delete, blob: None, src_path: None, mode: Mode::Regular });
+        }
+    }
+    out
+}
+
+#[test]
+fn dbg4() {
+    let base = snap(&[("f", Mode::Regular, b"1\n2\n3\n4\n5\n"), ("keep", Mode::Regular, b"k\n")]);
+    let ours = snap(&[("f", Mode::Regular, b"A\n2\n3\n4\n5\n"), ("keep", Mode::Regular, b"k\n")]);
+    let theirs = snap(&[("f", Mode::Regular, b"1\n2\n3\n4\nE\n"), ("keep", Mode::Regular, b"k\n")]);
+    let store = Arc::new(MemoryStore::new());
+    let engine = Engine::new(store.clone(), store.clone());
+    for s in [&base, &ours, &theirs] {
+        for (_, content) in s.values() { store.put_blob(content).unwrap(); }
+    }
+    let mut cs = |parents: Vec<Id>, changes: Vec<Change>, tag: &str| -> Id {
+        let c = Changeset { parents, changes, message: tag.to_owned(), author: ident(tag), committer: ident(tag), signature: None };
+        store.put_changeset(&c).unwrap()
+    };
+    let root = cs(vec![], vec![], "root");
+    let base_id = cs(vec![root], delta(&Snap::new(), &base), "base");
+    let ours_id = cs(vec![base_id], delta(&base, &ours), "ours");
+    let theirs_id = cs(vec![base_id], delta(&base, &theirs), "theirs");
+    let (b, _) = store.get_changeset(base_id).unwrap().unwrap();
+    let (o, _) = store.get_changeset(ours_id).unwrap().unwrap();
+    println!("base delta: {:?}", delta(&Snap::new(), &base));
+    println!("ours delta: {:?}", delta(&base, &ours));
+    println!("base cs: {:?}", b.changes);
+    println!("ours cs: {:?}", o.changes);
+    println!("trees: base={:?} ours={:?} theirs={:?}", engine.derive_tree(base_id).unwrap(), engine.derive_tree(ours_id).unwrap(), engine.derive_tree(theirs_id).unwrap());
+    match engine.merge_changesets(ours_id, theirs_id).unwrap() {
+        gardenbed_derive::MergeOutcome::Merged { changes, .. } => println!("Merged: {changes:?}"),
+        gardenbed_derive::MergeOutcome::Conflicted { conflicts } => println!("Conflicted: {conflicts:?}"),
+    }
+}

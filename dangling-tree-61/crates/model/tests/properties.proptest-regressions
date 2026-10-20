@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ea44ce3a02ef946e33d46c8cceaf03fe87aa7dcf2adafd52800740e304cc91ae # shrinks to cs = Changeset { parents: [], changes: [], message: "", author: Identity { name: "a", email: "a@a", time_secs: 0, tz_min: 0 }, committer: Identity { name: "a", email: "a@a", time_secs: 0, tz_min: 0 }, signature: Some([]) }

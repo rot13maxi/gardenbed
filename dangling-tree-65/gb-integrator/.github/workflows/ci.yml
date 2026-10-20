@@ -1,0 +1,125 @@
+# The v0.1 CI gate (docs/v0.1.md §9).
+#
+# Every push/PR runs the whole verification matrix in parallel jobs; the
+# expensive ones (release perf budgets, fuzz smoke, the north-star demo)
+# are the same commands the release checklist runs locally
+# (docs/release-0.1.md). Budgets assume the GitHub ubuntu runners: tmpfs
+# exists (/dev/shm) and the perf fixtures prefer it, exactly as they do
+# locally; the fsync toggle is never set in CI — durability is under test,
+# and tmpfs keeps fsync cheap without turning it off.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep generated artifacts off the corpus/cache paths.
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # ---------------------------------------------------------------- style
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ---------------------------------------------------------------- lint
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # --------------------------------------------------------------- tests
+  test:
+    name: test (--workspace)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@v2
+      # The default suite includes the M8 chaos suite (10 RPC classes ×
+      # 10 kill/restart cycles, SIGKILL + offline verification).
+      - run: cargo test --workspace
+
+  # ------------------------------------------------- perf budgets (M4/M5)
+  perf:
+    name: perf budgets (release --ignored)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@v2
+      # The budget tests build real fixtures (10k–1M files) and spawn real
+      # processes; they are release-only and assert their budgets.
+      - run: cargo test --workspace --release -- --ignored
+
+  # ----------------------------------------------------- fuzz smoke (M8)
+  fuzz-smoke:
+    name: fuzz smoke (30 s/target)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true # smoke only: a finding here fails the release gate, not every PR
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - run: cargo install cargo-fuzz --locked
+      # 30 s per target: enough to smoke the parsers, not to *fuzz* them
+      # (the release gate runs 120 s per target locally, docs/release-0.1.md).
+      - run: |
+          for t in fuzz_tree_apply fuzz_diff fuzz_difftree_parse fuzz_mcp_line fuzz_pack_reader; do
+            cargo fuzz run "$t" -- -max_total_time=30 -rss_limit_mb=4096
+          done
+        working-directory: fuzz
+
+  # ------------------------------------------------- north-star demo (§0)
+  demo:
+    name: demo (run-v0.1.sh)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+      - uses: Swatinem/rust-cache@v2
+      # sqlite3 and jq are preinstalled on the runner images; the demo
+      # requires both. The synthetic corpus (50k commits) stands in for
+      # §0's pinned 1 GB history — the demo's documented deviation.
+      - run: demo/run-v0.1.sh

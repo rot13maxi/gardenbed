@@ -1,0 +1,5 @@
+[package]
+name = "gardenbed-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true

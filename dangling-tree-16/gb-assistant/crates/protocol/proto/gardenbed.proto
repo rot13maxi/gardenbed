@@ -1,0 +1,410 @@
+// gardenbed wire protocol, v0.1.
+//
+// This file plus `docs/canonical-encoding.md` together form the published
+// gardenbed protocol (v0.1 design doc, decision D4): this .proto defines the
+// RPC surface and wire shapes; canonical-encoding.md defines the byte-level
+// object model (ids, changesets, trees) that these messages mirror
+// field-for-field. Any change to this file is a protocol change and must be
+// made against both documents.
+//
+// Modeling rules (mirroring docs/canonical-encoding.md):
+//   * Content addresses are SHA-256 digests carried as exactly 32 raw bytes
+//     (proto `bytes`) — never hex strings, never base64.
+//   * `Op` and `Mode` are proto enums whose numeric values are the canonical
+//     encoding's op/mode bytes: ADD=0, MODIFY=1, DELETE=2, RENAME=3 and
+//     REGULAR=0, EXEC=1, SYMLINK=2, GITLINK=3.
+//   * Timestamps are git-native epoch seconds + tz offset in minutes, carried
+//     verbatim (`time_secs` u64, `tz_min` sint32) so git round-trips can
+//     reproduce identical git SHAs.
+//   * Changesets carry metadata + blob *ids* only. Blob content never rides
+//     on Diff/Log messages; blob bytes move exclusively through PutBlob
+//     (bodies > 1 MiB) or CreateChangeset.inline_blobs (bodies <= 1 MiB).
+//   * Every request carries `repo` (single-repo in v0.1, but the field is
+//     part of the wire format from day one; see v0.1.md §1).
+//
+// All object access is want-list (v0.1.md §2): clients resolve
+// RootTree(cs) then request exactly the trees/blobs they are missing. Every
+// request names a content-addressed object, so any tier can answer and any
+// interrupted session resumes exactly.
+
+syntax = "proto3";
+
+package gardenbed.protocol.v1;
+
+// How a single path changed relative to a changeset's first parent.
+// Numeric values mirror the canonical encoding's op byte.
+enum Op {
+  // Path created.
+  OP_ADD = 0;
+  // Path's content or mode changed.
+  OP_MODIFY = 1;
+  // Path removed.
+  OP_DELETE = 2;
+  // Path moved from src_path.
+  OP_RENAME = 3;
+}
+
+// File mode, mirroring git's model. Numeric values mirror the canonical
+// encoding's mode byte.
+enum Mode {
+  MODE_REGULAR = 0;
+  MODE_EXEC = 1;
+  MODE_SYMLINK = 2;
+  // Submodule pointer: the entry's blob id is the upstream git SHA-1
+  // left-padded with zero bytes to 32 (canonical-encoding.md §3).
+  MODE_GITLINK = 3;
+}
+
+// Who made a change, with git-native timestamps preserved verbatim.
+message IdentityMsg {
+  string name = 1;
+  string email = 2;
+  // Epoch seconds (never normalized to ms — that is what keeps git
+  // round-trips byte-exact).
+  uint64 time_secs = 3;
+  // git's `±hhmm` tz offset in minutes; signed, zigzag on the wire.
+  sint32 tz_min = 4;
+}
+
+// One changed path on the wire. Mirrors gardenbed_model::Change: metadata and
+// blob *ids* only — blob content is never carried here.
+message ChangeMsg {
+  Op op = 1;
+  // Repo-relative path, e.g. "src/lib.rs".
+  string path = 2;
+  // Content address of the new blob. Required for ADD/MODIFY/RENAME, absent
+  // for DELETE (and forbidden there). A pure rename reuses the source blob's
+  // id.
+  optional bytes blob_id = 3;
+  // Previous path; present exactly when op == RENAME.
+  optional string src_path = 4;
+  Mode mode = 5;
+}
+
+// The unit of work: a seed. Mirrors gardenbed_model::Changeset field-for-field
+// (the canonical encoding is the identity; this message is the wire view).
+message ChangesetMsg {
+  // Empty => root changeset; otherwise >= 1. The first parent is the delta
+  // base and the mainline for blame.
+  repeated bytes parents = 1;
+  // Changes vs. the first parent. The wire preserves the sender's order; the
+  // canonical form (which defines the changeset's id) is strictly ascending
+  // by path bytes, as encoded by docs/canonical-encoding.md §3.
+  repeated ChangeMsg changes = 2;
+  string message = 3;
+  IdentityMsg author = 4;
+  IdentityMsg committer = 5;
+  // Arbitrary bytes (e.g. SSH/GPG armored signature over the canonical
+  // payload).
+  optional bytes signature = 6;
+}
+
+// One entry of a derived tree. `id` is exactly one of blob_id (file leaf) or
+// tree_id (subtree), mirroring gardenbed_model::TreeEntry's kind/blob/tree
+// fields.
+message TreeEntry {
+  // Single path component; no '/'.
+  string name = 1;
+  Mode mode = 2;
+  oneof id {
+    // Present exactly when the entry is a file leaf.
+    bytes blob_id = 3;
+    // Present exactly when the entry is a child subtree.
+    bytes tree_id = 4;
+  }
+}
+
+// The entries of a derived tree (GetTree).
+message TreeResp {
+  // Sender's order is preserved on the wire; the canonical form (which
+  // defines the tree's id) is strictly ascending by name bytes.
+  repeated TreeEntry entries = 1;
+}
+
+// One chunk of a streamed blob body (GetBlob).
+message BlobChunk {
+  bytes data = 1;
+}
+
+// One frame of a PutBlob upload. gRPC client-streaming has no unary request
+// message, so the repo rides on a leading header frame: the first frame MUST
+// be `header`; every subsequent frame is a body chunk, streamed in order.
+message PutBlobChunk {
+  oneof frame {
+    PutBlobHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message PutBlobHeader {
+  string repo = 1;
+}
+
+// Summary of one changeset for log-style listings. Not a canonical object:
+// `cs_id` is the changeset's identity, computed from its canonical bytes.
+message ChangesetSummary {
+  bytes cs_id = 1;
+  repeated bytes parents = 2;
+  string message = 3;
+  IdentityMsg author = 4;
+  IdentityMsg committer = 5;
+}
+
+// An inclusive, 1-based line range attributed to one changeset (first-parent
+// lineage blame with rename following, v0.1.md D7).
+message BlameRange {
+  uint64 lo = 1;
+  uint64 hi = 2;
+  // Changeset that introduced these lines.
+  bytes cs_id = 3;
+}
+
+// One ref in the repo's namespace (e.g. "main", "refs/heads/feature").
+message RefEntry {
+  string name = 1;
+  bytes cs_id = 2;
+}
+
+// Result of a compare-and-swap ref update.
+message CasResp {
+  oneof result {
+    // True when the CAS succeeded and the ref now points at `new`.
+    bool won = 1;
+    // Present on loss: the ref's current value, which was not `expected`.
+    bytes conflict_current = 2;
+  }
+}
+
+// --------------------------------------------------------------- requests
+
+// Addresses one changeset by id. Used by RootTree and GetChangeset.
+message GetChangesetReq {
+  string repo = 1;
+  bytes cs_id = 2;
+}
+
+// One derived tree by id.
+message GetTreeReq {
+  string repo = 1;
+  bytes id = 2;
+}
+
+message GetBlobReq {
+  string repo = 1;
+  bytes id = 2;
+}
+
+// The content address assigned to an uploaded blob body.
+message PutBlobResp {
+  bytes id = 1;
+}
+
+// Commits a new changeset. Blobs <= 1 MiB ride along in `inline_blobs`, keyed by
+// their 64-hex-character lowercase blob id (SHA-256 of the raw content);
+// larger blobs must be uploaded via PutBlob first and referenced by id in the
+// changeset. The reply is the changeset's id.
+message CreateChangesetReq {
+  string repo = 1;
+  ChangesetMsg cs = 2;
+  map<string, bytes> inline_blobs = 3;
+}
+
+message CreateChangesetResp {
+  bytes id = 1;
+}
+
+// Two changeset ids, `a` and `b`.
+message MergeBaseReq {
+  string repo = 1;
+  bytes a = 2;
+  bytes b = 3;
+}
+
+// The merge base, absent when the ids share none.
+message MergeBaseResp {
+  optional bytes id = 1;
+}
+
+message IsAncestorReq {
+  string repo = 1;
+  // Candidate ancestor.
+  bytes a = 2;
+  // Candidate descendant.
+  bytes b = 3;
+}
+
+message IsAncestorResp {
+  bool is_ancestor = 1;
+}
+
+// Diff between trees of changesets `a` and `b` (a -> b).
+message DiffReq {
+  string repo = 1;
+  bytes a = 2;
+  bytes b = 3;
+}
+
+// Walks the changeset history from `cs_id`, newest first, up to `limit`
+// changesets (0 = no limit). The walk is date-ordered over ALL parent
+// lineages — `git log`'s default algorithm, not `--first-parent`.
+message LogReq {
+  string repo = 1;
+  bytes cs_id = 2;
+  uint32 limit = 3;
+}
+
+// Blame `path` as of changeset `cs_id`.
+message BlameReq {
+  string repo = 1;
+  bytes cs_id = 2;
+  string path = 3;
+}
+
+message ListRefsReq {
+  string repo = 1;
+}
+
+// One ref's value; absent when the ref does not exist. This RPC is also
+// the shared revspec resolver for `<cs-or-ref>` arguments: when no ref
+// matches the name, an all-hex token of 8..=63 chars resolves as a
+// changeset id prefix (case-insensitive; one indexed range seek over the
+// metadata's 32-byte ids). An existing ref with that exact name wins over
+// prefix interpretation; a full 64-hex token is never prefix-interpreted
+// (clients parse those as ids directly). Exactly one prefix match answers
+// with its id; several fail with INVALID_ARGUMENT naming the match count
+// ("prefix <p> is ambiguous (N changesets)"); none fails with NOT_FOUND
+// ("no ref or changeset matching <p>"); a shorter hex token fails with
+// INVALID_ARGUMENT ("changeset id prefix must be at least 8 hex chars").
+message GetRefReq {
+  string repo = 1;
+  string name = 2;
+}
+
+// The ref's value, absent when the ref does not exist.
+message GetRefResp {
+  optional bytes cs_id = 1;
+}
+
+// Compare-and-swap one ref. `expected` absent means the ref must not exist
+// yet (create); present, it must currently hold that value. Conflicts are
+// reported in CasResp, never as errors.
+message CasRefReq {
+  string repo = 1;
+  string name = 2;
+  optional bytes expected = 3;
+  bytes new = 4;
+}
+
+// Server-side replay of `cs_id`'s changes onto `new_parent`'s tree
+// (linearized rebase). Semantic conflicts abort the RPC with
+// FAILED_PRECONDITION (conflicting paths in the status message).
+message RebaseReq {
+  string repo = 1;
+  bytes cs_id = 2;
+  bytes new_parent = 3;
+}
+
+// The id of the rebased changeset.
+message RebaseResp {
+  bytes id = 1;
+}
+
+// Fast-forwards ref "main" to `cs_id`: asserts IsAncestor(current main,
+// cs_id), then CAS-moves "main" (v0.1.md D5). Violating the ancestry
+// precondition fails with FAILED_PRECONDITION.
+message PublishReq {
+  string repo = 1;
+  bytes cs_id = 2;
+}
+
+// The changeset "main" now points at (== the published cs_id).
+message PublishResp {
+  bytes id = 1;
+}
+
+// Per-repo request counters (debug/test infrastructure, e.g. proving a
+// resumed clone fetched nothing twice).
+message GetStatsReq {
+  string repo = 1;
+}
+
+message StatsResp {
+  // e.g. get_tree, get_blob, put_blob, create_changeset.
+  map<string, uint64> counters = 1;
+}
+
+// --------------------------------------------------------------- responses
+
+// The root tree id of the changeset; absent for an empty root (no files
+// anywhere in history).
+message RootTreeResp {
+  optional bytes tree_id = 1;
+}
+
+// The gardenbed object + graph API. Identical RPCs are answered at every
+// tier (v0.1.md §2); the `repo` field is on every request.
+service Gardenbed {
+  // Id of the root tree of a changeset. Absent for an empty root.
+  rpc RootTree(GetChangesetReq) returns (RootTreeResp);
+
+  // Fetch a tree's entries by id (want-list recursion uses this).
+  rpc GetTree(GetTreeReq) returns (TreeResp);
+
+  // Stream one blob's raw (uncompressed) content.
+  rpc GetBlob(GetBlobReq) returns (stream BlobChunk);
+
+  // Fetch one changeset.
+  rpc GetChangeset(GetChangesetReq) returns (ChangesetMsg);
+
+  // Upload one blob body, streamed; replies with its content address.
+  // Used for blobs > 1 MiB (smaller ones ride on CreateChangeset).
+  // The first frame must be the header (which names the repo).
+  rpc PutBlob(stream PutBlobChunk) returns (PutBlobResp);
+
+  // Commit a changeset (with <= 1 MiB blobs inline); replies with its id.
+  rpc CreateChangeset(CreateChangesetReq) returns (CreateChangesetResp);
+
+  // Merge base of two changesets; absent when they share none.
+  rpc MergeBase(MergeBaseReq) returns (MergeBaseResp);
+
+  // Is `a` an ancestor of `b`?
+  rpc IsAncestor(IsAncestorReq) returns (IsAncestorResp);
+
+  // Stream the change list between trees of `a` and `b` (a -> b). Ids only —
+  // never blob content.
+  rpc Diff(DiffReq) returns (stream ChangeMsg);
+
+  // Log from `cs_id`, newest first, at most `limit` entries (0 =
+  // unlimited). Date-ordered over all parent lineages, like `git log`'s
+  // default walk.
+  rpc Log(LogReq) returns (stream ChangesetSummary);
+
+  // First-parent lineage blame of one path at `cs_id`, with rename following.
+  rpc Blame(BlameReq) returns (stream BlameRange);
+
+  // Stream all refs of the repo.
+  rpc ListRefs(ListRefsReq) returns (stream RefEntry);
+
+  // One ref's value; absent when the ref does not exist. Doubles as the
+  // shared revspec resolver: with no matching ref, a hex token of 8..=63
+  // chars resolves as a changeset id prefix (an existing ref with that
+  // exact name wins; a full 64-hex token is never prefix-interpreted).
+  // One prefix match answers; several fail INVALID_ARGUMENT ("prefix … is
+  // ambiguous (N changesets)"); none fails NOT_FOUND ("no ref or changeset
+  // matching <p>"); a shorter hex token fails INVALID_ARGUMENT with the
+  // "at least 8 hex chars" hint.
+  rpc GetRef(GetRefReq) returns (GetRefResp);
+
+  // Compare-and-swap one ref; conflicts come back in CasResp.
+  rpc CasRef(CasRefReq) returns (CasResp);
+
+  // Replay a changeset's changes onto a new parent (conflicts are
+  // FAILED_PRECONDITION errors, not results).
+  rpc Rebase(RebaseReq) returns (RebaseResp);
+
+  // Fast-forward CAS of ref "main" to the given changeset.
+  rpc Publish(PublishReq) returns (PublishResp);
+
+  // Per-repo request counters (debug/test infrastructure).
+  rpc GetStats(GetStatsReq) returns (StatsResp);
+}

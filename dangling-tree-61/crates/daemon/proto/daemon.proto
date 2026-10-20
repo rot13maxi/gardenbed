@@ -1,0 +1,64 @@
+// gardenbed daemon sidecar protocol, v0.2.
+//
+// The daemon speaks the full Gardenbed RPC surface (it implements the
+// generated `Gardenbed` trait and forwards every RPC verbatim, answering
+// GetTree/GetBlob cache-first from its shared object store). This file
+// defines only the small *sidecar* service that rides on the same unix
+// socket: liveness and per-working-copy watch registration.
+//
+// Watching is generation-counted by design (v0.2.md D18): the daemon never
+// inspects working-copy content or the index, it only reports whether the
+// working-copy root *may* have changed since registration. `bed status`
+// decides what to do with that hint — the offline scan is always available
+// as the correctness fallback.
+
+syntax = "proto3";
+
+package gardenbed.daemon.v1;
+
+message PingReq {}
+
+message PingResp {
+  // The daemon's process id, for diagnostics.
+  uint64 pid = 1;
+}
+
+message RegisterReq {
+  // The working copy's state directory (`.bed`), absolute or relative to
+  // the daemon's working directory. The watched root is its parent — the
+  // working-copy root. The state directory itself, checkout staging
+  // entries under it, and the daemon's own writes are excluded from the
+  // watch.
+  string state_dir = 1;
+}
+
+message RegisterResp {
+  // The generation at registration time. Every watched filesystem event
+  // (debounced) increments it; a later poll returning the same value means
+  // "no event observed since you last looked".
+  uint64 generation = 1;
+}
+
+message GenerationReq {
+  // The working copy's state directory, exactly as passed to Register.
+  string state_dir = 1;
+}
+
+message GenerationResp {
+  // The current generation; absent when the state directory is not
+  // registered (watcher gone, daemon restarted, …) — callers must fall
+  // back to a full scan and never trust a stale report.
+  optional uint64 generation = 1;
+}
+
+service DaemonSidecar {
+  // Liveness probe.
+  rpc Ping(PingReq) returns (PingResp);
+
+  // Start (or re-start) a recursive watch on the working-copy root of
+  // `state_dir` and return the current generation counter.
+  rpc Register(RegisterReq) returns (RegisterResp);
+
+  // Read the current generation of a registered working copy.
+  rpc Generation(GenerationReq) returns (GenerationResp);
+}

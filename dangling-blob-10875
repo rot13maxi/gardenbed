@@ -1,0 +1,4 @@
+server = "http://127.0.0.1:9418"
+repo = "default"
+sparse = ["crates", "docs", "fuzz", "tools", "demo", ".github", "README.md", "DESIGN.md", "LICENSE", "CHANGELOG.md", ".gitignore", "Cargo.lock", "Cargo.toml", "e2e", "LANDING.md", "tools/scale"]
+current_cs = "55c108433444ae8f25337c3a3c9de409906f478e12cfee08f92c6a88d6989714"

@@ -1,0 +1,55 @@
+[package]
+name = "gardenbed-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gardenbed-server"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+env_logger = "0.11"
+gardenbed-model.workspace = true
+# Path deps until the orchestrator adds them to `[workspace.dependencies]`.
+gardenbed-store = { path = "../store" }
+gardenbed-derive = { path = "../derive" }
+gardenbed-git = { path = "../git" }
+gardenbed-protocol = { path = "../protocol" }
+log = "0.4"
+prost = "0.14"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    # Extra capabilities the integration tests use (spawned server binary,
+    # buffered line reads). Additive and harmless for the library itself.
+    "process",
+    "io-util",
+] }
+tonic = { version = "0.14.6", default-features = false, features = [
+    "transport",
+    "server",
+    "router",
+    "codegen",
+    "channel",
+] }
+# The root advisory lock (repos::ROOT_LOCK): flock via rustix, the same
+# primitive the working-copy staging journal uses.
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+gardenbed-harness = { path = "../harness" }
+# The chaos suite verifies object checksums and metadata integrity offline
+# (same codec versions as the stores they inspect).
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+tempfile = "3"
+tokio-stream = "0.1"
+zstd = "0.13"

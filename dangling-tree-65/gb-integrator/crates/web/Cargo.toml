@@ -1,0 +1,32 @@
+[package]
+name = "gardenbed-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "gardenbed-web"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.8"
+clap = { version = "4", features = ["derive"] }
+gardenbed-model.workspace = true
+# The web API answers through the server's own service layer
+# (`gardenbed_server::Repo`) in-process — the same service layer the gRPC
+# server and the MCP tools speak through, with no working copy anywhere.
+gardenbed-server = { path = "../server" }
+serde_json = "1"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+] }
+
+[dev-dependencies]
+# `MemoryStore` backs the integration tests' fully in-memory repo.
+gardenbed-store = { path = "../store" }
+tower = { version = "0.5", features = ["util"] }

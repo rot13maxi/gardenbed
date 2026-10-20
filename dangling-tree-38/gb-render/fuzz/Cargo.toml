@@ -1,0 +1,73 @@
+[package]
+name = "gardenbed-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+gardenbed-model = { path = "../crates/model" }
+gardenbed-derive = { path = "../crates/derive" }
+gardenbed-store = { path = "../crates/store" }
+gardenbed-server = { path = "../crates/server" }
+gardenbed-git = { path = "../crates/git" }
+gardenbed-mcp = { path = "../crates/mcp" }
+sha1 = "0.10"
+
+[[bin]]
+name = "decode_changeset"
+path = "fuzz_targets/decode_changeset.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_tree"
+path = "fuzz_targets/decode_tree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_tree_apply"
+path = "fuzz_targets/fuzz_tree_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_diff"
+path = "fuzz_targets/fuzz_diff.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_difftree_parse"
+path = "fuzz_targets/fuzz_difftree_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_mcp_line"
+path = "fuzz_targets/fuzz_mcp_line.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_merge3"
+path = "fuzz_targets/fuzz_merge3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_pack_reader"
+path = "fuzz_targets/fuzz_pack_reader.rs"
+test = false
+doc = false
+bench = false

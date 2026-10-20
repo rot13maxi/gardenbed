@@ -1,0 +1,56 @@
+[package]
+name = "gardenbed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "gardenbed"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bed"
+path = "src/main.rs"
+
+[dependencies]
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+http = "1"
+gardenbed-model.workspace = true
+# Not in `[workspace.dependencies]` yet; path until the orchestrator adds it.
+gardenbed-store = { path = "../store" }
+# The wire client (M4 read path): thin, runtime-only — bed never links the
+# server; tests ingest fixtures through `gardenbed-server` as a dev-dep.
+gardenbed-protocol = { path = "../protocol" }
+rustix = { version = "1", features = ["fs"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "sync",
+    # Runtime knobs the binary needs plus the ones the integration tests
+    # use (#[tokio::test], spawned processes, timeouts). Additive.
+    "macros",
+    "time",
+    "process",
+    "io-util",
+] }
+tokio-stream = "0.1"
+tonic = { version = "0.14", default-features = false, features = ["transport", "channel"] }
+toml = "1"
+
+# Unix only: `bed` restores the default SIGPIPE disposition at startup so
+# a closed pipe (`bed log | head`) dies silently like git, not with a
+# `failed printing to stdout` panic (Rust ignores SIGPIPE by default).
+# Windows has no SIGPIPE; nothing to restore there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+gardenbed-harness = { path = "../harness" }
+# Dev-only: the server, for ingesting fixtures and spawning the real
+# server binary in integration tests. A runtime dependency would be wrong
+# for a thin client.
+gardenbed-server = { path = "../server" }
+tempfile = "3"
