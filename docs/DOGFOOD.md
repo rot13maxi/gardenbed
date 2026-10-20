@@ -389,6 +389,78 @@ unknown `--repo` refused) and two in-process (`loam`-named sibling stays
 served, bare `loam/objects` root refused) — each of which fails on the pre-fix
 tree (mutation-verified for the two predicate tests).
 
+## Dogfood finding #28 (2026-10-20) — guard tests were not override-safe; an aborted run poisoned the tree
+
+Two defects surfaced while running the release canary through the deployed pair:
+
+1. **The staleness guard tests cannot pass with `BED_SERVER_BIN`/`BED_DAEMON_BIN`
+   set**, and they failed rather than saying so. The override is trusted as-is
+   by design (`locate_guarded_bin` returns it after an existence check), so the
+   property under test is unreachable — `catch_unwind(...).expect_err` receives
+   `Ok` and panics. The canary form that points the harness at the deployed pair
+   is exactly that configuration, so a correct harness setup produced a red.
+2. **An aborted mutation deposited a probe and poisoned later runs.** The
+   mutation phases wrote `// tree-state staleness probe` into
+   `crates/{server,daemon}/src/lib.rs` and restored the file *after*
+   `expect_err`. A failure before that line (missing sibling bin, wrong answer,
+   kill) left the probe behind with the original mtime, so the source digest no
+   longer matched the built binary and the NEXT run's oracle refused a tree it
+   should have accepted. Observed growing 1 → 2 probes across attempts, and it
+   blocked the first landing chain attempt.
+
+Fix (this entry): both guard tests skip with an actionable message when their
+override is set, and the mutation phases restore through the existing RAII
+`Restore` guard instead of inline writes, so content and mtimes return on the
+panic path too. Verified both ways: with the overrides set the guards skip
+cleanly and leave zero residue; without them the oracles run and the tests pass
+(3.2 s / 0.7 s). An injected panic immediately after the mutation leaves zero
+residue, which the old shape did not.
+
+Class: a test's *setup* was assumed rather than checked (`env` hadn't been
+considered), and its *cleanup* was on the happy path only. Both are the same
+mistake the #19 rule names in another form — green in the configuration you
+tested is not green in the configuration the release actually uses.
+
+Chain note: bed has no ref-delete verb; retiring lane refs required a direct
+store transaction (`DELETE FROM refs WHERE name=? AND cs=<tip>`, six refs,
+integrity_check ok). A first-class `bed ref delete` would make lane retirement
+a supported operation.
+
+## Landing record — 2026-10-20 backlog sweep (bed c4d27378e502c53d)
+
+The five-lane backlog sweep (groups A-E) plus a re-union with three
+git-native upstream commits landed as one union changeset.
+
+- **Bed tip:** `c4d27378e502c53d` · **Git tip:** `6f6fc584b8f31a83`
+  (the pair for the next pre-publish 1.1b check).
+- **Composition:** 32 sweep paths + 12 upstream paths, four of them hand-merged
+  (`crates/server/src/lib.rs`, `CHANGELOG.md`, `Cargo.lock`, `README.md`), each
+  verified line-wise by a fresh reviewer.
+- **Reviews:** five lane reviews (2-5 rounds each) plus a dedicated re-union
+  review (5 rounds). Final verdict quoted verbatim: *"APPROVE. Rounds 1-5 are
+  closed."*
+- **Gates:** fmt; clippy `--workspace --all-targets -D warnings`; full workspace
+  suite; release `gc_chaos` 4/4 (109.03 s deployed / 102.4 s in-tree); release
+  commit-p50 ratio 0.96-1.02 (budget 2.00); `demo/run-v0.2.sh` PASS 73 checks /
+  0 failures, run through the deployed pair as the capstone.
+- **Chain:** publish → export (`fsck --strict` clean, 134 commits, mapping row
+  for the bed tip == mirror main) → push → workspace-wide `--bins` redeploy
+  (gardenbed-ab's first deploy) → bounce (new layout-resolution code active) →
+  canary split form (guard tests without the override, the other 241 tests
+  through the deployed pair — see #28) → CI run 39370920642 SUCCESS.
+- **Retired:** the five lane refs and the probe ref, after the chain was green.
+  `lane/backlog-union` and `main` retained.
+
+Imported-content caveat (release manager's wording, verbatim): the three
+upstream commits ride as imported content, authorship untouched. Five real
+defects were found and fixed in `0ca2e4d2d` (the pre-rename layout class) with
+six mutation-verified regression tests; the other two commits (`c3d78765a`
+checkout cost, `7758dfbbe` bench harness) were gated by the workspace suite and
+demo but not line-reviewed. Imported commits now fall under the standing rule
+that all main content is reviewable — this landing establishes the precedent
+that they arrive with at least gate coverage, and line review when their surface
+intersects the union's.
+
 ## Backlog — product fixes from dogfood findings
 
 The 2026-10-19 backlog sweep landed every item below in one union changeset on

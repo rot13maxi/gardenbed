@@ -62,6 +62,20 @@ fn daemon_src_dir() -> PathBuf {
 /// window and fail confusingly.
 #[test]
 fn daemon_bin_refuses_tree_state_stale_and_trusts_override() {
+    // The oracles under test are INACTIVE when the override is set
+    // (`locate_guarded_bin` trusts `BED_DAEMON_BIN` as-is by design), so the
+    // mutation phases cannot pass in that configuration — and would instead
+    // fail after mutating sources. A canary that points the harness at the
+    // deployed pair sets exactly that variable. Skip with an actionable
+    // message rather than turning a correct harness configuration into a red.
+    if let Ok(path) = std::env::var("BED_DAEMON_BIN") {
+        eprintln!(
+            "skipping the {path} oracle proof: BED_DAEMON_BIN is set, and an \
+             override is trusted as-is (the oracles are deliberately inactive). \
+             Unset BED_DAEMON_BIN to exercise the staleness guard."
+        );
+        return;
+    }
     hermetic_oracles();
     real_source_mutations();
     override_passthrough();
@@ -190,23 +204,25 @@ fn real_source_mutations() {
         "the built daemon carries its fingerprint marker"
     );
 
-    let original = fs::read(&marker).expect("lib.rs readable");
+    // The RAII guard restores content and mtimes on BOTH paths: an assert
+    // below, or any panic (including a killed-run unwind), must never leave
+    // the probe in the tree — one aborted attempt used to deposit a probe
+    // that poisoned every later digest check in the checkout.
+    let restore = Restore::capture(&src);
     let restore_mtime = src
         .join("main.rs")
         .metadata()
         .and_then(|m| m.modified())
         .expect("main.rs stat");
 
-    let mut probe = original.clone();
+    let mut probe = fs::read(&marker).expect("lib.rs readable");
     probe.extend_from_slice(b"\n// tree-state staleness probe\n");
     fs::write(&marker, &probe).expect("probe written");
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(restore_mtime))
         .expect("mtime held");
     let panic = std::panic::catch_unwind(daemon_bin)
         .expect_err("tree-state-stale daemon binary must be refused");
-    fs::write(&marker, &original).expect("lib.rs restored");
-    filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(restore_mtime))
-        .expect("mtime restored");
+    drop(restore);
 
     let msg = panic_message(&panic);
     assert!(
@@ -238,12 +254,13 @@ fn real_source_mutations() {
     let future = SystemTime::now() + Duration::from_secs(3600);
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(future))
         .expect("touch lib.rs");
-    let panic = std::panic::catch_unwind(daemon_bin).expect_err("the stale binary must be refused");
+    let result = std::panic::catch_unwind(daemon_bin);
     filetime::set_file_mtime(
         &marker,
         filetime::FileTime::from_system_time(original_marker_mtime),
     )
     .expect("restore lib.rs mtime");
+    let panic = result.expect_err("the stale binary must be refused");
     let msg = panic_message(&panic);
     assert!(
         msg.contains("STALE") && msg.contains("cargo build -p gardenbed-daemon"),
@@ -529,12 +546,12 @@ fn override_passthrough() {
     unsafe {
         std::env::set_var("BED_DAEMON_BIN", "/nonexistent/gardenbed-daemon");
     }
-    let panic = std::panic::catch_unwind(daemon_bin)
-        .expect_err("a nonexistent BED_DAEMON_BIN must be refused");
+    let result = std::panic::catch_unwind(daemon_bin);
     // SAFETY: see above.
     unsafe {
         std::env::remove_var("BED_DAEMON_BIN");
     }
+    let panic = result.expect_err("a nonexistent BED_DAEMON_BIN must be refused");
     let msg = panic_message(&panic);
     assert!(
         msg.contains("BED_DAEMON_BIN"),

@@ -68,6 +68,18 @@ fn server_src_dir() -> PathBuf {
 /// tree-state refusal → fresh binary → override pass-through.
 #[test]
 fn server_bin_refuses_stale_and_trusts_override() {
+    // An override is trusted as-is (the oracles are deliberately inactive),
+    // so the mutation phases cannot pass while BED_SERVER_BIN is set — the
+    // canary form that points the harness at the deployed pair. Skip with an
+    // actionable message instead of failing after mutating sources.
+    if let Ok(path) = std::env::var("BED_SERVER_BIN") {
+        eprintln!(
+            "skipping the {path} oracle proof: BED_SERVER_BIN is set, and an \
+             override is trusted as-is (the oracles are deliberately inactive). \
+             Unset BED_SERVER_BIN to exercise the staleness guard."
+        );
+        return;
+    }
     hermetic_oracles();
     stale_binary_is_refused_with_fix_command();
     tree_state_stale_binary_is_refused_even_with_fresh_mtime();
@@ -183,12 +195,13 @@ fn stale_binary_is_refused_with_fix_command() {
     let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(future))
         .expect("touch lib.rs");
-    let panic = std::panic::catch_unwind(server_bin).expect_err("the stale binary must be refused");
+    let result = std::panic::catch_unwind(server_bin);
     filetime::set_file_mtime(
         &marker,
         filetime::FileTime::from_system_time(original_mtime),
     )
     .expect("restore lib.rs mtime");
+    let panic = result.expect_err("the stale binary must be refused");
     let msg = panic_message(&panic);
     assert!(
         msg.contains("STALE") && msg.contains("cargo build -p gardenbed-server"),
@@ -226,13 +239,16 @@ fn tree_state_stale_binary_is_refused_even_with_fresh_mtime() {
     fs::write(&marker, &probe).expect("probe written");
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(restore_mtime))
         .expect("mtime held");
-    let panic =
-        std::panic::catch_unwind(server_bin).expect_err("tree-state-stale binary must be refused");
-    // Restore content AND mtime — net-zero, and self-healing for a
-    // poisoned mtime (restore_mtime comes from main.rs, not the marker).
+    let result = std::panic::catch_unwind(server_bin);
+    // Restore content AND mtime BEFORE interpreting the result — net-zero,
+    // and self-healing for a poisoned mtime (restore_mtime comes from
+    // main.rs, not the marker). An aborted run must never leave the probe
+    // behind: one deposit per attempt used to poison every later digest
+    // check in the tree.
     fs::write(&marker, &original).expect("lib.rs restored");
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(restore_mtime))
         .expect("mtime restored");
+    let panic = result.expect_err("tree-state-stale binary must be refused");
     let msg = panic_message(&panic);
     assert!(
         msg.contains("DIFFERENT") && msg.contains("cargo build -p gardenbed-server"),
