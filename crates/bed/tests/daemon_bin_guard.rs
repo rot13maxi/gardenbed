@@ -75,8 +75,10 @@ fn daemon_bin_refuses_tree_state_stale_and_trusts_override() {
              The override contract itself is still checked below; unset \
              BED_DAEMON_BIN to exercise the staleness guard."
         );
-        // `override_passthrough` manages the variable itself and is the only
-        // coverage of the override contract — never skip it.
+        // `hermetic_oracles` never calls daemon_bin() (synthetic binary over
+        // a COPY) and `override_passthrough` is the override contract itself:
+        // both are reachable and must run even in the canary form.
+        hermetic_oracles();
         override_passthrough();
         return;
     }

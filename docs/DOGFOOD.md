@@ -408,13 +408,16 @@ Two defects surfaced while running the release canary through the deployed pair:
    should have accepted. Observed growing 1 → 2 probes across attempts, and it
    blocked the first landing chain attempt.
 
-Fix (this entry): both guard tests skip with an actionable message when their
-override is set, and the mutation phases restore through the existing RAII
-`Restore` guard instead of inline writes, so content and mtimes return on the
-panic path too. Verified both ways: with the overrides set the guards skip
-cleanly and leave zero residue; without them the oracles run and the tests pass
-(3.2 s / 0.7 s). An injected panic immediately after the mutation leaves zero
-residue, which the old shape did not.
+Fix (this entry): both guard tests skip only the source-mutating phases when
+their override is set (the hermetic oracle and the override-contract check
+still run — they need no real source tree), and every mutation phase arms an
+RAII guard BEFORE the write, in both files, so content and mtimes return on
+the false-answer path, on a panic, and while unwinding. Verified both ways:
+with the overrides set the guards skip the mutation phases, still exercise the
+override contract and the hermetic oracles, and leave zero residue; without
+them everything runs and passes. An injected panic immediately after the
+mutation write leaves zero residue in either file, which the old shape did
+not (it deposited one probe per aborted attempt).
 
 Class: a test's *setup* was assumed rather than checked (`env` hadn't been
 considered), and its *cleanup* was on the happy path only. Both are the same
@@ -446,8 +449,9 @@ git-native upstream commits landed as one union changeset.
 - **Chain:** publish → export (`fsck --strict` clean, 134 commits, mapping row
   for the bed tip == mirror main) → push → workspace-wide `--bins` redeploy
   (gardenbed-ab's first deploy) → bounce (new layout-resolution code active) →
-  canary split form (guard tests without the override, the other 241 tests
-  through the deployed pair — see #28) → CI run 39370920642 SUCCESS.
+  canary split form (the guard tests' source-mutating phases without the
+  override; every other `gardenbed` test through the deployed pair — see #28)
+  → CI run 39370920642 SUCCESS.
 - **Retired:** the five lane refs and the probe ref, after the chain was green.
   `lane/backlog-union` and `main` retained.
 
