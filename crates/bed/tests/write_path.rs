@@ -794,6 +794,939 @@ async fn stack_rebase_conflict_mid_stack_aborts_clean() {
     w.server.shutdown().await;
 }
 
+/// Builds a lane of `n` changesets on top of `w.head`, each editing the
+/// SAME file (`docs/lane.md`) so an intermediate state really differs from
+/// the final one — the shape that made ordinary replay conflict. Returns
+/// the lane's changeset ids oldest-first.
+fn build_lane(w: &World, n: usize, prefix: &str) -> Vec<Id> {
+    let mut tips = Vec::new();
+    for i in 1..=n {
+        fs::write(
+            w.garden.join("docs/lane.md"),
+            format!("# lane\n\nrevision {i}\n").as_bytes(),
+        )
+        .unwrap();
+        let (code, out, stderr) = bed(&w.garden, &["commit", "-m", &format!("{prefix} {i}")]);
+        assert_eq!(code, 0, "lane {i}: {stderr}\n{out}");
+        tips.push(current_cs(&w.garden));
+    }
+    tips
+}
+
+/// Runs `bed` with an extra environment variable (for the scan-cap
+/// tests, which shrink `GARDENBED_TWIN_SCAN_CAP`).
+fn bed_env(dir: &Path, args: &[&str], key: &str, value: &str) -> (i32, String, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bed"))
+        .current_dir(dir)
+        .args(args)
+        .env("NO_COLOR", "1")
+        .env(key, value)
+        .env_remove("GARDENBED_AUTHOR")
+        .output()
+        .expect("bed binary spawns");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// Hand-unions `from`'s tree onto `parent` as one new changeset with the
+/// same message — the incident's "landed by hand" shape: tree-equal,
+/// same-message, NO ancestry link. Returns the twin's id.
+fn hand_union(w: &World, parent: Id, from: Id, message: &str, secs: u64) -> Id {
+    let changes = w.repo.diff(parent, from).expect("diff works");
+    let mut inline = std::collections::BTreeMap::new();
+    for c in &changes {
+        let Some(blob) = c.blob else { continue };
+        if c.mode == Mode::Gitlink {
+            continue;
+        }
+        let content = w
+            .repo
+            .get_blob(blob)
+            .expect("blob readable")
+            .expect("blob exists");
+        inline.insert(blob.to_hex(), content);
+    }
+    let union_cs = cs(vec![parent], changes, message, secs);
+    w.repo
+        .create_changeset(&union_cs, &inline)
+        .expect("hand-union ingests")
+}
+
+/// The Group D regression: a lane whose element was hand-unioned onto main
+/// as a tree-equal, same-message changeset. `bed rebase --stack` must
+/// recognize the twin on main as already applied — NOT refuse with the
+/// server's "'<path>' was changed or deleted" — replay only the elements
+/// after the twin, log every resolution, and leave no duplicate content.
+#[tokio::test]
+async fn stack_rebase_recognizes_a_tree_equal_same_message_twin() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // A 3-deep lane, every layer editing the same file.
+    let lane = build_lane(&w, 3, "lane layer");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // Main moves independently, then the lane's MIDDLE element is
+    // hand-unioned on top: same tree, same message, new changeset, no
+    // ancestry link. (Its post-image carries layers 1 and 2 already — the
+    // shape where replaying from element 1 conflicts on its own content.)
+    let (up, up_content) = add("src/upstream.rs", b"pub fn up() {}\n", Mode::Regular);
+    let up_blob = up.blob.unwrap();
+    let up_cs = cs(vec![lane_base], vec![up], "upstream", 1_700_000_500);
+    let up_id = w
+        .repo
+        .create_changeset(
+            &up_cs,
+            &std::collections::BTreeMap::from([(up_blob.to_hex(), up_content)]),
+        )
+        .expect("upstream ingests");
+    let mid_message = w.repo.get_changeset(lane[1]).unwrap().message;
+    let twin = hand_union(&w, up_id, lane[1], &mid_message, 1_700_000_600);
+    // Main keeps moving after the union: the suffix must build on main's
+    // CURRENT tip, never on the twin.
+    let (after, after_content) = add("src/after.rs", b"pub fn after() {}\n", Mode::Regular);
+    let after_blob = after.blob.unwrap();
+    let after_cs = cs(vec![twin], vec![after], "after the union", 1_700_000_650);
+    let after_id = w
+        .repo
+        .create_changeset(
+            &after_cs,
+            &std::collections::BTreeMap::from([(after_blob.to_hex(), after_content)]),
+        )
+        .expect("post-union main ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), after_id)
+        .expect("main moves to the hand-union");
+
+    // Pre-condition of the incident: main's twin tree equals lane[1]'s.
+    assert_eq!(
+        w.repo.root_tree(twin).unwrap(),
+        w.repo.root_tree(lane[1]).unwrap(),
+        "the hand-union is tree-equal to the lane element"
+    );
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "a twin must resolve, not refuse: {stderr}\n{out}");
+    assert!(
+        out.contains("already applied"),
+        "every resolution is logged: {out}"
+    );
+    assert!(
+        out.contains(&lane[1].short()),
+        "the resolved element is named: {out}"
+    );
+    assert!(out.contains(&twin.short()), "the twin is named: {out}");
+    assert!(out.contains("skipped 2 already applied"), "{out}");
+
+    // Layer 3 replays (layers 1-2 are subsumed by the twin); the resulting
+    // tip's tree is exactly the lane tip's tree plus main's post-union
+    // work — the independent tree oracle. The hand-union's own tree is the
+    // lane tree (it replaces main's content by definition), so
+    // `src/upstream.rs` is gone by then; the files main added AFTER the
+    // union are kept.
+    let tip = current_cs(&w.garden);
+    let tip_files = flat_files(&w.repo, tip);
+    let mut expected = flat_files(&w.repo, lane[2]);
+    expected.insert(
+        "src/after.rs".into(),
+        (Mode::Regular, blob_id(b"pub fn after() {}\n")),
+    );
+    assert_eq!(tip_files, expected, "the replayed tip is the exact union");
+    // Exactly one replay, parented on main's CURRENT tip.
+    let gs = w.repo.get_changeset(tip).unwrap();
+    assert_eq!(
+        gs.parents,
+        vec![after_id],
+        "the suffix builds on main's tip"
+    );
+    assert_eq!(gs.message, w.repo.get_changeset(lane[2]).unwrap().message);
+    // No duplicate of the twin was created for either skipped element.
+    let log = w.repo.log(after_id, 0).expect("log works");
+    let same_message = log
+        .iter()
+        .filter(|(_, cs)| cs.message == mid_message)
+        .count();
+    assert_eq!(same_message, 1, "only the hand-union carries that message");
+    // The working copy moved and is clean.
+    let (code, out, stderr) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "status: {stderr}");
+    assert!(out.contains("working copy is clean"), "status: {out}");
+    assert_eq!(
+        fs::read_to_string(w.garden.join("docs/lane.md")).unwrap(),
+        "# lane\n\nrevision 3\n"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The whole lane is already on main (tip twin): nothing replays, the
+/// working copy lands at the new parent, and a follow-up publish is a
+/// no-op fast-forward rather than a rewind.
+#[tokio::test]
+async fn whole_stack_twin_resolves_to_nothing_and_publish_is_a_no_op() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 2, "whole");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    let tip_message = w.repo.get_changeset(lane[1]).unwrap().message;
+    let twin = hand_union(&w, lane_base, lane[1], &tip_message, 1_700_000_700);
+    w.repo
+        .cas_ref("main", Some(w.head), twin)
+        .expect("main moves to the hand-union");
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "whole-stack twin: {stderr}\n{out}");
+    assert!(
+        out.contains("stack already applied"),
+        "the whole-stack outcome is named: {out}"
+    );
+    assert!(
+        out.contains("nothing replayed"),
+        "nothing replayed is stated: {out}"
+    );
+
+    // Lands at the new parent (which here IS the twin: the hand-union is
+    // main's tip) — the incident's exact shape.
+    assert_eq!(current_cs(&w.garden), twin);
+    let (code, out, stderr) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0, "status: {stderr}");
+    assert!(out.contains("working copy is clean"), "status: {out}");
+
+    // Publish from there fast-forwards main to itself: accepted, no move.
+    let (code, out, stderr) = bed(&w.garden, &["publish"]);
+    assert_eq!(
+        code, 0,
+        "publish after a twin is a no-op FF: {stderr}\n{out}"
+    );
+    assert!(out.contains("published"), "publish output: {out}");
+    assert_eq!(
+        w.repo.get_ref("main").unwrap(),
+        Some(twin),
+        "main did not move backward"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// A prefix twin: main already carries element 1 of the lane (same tree,
+/// same message) but not element 2. The suffix replays onto the new parent
+/// and the result succeeds, with the skip logged.
+#[tokio::test]
+async fn prefix_twin_skips_and_replays_the_suffix() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 2, "prefix");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    // Element 1's tree must be reachable from `lane[1]`'s diff base: it is
+    // `lane[0]`'s own post-image. Union it onto main as a new changeset.
+    let m1 = w.repo.get_changeset(lane[0]).unwrap().message;
+    let twin1 = hand_union(&w, lane_base, lane[0], &m1, 1_700_000_800);
+    // Main moves further, so the suffix replays onto the FINAL tip, not
+    // onto the twin.
+    let (up, up_content) = add("src/after-twin.rs", b"pub fn after() {}\n", Mode::Regular);
+    let up_blob = up.blob.unwrap();
+    let up_cs = cs(vec![twin1], vec![up], "after the twin", 1_700_000_900);
+    let up_id = w
+        .repo
+        .create_changeset(
+            &up_cs,
+            &std::collections::BTreeMap::from([(up_blob.to_hex(), up_content)]),
+        )
+        .expect("upstream ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), up_id)
+        .expect("main moves");
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "prefix twin must resolve: {stderr}\n{out}");
+    assert!(
+        out.contains("already applied") && out.contains(&twin1.short()),
+        "the prefix skip is logged: {out}"
+    );
+    assert!(out.contains("skipped 1 already applied"), "{out}");
+
+    // Exactly ONE replay: the suffix link, parented on main's current tip.
+    let tip = current_cs(&w.garden);
+    let gs = w.repo.get_changeset(tip).unwrap();
+    assert_eq!(gs.parents, vec![up_id], "the suffix builds on main's tip");
+    assert_eq!(gs.message, w.repo.get_changeset(lane[1]).unwrap().message);
+    // Both sides survive in the tree.
+    let files = flat_files(&w.repo, tip);
+    assert!(files.contains_key("src/after-twin.rs"));
+    assert_eq!(
+        files.get("docs/lane.md"),
+        flat_files(&w.repo, lane[1]).get("docs/lane.md")
+    );
+
+    w.server.shutdown().await;
+}
+
+/// Same twin shape but genuinely diverged content: main did NOT land the
+/// lane's content (same message, different tree) — a hard refusal that
+/// names the path, proving twin recognition did not weaken the conflict
+/// contract.
+#[tokio::test]
+async fn same_message_different_tree_still_refuses_as_a_conflict() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 2, "clash");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    // Main edits the SAME file with DIFFERENT content, and reuses the
+    // lane's tip message (so message alone would match — the guard proves
+    // tree equality is required too).
+    let tip_message = w.repo.get_changeset(lane[1]).unwrap().message;
+    let diverge = Change {
+        path: "docs/lane.md".into(),
+        op: Op::Modify,
+        blob: Some(blob_id(b"# lane\n\nmain diverged\n")),
+        src_path: None,
+        mode: Mode::Regular,
+    };
+    let diverge_blob = diverge.blob.unwrap();
+    let diverge_cs = cs(vec![lane_base], vec![diverge], &tip_message, 1_700_001_000);
+    let diverge_id = w
+        .repo
+        .create_changeset(
+            &diverge_cs,
+            &std::collections::BTreeMap::from([(
+                diverge_blob.to_hex(),
+                b"# lane\n\nmain diverged\n".to_vec(),
+            )]),
+        )
+        .expect("diverged main ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), diverge_id)
+        .expect("main moves");
+
+    let before = current_cs(&w.garden);
+    let (code, _, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 1, "diverged content must still refuse");
+    assert!(
+        stderr.contains("docs/lane.md"),
+        "the conflicting path is named: {stderr}"
+    );
+    assert_eq!(
+        current_cs(&w.garden),
+        before,
+        "a refusal leaves the working copy untouched"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The same twin class in the SINGLE (non-stack) rebase: `bed rebase main`
+/// on a changeset whose exact result main already carries must resolve to
+/// "already applied" instead of refusing with the server's own-content
+/// conflict.
+#[tokio::test]
+async fn single_rebase_recognizes_a_tree_equal_same_message_twin() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // One working-copy change.
+    fs::write(w.garden.join("docs/one.md"), b"# one\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "single twin"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    let lane_tip = current_cs(&w.garden);
+    let message = w.repo.get_changeset(lane_tip).unwrap().message;
+
+    // Main moves independently, then the lane's content is hand-unioned on
+    // top: tree-equal, same message, new changeset id.
+    let (up, up_content) = add("src/up2.rs", b"pub fn up2() {}\n", Mode::Regular);
+    let up_blob = up.blob.unwrap();
+    let up_cs = cs(vec![w.head], vec![up], "upstream again", 1_700_001_100);
+    let up_id = w
+        .repo
+        .create_changeset(
+            &up_cs,
+            &std::collections::BTreeMap::from([(up_blob.to_hex(), up_content)]),
+        )
+        .expect("upstream ingests");
+    let twin = hand_union(&w, up_id, lane_tip, &message, 1_700_001_200);
+    assert_eq!(
+        w.repo.root_tree(twin).unwrap(),
+        w.repo.root_tree(lane_tip).unwrap()
+    );
+    w.repo
+        .cas_ref("main", Some(w.head), twin)
+        .expect("main moves");
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "main"]);
+    assert_eq!(code, 0, "single twin must resolve: {stderr}\n{out}");
+    assert!(out.contains("already applied"), "{out}");
+    assert!(out.contains(&twin.short()), "the twin is named: {out}");
+    assert_eq!(
+        current_cs(&w.garden),
+        twin,
+        "the working copy moved to the twin (the new parent here)"
+    );
+    // The working copy is clean and carries the lane's file.
+    let (code, out, _) = bed(&w.garden, &["status"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("working copy is clean"), "{out}");
+    assert_eq!(
+        fs::read_to_string(w.garden.join("docs/one.md")).unwrap(),
+        "# one\n"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// A twin whose content main later REVERTED is not "already applied": the
+/// guard replays the element instead of silently skipping it, so the lane's
+/// change comes back rather than vanishing with a misleading success.
+#[tokio::test]
+async fn twin_reverted_after_landing_is_replayed_not_skipped() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 1, "revert-me");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    let message = w.repo.get_changeset(lane[0]).unwrap().message;
+    let twin = hand_union(&w, lane_base, lane[0], &message, 1_700_001_200);
+    // Main reverts it: the same path goes back to the seed content.
+    let revert = Change {
+        path: "docs/lane.md".into(),
+        op: Op::Modify,
+        blob: Some(blob_id(b"# hello\n\n tended\n")),
+        src_path: None,
+        mode: Mode::Regular,
+    };
+    let revert_blob = revert.blob.unwrap();
+    let revert_cs = cs(vec![twin], vec![revert], "revert the union", 1_700_001_300);
+    let revert_id = w
+        .repo
+        .create_changeset(
+            &revert_cs,
+            &std::collections::BTreeMap::from([(
+                revert_blob.to_hex(),
+                b"# hello\n\n tended\n".to_vec(),
+            )]),
+        )
+        .expect("revert ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), revert_id)
+        .expect("main moves");
+
+    let before = current_cs(&w.garden);
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    // Replaying the element is the honest outcome, and the content it
+    // writes genuinely differs from main's reverted state — the server's
+    // ordinary hard conflict. The point of the guard: NOT a silent
+    // "already applied" success.
+    assert_eq!(code, 1, "a reverted twin must not be skipped: {out}");
+    assert!(
+        !out.contains("already applied") && !stderr.contains("already applied"),
+        "a reverted twin must not be reported as applied: {out}{stderr}"
+    );
+    assert!(
+        stderr.contains("replaying instead of skipping"),
+        "the guard says why it replayed: {stderr}"
+    );
+    assert!(
+        stderr.contains("docs/lane.md"),
+        "the genuine conflict names the path: {stderr}"
+    );
+    assert_eq!(
+        current_cs(&w.garden),
+        before,
+        "the refusal leaves the working copy untouched"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// `bed rebase --stack` on a changeset main already contains: the chain
+/// from the merge base is empty and the command must say so, not panic.
+#[tokio::test]
+async fn stack_rebase_when_already_up_to_date_is_a_no_op() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Commit locally, then publish, so the working copy's changeset IS
+    // main's tip (an ancestor of itself).
+    fs::write(w.garden.join("docs/up.md"), b"# up\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "already on main"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    let tip = current_cs(&w.garden);
+    let (code, _, stderr) = bed(&w.garden, &["publish"]);
+    assert_eq!(code, 0, "publish: {stderr}");
+    assert_eq!(w.repo.get_ref("main").unwrap(), Some(tip));
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "already up to date is a success: {stderr}\n{out}");
+    assert!(out.contains("already up to date"), "{out}");
+    assert!(out.contains("nothing to rebase"), "{out}");
+    assert_eq!(current_cs(&w.garden), tip, "the working copy did not move");
+
+    w.server.shutdown().await;
+}
+
+/// P2.1: the scan-cap note must reach stderr even when the cap-induced
+/// miss turns into the server's ordinary conflict — the exact failure the
+/// note explains. The cap is shrunk so the twin sits beyond it.
+#[tokio::test]
+async fn capped_twin_scan_notes_the_cap_on_the_conflict_path() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 2, "capped");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    let tip_message = w.repo.get_changeset(lane[1]).unwrap().message;
+    let twin = hand_union(&w, lane_base, lane[1], &tip_message, 1_700_001_400);
+    // Main moves once past the union so the twin is not the new parent:
+    // the walk then has to reach it.
+    let (post, post_content) = add("src/post.rs", b"pub fn post() {}\n", Mode::Regular);
+    let post_blob = post.blob.unwrap();
+    let post_cs = cs(vec![twin], vec![post], "after the union", 1_700_001_450);
+    let post_id = w
+        .repo
+        .create_changeset(
+            &post_cs,
+            &std::collections::BTreeMap::from([(post_blob.to_hex(), post_content)]),
+        )
+        .expect("post-union ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), post_id)
+        .expect("main moves past the hand-union");
+
+    // Cap 1 sees only the new parent, so the twin one step back is missed
+    // and the replay conflicts — and the note must say why the scan was
+    // blind.
+    let (code, out, stderr) = bed_env(
+        &w.garden,
+        &["rebase", "--stack", "main"],
+        "GARDENBED_TWIN_SCAN_CAP",
+        "1",
+    );
+    assert_eq!(
+        code, 1,
+        "the capped scan misses the twin and conflicts: {out}"
+    );
+    assert!(
+        stderr.contains("twin scan capped at 1 changesets"),
+        "the cap note must be on the conflict path: {stderr}"
+    );
+    assert!(
+        stderr.contains("docs/lane.md"),
+        "the ordinary conflict still names the path: {stderr}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// P3 (round 3): the cap note is a statement about what could have been
+/// MISSED. When the capped scan still found and applied the twin, the note
+/// must stay silent; when the cap truly hid the twin, the replay hits its
+/// own-content conflict and the note must explain it. The lane's last
+/// element DELETES a path, so replaying it without the twin is a genuine
+/// conflict (a removal whose pre-image main already dropped), not the
+/// benign exact-result case.
+#[tokio::test]
+async fn cap_note_speaks_only_when_the_twin_was_actually_missed() {
+    let mut w = setup().await;
+    plant(&w);
+
+    // Element 1 edits docs/lane.md; element 2 deletes notes/todo.txt.
+    fs::write(w.garden.join("docs/lane.md"), b"# lane\n\nrev\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "capnote 1"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    let first = current_cs(&w.garden);
+    fs::remove_file(w.garden.join("notes/todo.txt")).unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "capnote 2"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    let tip = current_cs(&w.garden);
+    let lane_base = w
+        .repo
+        .get_changeset(first)
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // The tip is hand-unioned on the base; a branch above it keeps the walk
+    // going after the twin is seen, and main merges that branch with the
+    // twin (empty changes: the merge's tree is its first parent's).
+    let tip_message = w.repo.get_changeset(tip).unwrap().message;
+    let twin = hand_union(&w, lane_base, tip, &tip_message, 1_700_001_800);
+    let (extra, extra_content) = add("src/above.rs", b"pub fn above() {}\n", Mode::Regular);
+    let extra_blob = extra.blob.unwrap();
+    let extra_cs = cs(vec![twin], vec![extra], "above the twin", 1_700_001_850);
+    let extra_id = w
+        .repo
+        .create_changeset(
+            &extra_cs,
+            &std::collections::BTreeMap::from([(extra_blob.to_hex(), extra_content)]),
+        )
+        .expect("above ingests");
+    let merge_cs = cs(
+        vec![extra_id, twin],
+        vec![],
+        "merge above and twin",
+        1_700_001_900,
+    );
+    let merge_id = w
+        .repo
+        .create_changeset(&merge_cs, &std::collections::BTreeMap::new())
+        .expect("merge ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), merge_id)
+        .expect("main moves");
+
+    // Cap 1 first (the working copy must still be at the lane tip): only
+    // the merge node is scanned, so the twin IS missed; the delete's
+    // pre-image conflict follows and the note must explain it.
+    let (code, _out, stderr) = bed_env(
+        &w.garden,
+        &["rebase", "main"],
+        "GARDENBED_TWIN_SCAN_CAP",
+        "1",
+    );
+    assert_eq!(code, 1, "the capped scan misses the twin: {stderr}");
+    assert!(
+        stderr.contains("twin scan capped at 1 changesets"),
+        "a genuinely missed twin must raise the note: {stderr}"
+    );
+    // Single form, found-then-truncated shape: cap 2 scans the merge node +
+    // the twin and truncates on `above`; the twin resolves, so no
+    // conflict-form note.
+    let (code, out, stderr) = bed_env(
+        &w.garden,
+        &["rebase", "main"],
+        "GARDENBED_TWIN_SCAN_CAP",
+        "2",
+    );
+    assert_eq!(code, 0, "the twin still applies: {stderr}\n{out}");
+    assert!(out.contains("already applied"), "{out}");
+    assert!(
+        !stderr.contains("twin scan capped"),
+        "a twin that WAS found must not raise the conflict-form cap note: {stderr}"
+    );
+
+    // Stack form, same shape: put the working copy back on the lane tip
+    // (the successful single rebase moved it to main) and replay.
+    let (code, _, stderr) = bed(&w.garden, &["switch", &tip.to_hex()]);
+    assert_eq!(code, 0, "switch back to the lane tip: {stderr}");
+    let (code, out, stderr) = bed_env(
+        &w.garden,
+        &["rebase", "--stack", "main"],
+        "GARDENBED_TWIN_SCAN_CAP",
+        "2",
+    );
+    assert_eq!(code, 0, "stack form twin still applies: {stderr}\n{out}");
+    assert!(out.contains("stack already applied"), "{out}");
+    assert!(
+        !stderr.contains("twin scan capped"),
+        "fully resolved stack must not raise the cap note: {stderr}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// The cap note must also fire when the only twin found was REJECTED as
+/// stale: the run still replays (and conflicts), so the cap genuinely
+/// could have hidden the applicable twin. This is the leg the "note only
+/// when the twin applied" rule must NOT silence.
+#[tokio::test]
+async fn cap_note_fires_when_the_found_twin_is_stale() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 1, "stale-cap");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    let message = w.repo.get_changeset(lane[0]).unwrap().message;
+    let twin = hand_union(&w, lane_base, lane[0], &message, 1_700_002_000);
+
+    // A branch above the twin keeps the walk alive after the twin is seen.
+    let (extra, extra_content) = add("src/stale-above.rs", b"pub fn above() {}\n", Mode::Regular);
+    let extra_blob = extra.blob.unwrap();
+    let extra_cs = cs(
+        vec![twin],
+        vec![extra],
+        "above the stale twin",
+        1_700_002_020,
+    );
+    let extra_id = w
+        .repo
+        .create_changeset(
+            &extra_cs,
+            &std::collections::BTreeMap::from([(extra_blob.to_hex(), extra_content)]),
+        )
+        .expect("above ingests");
+
+    // Main merges `extra` and the twin, rewriting the twin's path: the twin
+    // is found but stale, so the run replays and hits the ordinary conflict.
+    // The twin is the LAST parent, so the walk scans it before truncating.
+    let rewrite = Change {
+        path: "docs/lane.md".into(),
+        op: Op::Modify,
+        blob: Some(blob_id(b"# lane\n\nmain rewrote this\n")),
+        src_path: None,
+        mode: Mode::Regular,
+    };
+    let rewrite_blob = rewrite.blob.unwrap();
+    let merge_cs = cs(
+        vec![extra_id, twin],
+        vec![rewrite],
+        "merge with a rewrite",
+        1_700_002_050,
+    );
+    let merge_id = w
+        .repo
+        .create_changeset(
+            &merge_cs,
+            &std::collections::BTreeMap::from([(
+                rewrite_blob.to_hex(),
+                b"# lane\n\nmain rewrote this\n".to_vec(),
+            )]),
+        )
+        .expect("merge ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), merge_id)
+        .expect("main moves");
+
+    let (code, _out, stderr) = bed_env(
+        &w.garden,
+        &["rebase", "main"],
+        "GARDENBED_TWIN_SCAN_CAP",
+        "2",
+    );
+    assert_eq!(code, 1, "the stale twin replays and conflicts: {stderr}");
+    assert!(
+        stderr.contains("replaying instead of skipping"),
+        "the stale twin is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("twin scan capped at 2 changesets"),
+        "the cap note must accompany the conflict even when a twin was found: {stderr}"
+    );
+    assert!(
+        stderr.contains("docs/lane.md"),
+        "the ordinary conflict names the path: {stderr}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// P2.2: the twin scan must stay within `ancestors(parent) \ ancestors(base)`.
+/// Main here is a MERGE whose first parent carries the lane and whose second
+/// parent is the merge base — descending through the second parent would
+/// walk the base's ancient history. A legitimate twin above the base must
+/// still resolve, even with a cap sized to the span alone.
+#[tokio::test]
+async fn twin_scan_does_not_descend_below_the_merge_base() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 2, "mergey");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+
+    // One changeset below the merge base (the seed): a merge parent that
+    // is an ancestor of `base`, not `base` itself.
+    let below_base = w
+        .repo
+        .get_changeset(lane_base)
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .expect("the seed has a parent");
+
+    // The twin lands on main as usual.
+    let tip_message = w.repo.get_changeset(lane[1]).unwrap().message;
+    let twin = hand_union(&w, lane_base, lane[1], &tip_message, 1_700_001_500);
+
+    // Main then merges that below-base changeset back in; its history must
+    // never be scanned.
+    let merge_cs = cs(
+        vec![twin, below_base],
+        vec![],
+        "merge the seed back",
+        1_700_001_550,
+    );
+    let merge_id = w
+        .repo
+        .create_changeset(&merge_cs, &std::collections::BTreeMap::new())
+        .expect("merge changeset ingests");
+    w.repo
+        .cas_ref("main", Some(w.head), merge_id)
+        .expect("main moves to the merge");
+
+    // Span above the base is {merge, twin} = 2. With a cap of 2 the scan
+    // must finish exactly: if it wandered below the base it would truncate
+    // and miss the twin, and the replay would conflict.
+    let (code, out, stderr) = bed_env(
+        &w.garden,
+        &["rebase", "--stack", "main"],
+        "GARDENBED_TWIN_SCAN_CAP",
+        "2",
+    );
+    assert_eq!(
+        code, 0,
+        "the twin above the merge base must resolve without descending: {stderr}\n{out}"
+    );
+    assert!(out.contains("already applied"), "{out}");
+    assert!(
+        !stderr.contains("capped"),
+        "the scan must not have exhausted the cap: {stderr}"
+    );
+    // The whole stack resolved: the merge carries the lane's tip tree, so
+    // nothing replays and the working copy lands on main.
+    assert!(out.contains("stack already applied"), "{out}");
+
+    w.server.shutdown().await;
+}
+
+/// P3.3: twin / non-twin / twin. Element 2 is not landed, but element 3 is
+/// (subsuming it). stderr must not claim element 2 "replays" — the outcome
+/// reports it as subsumed, and the notes must agree.
+#[tokio::test]
+async fn subsumed_stale_candidate_does_not_claim_a_replay() {
+    let mut w = setup().await;
+    plant(&w);
+
+    let lane = build_lane(&w, 3, "mix");
+    let lane_base = w
+        .repo
+        .get_changeset(lane[0])
+        .unwrap()
+        .parents
+        .first()
+        .copied()
+        .unwrap();
+    let m1 = w.repo.get_changeset(lane[0]).unwrap().message;
+    let m3 = w.repo.get_changeset(lane[2]).unwrap().message;
+    // Twin element 1, then main rewrites the same file (so element 1 goes
+    // stale), then twin the TIP. The tip's twin subsumes elements 1-3.
+    let twin1 = hand_union(&w, lane_base, lane[0], &m1, 1_700_001_600);
+    let diverge = Change {
+        path: "docs/lane.md".into(),
+        op: Op::Modify,
+        blob: Some(blob_id(b"# lane\n\nsomewhere else\n")),
+        src_path: None,
+        mode: Mode::Regular,
+    };
+    let diverge_blob = diverge.blob.unwrap();
+    let diverge_cs = cs(vec![twin1], vec![diverge], "main moves on", 1_700_001_650);
+    let diverge_id = w
+        .repo
+        .create_changeset(
+            &diverge_cs,
+            &std::collections::BTreeMap::from([(
+                diverge_blob.to_hex(),
+                b"# lane\n\nsomewhere else\n".to_vec(),
+            )]),
+        )
+        .expect("main ingests");
+    // The tip union is taken against `lane[2]` (tree-equal to the lane tip)
+    // but parented on the diverged main.
+    let twin3 = hand_union(&w, diverge_id, lane[2], &m3, 1_700_001_700);
+    w.repo
+        .cas_ref("main", Some(w.head), twin3)
+        .expect("main moves to the tip union");
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "--stack", "main"]);
+    assert_eq!(code, 0, "the tip twin resolves: {stderr}\n{out}");
+    assert!(out.contains("subsumed by"), "prefix report: {out}");
+    assert!(
+        stderr.contains("not replayed"),
+        "the stale candidate inside the prefix says it is not replayed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("replaying instead of skipping"),
+        "stderr must not claim a replay for a subsumed element: {stderr}"
+    );
+
+    w.server.shutdown().await;
+}
+
+/// P3.4: the single form also answers already-up-to-date when the current
+/// changeset is an ancestor of the new parent.
+#[tokio::test]
+async fn single_rebase_when_already_up_to_date_is_a_no_op() {
+    let mut w = setup().await;
+    plant(&w);
+
+    fs::write(w.garden.join("docs/single-up.md"), b"# up\n").unwrap();
+    let (code, out, stderr) = bed(&w.garden, &["commit", "-m", "single up"]);
+    assert_eq!(code, 0, "{stderr}\n{out}");
+    let tip = current_cs(&w.garden);
+    let (code, _, stderr) = bed(&w.garden, &["publish"]);
+    assert_eq!(code, 0, "publish: {stderr}");
+    assert_eq!(w.repo.get_ref("main").unwrap(), Some(tip));
+
+    let (code, out, stderr) = bed(&w.garden, &["rebase", "main"]);
+    assert_eq!(code, 0, "already up to date: {stderr}\n{out}");
+    assert!(out.contains("already up to date"), "{out}");
+    assert!(out.contains("nothing to rebase"), "{out}");
+    assert_eq!(current_cs(&w.garden), tip, "the working copy did not move");
+
+    w.server.shutdown().await;
+}
+
 /// M5 write path 3: a lone publish fast-forwards `main`; a working copy left
 /// behind gets the not-fast-forward refusal with the recipe spelled out.
 #[tokio::test]

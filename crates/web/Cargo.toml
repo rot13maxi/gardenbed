@@ -30,3 +30,5 @@ tokio = { version = "1", default-features = false, features = [
 # `MemoryStore` backs the integration tests' fully in-memory repo.
 gardenbed-store = { path = "../store" }
 tower = { version = "0.5", features = ["util"] }
+# `seed_lock` holds the repo lock across a spawned `gardenbed-web seed`.
+tempfile = "3"

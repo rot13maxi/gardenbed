@@ -331,10 +331,66 @@ check, a conflict anywhere aborts the entire stack before the working
 copy moves, and unrelated histories or a non-first-parent merge base
 are refused up front.
 
+**Twin recognition (already applied).** A lane is sometimes landed on
+`main` by hand: the same content is committed as a NEW changeset with
+the same message but no ancestry link. That changeset's post-image root
+tree is *exactly* the lane element's, so replaying the element would hit
+the server's own-content check (`"<path>" was changed or deleted`)
+although the result is already there. Before replaying, both forms walk
+the new parent's side of the merge base and match on **both** the exact
+message string and the exact post-image tree. A match is a *twin*: the
+element is treated as already applied and is not replayed. Every
+resolution is printed, naming the skipped element and its twin:
+
+```sh
+bed rebase --stack main
+# rebased 1 change(s) onto <new-parent> as <new-tip>, skipped 1 already applied
+#   <cs> "layer 1" already applied — subsumed by <twin> (tree-equal, same message)
+#   <twin>
+```
+
+Rules and honest limits:
+
+- Equality is exact on both sides. Message alone proves nothing about
+  content; a tree alone can coincide with an unrelated changeset.
+  **Partial** file overlap is not a twin — it stays a hard conflict.
+- The LAST twinned element subsumes the elements before it (its tree is
+  the cumulative lane state), so the prefix is skipped and only the
+  suffix after it replays, parented on the new parent's current tip.
+- When **every** element is a twin, nothing is replayed: the command
+  prints `stack already applied`, names the tip's twin, and moves the
+  working copy to the new parent. In the incident shape the hand-union
+  IS the new parent, so the working copy lands on the twin, and a
+  follow-up `bed publish` is a fast-forward no-op.
+- A twin whose paths `main` rewrote (or reverted) *after* the twin is
+  not treated as applied: the element replays, and the ordinary
+  conflict rule decides. Never a silent skip.
+- When the current changeset is already an ancestor of the new parent
+  there is nothing to replay at all, in both forms: `already up to date —
+  <cs> is an ancestor of <parent>; nothing to rebase`.
+- The ancestry walk visits exactly `ancestors(new parent) \
+  ancestors(merge base)`: one `GetChangeset` per changeset main gained
+  since the branch point, never the base or its history (frontier parents
+  are pruned with `IsAncestor`). On top of that it costs one `RootTree`
+  per message match, one `IsAncestor` per matched candidate, and one
+  `Diff` per twin candidate for the rewrite guard. The walk is capped at
+  4096 span changesets (`GARDENBED_TWIN_SCAN_CAP` overrides it for tests
+  and diagnostics); a longer span prints the cap note on stderr
+  **immediately** — including when the miss then surfaces as the ordinary
+  conflict — and a truncated scan can only miss a twin, never produce a
+  wrong skip. The note appears only when the run still has to replay
+  something: a twin that was found and applied (or a stack whose every
+  element resolved) prints nothing, because the truncation then hid
+  nothing this run needed.
+
 ```sh
 bed rebase main
 # rebased <cs> onto <new-parent> as <replayed-cs>
 # fetched <N> tree(s), <M> blob(s)
+
+bed rebase main          # after the same change was landed by hand
+# already applied — <cs> "<message>" is on <new-parent> as <twin> (tree-equal, same message)
+# nothing replayed; working copy moved to <new-parent>
 
 bed rebase --stack main
 # rebased 3 change(s) onto <new-parent> as <new-tip>
@@ -383,17 +439,38 @@ Usage: bed publish [OPTIONS]
 Fast-forwards a ref to the current changeset (a compare-and-swap: one
 winner per race; a loser is told the new tip).
 
+> **Upgrade note — restart the server before using `--ref`.** The `ref`
+> field is newer than the rest of the publish message. An OLD server binary
+> (pre-`fd29b3d`, before `PublishReq` gained `ref`/`force`) plus a NEW `bed`
+> makes `bed publish --ref <lane>` silently publish to `refs/heads/main`:
+> proto3 skips the unknown field, the old server takes the plain main form,
+> and the client still prints the lane name it was given — it echoes its own
+> argv, never the server's ref choice. The server never errors, so the only
+> detection is reading the refs back — **both** of them: publish the lane,
+> then check that `bed log --cs refs/heads/<lane> --limit 1` names the tip
+> you just published **and** that `bed log --cs refs/heads/main --limit 1`
+> is still the main id you recorded before publishing (a `GetRef` probe is
+> equivalent). Checking only the lane ref gives a false all-clear whenever
+> the lane row already existed — `import --ref` pre-creates it — while
+> `main` moved silently. Coordinate the restart when protocol messages
+> change. Background: dogfood finding #13 in
+> [DOGFOOD.md](DOGFOOD.md); the harness's `server_bin()` digest guard
+> refuses a binary built from different tree state, but a deliberately
+> deployed old server is outside its reach.
+
 | flag | meaning |
 |---|---|
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
-| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form) |
+| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form; an old server drops the field silently — see the upgrade note) |
 | `--force` | permit a non-fast-forward (rewind) move of a named ref |
 
 A named ref is the lane-agent form: agents committing off-main publish
 their branch so a fresh clone's `bed switch <branch>` resolves to the new
 tip. A lane ref gets the same rewind guard as `import`: a non-descendant
 move is refused (the error names the ref, both tips, and what falls off)
-unless `--force` is passed.
+unless `--force` is passed. `--ref` requires a server new enough to carry
+the field (see the upgrade note above); against an older server the flag is
+dropped and the publish hits `main`.
 
 ```sh
 bed publish

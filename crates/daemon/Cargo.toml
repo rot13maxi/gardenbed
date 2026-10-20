@@ -45,6 +45,8 @@ tonic-prost = "0.14.6"
 libc = "0.2"
 
 [build-dependencies]
+# The build fingerprint's digest (same oracle as crates/server).
+sha2 = "0.10"
 protox = "0.10"
 prost = "0.14"
 prost-types = "0.14"

@@ -52,6 +52,11 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Keep the build fingerprint in this binary's rodata: the test
+    // harness greps the located executable for it, proving the file was
+    // built from the tree it claims (dogfood #12's staleness class).
+    // `black_box` keeps the reference alive through optimization.
+    std::hint::black_box(gardenbed_daemon::SRC_DIGEST_MARKER);
     let args = Args::parse();
     match args.command {
         Command::Serve {

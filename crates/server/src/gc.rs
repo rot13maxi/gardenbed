@@ -39,6 +39,23 @@
 //! uploaded-but-not-yet-referenced blob — including an interrupted sync —
 //! keeps its grace period from its last arrival, not from its first.
 //!
+//! **Mark transaction shape.** Every mark write lands in the mark
+//! connection's `temp` schema, so no mark row is ever visible to another
+//! connection and none survives the mark connection: the documented
+//! contract "a crash before the mark commits writes nothing" holds
+//! structurally, not through a single enclosing transaction. The mark
+//! therefore batches its temp writes — `gc_live` ids and tree-closure
+//! claims each in bounded [`WRITE_BATCH`] transactions instead of one
+//! statement per id. Those transactions are temp-database only: they take
+//! no main-database write lock, so they cannot contend with the ingest
+//! path; what they save is a journal create/delete cycle per batch.
+//! Batching is invisible to the mark set: the reachability
+//! computation is unchanged, and the sweep starts only after the build
+//! returns, when every buffer has been flushed and every batch committed.
+//! A failure mid-build propagates before the sweep; the partially built
+//! temp tables die with the mark connection and can never be observed as
+//! a mark.
+//!
 //! **Blob vs tree on disk**: blobs carry the `GBLO1` envelope (first byte
 //! `'G'`), trees are canonical payloads (first byte `0x02`). The sweep
 //! types every candidate by magic so the report's blob/tree split is
@@ -62,6 +79,18 @@ pub const DEFAULT_MIN_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// Metadata rows per batch read. Bounded so the mark stays
 /// constant-memory at any scale (the kernel-store criterion).
 const BATCH: usize = 4_096;
+
+/// Live-set ids buffered before one `gc_live` insert transaction, and
+/// claims buffered before one `gc_expanded` claim transaction. Same bound
+/// as [`BATCH`]: small enough that the buffers (128 KiB each) never
+/// register against the kernel-store RSS budget, large enough that the
+/// tens-of-millions of mark ids cost thousands of transactions instead of
+/// tens of millions.
+///
+/// Public so the batch-boundary regression test sizes its fixture from
+/// the real bound instead of a copy: a test-local copy silently stops
+/// covering the flush points whenever this value changes.
+pub const WRITE_BATCH: usize = BATCH;
 
 /// Trees are canonical payloads whose first byte is the tree format byte
 /// `0x02` (canonical-encoding.md §4); blob envelopes start `"GBLO1"`.
@@ -572,6 +601,10 @@ pub struct Mark {
     offline: bool,
     /// The ingest generation at mark time (live mode's abort detector).
     watermark: u64,
+    /// Live ids awaiting the next `gc_live` batch transaction. Bounded by
+    /// [`WRITE_BATCH`]; empty once [`Mark::materialize`] returns, which is
+    /// what makes the sweep's `gc_live` reads observe the complete mark.
+    live_buf: Vec<[u8; 32]>,
 }
 
 impl Mark {
@@ -631,6 +664,7 @@ impl Mark {
             conn,
             offline,
             watermark: 0,
+            live_buf: Vec::new(),
         };
         mark.watermark = mark.read_generation()?;
         mark.build(root)?;
@@ -764,7 +798,8 @@ impl Mark {
             .execute_batch(
                 "CREATE TEMP TABLE gc_live(id BLOB PRIMARY KEY); \
                  CREATE TEMP TABLE gc_probe(i INTEGER PRIMARY KEY, id BLOB); \
-                 CREATE TEMP TABLE gc_expanded(id BLOB PRIMARY KEY);",
+                 CREATE TEMP TABLE gc_expanded(id BLOB PRIMARY KEY); \
+                 CREATE TEMP TABLE gc_claim_batch(id BLOB PRIMARY KEY);",
             )
             .map_err(|e| StoreError::Db(e.to_string()))?;
 
@@ -829,14 +864,37 @@ impl Mark {
         // Pop-time dedup would let the queue grow with the edge count
         // (~134M duplicate pushes on the kernel corpus → ~4 GiB RSS);
         // push-time claims bound it by the distinct-tree count.
+        //
+        // Claim *statements* are batched (C2): children accumulate in a
+        // [`WRITE_BATCH`]-bounded buffer, and each batch is published with
+        // one `INSERT OR IGNORE INTO gc_expanded SELECT ... RETURNING` —
+        // the returned rows are exactly the ids that were not claimed
+        // before, i.e. the ones to enqueue. The buffer is flushed when it
+        // fills (inside the entry loop, so a single wide tree cannot
+        // overshoot it) and when the queue drains, so forward progress
+        // never waits on a full batch. Duplicates inside one batch
+        // collapse in the temp table's primary key, so the push-time
+        // invariant (one queue entry per distinct tree) is preserved; the
+        // extra memory is at most `WRITE_BATCH` ids (128 KiB), not the
+        // edge count.
         let objects = open_objects(root)?;
         let mut queue: VecDeque<Id> = VecDeque::new();
-        for id in self.pending_tree_ids()? {
-            if !self.claim_expanded(id)? {
-                queue.push_back(id);
-            }
+        let mut claim_buf: Vec<[u8; 32]> = Vec::with_capacity(WRITE_BATCH);
+        for chunk in self.pending_tree_ids()?.chunks(WRITE_BATCH) {
+            let ids: Vec<[u8; 32]> = chunk.iter().map(|id| *id.as_bytes()).collect();
+            queue.extend(self.claim_batch(&ids)?);
         }
-        while let Some(id) = queue.pop_front() {
+        loop {
+            let Some(id) = queue.pop_front() else {
+                // Queue drained: publish buffered claims; if that enqueued
+                // nothing, every reachable tree has been expanded.
+                let newly = self.flush_claims(&mut claim_buf)?;
+                if newly.is_empty() {
+                    break;
+                }
+                queue.extend(newly);
+                continue;
+            };
             let Some(bytes) = objects.get_tree(id)? else {
                 // A certificate/derived root whose object is gone: a cache
                 // miss in the engine, not data loss. Nothing to expand.
@@ -854,13 +912,25 @@ impl Mark {
                             // with the edge count (hundreds of millions
                             // of duplicate 32-byte entries on the kernel
                             // corpus) instead of the distinct-tree count.
-                            if !self.claim_expanded(child)? {
-                                queue.push_back(child);
+                            claim_buf.push(*child.as_bytes());
+                            // Flush inside the entry loop, not only between
+                            // trees: one tree may legally carry ~2^20
+                            // entries, so flushing per tree would let the
+                            // buffer overshoot [`WRITE_BATCH`] by 32 MiB.
+                            // Order is irrelevant (claims are a set), so
+                            // splitting one tree's children across batches
+                            // is free.
+                            if claim_buf.len() >= WRITE_BATCH {
+                                let newly = self.flush_claims(&mut claim_buf)?;
+                                queue.extend(newly);
                             }
                         }
                     }
                     TreeKind::File => {
                         if let Some(blob) = entry.blob {
+                            // `insert_live` only buffers; its own bound is
+                            // [`WRITE_BATCH`], so a 2^20-entry tree does
+                            // not grow a per-tree staging vector either.
                             self.insert_live(std::iter::once(blob.as_bytes()))?;
                         }
                     }
@@ -868,20 +938,50 @@ impl Mark {
             }
             self.insert_live(std::iter::once(id.as_bytes()))?;
         }
+        // The sweep (and every `gc_live` read) starts after `materialize`
+        // returns, so the mark must be complete here — never leave a
+        // buffered id uncommitted.
+        self.flush_live()?;
         Ok(())
     }
 
-    /// Claims `id` for expansion; `true` when someone else already
-    /// claimed it (queued or done). One claim per distinct tree id.
-    fn claim_expanded(&mut self, id: Id) -> Result<bool, StoreError> {
-        let claimed = self
+    /// Claims `ids`: the ids that were not already claimed, i.e. the ones
+    /// to enqueue. One transaction per batch: rows land in the
+    /// `gc_claim_batch` temp table (primary key collapses duplicates
+    /// inside the batch), and a single `INSERT OR IGNORE ... RETURNING`
+    /// publishes exactly the rows `gc_expanded` did not already hold.
+    /// This replaces one statement per distinct tree id.
+    ///
+    /// The transaction is temp-database only — no row in this batch (or
+    /// anywhere in the mark) touches `metadata.sqlite3` — so it takes no
+    /// main-database write lock and cannot contend with the ingest path
+    /// the sweep's `--force` watermark guards against. Its cost is the
+    /// temp database's journal create/delete cycle, which is why batching
+    /// (one cycle per 4096 ids instead of per id) is the whole win.
+    fn claim_batch(&mut self, ids: &[[u8; 32]]) -> Result<Vec<Id>, StoreError> {
+        let tx = self
             .conn
-            .execute(
-                "INSERT OR IGNORE INTO gc_expanded(id) VALUES(?1)",
-                rusqlite::params![id.as_bytes()],
-            )
+            .transaction()
             .map_err(|e| StoreError::Db(e.to_string()))?;
-        Ok(claimed == 0)
+        tx.execute_batch("DELETE FROM gc_claim_batch;")
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+        insert_claim_rows(&tx, ids)?;
+        let claimed = claim_returning(&tx)?;
+        tx.commit().map_err(|e| StoreError::Db(e.to_string()))?;
+        Ok(claimed)
+    }
+
+    /// Publishes `buf`'s buffered claims and returns the newly claimed
+    /// ids (those to enqueue). `buf` is emptied and keeps its capacity.
+    fn flush_claims(&mut self, buf: &mut Vec<[u8; 32]>) -> Result<Vec<Id>, StoreError> {
+        if buf.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids = std::mem::take(buf);
+        let claimed = self.claim_batch(&ids)?;
+        *buf = ids;
+        buf.clear();
+        Ok(claimed)
     }
 
     /// One batch of stored changesets with `id > after`, ascending.
@@ -927,7 +1027,7 @@ impl Mark {
     /// payloads. Discovered children join during the walk itself. Blob
     /// ids never enter this set (they are not tree-named), so the walk
     /// never asks the object store to decode a blob envelope as a tree.
-    fn pending_tree_ids(&self) -> Result<VecDeque<Id>, StoreError> {
+    fn pending_tree_ids(&self) -> Result<Vec<Id>, StoreError> {
         let mut stmt = self
             .conn
             .prepare(
@@ -946,11 +1046,40 @@ impl Mark {
             .collect())
     }
 
-    /// Inserts ids into `gc_live` inside one transaction.
+    /// Buffers ids for `gc_live`, flushing every [`WRITE_BATCH`] ids.
+    ///
+    /// The old shape opened and committed a transaction per call (one per
+    /// tree and one per file entry in the walk, plus one per parent/blob
+    /// chunk per changeset): tens of millions of transactions on the
+    /// kernel corpus. They are temp-database transactions — nothing here
+    /// touches `metadata.sqlite3` — but each still pays a journal
+    /// create/delete cycle and a commit. Ordering inside `gc_live` is
+    /// irrelevant — the table is a set, and the only reader
+    /// (`batch_not_live`) runs after [`Mark::materialize`] has flushed.
+    /// Bounded by [`WRITE_BATCH`] ids (128 KiB), so the kernel-store RSS
+    /// budget is untouched.
     fn insert_live<'a>(
         &mut self,
         ids: impl Iterator<Item = &'a [u8; 32]>,
     ) -> Result<(), StoreError> {
+        for id in ids {
+            self.live_buf.push(*id);
+            if self.live_buf.len() >= WRITE_BATCH {
+                self.flush_live()?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Commits the buffered ids into `gc_live` in ONE transaction. Called
+    /// whenever the buffer fills and unconditionally at the end of
+    /// [`Mark::build`], so the sweep and every test/introspection read
+    /// observe the complete mark. A failure leaves the buffer intact and
+    /// propagates; the mark (and its temp tables) then never materializes.
+    fn flush_live(&mut self) -> Result<(), StoreError> {
+        if self.live_buf.is_empty() {
+            return Ok(());
+        }
         let tx = self
             .conn
             .transaction()
@@ -959,16 +1088,58 @@ impl Mark {
             let mut stmt = tx
                 .prepare("INSERT OR IGNORE INTO gc_live(id) VALUES(?1)")
                 .map_err(|e| StoreError::Db(e.to_string()))?;
-            for id in ids {
+            for id in &self.live_buf {
                 stmt.execute([id.as_slice()])
                     .map_err(|e| StoreError::Db(e.to_string()))?;
             }
         }
-        tx.commit().map_err(|e| StoreError::Db(e.to_string()))
+        tx.commit().map_err(|e| StoreError::Db(e.to_string()))?;
+        self.live_buf.clear();
+        Ok(())
     }
 }
 
 /// Opens the object store read path for the tree closure.
 fn open_objects(root: &Path) -> Result<gardenbed_store::FsObjectStore, StoreError> {
     gardenbed_store::FsObjectStore::open(root)
+}
+
+/// Loads `ids` into the `gc_claim_batch` temp table inside `tx`. A loop of
+/// prepared inserts (not one statement per commit): the transaction is the
+/// unit that matters, and rusqlite reuses one prepared statement.
+fn insert_claim_rows(tx: &rusqlite::Transaction<'_>, ids: &[[u8; 32]]) -> Result<(), StoreError> {
+    let mut stmt = tx
+        .prepare("INSERT OR IGNORE INTO gc_claim_batch(id) VALUES(?1)")
+        .map_err(|e| StoreError::Db(e.to_string()))?;
+    for id in ids {
+        stmt.execute([id.as_slice()])
+            .map_err(|e| StoreError::Db(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Publishes `gc_claim_batch` into `gc_expanded` and returns the rows that
+/// were actually inserted (unclaimed until now). `RETURNING` on
+/// `INSERT OR IGNORE` yields only the accepted rows, which is exactly the
+/// enqueue set; `gc_claim_batch`'s primary key already collapsed
+/// duplicates within the batch.
+fn claim_returning(tx: &rusqlite::Transaction<'_>) -> Result<Vec<Id>, StoreError> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT OR IGNORE INTO gc_expanded(id) \
+             SELECT id FROM gc_claim_batch RETURNING id",
+        )
+        .map_err(|e| StoreError::Db(e.to_string()))?;
+    let rows: Vec<Vec<u8>> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(|e| StoreError::Db(e.to_string()))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| StoreError::Db(e.to_string()))?;
+    rows.into_iter()
+        .map(|b| {
+            <[u8; 32]>::try_from(&b[..])
+                .map(Id::from_bytes)
+                .map_err(|_| StoreError::Corrupt("claimed id BLOB is not 32 bytes".into()))
+        })
+        .collect()
 }

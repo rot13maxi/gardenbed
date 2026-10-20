@@ -120,6 +120,9 @@ pub enum Command {
     /// `--stack`, replay the whole first-parent chain from the merge
     /// base up to the current changeset, oldest first — a conflict
     /// anywhere aborts the entire stack (nothing is replayed).
+    /// A changeset whose exact result (same message, same post-image
+    /// tree) is already on the new parent's lineage is reported as
+    /// already applied and is not replayed.
     Rebase {
         /// The new parent: changeset id or ref.
         new_parent: String,

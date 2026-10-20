@@ -86,6 +86,12 @@ async fn main() -> ExitCode {
 
 fn run_seed(root: &std::path::Path) -> ExitCode {
     let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        // Seeding writes objects and metadata exactly as a running server
+        // or `gardenbed-server import` does. Hold the shared repo.lock for
+        // the whole seed so an offline `gardenbed-server gc` (exclusive,
+        // non-blocking) refuses to interleave — the same contract serve
+        // and import honor.
+        let _lock = gardenbed_server::gc::lock_shared_blocking(root)?;
         let repo = Repo::open(root)?;
         match gardenbed_web::seed::seed(&repo)? {
             Some(tip) => println!("seeded tip {}", tip.to_hex()),
