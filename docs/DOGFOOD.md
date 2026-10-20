@@ -299,10 +299,10 @@ finishes first.
 
 Evidence (2026-10-19, this box, `GARDENBED_FSYNC=off`, `env -u GARDENBED_AUTHOR`,
 serial `--exact` runs): pristine main 2 failures in 16; the sweep's union tree
-3 in 16; the test body is byte-identical between the two trees
-(`crates/bed/tests/write_path.rs`, 2718 bytes), so this is pre-existing, not
-sweep-introduced. Under 8 concurrent runs each tree also failed at the same
-assertion, so load amplifies it.
+3 in 16; the test function's body is byte-identical between the two trees
+(verified by comparing the function text; the files differ only outside it),
+so this is pre-existing, not sweep-introduced. Under 8 concurrent runs each
+tree also failed at the same assertion, so load amplifies it.
 
 Not a product finding as written: nothing in the failure shows state moving before a
 successful commit — it shows the kill landing after success. Fix direction: make the
