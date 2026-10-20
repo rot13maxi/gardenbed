@@ -538,12 +538,41 @@ fn heal_marker_stamp(src: &Path, marker: &Path) {
     let Ok(current) = marker.metadata().and_then(|m| m.modified()) else {
         return;
     };
-    if current > true_stamp {
+    // A hard kill (SIGKILL/SIGABRT) between a probe write and Drop runs no
+    // destructor: it leaves the probe AND the original mtime. Heal both, or
+    // the probe trailer keeps changing the digest no matter what the stamp
+    // says (#28's kill case, found in review).
+    let healed_content = std::fs::read_to_string(marker)
+        .map(|text| {
+            let original_len = text.len();
+            let mut out = text;
+            for probe in [
+                "\n// tree-state staleness probe\n",
+                "\n// daemon tree-state probe\n",
+                "\n// remedy-proof marked build\n",
+            ] {
+                if out.contains(probe) {
+                    out = out.replace(probe, "");
+                }
+            }
+            let changed = out.len() != original_len;
+            if changed {
+                let _ = std::fs::write(marker, out);
+            }
+            changed
+        })
+        .unwrap_or(false);
+    if current > true_stamp || healed_content {
         let _ = filetime::set_file_mtime(marker, filetime::FileTime::from_system_time(true_stamp));
         eprintln!(
-            "healed a poisoned source stamp on {} (an earlier aborted run left it \
-             newer than main.rs; restoring the true commit-time stamp)",
-            marker.display()
+            "healed a source left behind by an aborted run on {} ({}; restoring the \
+             true commit-time stamp)",
+            marker.display(),
+            if healed_content {
+                "probe trailer removed"
+            } else {
+                "stamp was in the future"
+            }
         );
     }
 }
