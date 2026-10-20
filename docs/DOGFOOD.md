@@ -429,6 +429,22 @@ store transaction (`DELETE FROM refs WHERE name=? AND cs=<tip>`, six refs,
 integrity_check ok). A first-class `bed ref delete` would make lane retirement
 a supported operation.
 
+## Dogfood finding #29 (2026-10-20) — a reviewer that mutates the checkout poisons its own evidence
+
+A fresh-reviewer agent verifying the guard tests by mutating `crates/*/src/lib.rs`
+(or stamping mtimes) in the SAME checkout it was running the workspace suite in
+produced a result that could not be separated from its own interference: the
+suite observed the mutation window, and the reviewer then spent rounds
+attributing its own edits. The earlier rounds' findings were real; the last
+round's were not separable.
+
+Rule: a reviewer verifies mutations in a SCRATCH copy (`bed clone` + `switch`,
+as the lane briefs already say), never in the checkout whose suite it is
+running, and never concurrently with its own suite. Mutation evidence is only
+evidence if the observer is outside the window. The guard tests themselves are
+now mutation-safe (finding #28), but that protects the AUTOMATED run, not a
+human or agent editing sources mid-suite.
+
 ## Landing record — 2026-10-20 backlog sweep (bed c4d27378e502c53d)
 
 The five-lane backlog sweep (groups A-E) plus a re-union with three
