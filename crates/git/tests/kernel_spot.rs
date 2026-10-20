@@ -31,27 +31,18 @@ fn kernel_export_spot_check() {
     // `SqliteMetadataStore::open` writes (WAL pragma + schema), so the
     // metadata is opened from a scratch copy — the corpus store stays
     // pristine. Objects are read-only and stay in place.
+    //
+    // The layout comes from the server's own resolver, not from a local
+    // guess: the database FILE is the discriminator (a repository literally
+    // named `loam` also has a `loam/` directory, and a bare `loam/` is not a
+    // layout). Same rule as every one-shot path after finding #27.
+    let layout = gardenbed_server::resolve_layout(&root);
     let meta_path = std::env::var("GARDENBED_KERNEL_META")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            let seedbed = root.join("seedbed.sqlite3");
-            if seedbed.is_file() {
-                seedbed
-            } else {
-                root.join("metadata.sqlite3")
-            }
-        });
+        .unwrap_or(layout.metadata.clone());
     let objects_root = std::env::var("GARDENBED_KERNEL_OBJECTS")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            // The full corpus keeps objects under `loam/`; a store made by
-            // `gardenbed-server import` keeps them under its root.
-            if root.join("loam").is_dir() {
-                root.join("loam")
-            } else {
-                root.clone()
-            }
-        });
+        .unwrap_or(layout.objects.clone());
     let objects = Arc::new(FsObjectStore::open(&objects_root).expect("open kernel object store"));
     let metadata = Arc::new(SqliteMetadataStore::open(&meta_path).expect("open kernel metadata"));
 
