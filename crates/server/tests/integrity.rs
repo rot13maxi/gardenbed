@@ -348,8 +348,12 @@ impl MetadataStore for CountingMetadata {
         root: Option<gardenbed_model::Id>,
         rows: &[gardenbed_store::DerivedRow],
         git: Option<&str>,
+        raw: Option<&[u8]>,
+        _verify: Option<&dyn Fn() -> Result<(), gardenbed_store::StoreError>>,
     ) -> Result<gardenbed_model::Id, gardenbed_store::StoreError> {
-        let id = self.inner.put_validated_changeset(cs, root, rows, git)?;
+        let id = self
+            .inner
+            .put_validated_changeset(cs, root, rows, git, raw, None)?;
         self.certificates_written
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(id)
@@ -529,15 +533,362 @@ fn eager_rebuild_restores_certificate_backed_derived_tree_rows() {
 }
 
 #[test]
-fn obsolete_layout_is_rejected_without_creating_an_empty_repository() {
+fn pre_rename_layout_opens_in_place() {
+    // `seedbed.sqlite3` + `loam/objects` is the same store format under the
+    // historical directory names: it must open, not be refused.
+    use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
+
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("seedbed.sqlite3"), b"old metadata").unwrap();
+    let loam = dir.path().join("loam");
+    std::fs::create_dir_all(loam.join("objects")).unwrap();
+    let seedbed = dir.path().join("seedbed.sqlite3");
+    // Create a real (empty) store at the historical paths, then write one
+    // changeset into it through the ordinary stores.
+    let objects = std::sync::Arc::new(FsObjectStore::open(&loam).unwrap());
+    let metadata = std::sync::Arc::new(SqliteMetadataStore::open(&seedbed).unwrap());
+    let repo = Repo::new(objects, metadata);
+    let head = commit(&repo, &changeset(vec![], vec![], "pre-rename seed"));
+    repo.cas_ref("main", None, head).unwrap();
+    drop(repo);
+
+    // Reopening by root must find the same repository.
+    let reopened = Repo::open(dir.path()).expect("pre-rename layout opens");
+    assert_eq!(
+        reopened.get_ref("main").unwrap(),
+        Some(head),
+        "the seed written under the old paths must be visible"
+    );
+    // Opening must not migrate files or create a second, empty store.
+    assert!(!dir.path().join("metadata.sqlite3").exists());
+    assert!(!dir.path().join("objects").exists());
+    assert!(seedbed.exists());
+}
+
+#[test]
+fn a_root_with_foreign_content_is_refused_instead_of_silently_empty() {
+    // A wrong `--root` must not produce an empty repository beside the
+    // user's data: that reads as "all history vanished".
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("Makefile"), b"not a repository").unwrap();
     let error = Repo::open(dir.path()).unwrap_err();
-    assert!(error.to_string().contains("obsolete storage layout"));
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to create an empty repository"),
+        "unexpected error: {error}"
+    );
     assert!(!dir.path().join("metadata.sqlite3").exists());
     assert!(!dir.path().join("objects").exists());
     assert_eq!(
-        std::fs::read(dir.path().join("seedbed.sqlite3")).unwrap(),
-        b"old metadata"
+        std::fs::read(dir.path().join("Makefile")).unwrap(),
+        b"not a repository"
+    );
+}
+
+#[test]
+fn an_empty_root_still_initializes_as_the_current_layout() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = Repo::open(dir.path()).unwrap();
+    assert!(dir.path().join("metadata.sqlite3").exists());
+    assert!(dir.path().join("objects").is_dir());
+    assert!(repo.get_ref("main").unwrap().is_none());
+}
+
+// ------------------------------------------------- pre-rename layout (upstream)
+//
+// The pre-rename layout (`seedbed.sqlite3` + `loam/objects`) is the same store
+// under historical names. `Repo::open` resolves it; every OTHER entry point
+// must resolve it the same way, or it reads (and creates) an empty current
+// layout store beside the real one. These tests pin the entry points that had
+// drifted: export/import, gc's mark and sweep walk, and `move`.
+
+/// Builds a seeded pre-rename store under `root` and returns it.
+fn pre_rename_store(root: &std::path::Path) {
+    let loam = root.join("loam");
+    std::fs::create_dir_all(loam.join("objects")).unwrap();
+    // Create the pre-rename database first: the FILE is the discriminator
+    // (a bare `loam/objects` is an ordinary repository store, not a layout).
+    drop(gardenbed_store::SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).unwrap());
+    // `Repo::open` resolves the pre-rename layout and writes real objects
+    // (a bare `Repo::new` over fresh stores cannot resolve blob content).
+    let repo = Repo::open(root).expect("pre-rename root opens");
+    // `commit` passes no inline blobs, so the content must be in the store.
+    repo.put_blob(b"pre-rename").unwrap();
+    let head = commit(
+        &repo,
+        &changeset(
+            vec![],
+            vec![change(
+                "f",
+                Op::Add,
+                Some(b"pre-rename"),
+                Mode::Regular,
+                None,
+            )],
+            "pre-rename seed",
+        ),
+    );
+    repo.cas_ref("main", None, head).unwrap();
+    // The seed must have gone to the historical paths, not a new store.
+    assert!(root.join("seedbed.sqlite3").is_file());
+    assert!(!root.join("metadata.sqlite3").exists());
+}
+
+#[test]
+fn exported_pre_rename_root_is_not_read_as_an_empty_repository() {
+    // `gardenbed-server export` used to hardcode `<dir>/metadata.sqlite3` and
+    // `<dir>/objects`, so a pre-rename root exported zero commits and left a
+    // shadow current-layout store behind.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    let repo_root = root.join("default");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    pre_rename_store(&repo_root);
+
+    let into = dir.path().join("out.git");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["export", "--root"])
+        .arg(&root)
+        .args(["--repo", "default", "--into"])
+        .arg(&into)
+        .output()
+        .expect("export runs");
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.starts_with("0 commits"),
+        "the pre-rename store must export its history, got: {stdout}"
+    );
+    // And it must not shadow the real store with an empty one.
+    assert!(
+        !repo_root.join("metadata.sqlite3").exists(),
+        "export created a shadow current-layout database beside seedbed.sqlite3"
+    );
+    assert!(
+        !repo_root.join("objects").exists(),
+        "export created a shadow current-layout object store beside loam/objects"
+    );
+}
+
+#[test]
+fn gc_mark_and_sweep_walk_the_pre_rename_object_store() {
+    // The mark used to read `<root>/metadata.sqlite3` and the sweep walked
+    // `<root>/objects`, so a pre-rename store reported 0 scanned / 0 live.
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    pre_rename_store(&repo_root);
+    let on_disk = walk_count(&repo_root.join("loam").join("objects"));
+    assert!(on_disk > 0, "the fixture has object files");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["gc", "--root"])
+        .arg(&repo_root)
+        .args(["--dry-run"])
+        .output()
+        .expect("gc runs");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let scanned: u64 = text
+        .split("object(s) scanned")
+        .next()
+        .and_then(|s| s.trim().rsplit(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(
+        scanned, on_disk,
+        "gc must scan the pre-rename object store (report: {text})"
+    );
+    assert!(
+        text.contains(&format!("{on_disk} live")),
+        "every object must be live in the pre-rename mark (report: {text})"
+    );
+}
+
+/// Number of object files under an `objects/` root.
+fn walk_count(objects: &std::path::Path) -> u64 {
+    let mut n = 0u64;
+    let mut stack = vec![objects.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|f| f != "pack") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn moving_a_pre_rename_root_moves_the_real_store() {
+    // `move` renamed only the current-layout names, so a pre-rename root
+    // produced an empty destination while printing "history byte-identical".
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    std::fs::create_dir_all(&root).unwrap();
+    pre_rename_store(&root);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["move", "--root"])
+        .arg(&root)
+        .args(["--from", "default", "--into", "moved"])
+        .output()
+        .expect("move runs");
+    assert!(
+        out.status.success(),
+        "move failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let moved = root.join("moved");
+    assert!(
+        moved.join("seedbed.sqlite3").is_file() || moved.join("metadata.sqlite3").is_file(),
+        "the moved repository has no metadata store"
+    );
+    assert!(
+        walk_count(&moved.join("loam").join("objects")) > 0
+            || walk_count(&moved.join("objects")) > 0,
+        "the moved repository has no objects"
+    );
+    // The moved repository must open and keep its history.
+    let reopened = Repo::open(&moved).expect("moved repository opens");
+    assert!(
+        reopened.get_ref("main").unwrap().is_some(),
+        "history must survive the move"
+    );
+}
+
+#[test]
+fn a_repository_named_loam_does_not_masquerade_as_the_pre_rename_layout() {
+    // `loam/objects` is a normal repository store, not proof of the
+    // pre-rename layout: keying on it made `default` resolve to the
+    // multi-repo root and hid every sibling from the served list.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    for name in ["alpha", "loam"] {
+        let repo_root = root.join(name);
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo = Repo::open(&repo_root).expect("repository opens");
+        repo.put_blob(b"x").unwrap();
+        let head = commit(
+            &repo,
+            &changeset(
+                vec![],
+                vec![change("f", Op::Add, Some(b"x"), Mode::Regular, None)],
+                "seed",
+            ),
+        );
+        repo.cas_ref("main", None, head).unwrap();
+    }
+    // The resolver must also agree: a repository named `loam` is a
+    // current-layout repository, so its own root resolves to
+    // `loam/metadata.sqlite3` + `loam/objects`, never to `loam/` as this
+    // repository's object root (the regression the predicate fix closed).
+    let layout = gardenbed_server::resolve_layout(&root.join("loam"));
+    assert_eq!(
+        layout.metadata,
+        root.join("loam").join("metadata.sqlite3"),
+        "a repo named loam resolves its own database"
+    );
+    assert_eq!(
+        layout.objects,
+        root.join("loam"),
+        "a repo named loam resolves its own object root"
+    );
+    // And the multi-repo root itself is not a repository.
+    let root_layout = gardenbed_server::resolve_layout(&root);
+    assert_eq!(
+        root_layout.metadata,
+        root.join("metadata.sqlite3"),
+        "a multi-repo root resolves to the current layout, not to loam/"
+    );
+
+    let set = gardenbed_server::repos::RepoSet::new(&root, 8);
+    let served = set.served_names();
+    assert_eq!(
+        served,
+        vec!["alpha".to_owned(), "loam".to_owned()],
+        "both repositories must be served (a repo named loam is not the layout)"
+    );
+    // `default` is not a repository here and must not resolve to the root.
+    assert!(
+        set.existing_repo_dir_for("default").is_err(),
+        "default must not resolve to a multi-repo root"
+    );
+}
+
+#[test]
+fn exporting_an_unknown_repository_is_refused_not_created() {
+    // A mistyped `--repo` used to initialize an empty repository and export
+    // 0 commits with exit 0.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    let repo_root = root.join("alpha");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let repo = Repo::open(&repo_root).expect("repository opens");
+    repo.put_blob(b"x").unwrap();
+    let head = commit(
+        &repo,
+        &changeset(
+            vec![],
+            vec![change("f", Op::Add, Some(b"x"), Mode::Regular, None)],
+            "seed",
+        ),
+    );
+    repo.cas_ref("main", None, head).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["export", "--root"])
+        .arg(&root)
+        .args(["--repo", "nope", "--into"])
+        .arg(dir.path().join("out.git"))
+        .output()
+        .expect("export runs");
+    assert!(
+        !out.status.success(),
+        "an unknown repository must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not found") && stderr.contains("alpha"),
+        "the refusal names the served repositories: {stderr}"
+    );
+    assert!(
+        !root.join("nope").exists(),
+        "export must not create the unknown repository"
+    );
+}
+
+#[test]
+fn a_bare_loam_objects_root_is_refused_not_shadowed() {
+    // A root holding only `loam/objects` is not the pre-rename layout (the
+    // database file is the discriminator). It has foreign content, so opening
+    // it must refuse rather than create an empty current-layout store beside
+    // it — the same shadowing class as `resolve_layout`'s loam clause.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("loam").join("objects")).unwrap();
+    let error = Repo::open(dir.path()).expect_err("a bare loam/objects root must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to create an empty repository"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !dir.path().join("metadata.sqlite3").exists(),
+        "opening created a shadow database"
+    );
+    assert!(
+        !dir.path().join("objects").exists(),
+        "opening created a shadow object store"
     );
 }

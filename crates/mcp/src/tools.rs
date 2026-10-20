@@ -1,5 +1,5 @@
-//! The four MCP tools (v0.1.md §1): `log`, `diff`, `blame`, `file` — each
-//! answering through the server's own service layer
+//! The five MCP tools (v0.1.md §1 + the cuttings feature): `log`, `diff`,
+//! `blame`, `file`, `copies` — each
 //! ([`gardenbed_server::Repo`]), which is the very layer the CLI's server
 //! serves gRPC from. **Parity by construction**: an MCP answer and a
 //! `bed`-over-gRPC answer come from the same function calls on the same
@@ -62,7 +62,7 @@ impl ToolOutcome {
     }
 }
 
-/// The `tools/list` payload: the four tools with JSON-Schema
+/// The `tools/list` payload: the five tools with JSON-Schema
 /// `inputSchema`s. All ids and refs are strings; `cs`-taking tools accept
 /// either form and default to the `main` ref.
 pub fn descriptors() -> serde_json::Value {
@@ -135,6 +135,17 @@ pub fn descriptors() -> serde_json::Value {
                     "required": ["path"],
                 },
             },
+            {
+                "name": "copies",
+                "description": "Exact-blob copy and rename facts of one changeset against its first parent, as JSON: entries with path, from (source path), kind (\"rename\" or \"copy\"). A rename is a move whose blob is unchanged; a copy is an add whose blob already existed at another path (source = lexicographically smallest such path). No similarity heuristic — exact blob equality only, unlike git's rename/copy detection.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "cs": cs_prop,
+                    },
+                    "required": ["cs"],
+                },
+            },
         ],
     })
 }
@@ -144,7 +155,7 @@ pub fn descriptors() -> serde_json::Value {
 /// tool outcome, since no tool ran).
 pub fn extract_call(params: &serde_json::Value) -> Result<(String, serde_json::Value), String> {
     let Some(name) = params.get("name") else {
-        return Err("tools/call needs a \"name\" naming one of the four tools".into());
+        return Err("tools/call needs a \"name\" naming one of the five tools".into());
     };
     let Some(name) = name.as_str() else {
         return Err("tools/call's \"name\" must be a string".into());
@@ -168,8 +179,9 @@ pub fn call_tool(repo: &Repo, name: &str, args: &serde_json::Value) -> ToolOutco
         "diff" => tool_diff(repo, args),
         "blame" => tool_blame(repo, args),
         "file" => tool_file(repo, args),
+        "copies" => tool_copies(repo, args),
         other => ToolOutcome::error(format!(
-            "unknown tool {other:?} — the repository answers log, diff, blame and file"
+            "unknown tool {other:?} — the repository answers log, diff, blame, file and copies"
         )),
     }
 }
@@ -179,7 +191,7 @@ pub fn call_tool(repo: &Repo, name: &str, args: &serde_json::Value) -> ToolOutco
 /// Resolves the `cs` argument to a changeset id: absent → the `main` ref;
 /// 64 hex chars → an id; anything else → a ref name, falling back to a
 /// changeset id prefix (8+ hex chars) through `Repo::get_ref` — the same
-/// shared resolver the server's `GetRef` RPC serves `bed`, so all four
+/// shared resolver the server's `GetRef` RPC serves `bed`, so every
 /// tools accept truncated ids exactly like the CLI. Precedence lives
 /// server-side: an existing ref with that exact name wins over prefix
 /// interpretation. A 64-hex id is passed through and verified by the Repo
@@ -581,6 +593,54 @@ pub fn tool_file(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
             );
             ToolOutcome::text(String::from_utf8_lossy(e.as_bytes()).into_owned())
         }
+    }
+}
+
+// ------------------------------------------------------------------ copies
+
+/// `copies`: `{cs}` (required) — the exact-blob copy/rename facts of one
+/// changeset against its first parent, as pretty JSON:
+/// `{"changeset": "<hex>", "entries": [{"path", "from", "kind"}]}`.
+/// A changeset with no facts answers an empty `entries` array. Facts are
+/// exact-blob only (no similarity heuristic; a documented divergence
+/// from git's rename/copy detection).
+pub fn tool_copies(repo: &Repo, args: &serde_json::Value) -> ToolOutcome {
+    let Some(cs_arg) = arg_str(args, "cs") else {
+        return ToolOutcome::error(
+            "copies needs a \"cs\" argument — a 64-hex changeset id, a ref name, \
+             or a changeset id prefix (8+ hex chars); give the changeset to list \
+             the copies and renames of",
+        );
+    };
+    let cs = match resolve_cs(repo, Some(cs_arg)) {
+        Ok(cs) => cs,
+        Err(e) => return ToolOutcome::error(e),
+    };
+    let cuttings = match repo.copies(cs) {
+        Ok(c) => c,
+        Err(e) => return ToolOutcome::error(err_text(e)),
+    };
+    let entries: Vec<serde_json::Value> = cuttings
+        .entries
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "path": e.path,
+                "from": e.src,
+                "kind": match e.kind {
+                    gardenbed_derive::CuttingKind::Rename => "rename",
+                    gardenbed_derive::CuttingKind::Copy => "copy",
+                },
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "changeset": cs.to_hex(),
+        "entries": entries,
+    });
+    match serde_json::to_string_pretty(&out) {
+        Ok(text) => ToolOutcome::text(text),
+        Err(e) => ToolOutcome::error(format!("copies could not render its answer: {e}")),
     }
 }
 

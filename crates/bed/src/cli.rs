@@ -3,7 +3,8 @@
 //!
 //! All commands are wired: the read path (`clone`, `sparse add`, `switch`,
 //! `file`, `log`, `diff`, `blame`), the write path (`commit`, `rebase`,
-//! `publish`), and the fully offline ones (`status`, `sparse list/remove`).
+//! `publish`, `merge`), the FUSE view (`mount`), and the fully offline
+//! ones (`status`, `sparse list/remove`).
 
 use std::path::PathBuf;
 
@@ -35,10 +36,12 @@ pub struct Cli {
 pub enum Command {
     /// Create a working copy connected to a server; materialize no files.
     Clone {
-        /// Repository server endpoint: `http(s)://host:port` or
-        /// `unix:///path/to/socket`.
+        /// Repository server endpoint: `http(s)://host:port[/repo]` or
+        /// `unix:///path/to/socket`. An http(s) URL's path names the
+        /// repository; no path selects `default`.
         server: String,
-        /// Repository name (default: default).
+        /// Repository name (default: from the URL path, else `default`;
+        /// the flag wins on conflict).
         #[arg(long)]
         repo: Option<String>,
         /// Starting ref. Defaults to `main`, then `master` or `trunk`.
@@ -113,10 +116,19 @@ pub enum Command {
         author: Option<String>,
     },
 
-    /// Rebase the current changeset onto another changeset or ref.
+    /// Rebase the current changeset onto another changeset or ref. With
+    /// `--stack`, replay the whole first-parent chain from the merge
+    /// base up to the current changeset, oldest first — a conflict
+    /// anywhere aborts the entire stack (nothing is replayed).
+    /// A changeset whose exact result (same message, same post-image
+    /// tree) is already on the new parent's lineage is reported as
+    /// already applied and is not replayed.
     Rebase {
         /// The new parent: changeset id or ref.
         new_parent: String,
+        /// Replay the entire first-parent stack, not just the tip.
+        #[arg(long)]
+        stack: bool,
     },
 
     /// Publish the current changeset by fast-forwarding a ref (default
@@ -147,6 +159,9 @@ pub enum Command {
         author: Option<String>,
     },
 
+    /// Upload queued offline commits to the server.
+    Sync,
+
     /// Show first-parent line attribution, following renames.
     Blame {
         /// The file's repo-relative path.
@@ -154,6 +169,16 @@ pub enum Command {
         /// Changeset id or ref to blame at (default: the current one).
         #[arg(long = "cs", value_name = "ID-OR-REF")]
         cs: Option<String>,
+    },
+
+    /// Mount the current changeset as a read-only FUSE filesystem
+    /// (virtualized checkout). The whole repository tree is visible and
+    /// readable; each read materializes exactly the blob it needs.
+    /// Stays in the foreground; unmount with Ctrl-C.
+    Mount {
+        /// The directory to mount over. Created when missing; an ordinary
+        /// removable directory is left behind after unmount.
+        mountpoint: PathBuf,
     },
 }
 
@@ -373,7 +398,14 @@ mod tests {
             other => panic!("expected Commit, got {other:?}"),
         }
         match parsed(&["rebase", "main"]).command {
-            Command::Rebase { new_parent } => assert_eq!(new_parent, "main"),
+            Command::Rebase { new_parent, stack } => {
+                assert_eq!(new_parent, "main");
+                assert!(!stack);
+            }
+            other => panic!("expected Rebase, got {other:?}"),
+        }
+        match parsed(&["rebase", "--stack", "main"]).command {
+            Command::Rebase { stack, .. } => assert!(stack),
             other => panic!("expected Rebase, got {other:?}"),
         }
         match parsed(&["publish"]).command {
@@ -390,6 +422,12 @@ mod tests {
             }
             other => panic!("expected Publish, got {other:?}"),
         }
+        match parsed(&["sync"]).command {
+            Command::Sync => {}
+            other => panic!("expected Sync, got {other:?}"),
+        }
+        // `sync` takes no arguments.
+        assert!(Cli::try_parse_from(["bed", "sync", "extra"]).is_err());
         match parsed(&["blame", "src/lib.rs"]).command {
             Command::Blame { path, cs } => {
                 assert_eq!(path, "src/lib.rs");
@@ -408,6 +446,18 @@ mod tests {
         assert!(Cli::try_parse_from(["bed", "commit"]).is_err());
         // `--author` takes exactly one value.
         assert!(Cli::try_parse_from(["bed", "commit", "-m", "x", "--author"]).is_err());
+    }
+
+    #[test]
+    fn mount_parses_mountpoint() {
+        match parsed(&["mount", "/tmp/view"]).command {
+            Command::Mount { mountpoint } => {
+                assert_eq!(mountpoint, PathBuf::from("/tmp/view"));
+            }
+            other => panic!("expected Mount, got {other:?}"),
+        }
+        // The mountpoint is required.
+        assert!(Cli::try_parse_from(["bed", "mount"]).is_err());
     }
 
     #[test]

@@ -257,19 +257,23 @@ fn write_path_and_blame_fail_cleanly_without_an_server() {
     assert!(stderr.contains("working copy is clean"), "stderr: {stderr}");
     assert!(stdout.is_empty(), "stdout: {stdout:?}");
 
-    // -- with something to commit, the (deliberately unreachable) server
-    //    connection is what fails — nothing was uploaded, no half-state.
+    // -- with something to commit and the (deliberately unreachable)
+    //    server down at connect time, the commit queues offline (v0.2
+    //    §6/D17): exit 0, the queue line first, one pending commit.
     let dir = planted_bed();
     sparse(&dir, &["src"]);
     fs::create_dir_all(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/new.txt"), b"fresh\n").unwrap();
     let (code, stdout, stderr) = bed(&dir, &["commit", "-m", "tend the rows"]);
-    assert_eq!(code, 1, "stdout {stdout:?} stderr {stderr:?}");
+    assert_eq!(code, 0, "stdout {stdout:?} stderr {stderr:?}");
     assert!(
-        stderr.contains("cannot reach the server"),
-        "stderr: {stderr}"
+        stdout.contains("queued as") && stdout.contains("1 pending — run bed sync when online"),
+        "stdout names the queue: {stdout:?}"
     );
-    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert!(
+        stdout.lines().next().unwrap().starts_with("queued as"),
+        "the queue line comes first: {stdout:?}"
+    );
 
     // -- rebase and publish are wired too: the connection fails before any
     //    local state is touched.
@@ -492,7 +496,7 @@ struct CloneWorld {
 /// Spawns the world; `index` 0 points the ref at cs1, 1 at cs2.
 async fn clone_world(refs: &[(&str, usize)]) -> CloneWorld {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arb_root = dir.path().join("server");
+    let arb_root = dir.path().join("server").join(common::REPO);
     let (cs1, cs2) = seed_repo(&arb_root);
     {
         let repo = Repo::open(&arb_root).expect("repo opens");
@@ -751,7 +755,7 @@ fn seed_bed_shaded_repo(root: &Path) -> Id {
 /// changeset that ships `.bed/initialized.txt` and `.bed/sub/x`), one garden.
 async fn bed_shaded_world() -> CloneWorld {
     let dir = tempfile::tempdir().expect("tempdir");
-    let arb_root = dir.path().join("server");
+    let arb_root = dir.path().join("server").join(common::REPO);
     let cs1 = seed_bed_shaded_repo(&arb_root);
     {
         let repo = Repo::open(&arb_root).expect("repo opens");

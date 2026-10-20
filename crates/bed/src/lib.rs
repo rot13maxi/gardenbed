@@ -12,10 +12,13 @@
 pub mod cli;
 pub mod commit;
 pub mod config;
+pub mod daemon;
 pub mod error;
 pub mod heads;
 pub mod ignore;
+pub mod mount;
 pub mod ops;
+pub mod queue;
 pub mod render;
 pub mod revspec;
 pub mod rpc;

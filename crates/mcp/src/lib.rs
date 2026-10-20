@@ -25,7 +25,7 @@
 //! | `initialize` | echo the client's `protocolVersion`, else `2025-06-18`; capabilities `{tools:{}}`; serverInfo |
 //! | `notifications/initialized` | nothing (a notification) |
 //! | `ping` | empty result |
-//! | `tools/list` | the four tools with JSON-Schema input schemas |
+//! | `tools/list` | the five tools with JSON-Schema input schemas |
 //! | `tools/call` | `{content:[{type:"text",text}], isError?}` |
 //! | anything else with an id | JSON-RPC error `-32601` |
 //! | malformed line | JSON-RPC error `-32700`; the server keeps serving |

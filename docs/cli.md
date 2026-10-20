@@ -51,7 +51,9 @@ Usage: bed [OPTIONS] <COMMAND>
 | `diff` | diff the working copy (when dirty by modified/deleted tracked files) or two changesets; every diff prints a header naming its sides |
 | `commit` | record local changes as a changeset on the server |
 | `rebase` | replay the current changeset onto a new parent (server-side rebase) |
+| `merge` | merge a changeset or ref into the current changeset (server-side two-parent merge) |
 | `publish` | fast-forward a ref (default `main`) to the current changeset |
+| `mount` | mount the current changeset as a read-only FUSE filesystem |
 | `blame` | show first-parent line attribution, following renames |
 | `help` | print help for any subcommand |
 
@@ -61,23 +63,25 @@ Usage: bed [OPTIONS] <COMMAND>
 Usage: bed clone [OPTIONS] <SERVER>
 ```
 
-`<SERVER>` — the repository server endpoint: `http(s)://host:port` or
-`unix:///path/to/socket`.
+`<SERVER>` — the repository server endpoint: `http(s)://host:port[/repo]`
+or `unix:///path/to/socket`. An http(s) URL's path names the repository
+(the URL addresses the repository, not just the server); no path selects
+`default`.
 
 | flag | meaning |
 |---|---|
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
-| `--repo <REPO>` | repository name (default: `default`) |
+| `--repo <REPO>` | repository name (default: from the URL path, else `default`; the flag wins on conflict) |
 | `--ref <REF>` | starting ref; defaults to `main`, then `master` or `trunk` |
 | `--sparse <PATH>...` | sparse prefixes to record (repeat or list several); materialize with `bed sparse add` |
 
 ```sh
-bed clone http://127.0.0.1:9418
-# created working copy for default at http://127.0.0.1:9418
+bed clone http://127.0.0.1:9418/myrepo
+# created working copy for myrepo at http://127.0.0.1:9418
 # current changeset: b273e12d1c6f11ee (main)
 # no files materialized — select paths with `bed sparse add <path>`
 
-bed clone http://127.0.0.1:9418 --ref master --sparse src docs
+bed clone http://127.0.0.1:9418 --repo myrepo --ref master --sparse src docs
 ```
 
 A ref the server does not have is refused — no working copy is created:
@@ -159,10 +163,34 @@ hashed.
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
 | `--full-scan` | hash every tracked file, ignoring the hints |
 
+With offline commits queued (see [`bed commit`](#bed-commit)), the
+pending line prints first, offline:
+
 ```sh
-bed status                   # working copy is clean — nothing modified, deleted, or untracked.
-bed status --full-scan
+bed status
+# 1 pending commit(s) not yet on the server — run bed sync
+# working copy is clean — nothing modified, deleted, or untracked.
 ```
+
+### bed sync
+
+```text
+Usage: bed sync [OPTIONS]
+```
+
+Drains the offline commit queue: every pending commit is uploaded
+oldest-first as an idempotent re-upload of content-addressed facts (a
+crash mid-sync costs a re-upload, never a divergence), then the state
+move each offline commit already performed locally is replayed. A
+failure stops the drain at the failing commit and says how many remain;
+`bed switch`, `rebase`, and `publish` refuse while commits are pending.
+
+```sh
+bed sync
+# synced <cs>
+# synced 2 commit(s), queue empty
+```
+
 
 ### bed file
 
@@ -274,6 +302,20 @@ bed commit -m "Describe the change"
 # working copy at b273e12d1c6f11ee (was 984213bc33e9f924)
 ```
 
+When the server is unreachable *at connect time* — and only then; a
+server that answers, even to refuse, is online and its error must be
+seen — the commit completes offline: the changeset is built and
+content-addressed locally, every changed blob is staged into
+`.bed/objects`, and a queue row records what `bed sync` later replays.
+The working copy moves exactly as an online commit's would.
+
+```sh
+bed commit -m "offline work"
+# created changeset <cs>: 1 change(s) (1 added)
+# queued as <cs> — 1 pending — run bed sync when online
+# working copy at <cs> (was <parent>)
+```
+
 ### bed rebase
 
 ```text
@@ -282,12 +324,77 @@ Usage: bed rebase [OPTIONS] <NEW_PARENT>
 
 Replays the current changeset onto a new parent (server-side rebase).
 `<NEW_PARENT>` is a `<cs-or-ref>`. Conflicts are hard errors listing
-every conflicting path.
+every conflicting path. With `--stack`, the whole first-parent chain
+from the merge base of (current, new parent) replays onto the new
+parent, oldest first — each link gets the same per-changeset conflict
+check, a conflict anywhere aborts the entire stack before the working
+copy moves, and unrelated histories or a non-first-parent merge base
+are refused up front.
+
+**Twin recognition (already applied).** A lane is sometimes landed on
+`main` by hand: the same content is committed as a NEW changeset with
+the same message but no ancestry link. That changeset's post-image root
+tree is *exactly* the lane element's, so replaying the element would hit
+the server's own-content check (`"<path>" was changed or deleted`)
+although the result is already there. Before replaying, both forms walk
+the new parent's side of the merge base and match on **both** the exact
+message string and the exact post-image tree. A match is a *twin*: the
+element is treated as already applied and is not replayed. Every
+resolution is printed, naming the skipped element and its twin:
+
+```sh
+bed rebase --stack main
+# rebased 1 change(s) onto <new-parent> as <new-tip>, skipped 1 already applied
+#   <cs> "layer 1" already applied — subsumed by <twin> (tree-equal, same message)
+#   <twin>
+```
+
+Rules and honest limits:
+
+- Equality is exact on both sides. Message alone proves nothing about
+  content; a tree alone can coincide with an unrelated changeset.
+  **Partial** file overlap is not a twin — it stays a hard conflict.
+- The LAST twinned element subsumes the elements before it (its tree is
+  the cumulative lane state), so the prefix is skipped and only the
+  suffix after it replays, parented on the new parent's current tip.
+- When **every** element is a twin, nothing is replayed: the command
+  prints `stack already applied`, names the tip's twin, and moves the
+  working copy to the new parent. In the incident shape the hand-union
+  IS the new parent, so the working copy lands on the twin, and a
+  follow-up `bed publish` is a fast-forward no-op.
+- A twin whose paths `main` rewrote (or reverted) *after* the twin is
+  not treated as applied: the element replays, and the ordinary
+  conflict rule decides. Never a silent skip.
+- When the current changeset is already an ancestor of the new parent
+  there is nothing to replay at all, in both forms: `already up to date —
+  <cs> is an ancestor of <parent>; nothing to rebase`.
+- The ancestry walk visits exactly `ancestors(new parent) \
+  ancestors(merge base)`: one `GetChangeset` per changeset main gained
+  since the branch point, never the base or its history (frontier parents
+  are pruned with `IsAncestor`). On top of that it costs one `RootTree`
+  per message match, one `IsAncestor` per matched candidate, and one
+  `Diff` per twin candidate for the rewrite guard. The walk is capped at
+  4096 span changesets (`GARDENBED_TWIN_SCAN_CAP` overrides it for tests
+  and diagnostics); a longer span prints the cap note on stderr
+  **immediately** — including when the miss then surfaces as the ordinary
+  conflict — and a truncated scan can only miss a twin, never produce a
+  wrong skip. The note appears only when the run still has to replay
+  something: a twin that was found and applied (or a stack whose every
+  element resolved) prints nothing, because the truncation then hid
+  nothing this run needed.
 
 ```sh
 bed rebase main
 # rebased <cs> onto <new-parent> as <replayed-cs>
 # fetched <N> tree(s), <M> blob(s)
+
+bed rebase main          # after the same change was landed by hand
+# already applied — <cs> "<message>" is on <new-parent> as <twin> (tree-equal, same message)
+# nothing replayed; working copy moved to <new-parent>
+
+bed rebase --stack main
+# rebased 3 change(s) onto <new-parent> as <new-tip>
+#   <link1> -> <link2> -> <link3>
 ```
 
 ### bed merge
@@ -332,17 +439,38 @@ Usage: bed publish [OPTIONS]
 Fast-forwards a ref to the current changeset (a compare-and-swap: one
 winner per race; a loser is told the new tip).
 
+> **Upgrade note — restart the server before using `--ref`.** The `ref`
+> field is newer than the rest of the publish message. An OLD server binary
+> (pre-`fd29b3d`, before `PublishReq` gained `ref`/`force`) plus a NEW `bed`
+> makes `bed publish --ref <lane>` silently publish to `refs/heads/main`:
+> proto3 skips the unknown field, the old server takes the plain main form,
+> and the client still prints the lane name it was given — it echoes its own
+> argv, never the server's ref choice. The server never errors, so the only
+> detection is reading the refs back — **both** of them: publish the lane,
+> then check that `bed log --cs refs/heads/<lane> --limit 1` names the tip
+> you just published **and** that `bed log --cs refs/heads/main --limit 1`
+> is still the main id you recorded before publishing (a `GetRef` probe is
+> equivalent). Checking only the lane ref gives a false all-clear whenever
+> the lane row already existed — `import --ref` pre-creates it — while
+> `main` moved silently. Coordinate the restart when protocol messages
+> change. Background: dogfood finding #13 in
+> [DOGFOOD.md](DOGFOOD.md); the harness's `server_bin()` digest guard
+> refuses a binary built from different tree state, but a deliberately
+> deployed old server is outside its reach.
+
 | flag | meaning |
 |---|---|
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
-| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form) |
+| `--ref <REF>` | the ref to fast-forward (default: `main`; `main` itself must use the plain form; an old server drops the field silently — see the upgrade note) |
 | `--force` | permit a non-fast-forward (rewind) move of a named ref |
 
 A named ref is the lane-agent form: agents committing off-main publish
 their branch so a fresh clone's `bed switch <branch>` resolves to the new
 tip. A lane ref gets the same rewind guard as `import`: a non-descendant
 move is refused (the error names the ref, both tips, and what falls off)
-unless `--force` is passed.
+unless `--force` is passed. `--ref` requires a server new enough to carry
+the field (see the upgrade note above); against an older server the flag is
+dropped and the publish hits `main`.
 
 ```sh
 bed publish
@@ -370,6 +498,34 @@ bed blame src/main.rs
 bed blame --cs master Makefile
 ```
 
+
+### bed mount
+
+```text
+Usage: bed mount [OPTIONS] <MOUNTPOINT>
+```
+
+Mounts the current changeset as a read-only FUSE filesystem — the
+**virtualized checkout**: the whole repository tree is visible and
+readable at `<MOUNTPOINT>` with no sparse selection, while `.bed/objects`
+grows only by what is actually read (a file's blob materializes on first
+`stat`, a symlink's on first `lstat`; listing alone fetches only trees).
+Every mutating operation fails with `EROFS`. Snapshot semantics: the
+mount reflects the current changeset at mount time and does not track
+later ref movement — unmount and mount again to switch.
+
+The command stays in the foreground serving the filesystem; `Ctrl-C`
+(SIGINT or SIGTERM) unmounts cleanly and exits 0, leaving an ordinary
+removable directory behind. No root privileges are needed (mounting
+goes through `fusermount3`); hosts without `/dev/fuse` refuse with
+`this host cannot mount a virtualized checkout`.
+
+```sh
+bed mount /tmp/view
+# mounted b273e12d1c6f11ee read-only at /tmp/view — Ctrl-C to unmount
+cat /tmp/view/src/main.rs      # fetched exactly this blob, cache-first
+```
+
 ## gardenbed-server
 
 ```text
@@ -381,14 +537,15 @@ Usage: gardenbed-server [OPTIONS] [COMMAND]
 | option | meaning |
 |---|---|
 | `--addr <ADDR>` | listen address (`host:port`; `:0` picks an ephemeral port), default `127.0.0.1:9418` |
-| `--root <ROOT>` | repository directory; must be a non-empty path (created if missing) — holds `<root>/objects` and `<root>/metadata.sqlite3` |
-| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode |
+| `--root <ROOT>` | the server root directory (created if missing): one subdirectory per repository (`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3`); a v0.1 root (stores at the top level) serves unchanged as repository `default` |
+| `--max-repos <N>` | cap on simultaneously open repositories (LRU eviction above it), default 256; local (`--root`) mode only |
+| `--storage <FILE>` | storage configuration file (TOML) for the scaled backends (Postgres metadata + S3 objects); takes precedence over `--root`. The `GARDENBED_STORAGE` environment variable (a path to the same TOML file) is the fallback when the flag is absent — resolution order is `--storage` → `GARDENBED_STORAGE` → `--root` local mode. Scaled mode serves one repository; the request's `repo` name is a label, not a directory |
 
 Without a subcommand, the top-level `--addr`/`--root` flags serve the
 gRPC API — the printed address is the contract for scripts:
 
 ```sh
-gardenbed-server --addr 127.0.0.1:9418 --root /tmp/gardenbed-repo
+gardenbed-server --addr 127.0.0.1:9418 --root /tmp/gardenbed
 # listening on 127.0.0.1:9418
 ```
 
@@ -440,6 +597,59 @@ Serves the gRPC API. Takes the same `--addr`/`--root`/`--storage` flags
 (see [scaled storage](#scaled-storage)); this is the default when no
 subcommand is given.
 
+For its lifetime the server holds an exclusive lock on
+`<root>/gardenbed.lock`: a second server over the same root refuses to
+start (`cannot lock the server root`), and `gardenbed-server move`
+refuses to run while the lock is held.
+
+| flag | meaning |
+|---|---|
+| `--auth <PATH>` | optional token auth config (`auth.toml`): `[tokens.<token>]` entries, each with `repos` (repository names, or `*` for any) and `role` (`read`, `write`, or `admin`; admin implies write, write implies read). Without the flag the server is open. A malformed file refuses startup |
+
+Clients authenticate with the gRPC `authorization: Bearer <token>`
+metadata; `bed` sends it when `GARDENBED_TOKEN` is set in its
+environment. Anonymous or insufficient tokens get `PERMISSION_DENIED`
+naming the repository and the next step.
+
+```toml
+# auth.toml — gardenbed-server serve --auth auth.toml
+[tokens."operator-token"]
+repos = ["garden"]
+role = "write"
+
+[tokens."auditor-token"]
+repos = ["*"]        # any repository
+role = "read"
+```
+
+### gardenbed-server move
+
+```text
+Usage: gardenbed-server move [OPTIONS] --root <ROOT> --from <FROM> --into <INTO>
+```
+
+Renames a repository under the server root (the two renames: stores,
+then the git mirror when present). Both stores are path-free and
+self-contained, so history is byte-identical after the move; the vacated
+name stops being served.
+
+An **offline operation**: stop the server first. The move checkpoints
+the repository's WAL into `metadata.sqlite3` before renaming (committed
+rows may legally live only in the WAL sidecar), carries `-wal`/`-shm`
+along, and refuses — non-zero exit, nothing changed — while a server is
+serving the root or any other process holds the database.
+
+| flag | meaning |
+|---|---|
+| `--root <ROOT>` | the server root directory |
+| `--from <FROM>` | the repository's current name |
+| `--into <INTO>` | the new name (must not name an existing repository or directory) |
+
+```sh
+gardenbed-server move --root /tmp/gardenbed --from default --into myrepo
+# moved repository default to myrepo (/tmp/gardenbed/myrepo), history byte-identical
+```
+
 ### gardenbed-server import
 
 ```text
@@ -450,8 +660,9 @@ Imports a git repository's history into the Gardenbed stores.
 
 | flag | meaning |
 |---|---|
-| `--from <FROM>` | git repository: a local path (bare or working tree) or a URL. URLs are cloned (mirror) into `<root>/git-mirror.git` and refreshed on re-use |
-| `--root <ROOT>` | gardenbed repository directory (created if missing) |
+| `--from <FROM>` | git repository: a local path (bare or working tree) or a URL. URLs are cloned (mirror) into the repository's `git-mirror.git` and refreshed on re-use |
+| `--root <ROOT>` | the server root directory: one subdirectory per repository |
+| `--repo <REPO>` | repository name under the root (default `default`) |
 | `--limit <LIMIT>` | ingest only the newest N commits (topological suffix; slice boundaries are re-rooted as full-tree root changesets) |
 | `--renames <RENAMES>` | detect renames with `git diff-tree -M` (`on`, default) or import them as delete+add pairs (`off`) |
 | `--ref <REFS>` | only import branches matching this glob (e.g. `refs/heads/*`); repeatable, empty means every branch |
@@ -488,13 +699,44 @@ any non-descendant move — but sideways merges onto shared history count
 only what is actually unreachable) are permitted with just the warning.
 
 ```sh
-gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed-repo \
-    --ref refs/heads/master --renames on
+gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed \
+    --repo myrepo --ref refs/heads/master --renames on
 # 2 commits (2 new, 0 skipped), 9 objects, 1 ref(s) moved, 0.24s (8 commits/s)
 ```
 
 `demo/run-v0.1.sh` runs the same import against the deterministic demo
 corpus (`$CORPUS` → `$SERVER_ROOT`).
+
+### gardenbed-server gc
+
+```text
+Usage: gardenbed-server gc [OPTIONS] --root <ROOT>
+```
+
+Garbage-collects unreachable objects (v0.2.md §7): a mark over the
+metadata (refs, every stored changeset row, certificates, derived trees —
+closed over parents, blob refs, and tree payloads), then one sweep of the
+object shards unlinking what is unreachable and older than `--min-age`.
+Stale `.tmp-*` staging files are reaped under the same gate.
+
+| flag | meaning |
+|---|---|
+| `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
+| `--dry-run` | report what would be collected; delete nothing |
+| `--force` | run live without the exclusive lock (the sweep unlinks under the metadata write lock and aborts if an ingest lands mid-run) |
+| `--min-age <SECONDS>` | minimum age of collectible objects, default 86400 (24 h) |
+
+```sh
+gardenbed-server gc --root /tmp/gardenbed-repo
+# gc: 812 object(s) scanned, 800 live, 4 blob(s) and 8 tree(s) deleted, \
+# 1 tmp file(s) reaped, 262144 byte(s) reclaimed [mark 0.012s, sweep 0.004s]
+```
+
+Offline by default: the server holds a shared `flock` on
+`<root>/repo.lock` (serve's root mode holds one per open repository
+handle, so repositories created after startup are covered too), and gc
+wants it exclusive — running gc against a live server fails with exit
+code 1 and the message to stop the server or pass `--force`.
 
 ### gardenbed-server export
 
@@ -502,20 +744,23 @@ corpus (`$CORPUS` → `$SERVER_ROOT`).
 Usage: gardenbed-server export [OPTIONS] --root <ROOT> --into <INTO>
 ```
 
-Exports the changeset graph into a real git repository (one
-`git fast-import` stream). The changeset→git mapping rides in the
-report; `--mapping FILE` writes it as TSV for verification.
+Exports the changeset graph into a real git repository (a native
+SHA-1 pack + `.idx`, written directly — no git subprocess). Every
+computed commit SHA is asserted against the store's git-mapping row.
+The changeset→git mapping rides in the report; `--mapping FILE` writes
+it as TSV for verification.
 
 | flag | meaning |
 |---|---|
-| `--root <ROOT>` | gardenbed repository directory (holds `objects/` and `metadata.sqlite3`) |
+| `--root <ROOT>` | the server root directory (one subdirectory per repository) |
+| `--repo <REPO>` | repository name under the root (default `default`) |
 | `--into <INTO>` | destination git repository: created as a bare sha1 repository when missing, accepted as-is when present |
 | `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
 | `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback) |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
 
 ```sh
-gardenbed-server export --root /tmp/gardenbed-repo --into /tmp/export.git \
+gardenbed-server export --root /tmp/gardenbed --repo myrepo --into /tmp/export.git \
     --mapping /tmp/mapping.tsv
 # 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
 git -C /tmp/export.git fsck --strict   # clean
@@ -531,8 +776,8 @@ Usage: gardenbed-mcp [OPTIONS] --root <DIR>
 
 | flag | meaning |
 |---|---|
-| `--root <DIR>` (required) | the server's data directory (its `objects/` object store and `metadata.sqlite3` metadata database) |
-| `--repo <NAME>` | repo name; accepted and validated for forward compatibility (v0.1 servers are single-repo; the API carries a repo field from day one, docs/v0.1.md §1) |
+| `--root <DIR>` (required) | the server's root directory |
+| `--repo <NAME>` | repository name under the root (default `default`); the session answers from this repository only — an unknown name exits 1 listing what the root serves |
 
 Newline-delimited JSON-RPC 2.0 on stdin/stdout, one response line per
 request; diagnostics go to stderr only. Serves tools `log`, `diff`,
@@ -540,7 +785,7 @@ request; diagnostics go to stderr only. Serves tools `log`, `diff`,
 
 ```sh
 echo '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  | gardenbed-mcp --root /tmp/gardenbed-repo
+  | gardenbed-mcp --root /tmp/gardenbed --repo myrepo
 
-gardenbed-mcp --root /tmp/gardenbed-repo --repo default < requests.jsonl
+gardenbed-mcp --root /tmp/gardenbed --repo myrepo < requests.jsonl
 ```

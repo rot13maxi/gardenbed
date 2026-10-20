@@ -17,18 +17,23 @@ repository has a `main` branch and a `src` directory.
 
 ## Import and serve a repository
 
-Import before starting the server:
+The server serves any number of repositories from one root: each lives in
+its own directory under the root. Import before starting the server:
 
 ```sh
-gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed-repo
+gardenbed-server import --from /path/to/git-repo --root /tmp/gardenbed --repo myrepo
 
-gardenbed-server --root /tmp/gardenbed-repo --addr 127.0.0.1:9418
+gardenbed-server --root /tmp/gardenbed --addr 127.0.0.1:9418
 # listening on 127.0.0.1:9418
 ```
 
-The repository directory contains `objects/` and `metadata.sqlite3`. A URL
-can be used instead of a local Git path; its mirror is kept in `git-mirror.git`.
-Re-importing brings in new history and updates imported refs.
+Each repository directory (`/tmp/gardenbed/myrepo`) contains `objects/` and
+`metadata.sqlite3`. A URL can be used instead of a local Git path; its
+mirror is kept in the repository's `git-mirror.git`. Re-importing brings in
+new history and updates imported refs. A root laid out the v0.1 way (stores
+directly under the root) keeps serving unchanged as the repository named
+`default`; `gardenbed-server move --root DIR --from default --into NAME`
+renames it into the per-directory layout.
 
 Useful import options:
 
@@ -47,7 +52,7 @@ In another terminal, with the built binaries on `PATH`:
 
 ```sh
 mkdir -p /tmp/gardenbed-work && cd /tmp/gardenbed-work
-bed clone http://127.0.0.1:9418
+bed clone http://127.0.0.1:9418/myrepo
 bed sparse add src
 bed status
 ```
@@ -62,9 +67,12 @@ bed sparse list
 bed sparse remove tests    # remove the selection; keep working files
 ```
 
-Without `--ref`, clone tries `main`, `master`, then `trunk`. Select another
-starting ref with `bed clone <server> --ref feature`. `clone --sparse src`
-records an initial selection but does not materialize files.
+The clone URL addresses the repository: its path names the repository
+(`http://host:port/myrepo`; no path selects `default`). `--repo` names it
+too and wins on conflict. Without `--ref`, clone tries `main`, `master`,
+then `trunk`. Select another starting ref with
+`bed clone <server-url> --ref feature`. `clone --sparse src` records an
+initial selection but does not materialize files.
 
 `--state-dir DIR` selects another local state directory. It names the state
 directory itself, not the working-copy root. The default is `./.bed`.
@@ -122,7 +130,7 @@ are protected. Cross-filesystem state directories are supported, including a
 ## Export to Git
 
 ```sh
-gardenbed-server export --root /tmp/gardenbed-repo --into /tmp/export.git \
+gardenbed-server export --root /tmp/gardenbed --repo myrepo --into /tmp/export.git \
   --mapping /tmp/mapping.tsv
 git -C /tmp/export.git fsck --strict
 git -C /tmp/export.git log --oneline
@@ -138,21 +146,28 @@ The MCP server opens repository storage directly and speaks newline-delimited
 JSON-RPC on stdio:
 
 ```sh
-gardenbed-mcp --root /tmp/gardenbed-repo < requests.jsonl
+gardenbed-mcp --root /tmp/gardenbed --repo myrepo < requests.jsonl
 ```
+
+The named repository is the only one the session answers from.
 
 It exposes `log`, `diff`, `file`, and `blame`. No working copy is needed.
 See [MCP setup and tool schemas](mcp.md) for client configuration.
 
 ## Offline behavior and troubleshooting
 
-`status`, `sparse list`, and `sparse remove` work offline. Commands that query
-history, fetch files, or write to the repository require the server.
+`status`, `sparse list`, and `sparse remove` work offline. Commands that
+query history or fetch files require the server. `commit` also completes
+offline when the server is unreachable at connect time: the changeset is
+built and content-addressed locally and queued; `bed sync` uploads the
+queue when the server returns (`switch`, `rebase`, and `publish` refuse
+while commits are pending).
 
 | Problem | Next step |
 |---|---|
 | No local state | Run `bed clone`, or select existing state with `--state-dir` |
 | Cannot reach the server | Start `gardenbed-server` and check its address |
+| Commits queued offline | Run `bed sync` once the server is reachable |
 | Clone finds no default ref | Pass `--ref` with an existing branch name |
 | Changeset prefix is ambiguous | Use more hex characters |
 | Checkout would overwrite local work | Commit or move that work aside |

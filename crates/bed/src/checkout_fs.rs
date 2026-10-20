@@ -27,6 +27,11 @@ pub(crate) enum Entry {
     Other,
 }
 
+/// The treestate's mtime convention: nanoseconds since the Unix epoch.
+fn stat_mtime_ns(stat: &fs::Stat) -> i64 {
+    stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec as i64
+}
+
 const JOURNAL_PREFIX: &str = "checkout-stage-";
 const TEMP_PREFIX: &str = ".bed-checkout-";
 
@@ -124,6 +129,40 @@ impl CheckoutFs {
     }
 
     pub(crate) fn entry(&self, path: &str) -> Result<Option<Entry>, ClientError> {
+        Ok(self.entry_inner(path, None)?.map(|(entry, _)| entry))
+    }
+
+    /// Like [`CheckoutFs::entry`], but when `known` describes a
+    /// hash-verified row, a `stat` that still matches it settles the
+    /// question without opening or reading the file.
+    ///
+    /// The returned entry then repeats the row's blob id instead of
+    /// re-hashing. That is the same trust `bed status` extends to hints: a
+    /// row with [`HINT_VERIFIED`](crate::treestate::HINT_VERIFIED) whose
+    /// size, mtime, and mode still match was hashed when it was written, and
+    /// a content change that leaves all three identical is not something a
+    /// re-read could distinguish after the fact either — it would have
+    /// already been missed by every hint-guided scan.
+    ///
+    /// Checkout updates walk the whole selection; without this, every
+    /// update reads and hashes every selected file, which makes refresh
+    /// cost scale with the selection rather than with the change.
+    pub(crate) fn entry_verified(
+        &self,
+        path: &str,
+        known: &crate::treestate::TreestateEntry,
+    ) -> Result<Option<Entry>, ClientError> {
+        if known.hint != crate::treestate::HINT_VERIFIED {
+            return self.entry(path);
+        }
+        Ok(self.entry_inner(path, Some(known))?.map(|(entry, _)| entry))
+    }
+
+    fn entry_inner(
+        &self,
+        path: &str,
+        known: Option<&crate::treestate::TreestateEntry>,
+    ) -> Result<Option<(Entry, Option<fs::Stat>)>, ClientError> {
         let Some((dir, name)) = self.parent(path, false)? else {
             return Ok(None);
         };
@@ -132,7 +171,7 @@ impl CheckoutFs {
             Err(rustix::io::Errno::NOENT) => return Ok(None),
             Err(e) => return Err(io(e)),
         };
-        Ok(Some(match FileType::from_raw_mode(stat.st_mode) {
+        let entry = match FileType::from_raw_mode(stat.st_mode) {
             FileType::Directory => Entry::Directory,
             FileType::Symlink => Entry::File {
                 blob: blob_id(
@@ -143,34 +182,59 @@ impl CheckoutFs {
                 mode: MODE_SYMLINK,
             },
             FileType::RegularFile => {
-                let fd = fs::openat(
-                    &dir,
-                    name.as_str(),
-                    OFlags::CLOEXEC | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                    fs::Mode::empty(),
-                )
-                .map_err(io)?;
-                // Verify the opened object too: a racing replacement must
-                // not turn this read into a device or FIFO operation.
-                let mut file = File::from(fd);
-                let meta = file.metadata()?;
-                if !meta.is_file() {
-                    return Ok(Some(Entry::Other));
-                }
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                use std::os::unix::fs::PermissionsExt as _;
-                Entry::File {
-                    blob: blob_id(&bytes),
-                    mode: if meta.permissions().mode() & 0o111 != 0 {
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    // `PermissionsExt` reads the stat's mode bits; no fd needed.
+                    let perms = std::fs::Permissions::from_mode(stat.st_mode & 0o7777);
+                    if perms.mode() & 0o111 != 0 {
                         MODE_EXEC
                     } else {
                         MODE_REGULAR
-                    },
+                    }
+                };
+                // The hint path: a verified row whose size, mtime, and mode
+                // still match proves the content without reading it.
+                if let Some(known) = known
+                    && known.hint == crate::treestate::HINT_VERIFIED
+                    && known.mode == mode
+                    && known.size == stat.st_size
+                    && known.mtime_ns == stat_mtime_ns(&stat)
+                {
+                    Entry::File {
+                        blob: known.blob_id,
+                        mode,
+                    }
+                } else {
+                    let fd = fs::openat(
+                        &dir,
+                        name.as_str(),
+                        OFlags::CLOEXEC | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                        fs::Mode::empty(),
+                    )
+                    .map_err(io)?;
+                    // Verify the opened object too: a racing replacement must
+                    // not turn this read into a device or FIFO operation.
+                    let mut file = File::from(fd);
+                    let meta = file.metadata()?;
+                    if !meta.is_file() {
+                        return Ok(Some((Entry::Other, Some(stat))));
+                    }
+                    let mut bytes = Vec::new();
+                    file.read_to_end(&mut bytes)?;
+                    use std::os::unix::fs::PermissionsExt as _;
+                    Entry::File {
+                        blob: blob_id(&bytes),
+                        mode: if meta.permissions().mode() & 0o111 != 0 {
+                            MODE_EXEC
+                        } else {
+                            MODE_REGULAR
+                        },
+                    }
                 }
             }
             _ => Entry::Other,
-        }))
+        };
+        Ok(Some((entry, Some(stat))))
     }
 
     /// Every leaf below a directory, without following symlinks. Empty

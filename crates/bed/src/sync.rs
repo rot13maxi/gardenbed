@@ -88,25 +88,40 @@ pub async fn sync_sparse(
     // Only identity-registered staging entries from dead writers are
     // reclaimed. Substituted names remain ordinary local/untracked work.
     disk.cleanup_staging()?;
+    // Load the index once. Every per-path decision below reads this map
+    // instead of hopping back into SQLite: a checkout update over N files
+    // must not cost N lookups.
+    let tracked: BTreeMap<String, TreestateEntry> = treestate
+        .all_entries()?
+        .into_iter()
+        .map(|entry| (entry.path.clone(), entry))
+        .collect();
     // Validate the whole operation before changing any file or index row.
-    let preserve = preflight(workspace_root, sparse, &target, treestate, &disk)?;
+    let preserve = preflight(
+        workspace_root,
+        sparse,
+        &target,
+        &tracked,
+        treestate.path(),
+        &disk,
+    )?;
     let mut outcome = SyncOutcome::default();
     let mut obsolete = Vec::new();
 
-    for path in treestate.all_paths()? {
-        if target.contains_key(&path) || !in_sparse(&path, sparse) {
+    for path in tracked.keys() {
+        if target.contains_key(path) || !in_sparse(path, sparse) {
             continue;
         }
         // An interrupted file→directory transition may already have the
         // new directory. Keep it; all of its leaves were preflighted.
-        if !materialized_ancestor(&path, &target, &disk)?
-            && disk.entry(&path)? != Some(crate::checkout_fs::Entry::Directory)
+        if !materialized_ancestor(path, &target, &disk)?
+            && disk.entry(path)? != Some(crate::checkout_fs::Entry::Directory)
         {
-            disk.remove(&path)?;
+            disk.remove(path)?;
         }
         // Keep the baseline until replacement entries are in place, so
         // an interrupted shape transition can still be preflighted.
-        obsolete.push(path);
+        obsolete.push(path.clone());
         outcome.removed += 1;
     }
 
@@ -132,8 +147,18 @@ pub async fn sync_sparse(
         disk.prune_empty(&dir, sparse)?;
     }
 
+    // Refresh hints in one transaction rather than one statement per file.
+    let mut refreshed: Vec<TreestateEntry> = Vec::with_capacity(target.len());
     for (path, file) in &target {
         if preserve.contains(path) {
+            continue;
+        }
+        // Already settled above: the row is verified and names this exact
+        // content, so neither the file nor the row needs touching.
+        if tracked.get(path).is_some_and(|row| {
+            row.hint == HINT_VERIFIED && row.blob_id == file.blob && row.mode == file.mode_code()
+        }) {
+            outcome.kept += 1;
             continue;
         }
         let expected = crate::checkout_fs::Entry::File {
@@ -142,37 +167,53 @@ pub async fn sync_sparse(
         };
         if file.mode == Mode::Gitlink {
             disk.remove(path)?;
-            treestate.upsert(&TreestateEntry {
+            refreshed.push(TreestateEntry {
                 path: path.clone(),
                 blob_id: file.blob,
                 mode: MODE_GITLINK,
                 size: 32,
                 mtime_ns: 0,
                 hint: HINT_UNVERIFIED,
-            })?;
+            });
             outcome.kept += 1;
             continue;
         }
-        if disk.entry(path)? == Some(expected) {
+        // The row describes this path from an earlier sync; let a matching
+        // stat settle it without reading the file.
+        let known = tracked.get(path);
+        let current = match known {
+            Some(known) => disk.entry_verified(path, known)?,
+            None => disk.entry(path)?,
+        };
+        if current == Some(expected) {
             outcome.kept += 1;
+            // Already correct: the row is unchanged, so only a row that is
+            // missing or unverified needs rewriting (an unverified row must
+            // not stay unverified — the next sync would re-read it).
+            if let Some(known) = known
+                && known.blob_id == file.blob
+                && known.mode == file.mode_code()
+                && known.hint == HINT_VERIFIED
+            {
+                continue;
+            }
         } else {
             let content = fetcher.blob(file.blob).await?;
             disk.write(path, &content, file.mode)?;
             outcome.written += 1;
         }
         let meta = disk.stat(path)?;
-        treestate.upsert(&TreestateEntry {
+        refreshed.push(TreestateEntry {
             path: path.clone(),
             blob_id: file.blob,
             mode: file.mode_code(),
             size: meta.st_size,
             mtime_ns: meta.st_mtime * 1_000_000_000 + meta.st_mtime_nsec as i64,
             hint: HINT_VERIFIED,
-        })?;
+        });
     }
-    for path in obsolete {
-        treestate.remove(&path)?;
-    }
+    treestate.upsert_all(&refreshed)?;
+    treestate.remove_all(&obsolete)?;
     Ok(outcome)
 }
 
@@ -189,7 +230,15 @@ pub(crate) fn state_prefixes(
     root: &std::path::Path,
     treestate: &Treestate,
 ) -> Result<BTreeSet<String>, ClientError> {
-    let state = treestate.path().parent().expect("treestate has a parent");
+    state_prefixes_of(root, treestate.path())
+}
+
+/// [`state_prefixes`] for a caller that already holds the state directory.
+pub(crate) fn state_prefixes_of(
+    root: &std::path::Path,
+    treestate_path: &std::path::Path,
+) -> Result<BTreeSet<String>, ClientError> {
+    let state = treestate_path.parent().expect("treestate has a parent");
     let mut prefixes = BTreeSet::new();
     if let Some(name) = state.file_name().and_then(|name| name.to_str()) {
         prefixes.insert(name.to_owned());
@@ -212,23 +261,45 @@ pub(crate) fn is_state_path(path: &str, prefixes: &BTreeSet<String>) -> bool {
     })
 }
 
+/// Validates a sync against `tracked` (the treestate, loaded once by the
+/// caller) and returns the paths whose local edit must be preserved.
+///
+/// Every `disk.entry` here is a full read-and-hash of a regular file, so
+/// the walk is deliberately shaped to ask for one per affected path at
+/// most, and to ask with the verified-row hint when one exists.
 fn preflight(
     root: &std::path::Path,
     sparse: &[String],
     target: &BTreeMap<String, PlanFile>,
-    treestate: &Treestate,
+    tracked: &BTreeMap<String, TreestateEntry>,
+    treestate_path: &std::path::Path,
     disk: &crate::checkout_fs::CheckoutFs,
 ) -> Result<BTreeSet<String>, ClientError> {
     use crate::checkout_fs::Entry;
-    let protected = state_prefixes(root, treestate)?;
-    let tracked: BTreeMap<_, _> = treestate
-        .all_paths()?
-        .into_iter()
-        .map(|path| Ok((path.clone(), treestate.lookup(&path)?.expect("listed row"))))
-        .collect::<Result<_, ClientError>>()?;
+    let protected = state_prefixes_of(root, treestate_path)?;
+    // Only paths this sync can actually act on need the disk. A path whose
+    // target already equals its hash-verified row is left exactly as it is:
+    // there is nothing to write and nothing that could be overwritten (an
+    // unchanged target never refuses a local edit — it preserves it). This
+    // is what keeps an update proportional to the change rather than to the
+    // size of the selection.
+    let settled = |path: &str| {
+        let Some(file) = target.get(path) else {
+            return false;
+        };
+        matches!(tracked.get(path), Some(row)
+            if row.hint == HINT_VERIFIED
+                && row.blob_id == file.blob
+                && row.mode == file.mode_code())
+    };
     let affected: BTreeSet<_> = target
         .keys()
-        .chain(tracked.keys().filter(|path| in_sparse(path, sparse)))
+        .filter(|path| !settled(path))
+        .chain(
+            tracked
+                .keys()
+                .filter(|path| in_sparse(path, sparse) && !target.contains_key(*path)),
+        )
         .cloned()
         .collect();
     let mut preserve = BTreeSet::new();
@@ -278,7 +349,10 @@ fn preflight(
         let current = if ancestor_removed {
             None
         } else {
-            disk.entry(path)?
+            match tracked.get(path) {
+                Some(known) => disk.entry_verified(path, known)?,
+                None => disk.entry(path)?,
+            }
         };
         let baseline = tracked.get(path).and_then(|entry| {
             (entry.mode != MODE_GITLINK).then_some(Entry::File {
@@ -384,6 +458,14 @@ mod tests {
     use gardenbed_model::blob_id;
     use std::fs;
 
+    fn loaded(ts: &Treestate) -> BTreeMap<String, TreestateEntry> {
+        ts.all_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.path.clone(), entry))
+            .collect()
+    }
+
     fn plan(files: &[(&str, &[u8])]) -> BTreeMap<String, PlanFile> {
         files
             .iter()
@@ -422,20 +504,59 @@ mod tests {
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         let sparse = vec![".".into()];
         assert_eq!(
-            preflight(dir.path(), &sparse, &plan(&[("f", b"base")]), &ts, &disk).unwrap(),
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[("f", b"base")]),
+                &loaded(&ts),
+                ts.path(),
+                &disk
+            )
+            .unwrap(),
             BTreeSet::from(["f".into()])
         );
-        assert!(preflight(dir.path(), &sparse, &plan(&[("f", b"target")]), &ts, &disk).is_err());
-        assert!(preflight(dir.path(), &sparse, &plan(&[]), &ts, &disk).is_err());
+        assert!(
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[("f", b"target")]),
+                &loaded(&ts),
+                ts.path(),
+                &disk
+            )
+            .is_err()
+        );
+        assert!(
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[]),
+                &loaded(&ts),
+                ts.path(),
+                &disk
+            )
+            .is_err()
+        );
         fs::remove_file(dir.path().join("f")).unwrap();
-        assert!(preflight(dir.path(), &sparse, &plan(&[("f", b"target")]), &ts, &disk).is_err());
+        assert!(
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[("f", b"target")]),
+                &loaded(&ts),
+                ts.path(),
+                &disk
+            )
+            .is_err()
+        );
         fs::write(dir.path().join("untracked"), b"local").unwrap();
         assert!(
             preflight(
                 dir.path(),
                 &sparse,
                 &plan(&[("untracked", b"target")]),
-                &ts,
+                &loaded(&ts),
+                ts.path(),
                 &disk
             )
             .is_err()
@@ -453,12 +574,12 @@ mod tests {
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         let sparse = vec![".".into()];
         let target = plan(&[("d", b"replacement")]);
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_ok());
         fs::write(dir.path().join("d/extra"), b"local").unwrap();
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_err());
         fs::remove_file(dir.path().join("d/extra")).unwrap();
         fs::write(dir.path().join("d/f"), b"local").unwrap();
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_err());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_err());
     }
 
     #[test]
@@ -471,15 +592,15 @@ mod tests {
         track(&ts, "d/f", b"base");
         fs::write(dir.path().join("d"), b"replacement").unwrap();
         let target = plan(&[("d", b"replacement")]);
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_ok());
         assert!(materialized_ancestor("d/f", &target, &disk).unwrap());
         // A crash after removing the old descendants but before installing
         // the new file retains baseline rows and an empty directory.
         fs::remove_file(dir.path().join("d")).unwrap();
         fs::create_dir(dir.path().join("d")).unwrap();
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_ok());
         fs::remove_dir(dir.path().join("d")).unwrap();
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_ok());
         fs::write(dir.path().join("d"), b"replacement").unwrap();
         ts.remove("d/f").unwrap();
         track(&ts, "d", b"replacement");
@@ -487,7 +608,7 @@ mod tests {
         fs::create_dir(dir.path().join("d")).unwrap();
         fs::write(dir.path().join("d/new"), b"done").unwrap();
         let target = plan(&[("d/new", b"done"), ("d/remaining", b"next")]);
-        assert!(preflight(dir.path(), &sparse, &target, &ts, &disk).is_ok());
+        assert!(preflight(dir.path(), &sparse, &target, &loaded(&ts), ts.path(), &disk).is_ok());
     }
 
     #[test]
@@ -503,7 +624,8 @@ mod tests {
                 dir.path(),
                 &sparse,
                 &plan(&[("custom/config.toml", b"bad")]),
-                &ts,
+                &loaded(&ts),
+                ts.path(),
                 &disk
             )
             .is_err()
@@ -513,17 +635,145 @@ mod tests {
                 dir.path(),
                 &sparse,
                 &plan(&[("custom", b"bad")]),
-                &ts,
+                &loaded(&ts),
+                ts.path(),
                 &disk
             )
             .is_err()
         );
         fs::write(outside.path().join("f"), b"outside").unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();
-        assert!(preflight(dir.path(), &sparse, &plan(&[("d/f", b"bad")]), &ts, &disk).is_err());
+        assert!(
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[("d/f", b"bad")]),
+                &loaded(&ts),
+                ts.path(),
+                &disk
+            )
+            .is_err()
+        );
         // Operations enforce the rule independently of preflight.
         assert!(disk.write("d/f", b"bad", Mode::Regular).is_err());
         assert!(disk.remove("d/f").is_err());
         assert_eq!(fs::read(outside.path().join("f")).unwrap(), b"outside");
+    }
+
+    /// The hint path must not weaken safety on the paths it skips.
+    ///
+    /// A settled path (verified row naming the target content) is skipped
+    /// entirely: no read, no write, no refusal. That is only sound because
+    /// skipping cannot *destroy* anything — a local edit is left exactly as
+    /// it is. The test pins the two halves that matter: a settled path
+    /// yields `kept` and leaves the working file untouched, and any path
+    /// whose target differs is still read and still refused when the
+    /// overwrite would lose work.
+    #[test]
+    fn settled_paths_are_skipped_and_edits_are_never_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = WorkingCopy::init(&dir.path().join(".bed"), "s", "r").unwrap();
+        let ts = bed.treestate().unwrap();
+        let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
+        let sparse = vec![".".into()];
+
+        fs::write(dir.path().join("f"), b"base").unwrap();
+        let meta = std::fs::metadata(dir.path().join("f")).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        ts.upsert(&TreestateEntry {
+            path: "f".into(),
+            blob_id: blob_id(b"base"),
+            mode: 0,
+            size: 4,
+            mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            hint: HINT_VERIFIED,
+        })
+        .unwrap();
+
+        // Settled: nothing to preserve, nothing refused, nothing read.
+        let preserve = preflight(
+            dir.path(),
+            &sparse,
+            &plan(&[("f", b"base")]),
+            &loaded(&ts),
+            ts.path(),
+            &disk,
+        )
+        .unwrap();
+        assert!(preserve.is_empty());
+        let verified = disk
+            .entry_verified("f", &ts.lookup("f").unwrap().unwrap())
+            .unwrap();
+        assert_eq!(
+            verified,
+            Some(crate::checkout_fs::Entry::File {
+                blob: blob_id(b"base"),
+                mode: 0
+            })
+        );
+
+        // A local edit makes the target differ from the row: the path is no
+        // longer settled, so preflight reads it and refuses an overwrite.
+        fs::write(dir.path().join("f"), b"local edit").unwrap();
+        assert!(
+            preflight(
+                dir.path(),
+                &sparse,
+                &plan(&[("f", b"target")]),
+                &loaded(&ts),
+                ts.path(),
+                &disk
+            )
+            .is_err(),
+            "an overwrite of a local edit must still be refused"
+        );
+        // ...while a plan that leaves the target alone skips the path, which
+        // also leaves the edit in place (skipping never writes).
+        let preserve = preflight(
+            dir.path(),
+            &sparse,
+            &plan(&[("f", b"base")]),
+            &loaded(&ts),
+            ts.path(),
+            &disk,
+        )
+        .unwrap();
+        assert!(preserve.is_empty());
+        assert_eq!(
+            fs::read(dir.path().join("f")).unwrap(),
+            b"local edit",
+            "a skipped path must never rewrite working content"
+        );
+    }
+
+    /// An UNVERIFIED row never takes the hint path: the file is read.
+    #[test]
+    fn unverified_rows_are_always_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let bed = WorkingCopy::init(&dir.path().join(".bed"), "s", "r").unwrap();
+        let ts = bed.treestate().unwrap();
+        let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
+        fs::write(dir.path().join("f"), b"base").unwrap();
+        let meta = std::fs::metadata(dir.path().join("f")).unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        ts.upsert(&TreestateEntry {
+            path: "f".into(),
+            blob_id: blob_id(b"base"),
+            mode: 0,
+            size: 4,
+            mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            hint: HINT_UNVERIFIED,
+        })
+        .unwrap();
+        let preserve = preflight(
+            dir.path(),
+            &[".".into()],
+            &plan(&[("f", b"base")]),
+            &loaded(&ts),
+            ts.path(),
+            &disk,
+        )
+        .unwrap();
+        assert!(preserve.is_empty());
     }
 }

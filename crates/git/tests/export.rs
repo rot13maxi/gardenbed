@@ -1,5 +1,4 @@
-//! Export roundtrip tests (v0.1.md §M5): changesets → git via one
-//! `git fast-import` stream.
+//! Export roundtrip tests: changesets → git via the native pack writer.
 //!
 //! The oracles are git itself:
 //!
@@ -7,8 +6,8 @@
 //!   (`fixture.mapping`: changeset id ↔ git sha), imported into gardenbed
 //!   stores and exported back must reproduce the *exact* same git commit
 //!   SHAs. Both sides are content-determined; any byte drift (identity,
-//!   dates, message, parents, tree) breaks equality, so that one
-//!   comparison covers every commit field at once.
+//!   dates, message, tree) breaks equality, so that one comparison covers
+//!   every commit field at once.
 //! * `git fsck --strict` on every exported repository.
 //! * Per-commit trees (`git ls-tree -r`) compared against independently
 //!   computed expectations for gardenbed-native (never-materialized)
@@ -17,10 +16,10 @@
 //!   `git cat-file --batch`.
 //! * Ref filtering (`ExportOptions::refs`), idempotent re-export into an
 //!   existing repository, and the empty-store no-op.
-//!
-//! The one deliberate divergence — signed commits are exported unsigned —
-//! gets its own test: the signature is dropped, the SHA differs, the tree
-//! matches, and the report counts it (see `docs/divergences.md` §1).
+//! * Fidelity (M18): signed commits, extra headers (`encoding`,
+//!   `mergetag`), and non-UTF-8 identity bytes roundtrip SHA-exact via
+//!   raw-commit capture; a git-mapping row that disagrees with the
+//!   computed SHA is a loud error, never a silent divergence.
 
 mod common;
 
@@ -544,12 +543,12 @@ fn export_honors_the_ref_glob() {
     git_fsck(&main_target).expect("fsck clean");
 }
 
-/// The deliberate divergence (docs/divergences.md §1): a signed commit is
-/// imported with its `gpgsig` captured, but fast-import cannot express a
-/// signature, so the export writes it **unsigned** — the git SHA differs,
-/// the tree matches byte-exactly, and the report counts the drop.
+/// M18.1 fidelity: a signed commit roundtrips SHA-exact. The importer
+/// captures the raw commit bytes (byte-compare against reconstruction
+/// fails on the `gpgsig` header), stores them in the raw-commit side
+/// table, and the export emits them verbatim — signature included.
 #[test]
-fn signed_commits_drop_their_signature() {
+fn signed_commits_roundtrip_exactly() {
     let dir = tempdir().expect("tempdir");
     let src = dir.path().join("signed.git");
     git_out(
@@ -623,33 +622,29 @@ fn signed_commits_drop_their_signature() {
     );
     assert_eq!(cs.message, "signed!\n");
 
-    // -- export: unsigned, counted, tree-preserving.
+    // -- export: signed commits now roundtrip SHA-exact (M18.1): the raw
+    // bytes captured at import are emitted verbatim, signature included.
     let target = dir.path().join("export.git");
     let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
         .expect("export succeeds");
     assert_eq!(report.commits_exported, 1);
-    assert_eq!(report.signed_dropped, 1, "the dropped signature is counted");
+    assert_eq!(
+        report.signed_dropped, 0,
+        "no signature is dropped (raw row exists)"
+    );
     let exported_sha = &report.commits[0].1;
-    assert_ne!(
+    assert_eq!(
         exported_sha, &orig_sha,
-        "dropping the signature changes the sha"
+        "the signed commit roundtrips byte-exact"
     );
 
-    // The tree survives byte-exactly; only the header is gone.
-    assert_eq!(
-        git_ls_tree_r(&src, &orig_sha).expect("ls-tree of the original"),
-        git_ls_tree_r(&target, exported_sha).expect("ls-tree of the export"),
-        "the exported commit's tree matches the signed original"
-    );
+    // Verbatim means verbatim: the raw object text is byte-identical.
     let mut cat = CatFile::spawn(&target);
-    let raw_text = String::from_utf8_lossy(&cat.commit_raw(exported_sha)).to_string();
-    assert!(
-        !raw_text.contains("gpgsig"),
-        "no signature header in:\n{raw_text}"
+    assert_eq!(
+        cat.commit_raw(exported_sha),
+        raw.into_bytes(),
+        "the exported commit object is the original object"
     );
-    assert!(raw_text.contains("author Gopher <g@arden> 1700000000 +0000"));
-    assert!(raw_text.contains("committer Gopher <g@arden> 1700000000 +0000"));
-    assert_eq!(commit_message(&mut cat, exported_sha), b"signed!\n");
     git_fsck(&target).expect("fsck clean");
 }
 
@@ -864,8 +859,9 @@ fn export_of_a_hand_built_history_reproduces_every_special_shape() {
     git_fsck(&target).expect("fsck clean");
 }
 
-/// An empty metadata exports a clean no-op: zero counts, no refs in git, an
-/// empty marks file that stays on disk, and a fsck-clean target.
+/// An empty metadata exports a clean no-op: zero counts, no refs, no pack
+/// (a store with nothing to say writes nothing but the skeleton), and a
+/// fsck-clean target.
 #[test]
 fn export_of_an_empty_store_is_a_clean_noop() {
     let dir = tempdir().expect("tempdir");
@@ -881,14 +877,10 @@ fn export_of_an_empty_store_is_a_clean_noop() {
     assert!(report.refs.is_empty());
     assert!(report.commits.is_empty());
 
-    // The marks file is created even for an empty stream and stays on disk.
-    assert!(report.marks_path.exists(), "marks file left in place");
-    assert!(
-        std::fs::read(&report.marks_path)
-            .expect("read marks")
-            .is_empty(),
-        "no marks for an empty stream"
-    );
+    // An empty store still writes a valid (empty) pack — git accepts
+    // zero-object packs, and the report points at it.
+    assert!(report.pack_path.is_file(), "empty pack written");
+    assert!(report.pack_path.to_string_lossy().ends_with(".pack"));
 
     git_fsck(&target).expect("fsck clean");
     assert_eq!(
@@ -896,4 +888,563 @@ fn export_of_an_empty_store_is_a_clean_noop() {
         None,
         "no ref was created (unborn branch)"
     );
+}
+
+/// M18.2: commits with headers the model does not carry (`encoding`,
+/// `mergetag`) roundtrip SHA-exact through raw-commit capture — the
+/// reconstruction differs from the original bytes, so the importer
+/// captures them and the export emits them verbatim.
+#[test]
+fn extra_header_commits_roundtrip_exactly() {
+    let dir = tempdir().expect("tempdir");
+    let src = dir.path().join("hdr.git");
+    git_out(
+        dir.path(),
+        &["init", "-q", "--bare", "--object-format=sha1", "hdr.git"],
+        b"",
+    );
+
+    // A linear history of two commits; the child carries `encoding` and a
+    // `mergetag` header (hand-built via plumbing — no merge needed).
+    let blob = git_out(&src, &["hash-object", "-w", "--stdin"], b"fidelity\n");
+    let blob_sha = String::from_utf8_lossy(&blob).trim().to_owned();
+    let tree = git_out(
+        &src,
+        &["mktree"],
+        format!("100644 blob {blob_sha}\tfile.txt\n").as_bytes(),
+    );
+    let tree_sha = String::from_utf8_lossy(&tree).trim().to_owned();
+    let root_raw = format!(
+        "tree {tree_sha}\n\
+         author E <e@x> 1700000000 +0000\n\
+         committer E <e@x> 1700000000 +0000\n\
+         \n\
+         root\n"
+    );
+    let root_sha = String::from_utf8_lossy(&git_out(
+        &src,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        root_raw.as_bytes(),
+    ))
+    .trim()
+    .to_owned();
+
+    // A fake tag object for the mergetag payload.
+    let tag_raw = format!(
+        "object {root_sha}\n\
+         type commit\n\
+         tag v0\n\
+         tagger T <t@x> 1700000000 +0000\n\
+         \n\
+         tagmsg\n"
+    );
+    let tag_sha = String::from_utf8_lossy(&git_out(
+        &src,
+        &["hash-object", "-t", "tag", "-w", "--stdin"],
+        tag_raw.as_bytes(),
+    ))
+    .trim()
+    .to_owned();
+
+    let child_raw = format!(
+        "tree {tree_sha}\n\
+         parent {root_sha}\n\
+         author E <e@x> 1700000001 +0000\n\
+         committer E <e@x> 1700000001 +0000\n\
+         encoding ISO-8859-1\n\
+         mergetag object {tag_sha}\n\
+          type commit\n\
+          tag v0\n\
+          tagger T <t@x> 1700000000 +0000\n\
+         \n\
+          tagmsg\n\
+         \n\
+         \n\
+         merge: keep the tag\n"
+    );
+    let child_sha = String::from_utf8_lossy(&git_out(
+        &src,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        child_raw.as_bytes(),
+    ))
+    .trim()
+    .to_owned();
+    git_out(&src, &["update-ref", "refs/heads/main", &child_sha], b"");
+    git_fsck(&src).expect("the hand-built history is valid git");
+
+    let (objects, metadata, engine) = open_stores(&dir.path().join("garden"));
+    let import = import_from_path(
+        &src,
+        objects.clone(),
+        metadata.clone(),
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
+    assert_eq!(import.commits_new, 2);
+
+    let target = dir.path().join("export.git");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
+    assert_eq!(report.commits_exported, 2);
+    assert_eq!(report.signed_dropped, 0);
+    let shas: Vec<&String> = report.commits.iter().map(|(_, s)| s).collect();
+    assert!(
+        shas.contains(&&root_sha),
+        "the plain root reconstructs exactly ({shas:?} vs {root_sha})"
+    );
+    assert!(
+        shas.contains(&&child_sha),
+        "the encoding+mergetag child roundtrips SHA-exact ({shas:?} vs {child_sha})"
+    );
+    let mut cat = CatFile::spawn(&target);
+    assert_eq!(
+        cat.commit_raw(&child_sha),
+        child_raw.into_bytes(),
+        "the child's object bytes are the original bytes"
+    );
+    git_fsck(&target).expect("fsck clean");
+}
+
+/// M18.3: non-UTF-8 identity bytes (a latin-1 author name) cannot be
+/// stored in the model's `String` fields; the capture predicate fires and
+/// the export emits the original bytes, SHA-exact.
+#[test]
+fn non_utf8_author_roundtrips_exactly() {
+    let dir = tempdir().expect("tempdir");
+    let src = dir.path().join("latin.git");
+    git_out(
+        dir.path(),
+        &["init", "-q", "--bare", "--object-format=sha1", "latin.git"],
+        b"",
+    );
+
+    let blob = git_out(&src, &["hash-object", "-w", "--stdin"], b"latin\n");
+    let blob_sha = String::from_utf8_lossy(&blob).trim().to_owned();
+    let tree = git_out(
+        &src,
+        &["mktree"],
+        format!("100644 blob {blob_sha}\tfile.txt\n").as_bytes(),
+    );
+    let tree_sha = String::from_utf8_lossy(&tree).trim().to_owned();
+    // "José" in latin-1: J o s \xe9 — invalid UTF-8. Built as bytes, not
+    // a Rust string literal (the escape is a byte, not a char).
+    let mut raw = format!("tree {tree_sha}\nauthor Jos").into_bytes();
+    raw.extend_from_slice(b"\xe9 <j@x> 1700000000 +0000\ncommitter Jos");
+    raw.extend_from_slice(b"\xe9 <j@x> 1700000000 +0000\n\nlatin-1 author\n");
+    let orig_sha = String::from_utf8_lossy(&git_out(
+        &src,
+        &["hash-object", "-t", "commit", "-w", "--stdin"],
+        &raw,
+    ))
+    .trim()
+    .to_owned();
+    git_out(&src, &["update-ref", "refs/heads/main", &orig_sha], b"");
+
+    let (objects, metadata, engine) = open_stores(&dir.path().join("garden"));
+    let import = import_from_path(
+        &src,
+        objects.clone(),
+        metadata.clone(),
+        engine,
+        &ImportOptions::default(),
+    )
+    .expect("import succeeds");
+    assert_eq!(import.commits_new, 1);
+
+    let target = dir.path().join("export.git");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
+    assert_eq!(report.commits_exported, 1);
+    assert_eq!(report.signed_dropped, 0);
+    assert_eq!(
+        &report.commits[0].1, &orig_sha,
+        "the non-UTF-8 author commit roundtrips SHA-exact"
+    );
+    let mut cat = CatFile::spawn(&target);
+    assert_eq!(
+        cat.commit_raw(&orig_sha),
+        raw.clone(),
+        "the object bytes are the original bytes"
+    );
+    git_fsck(&target).expect("fsck clean");
+}
+
+/// D20 loud failure: a git-mapping row that disagrees with the export's
+/// computed SHA aborts the export with a naming error — never a silent
+/// divergence. Tampering with the mapping row (the corruption the
+/// assertion exists for) is the trigger.
+#[test]
+fn a_corrupted_git_mapping_row_fails_loudly() {
+    let dir = tempdir().expect("tempdir");
+    let fx = Fixture::generate(42, &GenOptions::default());
+    let garden = dir.path().join("garden");
+    let import = common::import(&fx.repo, &garden, &ImportOptions::default());
+    assert_eq!(import.commits_new, fx.mapping.len() as u64);
+
+    // Corrupt one mapping row: flip the stored sha's first hex byte.
+    let rows = common::git_map_rows(&garden);
+    let (orig_sha, cs_hex) = &rows[0];
+    let tampered = format!("1{}", &orig_sha[1..]);
+    {
+        let conn = rusqlite::Connection::open(garden.join("metadata.sqlite3"))
+            .expect("open metadata sqlite");
+        conn.execute(
+            "UPDATE git_map SET git_sha = ?1 WHERE git_sha = ?2",
+            rusqlite::params![tampered, orig_sha],
+        )
+        .expect("tamper with the mapping row");
+    }
+
+    // The export must refuse, naming the changeset whose mapping lies.
+    let (objects, metadata, _engine) = open_stores(&garden);
+    let err = export_to_path(
+        &dir.path().join("export.git"),
+        objects,
+        metadata,
+        &ExportOptions::default(),
+    )
+    .expect_err("export must fail on a corrupted mapping row");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&cs_hex.to_lowercase()),
+        "the error names the changeset ({msg})"
+    );
+    assert!(
+        msg.contains("git mapping"),
+        "the error says what disagrees ({msg})"
+    );
+}
+
+/// A limit-slice boundary commit (its git parents fall below the slice)
+/// is captured raw at import; exporting that slice must refuse loudly —
+/// the raw bytes name parents the pack does not contain, and a silent
+/// re-root would rewrite the SHA (the v0.1 divergence this closes).
+#[test]
+fn limit_slice_boundary_export_refuses_loudly() {
+    use gardenbed_git::ImportOptions;
+
+    let dir = tempdir().expect("tempdir");
+    let fx = Fixture::generate(
+        42,
+        &GenOptions {
+            commits: 12,
+            ..GenOptions::default()
+        },
+    );
+    let garden = dir.path().join("garden");
+    let opts = ImportOptions {
+        limit: Some(8),
+        ..Default::default()
+    };
+    let import = common::import(&fx.repo, &garden, &opts);
+    assert_eq!(import.commits_new as usize, 8, "the slice is 8 commits");
+
+    let (objects, metadata, _engine) = open_stores(&garden);
+    let err = export_to_path(
+        &dir.path().join("export.git"),
+        objects,
+        metadata,
+        &ExportOptions::default(),
+    )
+    .expect_err("a sliced store must refuse (dangling parents in raw bytes)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("does not contain"),
+        "the error names the missing parent ({msg})"
+    );
+}
+
+/// A corrupt raw-commit row (malformed parent hex — the import path can
+/// never produce it, but a torn write or hand-edit can) must refuse loudly
+/// instead of panicking: the no-panic-on-bad-input contract (lib.rs docs)
+/// covers the raw side table just like the mapping table.
+#[test]
+fn a_corrupted_raw_commit_row_fails_loudly() {
+    let dir = tempdir().expect("tempdir");
+    let fx = Fixture::generate(
+        42,
+        &GenOptions {
+            commits: 12,
+            ..GenOptions::default()
+        },
+    );
+    let garden = dir.path().join("garden");
+    let opts = ImportOptions {
+        limit: Some(8),
+        ..Default::default()
+    };
+    let import = common::import(&fx.repo, &garden, &opts);
+    assert_eq!(import.commits_new as usize, 8, "the slice is 8 commits");
+
+    // Plant a raw row with a short, non-hex parent header: the exact
+    // shape that used to index out of bounds in the parent scan.
+    {
+        let conn = rusqlite::Connection::open(garden.join("metadata.sqlite3"))
+            .expect("open metadata sqlite");
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+            let mut stmt = conn
+                .prepare("SELECT cs, data FROM git_raw_commit")
+                .expect("select raw rows");
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .expect("map raw rows")
+                .collect::<Result<_, _>>()
+                .expect("collect raw rows")
+        };
+        assert!(!rows.is_empty(), "the slice captured raw rows");
+        // Splice a short, non-hex parent line into the REAL raw bytes so
+        // the tree header still matches (the tree check runs first): the
+        // exact shape that used to index out of bounds in the parent scan.
+        let (cs, frame) = &rows[0];
+        let raw = zstd::bulk::decompress(frame, 64 * 1024 * 1024).expect("decompress raw row");
+        let mut tampered = raw.clone();
+        tampered.splice(
+            raw.windows(7)
+                .position(|w| w == b"parent ")
+                .expect("parent header")..,
+            b"parent abc\n".iter().copied(),
+        );
+        conn.execute(
+            "INSERT INTO git_raw_commit(cs, data) VALUES(?1, ?2) \
+             ON CONFLICT (cs) DO UPDATE SET data = EXCLUDED.data",
+            rusqlite::params![cs, zstd_compress(&tampered)],
+        )
+        .expect("plant corrupt raw row");
+    }
+
+    let (objects, metadata, _engine) = open_stores(&garden);
+    let err = export_to_path(
+        &dir.path().join("export.git"),
+        objects,
+        metadata,
+        &ExportOptions::default(),
+    )
+    .expect_err("a corrupt raw row must refuse (malformed parent)");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("malformed parent"),
+        "the error names the malformed parent ({msg})"
+    );
+}
+
+/// One zstd frame per row, level fixed for determinism — the store's
+/// convention (D21). Inlined here because the test writes the row
+/// directly, bypassing the store API.
+fn zstd_compress(data: &[u8]) -> Vec<u8> {
+    zstd::bulk::compress(data, 3).expect("zstd compress")
+}
+
+/// M14 (v0.2.md §9 M14.4): import→export at ≥ 2 MiB blobs. The big blobs
+/// land GBLO2 (chunked) in the store; export must reproduce the exact
+/// same git SHAs — identity never sees the envelope — and the exported
+/// repository passes `git fsck --strict`.
+#[test]
+fn export_roundtrips_multi_mib_chunked_blobs_sha_exact() {
+    let fx = Fixture::generate(
+        20260217,
+        &GenOptions {
+            commits: 40,
+            big_blob_bytes: Some((5 << 20) / 2 + 123), // 2.5 MiB > 1 MiB: GBLO2
+            ..GenOptions::default()
+        },
+    );
+    import_fixture(&fx);
+
+    let (objects, metadata, _engine) = open_stores(&fx.garden);
+
+    // The big blobs really are multi-chunk GBLO2 objects in the store.
+    let mut chunked = 0usize;
+    for cs in &fx.history.changesets {
+        for change in &cs.changes {
+            let Some(blob) = change.blob else { continue };
+            if change.mode == Mode::Gitlink {
+                continue;
+            }
+            let Some(content) = fx.history.blob(&blob) else {
+                continue;
+            };
+            if content.len() > (1 << 20) {
+                let hex = blob.to_hex();
+                let raw = std::fs::read(fx.garden.join("objects").join(&hex[..2]).join(&hex[2..]))
+                    .expect("envelope on disk");
+                assert_eq!(&raw[..5], b"GBLO2", "blob > 1 MiB stores GBLO2");
+                let count = u32::from_le_bytes(raw[13..17].try_into().unwrap()) as usize;
+                assert!(count >= 2, "2.5 MiB blob spans several chunks");
+                chunked += 1;
+            }
+        }
+    }
+    assert!(
+        chunked >= 3,
+        "the fixture exercises the chunked path (found {chunked} big blobs)"
+    );
+
+    let target = fx.dir.path().join("export.git");
+    let report = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect("export succeeds");
+
+    assert_eq!(
+        report.commits_exported,
+        fx.mapping.len() as u64,
+        "one commit per imported changeset"
+    );
+    assert_eq!(report.signed_dropped, 0, "unsigned history");
+    let mut exported: Vec<&str> = report.commits.iter().map(|(_, s)| s.as_str()).collect();
+    let mut fixture: Vec<&str> = fx.mapping.iter().map(|(_, s)| s.as_str()).collect();
+    exported.sort_unstable();
+    fixture.sort_unstable();
+    assert_eq!(
+        exported, fixture,
+        "identical git SHAs through GBLO2 storage"
+    );
+
+    git_fsck(&target).expect("fsck --strict clean on chunked-blob export");
+
+    // Re-import the exported repository into a fresh store: the changeset
+    // ids and blob contents survive a second full cycle (blob bytes
+    // byte-exact through GBLO2 → git → GBLO2).
+    let garden2 = fx.dir.path().join("garden2");
+    let (objects2, metadata2, engine2) = open_stores(&garden2);
+    let report2 = import_from_path(
+        &target,
+        objects2,
+        metadata2,
+        engine2,
+        &ImportOptions::default(),
+    )
+    .expect("re-import succeeds");
+    assert_eq!(
+        report2.commits_new,
+        fx.mapping.len() as u64,
+        "the exported history re-imports whole"
+    );
+    for cs in &fx.history.changesets {
+        for change in &cs.changes {
+            let Some(blob) = change.blob else { continue };
+            if change.mode == Mode::Gitlink {
+                continue;
+            }
+            let Some(content) = fx.history.blob(&blob) else {
+                continue;
+            };
+            if content.len() > (1 << 20) {
+                let (objects2, ..) = open_stores(&garden2);
+                assert_eq!(
+                    objects2.get_blob(blob).expect("get").expect("present"),
+                    content,
+                    "big blob byte-exact through the full cycle"
+                );
+            }
+        }
+    }
+}
+
+/// Dogfood #11: an existing NON-BARE target is refused loudly, naming the
+/// worktree and the remedy — and the refusal happens before anything is
+/// written (no pack file, no ref move, clean index/worktree). The old
+/// failure mode advanced the ref via fast-import and left the index and
+/// worktree describing the previous HEAD, staging the mirror's entire
+/// content as deletions until `git reset --hard`.
+#[test]
+fn export_into_a_non_bare_worktree_is_refused_untouched() {
+    let fx = Fixture::generate(
+        42011,
+        &GenOptions {
+            commits: 6,
+            ..Default::default()
+        },
+    );
+    import_fixture(&fx);
+
+    // A real non-bare repository with its own commit and worktree file.
+    let target = fx.dir.path().join("mirror");
+    std::fs::create_dir_all(&target).expect("mirror dir");
+    git_out(&target, &["init", "-q", "--object-format=sha1"], b"");
+    std::fs::write(target.join("checked-in.txt"), b"prior mirror content\n")
+        .expect("worktree file");
+    git_out(&target, &["add", "checked-in.txt"], b"");
+    git_out(
+        &target,
+        &[
+            "-c",
+            "user.name=Mirror Owner",
+            "-c",
+            "user.email=mirror@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "mirror baseline",
+        ],
+        b"",
+    );
+    let before_head = rev_ref(&target, "HEAD").expect("baseline commit");
+    let before_config = std::fs::read(target.join(".git/config")).expect("config");
+    let before_files = tree_listing(&target.join(".git"));
+
+    let (objects, metadata, _engine) = open_stores(&fx.garden);
+    let err = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect_err("a non-bare target must be refused");
+
+    // The message names the worktree and the remedy ("use a bare target").
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not bare"),
+        "the refusal says the target is not bare: {msg}"
+    );
+    assert!(
+        msg.contains(&target.display().to_string()),
+        "the refusal names the worktree path: {msg}"
+    );
+    assert!(
+        msg.contains("bare target"),
+        "the refusal names the remedy: {msg}"
+    );
+
+    // Nothing moved: byte-identical .git, same ref, clean worktree/index.
+    // The listing is compared BEFORE `git status` runs — status may
+    // refresh the index stat cache and rewrite `.git/index`.
+    assert_eq!(
+        std::fs::read(target.join(".git/config")).expect("config after"),
+        before_config,
+        "config untouched"
+    );
+    assert_eq!(
+        tree_listing(&target.join(".git")),
+        before_files,
+        "no pack, index, ref or object appeared under .git"
+    );
+    assert_eq!(
+        rev_ref(&target, "HEAD").as_deref(),
+        Some(before_head.as_str())
+    );
+    let status = git_out(&target, &["status", "--porcelain"], b"");
+    assert!(
+        status.is_empty(),
+        "index/worktree untouched: {:?}",
+        String::from_utf8_lossy(&status)
+    );
+}
+
+/// Every file under `dir`: sorted `(relative path, length)` pairs —
+/// lengths catch an in-place rewrite, and any new pack/ref/object shows
+/// up as a new entry.
+fn tree_listing(dir: &Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("listing readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let len = path.metadata().expect("stat").len();
+                out.push((
+                    path.strip_prefix(dir).expect("under dir").to_path_buf(),
+                    len,
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
 }

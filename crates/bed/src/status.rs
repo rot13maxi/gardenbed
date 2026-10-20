@@ -504,6 +504,116 @@ fn mode_of(meta: &Metadata) -> i64 {
     }
 }
 
+/// The daemon-accelerated `bed status` (v0.2.md D18/M16): the cached
+/// report, when the daemon's watcher generation says nothing under the
+/// working-copy root has changed since the report was computed.
+///
+/// The rules, in order:
+///
+/// 1. `--full-scan` always scans — the correctness path is always
+///    available and never skipped.
+/// 2. The working copy is (re-)registered with the daemon's sidecar. No
+///    daemon, dead socket, or sidecar error → full scan; the daemon is an
+///    optional tier and its absence is normal.
+/// 3. A cached report keyed on the *current* generation is reused
+///    verbatim. Any doubt — no cache file, a different generation, an
+///    unreadable cache → full scan. A stale clean is forbidden; a missed
+///    cache reuse is merely slow.
+///
+/// After a full scan the report is cached under the generation it was
+/// computed at, so the *next* call can take the fast path. The watcher
+/// only excludes bed's own machinery (`.bed` and checkout staging), so
+/// any change a report could miss bumps the generation and misses the
+/// cache.
+///
+/// `scan` is the always-available fallback — [`scan_status`] by default;
+/// tests can inject a counting closure to prove which path ran.
+pub async fn status_via_daemon<F, Fut>(
+    state_dir: &Path,
+    full_scan: bool,
+    scan: F,
+) -> Result<StatusReport, ClientError>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Result<StatusReport, ClientError>>,
+{
+    // Rule 1: the correctness path is never skipped.
+    if full_scan {
+        return scan().await;
+    }
+    // Rule 2: no daemon → no fast path. Register (not just poll): a
+    // registration from this call is what makes the *next* call fast.
+    let generation = match crate::daemon::register(state_dir).await {
+        Ok(Some(generation)) => generation,
+        _ => return scan().await,
+    };
+    let cache = StatusCache {
+        path: state_dir.join("status-cache"),
+    };
+    // Rule 3: reuse only on an exact generation match.
+    if let Some((generation_at_scan, cached_report)) = cache.load()?
+        && generation_at_scan == generation
+    {
+        return Ok(cached_report);
+    }
+    let report = scan().await?;
+    cache.store(generation, &report)?;
+    Ok(report)
+}
+
+/// The on-disk shape of the status cache: `.bed/status-cache`, one small
+/// TOML document. `generation` is the daemon watcher generation the
+/// report was computed at; the report's three buckets are stored as-is.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedStatus {
+    generation: u64,
+    modified: Vec<String>,
+    deleted: Vec<String>,
+    untracked: Vec<String>,
+}
+
+/// Read/write wrapper around `.bed/status-cache`.
+struct StatusCache {
+    path: std::path::PathBuf,
+}
+
+impl StatusCache {
+    /// The cached report with its generation, or `None` when absent,
+    /// unreadable, or corrupt — every miss means "scan".
+    fn load(&self) -> Result<Option<(u64, StatusReport)>, ClientError> {
+        let Ok(bytes) = fs::read(&self.path) else {
+            return Ok(None);
+        };
+        let Ok(cached) = toml::from_str::<CachedStatus>(&String::from_utf8_lossy(&bytes)) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            cached.generation,
+            StatusReport {
+                modified: cached.modified,
+                deleted: cached.deleted,
+                untracked: cached.untracked,
+            },
+        )))
+    }
+
+    /// Best-effort store; a failed write costs only the next fast path.
+    fn store(&self, generation: u64, report: &StatusReport) -> Result<(), ClientError> {
+        let cached = CachedStatus {
+            generation,
+            modified: report.modified.clone(),
+            deleted: report.deleted.clone(),
+            untracked: report.untracked.clone(),
+        };
+        let raw = toml::to_string(&cached).map_err(|e| ClientError::ConfigWrite {
+            path: self.path.clone(),
+            message: e.to_string(),
+        })?;
+        fs::write(&self.path, raw)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

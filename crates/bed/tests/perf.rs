@@ -103,7 +103,7 @@ async fn setup(opts: GenOptions) -> World {
     let dir = temp_root();
     let garden = dir.path().join("garden");
     fs::create_dir_all(&garden).expect("garden dir");
-    let head = common::ingest(&seed, &dir.path().join("server"));
+    let head = common::ingest(&seed, &dir.path().join("server").join("garden"));
     let server = Server::spawn(&dir.path().join("server")).await;
     assert_eq!(head, seed.head);
     World {
@@ -126,7 +126,10 @@ async fn sparse_add_of_1k_files_under_5s() {
         ..GenOptions::default()
     })
     .await;
-    let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(
+        &w.garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
 
     let files = w.head_files.len();
@@ -222,7 +225,10 @@ async fn cold_file_p95_under_50ms() {
         ..GenOptions::default()
     })
     .await;
-    let (code, _, stderr) = bed(&w.garden, &["clone", &w.server.http()]);
+    let (code, _, stderr) = bed(
+        &w.garden,
+        &["clone", &format!("{}/garden", w.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
     let (code, _, stderr) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "sparse add: {stderr}");
@@ -343,8 +349,8 @@ async fn commit_p50_is_size_independent_10k_vs_1m() {
     const SMALL_FILES: usize = 100;
 
     let dir = temp_root();
-    let small_repo = dir.path().join("server-10k");
-    let big_repo = dir.path().join("server-1m");
+    let small_repo = dir.path().join("server-10k").join("garden");
+    let big_repo = dir.path().join("server-1m").join("garden");
 
     // Fixture ingest (uncounted, in-process). 1M files arrive as ~100
     // changesets of 10k adds each.
@@ -353,8 +359,8 @@ async fn commit_p50_is_size_independent_10k_vs_1m() {
     build_sized_repo(&big_repo, 1_000_000, 10_000);
     println!("fixtures ingested in {:.1?} (10k + 1M files)", t0.elapsed());
 
-    let mut small_server = Server::spawn(&small_repo).await;
-    let mut big_server = Server::spawn(&big_repo).await;
+    let mut small_server = Server::spawn(small_repo.parent().unwrap()).await;
+    let mut big_server = Server::spawn(big_repo.parent().unwrap()).await;
 
     // One fresh bed per rep: clone, sparse the small/ subtree, rewrite its
     // 100 files, commit. Only the commit is timed.
@@ -381,21 +387,25 @@ async fn commit_p50_is_size_independent_10k_vs_1m() {
     // One untimed warm-up per size (page cache, code paths), then the
     // measured reps.
     let _ = commit_once(
-        &small_server.http(),
+        &format!("{}/garden", small_server.http()),
         &dir.path().join("garden-warm-10k"),
         100,
     );
-    let _ = commit_once(&big_server.http(), &dir.path().join("garden-warm-1m"), 100);
+    let _ = commit_once(
+        &format!("{}/garden", big_server.http()),
+        &dir.path().join("garden-warm-1m"),
+        100,
+    );
     let mut small_samples = Vec::new();
     let mut big_samples = Vec::new();
     for rep in 0..REPS {
         small_samples.push(commit_once(
-            &small_server.http(),
+            &format!("{}/garden", small_server.http()),
             &dir.path().join(format!("garden-10k-{rep}")),
             rep,
         ));
         big_samples.push(commit_once(
-            &big_server.http(),
+            &format!("{}/garden", big_server.http()),
             &dir.path().join(format!("garden-1m-{rep}")),
             rep,
         ));

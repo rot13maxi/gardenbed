@@ -198,6 +198,116 @@ impl Treestate {
         Ok(paths)
     }
 
+    /// Every row, ordered by path — one query instead of one per path.
+    ///
+    /// Checkout and status walk the whole selection; hopping back into
+    /// SQLite per path there costs a lookup per file, which is exactly the
+    /// per-selection cost a checkout update should not have.
+    pub fn all_entries(&self) -> Result<Vec<TreestateEntry>, ClientError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, blob_id, mode, size, mtime_ns, hint FROM files ORDER BY path")
+            .map_err(|e| bed_err(&self.path, e))?;
+        let rows = stmt
+            .query_map([], |row| {
+                let path: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                Ok((
+                    path,
+                    blob,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|e| bed_err(&self.path, e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| bed_err(&self.path, e))?;
+        rows.into_iter()
+            .map(|(path, blob, mode, size, mtime_ns, hint)| {
+                let blob_id =
+                    Id::from_bytes(blob.try_into().map_err(|_| ClientError::Treestate {
+                        path: self.path.clone(),
+                        message: format!("blob_id for {path:?} is not 32 bytes"),
+                    })?);
+                Ok(TreestateEntry {
+                    path,
+                    blob_id,
+                    mode,
+                    size,
+                    mtime_ns,
+                    hint,
+                })
+            })
+            .collect()
+    }
+
+    /// Inserts or replaces every row in one transaction (a batch upsert).
+    ///
+    /// Same effect as [`Treestate::upsert`] per row, and the same
+    /// all-or-nothing shape as a single statement run: a checkout update
+    /// that refreshes a whole selection must not leave half its hints
+    /// behind if it dies.
+    pub fn upsert_all(&self, entries: &[TreestateEntry]) -> Result<(), ClientError> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| bed_err(&self.path, e))?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO files (path, blob_id, mode, size, mtime_ns, hint)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                     ON CONFLICT(path) DO UPDATE SET
+                       blob_id = excluded.blob_id,
+                       mode = excluded.mode,
+                       size = excluded.size,
+                       mtime_ns = excluded.mtime_ns,
+                       hint = excluded.hint",
+                )
+                .map_err(|e| bed_err(&self.path, e))?;
+            for entry in entries {
+                stmt.execute(params![
+                    entry.path,
+                    entry.blob_id.as_bytes().as_slice(),
+                    entry.mode,
+                    entry.size,
+                    entry.mtime_ns,
+                    entry.hint,
+                ])
+                .map_err(|e| bed_err(&self.path, e))?;
+            }
+        }
+        tx.commit().map_err(|e| bed_err(&self.path, e))?;
+        Ok(())
+    }
+
+    /// Forgets every listed path in one transaction.
+    pub fn remove_all(&self, paths: &[String]) -> Result<(), ClientError> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| bed_err(&self.path, e))?;
+        {
+            let mut stmt = tx
+                .prepare_cached("DELETE FROM files WHERE path = ?1")
+                .map_err(|e| bed_err(&self.path, e))?;
+            for path in paths {
+                stmt.execute(params![path])
+                    .map_err(|e| bed_err(&self.path, e))?;
+            }
+        }
+        tx.commit().map_err(|e| bed_err(&self.path, e))?;
+        Ok(())
+    }
+
     /// Forgets `path` entirely (no-op when unknown).
     pub fn remove(&self, path: &str) -> Result<(), ClientError> {
         self.conn

@@ -23,6 +23,7 @@
 mod ancestry;
 mod apply;
 mod blame;
+mod cuttings;
 mod diff;
 mod merge;
 mod pathsummary;
@@ -30,6 +31,7 @@ mod xdiff;
 
 pub use ancestry::SegmentEntry;
 pub use blame::BlameRange;
+pub use cuttings::{Cutting, CuttingKind, Cuttings};
 pub use merge::{Merge3Outcome, merge3};
 pub use pathsummary::{BLOOM_BITS, MAX_SUMMARY_PATHS, PathSummary};
 pub use xdiff::MAX_DIFF_LINES;
@@ -49,6 +51,129 @@ pub const DERIVED_SKIPLIST: &str = "skiplist";
 /// Derived-data kind tag for the per-changeset path summary (blame's
 /// segment-skip data: bounded touched-path set + segment bloom).
 pub const DERIVED_PATHSUMMARY: &str = "pathsummary";
+/// Derived-data kind tag for the per-changeset exact-blob copy/rename
+/// facts.
+pub const DERIVED_CUTTINGS: &str = "cuttings";
+
+/// One registered derived-data kind — the single registration point a
+/// kind passes through. Both eager paths iterate the registry
+/// ([`derived_kinds`]): [`Engine::on_changeset_created`] runs each `eager`
+/// hook in order, and [`Engine::derived_rows_for_validated_tree`] runs
+/// each `for_new` hook. Adding a kind is one module plus one entry in
+/// [`DERIVED_KINDS`]; no other wiring exists to miss.
+///
+/// A kind whose derivation cost scales with the **parent tree size**
+/// (not just the changeset's own changes) must not run on the write
+/// path — the M5 size-independence budget forbids commit latency that
+/// grows with repository size. Such a kind registers as lazy: no eager
+/// hook, no `for_new` row; its lazy getter computes and persists on
+/// first query instead. `cuttings` is the current lazy kind.
+pub struct DerivedKind {
+    /// The kind tag persisted in the `derived` table.
+    pub name: &'static str,
+    /// Eagerly computes and persists this kind's entry for an
+    /// already-stored changeset (idempotent; the kind's lazy getter's
+    /// compute-and-write half doubles as this hook).
+    pub(crate) eager: Option<EagerHook>,
+    /// Contributes this kind's rows for a not-yet-stored changeset to the
+    /// shared [`DerivedFlow`] (batched import), in registry order.
+    pub(crate) for_new: Option<ForNewHook>,
+}
+
+/// An eager hook: computes and persists one kind's entry for an
+/// already-stored changeset.
+pub(crate) type EagerHook = fn(&Engine, Id) -> Result<(), StoreError>;
+
+/// A batched hook: contributes one kind's row to a shared
+/// [`DerivedFlow`] for a not-yet-stored changeset.
+pub(crate) type ForNewHook = for<'a> fn(&Engine, &mut DerivedFlow<'a>) -> Result<(), StoreError>;
+
+// ---------------------------------------------------------- kind hooks
+
+/// Tree eager hook: derive (or restore from a certificate) and cache.
+fn tree_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    let tree = engine.derive_tree(cs_id)?;
+    // A durable certificate can answer derive_tree without consulting
+    // derived data. Explicit eager rebuilds must still restore its tree row.
+    engine.cache_tree(cs_id, tree)
+}
+
+/// Tree batched hook: the already-replayed root is the whole payload.
+fn tree_for_new(_engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    flow.push(DERIVED_TREE, cache_payload(flow.root));
+    Ok(())
+}
+
+/// Skiplist eager hook: the lazy getter computes and persists.
+fn skiplist_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    engine.skiplist_entry(cs_id).map(|_| ())
+}
+
+/// Skiplist batched hook: the head's entry is computed for the caller to
+/// store with the changeset row (batched import), never written here.
+fn skiplist_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    let bytes = flow.segment_entry(engine)?.encode();
+    flow.push(DERIVED_SKIPLIST, bytes);
+    Ok(())
+}
+
+/// Pathsummary eager hook: the lazy getter computes and persists.
+fn pathsummary_eager(engine: &Engine, cs_id: Id) -> Result<(), StoreError> {
+    engine.pathsummary_entry(cs_id).map(|_| ())
+}
+
+/// Pathsummary batched hook: consumes the skiplist kind's segment entry
+/// from the flow (computed once, shared — never recomputed).
+fn pathsummary_for_new(engine: &Engine, flow: &mut DerivedFlow<'_>) -> Result<(), StoreError> {
+    let bytes = {
+        let cs = flow.cs;
+        let seg = flow.segment_entry(engine)?;
+        pathsummary::pathsummary_entry_for_new(engine, cs, seg)?.encode()
+    };
+    flow.push(DERIVED_PATHSUMMARY, bytes);
+    Ok(())
+}
+
+// Cuttings is **lazy-only**: `build_cuttings` flattens the whole first
+// parent's tree (O(changes + parent size)), which is fine for a query
+// but is exactly what the M5 size-independence budget forbids on the
+// commit path. The eager and batched hooks stay `None`; the lazy getter
+// [`Engine::cuttings_entry`] computes and persists on first query.
+
+/// The derived-data kind registry, in eager-write and row order: tree,
+/// skiplist, pathsummary, cuttings. The order is part of the
+/// batched-import contract (the row list keeps this exact sequence); the
+/// skiplist's segment entry flows to the pathsummary through
+/// [`DerivedFlow`], so it is computed exactly once per flow.
+static DERIVED_KINDS: &[DerivedKind] = &[
+    DerivedKind {
+        name: DERIVED_TREE,
+        eager: Some(tree_eager),
+        for_new: Some(tree_for_new),
+    },
+    DerivedKind {
+        name: DERIVED_SKIPLIST,
+        eager: Some(skiplist_eager),
+        for_new: Some(skiplist_for_new),
+    },
+    DerivedKind {
+        name: DERIVED_PATHSUMMARY,
+        eager: Some(pathsummary_eager),
+        for_new: Some(pathsummary_for_new),
+    },
+    DerivedKind {
+        name: DERIVED_CUTTINGS,
+        eager: None,
+        for_new: None,
+    },
+];
+
+/// The registered derived-data kinds, in eager-write order — the order
+/// [`Engine::on_changeset_created`] writes them and
+/// [`Engine::derived_rows_for_validated_tree`] lists them.
+pub fn derived_kinds() -> &'static [DerivedKind] {
+    DERIVED_KINDS
+}
 
 /// The derived data engine over one repository's stores.
 ///
@@ -108,9 +233,22 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> CacheMap<K, V> {
 
     fn put(&mut self, key: K, value: V) {
         let w = (self.weight)(&value);
-        if self.map.insert(key.clone(), value).is_none() {
-            self.order.push_back(key);
-            self.bytes += w;
+        match self.map.insert(key.clone(), value) {
+            None => {
+                // Fresh key: FIFO order entry and full weight.
+                self.order.push_back(key);
+                self.bytes += w;
+            }
+            Some(old) => {
+                // Re-insert over an existing key: the old value's weight
+                // must come off (it is no longer cached) and the new one
+                // on, or `bytes` drifts upward on every refresh. The key
+                // keeps its original place in the FIFO order — pushing a
+                // duplicate would make later eviction pop a key that is
+                // still cached, leaking both its entry and its weight.
+                self.bytes += w;
+                self.bytes -= (self.weight)(&old);
+            }
         }
         while self.map.len() > self.cap_entries || self.bytes > self.cap_bytes {
             let Some(oldest) = self.order.pop_front() else {
@@ -198,6 +336,21 @@ impl Engine {
     /// with `MetadataStore::put_validated_changeset` after derived rows are
     /// prepared with `derived_rows_for_validated_tree`.
     pub fn validated_tree_for_new(&self, cs: &Changeset) -> Result<Option<Id>, StoreError> {
+        Ok(self.validated_tree_for_new_with_writes(cs)?.0)
+    }
+
+    /// [`validated_tree_for_new`] plus the derivation's write set (every
+    /// tree id the replay stored, idempotent re-puts included). The commit
+    /// handshake re-verifies exactly this set under the write transaction:
+    /// objects the derivation did not touch are reachable from already
+    /// certified rows, which the gc mark never collects (V1: mark ==
+    /// brute-force closure; D14: rows are never collected), so the write
+    /// set is the complete race surface — at O(touched directories), not
+    /// O(repository size).
+    pub fn validated_tree_for_new_with_writes(
+        &self,
+        cs: &Changeset,
+    ) -> Result<(Option<Id>, Vec<Id>), StoreError> {
         gardenbed_model::codec::validate_changeset(cs, true).map_err(codec_err)?;
         let mut base = None;
         for (index, parent) in cs.parents.iter().enumerate() {
@@ -219,7 +372,7 @@ impl Engine {
                 )));
             }
         }
-        self.apply_changeset_to_tree(base, cs)
+        apply::apply_changeset_with_writes(&*self.objects, base, cs)
     }
 
     /// Validate legacy history bottom-up until durable v1 certificates form
@@ -244,8 +397,16 @@ impl Engine {
                 continue;
             }
             let root = self.validated_tree_for_new(&cs)?;
+            // An EXPLICIT no-op verify (round-2 review, P3): certify
+            // history re-certifies already-committed rows whose objects
+            // the gc mark already sees live (they are reachable from a
+            // certified changeset), so there is nothing to re-check — but
+            // passing the no-op makes that a visible decision at the call
+            // site instead of a silent `None` skip a future caller could
+            // copy without justification.
+            let no_op = || Ok(());
             self.metadata
-                .put_validated_changeset(&cs, root, &[], None)?;
+                .put_validated_changeset(&cs, root, &[], None, None, Some(&no_op))?;
         }
         Ok(())
     }
@@ -391,6 +552,18 @@ impl Engine {
     /// that do not touch it), so a bounded cache turns most loads into
     /// cache hits. Content addressing makes the entry immortal — the same
     /// id always decodes to the same entries.
+    ///
+    /// The public twin of [`Engine::tree`] for hot paths: same content,
+    /// shared `Arc` instead of a fresh clone, and served from the cache
+    /// (the export's per-commit tree rendering hits the same stable ids
+    /// thousands of times in a row). A missing object surfaces as the
+    /// store's `Corrupt` error — a referenced tree id that is absent is
+    /// corruption, not an absence to report — so no existence probe runs
+    /// first: one store roundtrip per uncached id.
+    pub fn cached_tree_arc(&self, id: Id) -> Result<Option<Arc<Tree>>, StoreError> {
+        Ok(Some(self.decoded_tree(id)?))
+    }
+
     fn decoded_tree(&self, id: Id) -> Result<Arc<Tree>, StoreError> {
         if let Some(tree) = self.lock_trees().get(&id) {
             return Ok(tree);
@@ -561,26 +734,53 @@ impl Engine {
         cs: &Changeset,
         root: Option<Id>,
     ) -> Result<Vec<gardenbed_store::DerivedRow>, StoreError> {
-        let mut rows = Vec::with_capacity(3);
-        let tree_payload = cache_payload(root);
-        rows.push(gardenbed_store::DerivedRow {
-            kind: DERIVED_TREE.to_owned(),
-            cs: cs_id,
-            bytes: tree_payload,
+        let mut flow = DerivedFlow {
+            cs_id,
+            cs,
+            root,
+            rows: Vec::with_capacity(DERIVED_KINDS.len()),
+            segment: None,
+        };
+        for kind in DERIVED_KINDS {
+            if let Some(for_new) = kind.for_new {
+                for_new(self, &mut flow)?;
+            }
+        }
+        Ok(flow.rows)
+    }
+}
+
+/// The shared state of one batched-import derivation: the changeset, the
+/// already-replayed root, the rows accumulated so far (registry order),
+/// and the lazily-shared skiplist segment entry (computed at most once,
+/// consumed by both the skiplist and the pathsummary kinds).
+pub(crate) struct DerivedFlow<'a> {
+    cs_id: Id,
+    cs: &'a Changeset,
+    root: Option<Id>,
+    rows: Vec<gardenbed_store::DerivedRow>,
+    segment: Option<ancestry::SegmentEntry>,
+}
+
+impl DerivedFlow<'_> {
+    /// Appends one row (registry order; the batched-import contract).
+    fn push(&mut self, kind: &str, bytes: Vec<u8>) {
+        self.rows.push(gardenbed_store::DerivedRow {
+            kind: kind.to_owned(),
+            cs: self.cs_id,
+            bytes,
         });
-        let seg = ancestry::skiplist_entry_for_new(self, cs_id, cs)?;
-        rows.push(gardenbed_store::DerivedRow {
-            kind: DERIVED_SKIPLIST.to_owned(),
-            cs: cs_id,
-            bytes: seg.encode(),
-        });
-        let summary = pathsummary::pathsummary_entry_for_new(self, cs, &seg)?;
-        rows.push(gardenbed_store::DerivedRow {
-            kind: DERIVED_PATHSUMMARY.to_owned(),
-            cs: cs_id,
-            bytes: summary.encode(),
-        });
-        Ok(rows)
+    }
+
+    /// The changeset's segment entry, computed once per flow and shared
+    /// by every kind that needs it (skiplist row + pathsummary).
+    fn segment_entry(&mut self, engine: &Engine) -> Result<&ancestry::SegmentEntry, StoreError> {
+        if self.segment.is_none() {
+            self.segment = Some(ancestry::skiplist_entry_for_new(
+                engine, self.cs_id, self.cs,
+            )?);
+        }
+        Ok(self.segment.as_ref().expect("just set"))
     }
 }
 

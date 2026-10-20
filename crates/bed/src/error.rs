@@ -115,7 +115,32 @@ pub enum ClientError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
+    /// `bed mount` cannot run on this host: no usable FUSE.
+    #[error(
+        "this host cannot mount a virtualized checkout — /dev/fuse or fusermount3 \
+         is missing; install fuse3, or read files with `bed file` instead"
+    )]
+    MountUnavailable,
+
+    /// The virtualized checkout could not be unmounted cleanly.
+    #[error("unmounting the virtualized checkout failed: {source}")]
+    MountUnmount {
+        /// The underlying I/O error.
+        source: std::io::Error,
+    },
+
     // ------------------------------------------------- server (M4 read path)
+    /// The server URL is malformed in a way the command refuses to guess
+    /// around (e.g. a multi-segment http path, which cannot name a
+    /// repository).
+    #[error("bad server URL {server:?}: {reason}")]
+    BadServerUrl {
+        /// The URL as given.
+        server: String,
+        /// Why it is refused.
+        reason: String,
+    },
+
     /// The server could not be reached. Validation and connection both
     /// happen before any local state is written, so local state is unchanged.
     #[error(
@@ -289,5 +314,31 @@ pub enum ClientError {
         r#ref: String,
         /// The ref's current tip (short form), when the server said.
         tip: String,
+    },
+
+    /// A mutating ref/head command was refused because commits are still
+    /// queued offline — syncing first keeps the server's view coherent.
+    #[error(
+        "cannot {command} with {pending} pending commit(s) not yet on the server — \
+         run `bed sync` first"
+    )]
+    PendingCommits {
+        /// The refused command's name.
+        command: &'static str,
+        /// How many commits wait for `bed sync`.
+        pending: usize,
+    },
+
+    /// The requested changeset is queued offline: the object is local, but
+    /// its parents may only exist on the server. Sync uploads it first.
+    #[error(
+        "changeset {cs} is pending — {pending} commit(s) not yet on the server; \
+         run `bed sync` to upload it, or log a synced changeset"
+    )]
+    PendingCs {
+        /// The pending changeset (short form).
+        cs: String,
+        /// How many commits wait for `bed sync`.
+        pending: usize,
     },
 }

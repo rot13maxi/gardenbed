@@ -7,10 +7,10 @@ and SQLite metadata. Derived trees, blame, and ancestry data support queries.
 Use the standard terms in [Terminology](terminology.md). Repository storage uses `objects/` and `metadata.sqlite3`.
 
 ```text
-bed ──gRPC── gardenbed-server
-               ├─ metadata: SQLite  (changesets, refs,
-               │                    git-SHA map, derived)
-               └─ objects: filesystem CAS     (blobs, trees; zstd)
+bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
+                        (optional)                    ├─ <root>/<repo>/metadata.sqlite3
+                                                      └─ <root>/<repo>/objects/
+bed ──gRPC──────────────────────────────────────────┘   (direct, no daemon)
 gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 ```
 
@@ -21,17 +21,19 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
   **want-list** — a client resolves `RootTree(cs)` and requests exactly
   the trees/blobs it is missing. Every request names a content-addressed
   object, so any interrupted session resumes exactly.
-- No daemon in v0.1: `bed` embeds the client; a local daemon (filesystem watching, shared
-  node cache) is v0.2 (v0.1.md §1). The RPC surface is identical either
-  way.
+- The local daemon (v0.2, below and [docs/daemon.md](daemon.md)) is an
+  optional caching tier between `bed` and the server: present or absent,
+  outputs and on-disk state are identical, and the RPC surface is the
+  same either way.
 
 ## 1. Wire protocol
 
 `crates/protocol/proto/gardenbed.proto` — with
 [docs/canonical-encoding.md](canonical-encoding.md), it *is* the published
 protocol (D4). The tonic service `Gardenbed` exposes 17 RPCs; every
-request carries `repo` (single-repo in v0.1, the field is wire format
-from day one, v0.1.md §1).
+request carries `repo` — the field selects the repository it applies to
+(wire format from day one, v0.1.md §1; load-bearing since multi-repo
+serving, v0.2.md §5).
 
 | group | RPCs | notes |
 |---|---|---|
@@ -47,17 +49,46 @@ enum values are the spec's op/mode bytes; timestamps stay git-native
 (epoch seconds + tz offset in minutes) — that is what makes export
 reproduce identical git SHAs.
 
-## 2. Server (`gardenbed-server`, lib `gardenbed_server::Repo`)
+## 2. Server (`gardenbed-server`, lib `gardenbed_server::RepoSet`)
 
-`Repo` wires one repository's stores (`<root>/objects` + `<root>/metadata.sqlite3`)
-and holds the semantics every surface shares — the `bed` binary's gRPC
-service and `gardenbed-mcp` call the same methods, which is why MCP and
-CLI answers agree by construction (v0.1.md §M7.1).
+The server serves any number of repositories from one root directory:
+`<root>/<repo>/objects` + `<root>/<repo>/metadata.sqlite3` (v0.2.md §5).
+The directory tree is the registry — a repository exists iff its
+directory holds either store; serving a new repository is a directory
+plus a request, no restart. `RepoSet` opens repositories lazily on first
+request (singleflighted), keeps per-repository stats, and caps open
+handles with `--max-repos` (LRU eviction of idle handles; a v0.1 root
+with stores at the top level serves unchanged as the repository named
+`default`). Every handler resolves its request's `repo` field through
+`RepoSet::resolve` — the one seam where authentication slots in later.
+
+`Repo` wires one repository's stores and holds the semantics every
+surface shares — the `bed` binary's gRPC service and `gardenbed-mcp` call
+the same methods, which is why MCP and CLI answers agree by construction
+(v0.1.md §M7.1).
 
 **Subcommands** (binary): `serve` (default — gRPC on `--addr`,
-default `127.0.0.1:9418`), `import`, `export` (see
-[docs/cli.md](cli.md)). The bound address is printed on stdout's first
-line (`listening on …`) — the contract scripts rely on.
+default `127.0.0.1:9418`; `--max-repos` caps open repositories),
+`import` and `export` (both take `--repo NAME`), `move` (renames a
+repository — an offline operation: it checkpoints the repository's WAL,
+carries the sidecar files, and refuses while a server holds the root's
+`gardenbed.lock`; see [docs/cli.md](cli.md)). The bound address is
+printed on stdout's first line (`listening on …`) — the contract scripts
+rely on.
+
+**Token auth (`serve --auth <auth.toml>`, v0.2).** Optional bearer-token
+authentication with per-repository roles: each `[tokens.<token>]` entry
+lists the repositories it may access (`*` matches any) and a role —
+`read` (object and history RPCs), `write` (also object upload, ref
+writes, publish, merge), or `admin` (implies write). Enforcement is
+centralized in `GardenbedService::authorize`, checked for every RPC
+before any store is touched; credentials ride the gRPC `authorization:
+Bearer <token>` metadata, which `bed` sends when `GARDENBED_TOKEN` is
+set and the daemon forwards verbatim. Without `--auth` the server is
+open (every v0.1 workflow unchanged); with it, anonymous or
+insufficient tokens get `PERMISSION_DENIED` naming the repository and
+the next step, and unauthorized callers learn nothing about repository
+existence.
 
 **Revspec resolution (`Repo::get_ref`, also served by the `GetRef`
 RPC).** One resolver funnels every id-taking surface:
@@ -126,14 +157,23 @@ lost CAS race is a clean conflict result, not an error.
   with change size, not repo size). Trees are cached in object store and
   identified by their canonical bytes, so identical trees reached via
   different histories share one object.
-- **Three derived caches** (the metadata store `derived` table, keyed
-  `(kind, cs)`):
+- **Four derived caches** (the metadata store `derived` table, keyed
+  `(kind, cs)`), each registered in the `DerivedKind` registry
+  (`crates/derive/src/lib.rs`) — the registry drives both eager paths
+  (`on_changeset_created` per-kind hooks; `derived_rows_for_validated_tree`
+  per-kind rows for batched import), so a new kind is one module plus one
+  registry entry. A kind whose derivation cost scales with the parent
+  tree size (not just the changeset's own changes) registers as
+  **lazy-only** (no hooks) and computes on first query — the M5
+  size-independence budget forbids write-path work that grows with
+  repository size:
 
 | kind | what it is | what it buys |
 |---|---|---|
 | `tree` | the changeset's derived root tree id (the tree object itself lives in the object store) | clone/sparse/export resolve trees immediately (D3 eager materialization); recompute is a cache miss, never a wrong answer |
 | `skiplist` | segmented ancestry changelog over mainline (roots and merges are segment heads) | fast `MergeBase`/`IsAncestor` and blame segment skips |
 | `pathsummary` | per-changeset bounded touched-path set + cumulative per-segment Bloom filter | blame skips a whole linear segment with **one** derived read when the summary proves the path untouched (a false positive costs a step, never a wrong answer) |
+| `cuttings` | per-changeset exact-blob copy/rename facts against the first parent (rename = unchanged-blob move; copy = add duplicating an existing blob, source = lexicographically smallest matching path) — **lazy-only**: computed and cached on first `copies` query | the `copies` MCP tool answers without walking history; exact blob equality only — no similarity heuristic. Lazy because the fact walk flattens the whole parent tree, which would make commit latency grow with repository size |
 
 Everything derived is a **cache**: wipe + rebuild must converge to
 identical state (verified in M6 and re-verified after every chaos kill).
@@ -147,11 +187,20 @@ Under the server root, the object store lives at `<root>/objects`, and
 <root>/objects/<2 hex>/<62 hex>
 ```
 
-- **Blobs** are stored under `SHA-256(raw content)` in the §6 envelope:
-  `"GBLO1"` magic (5 bytes) · `raw_len: u64` little-endian · one zstd
-  frame. Compression is a storage detail, never identity; on read, the
-  decompressed length and the SHA-256 are verified against the addressed
-  id — a torn or tampered object can never be handed back as wrong bytes.
+- **Blobs** are stored under `SHA-256(raw content)` in one of two
+  envelopes, chosen by size (v0.2 §7): content ≤ 1 MiB uses the §6
+  envelope (`"GBLO1"` magic (5 bytes) · `raw_len: u64` little-endian ·
+  one zstd frame); content > 1 MiB uses the chunked `"GBLO2"` envelope
+  (`magic · raw_len: u64 LE · chunk_count: u32 LE · table of
+  (chunk_raw_len, chunk_comp_len) pairs · per-chunk zstd frames`).
+  Chunk boundaries come from FastCDC (min 64 KiB / avg 256 KiB / max
+  1 MiB) — content-defined, so identical content yields an identical
+  chunk table in every process. Compression and chunking are storage
+  details, never identity; on read, the reader dispatches on the magic,
+  decodes each chunk bounded by its declared length, reassembles, and
+  verifies the SHA-256 of the whole against the addressed id — a torn
+  or tampered object (one corrupted chunk included) can never be handed
+  back as wrong bytes.
 - **Trees and changesets** are stored as their canonical payload bytes
   (their own format bytes type them; no envelope).
 - **Immutability** is load-bearing: putting an existing id with different
@@ -170,7 +219,7 @@ WAL), 5 s busy timeout:
 | `changesets` | `id BLOB PK, canonical BLOB NOT NULL` | the changeset log; `canonical` is the identity bytes |
 | `refs` | `name TEXT PK, cs BLOB NOT NULL` | full ref names (`refs/heads/main`); moved only by CAS |
 | `git_map` | `git_sha TEXT PK, cs BLOB NOT NULL UNIQUE` | the git↔changeset bijection; import skips mapped history, export reads it back |
-| `derived` | `kind, cs, bytes, PK(kind, cs)` | the three caches above |
+| `derived` | `kind, cs, bytes, PK(kind, cs)` | the four caches above |
 
 `cas_ref` performs its read-and-compare inside one `BEGIN IMMEDIATE`
 transaction — a ref swap is a single atomic compare-and-swap. The import
@@ -188,8 +237,8 @@ All local state lives under `--state-dir` (default `./.bed`):
 .bed/index.sqlite3      sqlite: files(path PK, blob_id, mode,
                     size, mtime_ns, hint) — the hint marks rows whose
                     size+mtime were hash-verified at write time
-.bed/objects/       local CAS cache — the same GBLO1 envelope and
-                    2-level sharding as object store
+.bed/objects/       local CAS cache — the same GBLO1/GBLO2 envelopes
+                    and 2-level sharding as object store
 .bed/heads          local stack tips
 ```
 
@@ -227,6 +276,59 @@ All local state lives under `--state-dir` (default `./.bed`):
   unregistered temporary-looking entry; it remains ordinary untracked
   work rather than being assumed disposable. Checkout directory traversal
   uses open directory descriptors and refuses symlink ancestors.
+
+## 6a. Virtualized checkout (FUSE mount)
+
+`gardenbed::mount` exposes the current changeset as a read-only FUSE
+filesystem: the **whole** repository tree is visible and readable at the
+mountpoint with no sparse selection, while `.bed/objects` stays bounded
+by what was actually touched (a file's blob is materialized on first
+`stat`, a symlink's on first `lstat`; listing alone fetches only trees).
+Virtualization is lazy materialization through the existing
+content-addressed fetch path — not a second checkout mechanism:
+
+- `getattr`/`readdir` walk the changeset's derived trees via the
+  want-list fetch path (`Fetcher::tree`, cache-first); `read` pulls the
+  blob through `Fetcher::blob` (hash-verified, cached). Reading a file
+  through the mount and `bed file` use the identical path and cache.
+- **Snapshot semantics**: the mount reflects the current changeset at
+  mount time; it does not track ref movement. A remount switches
+  changesets (resolving `current_cs` fresh) — the v0.3 story.
+- **Deterministic metadata**: every entry's timestamps are the
+  changeset's committer time (the only timestamp the object model
+  records); directories report size 4096 and `nlink = 2 + subdirs`;
+  regular files report `nlink = 1` and their **true size**, fetched
+  cache-first on first `stat` — a buffered read is clamped to the
+  reported size, so it must be real; a file's blob is materialized
+  when it is first stat'ed. Symlinks report target lengths; gitlinks
+  list as read-only empty files (opaque upstream pointers, never
+  stored objects). Exec bits surface as `0555`, regular files as
+  `0444`.
+- **Read-only by construction**: every mutating operation answers
+  `EROFS`. Writing a file, creating, removing, renaming, chmod — all
+  fail with the read-only-filesystem error.
+- **No root required**: mounting goes through `fusermount3` (the
+  setuid helper ships with fuse3); `/dev/fuse` being world-writable on
+  ordinary hosts is what makes this work.
+- **Async/sync bridge**: fuser callbacks are synchronous but the fetch
+  path is async. The mount owns a dedicated single-threaded tokio
+  runtime that creates the `Session` and resolves the snapshot before
+  anything is mounted; callbacks hand their reply object to that
+  runtime through an unbounded channel and return, and the runtime
+  fills and sends the reply when the fetch completes. No callback ever
+  blocks on the runtime and the runtime never waits on a callback —
+  no cross-wait, no deadlock.
+- **Unmount**: `MountHandle::unmount` (unmount → stop the bridge →
+  join the serving thread) or an external `fusermount -u`; both leave
+  an ordinary, removable directory behind.
+
+The FUSE-dependent tests gate on availability (`/dev/fuse` +
+`fusermount3`): hosts without them skip with
+`mount test skipped: /dev/fuse unavailable`; hosts with them run the
+full suite — whole-tree listing, byte fidelity vs `bed file`, the
+on-demand proof (server `GetStats` counters corroborate that only read
+blobs were fetched), concurrent readers, a 200-iteration seeded read
+loop, `EROFS` for every mutation, and both unmount paths.
 
 ## 7. Import pipeline (git)
 
@@ -268,7 +370,7 @@ against the parent side with the store's own xdiff port; added lines
 attribute to the touching changeset, matched lines inherit and continue
 downward; a rename is followed through `src_path` when the path did not
 exist in the parent's tree. Merge commits blame through first parent
-only. Three caches keep the walk off the hot path: the `pathsummary`
+only. The caches keeping the walk off the hot path: the `pathsummary`
 bloom proves whole segments untouched in one read; a per-walk blob cache
 exploits the consecutive-toucher invariant (a path touched by consecutive
 chain steps re-reads one blob); and results are memoized per engine
@@ -276,6 +378,46 @@ keyed by `(changeset, path)`. Attribution is anchored per-line to
 `git blame --first-parent` on all corpora — the only documented
 divergence is blank hunk-edge placement ([docs/divergences.md](divergences.md)
 §5).
+
+
+## 8.5. The local daemon (v0.2 M16)
+
+`gardenbed-daemon` (lib `gardenbed_daemon`) is an optional per-machine
+tier between `bed` and the server — a **caching gRPC proxy** plus
+**filesystem watchers**, serving both on one unix socket
+(`$XDG_RUNTIME_DIR/gardenbed/daemon.sock`, 0700 directory; the
+`GARDENBED_DAEMON` env var overrides, and an empty value disables).
+Full lifecycle, socket/cache rules, and the sidecar contract:
+[docs/daemon.md](daemon.md).
+
+```text
+bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
+       (optional)      caching proxy
+```
+
+- **Never an owner of checkout or status logic** (D18): all `.bed`
+  writes stay in `bed`; the daemon never opens a working-copy index.
+- **Forwards every RPC verbatim** — the `repo` field rides untouched,
+  so one daemon serves every repository on its upstream. `GetTree`/
+  `GetBlob` are answered **cache-first** from a shared object store at
+  `$XDG_CACHE_HOME/gardenbed` (same envelope and sharding as
+  `.bed/objects`, write-through after each upstream fetch) —
+  cross-working-copy dedup falls out of content addressing.
+- **Write RPCs are peer-uid-gated**: `SO_PEERCRED` is checked before
+  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`; any uid other
+  than the daemon's owner is refused.
+- **Sidecar**: `Ping`, and `Register(state_dir) → generation counter` —
+  a recursive watch on the working-copy root (excluding `.bed` and
+  checkout staging), every debounced event bumps the generation.
+  `bed status` reuses its cached report while the generation is
+  unchanged; any doubt runs the full scan. A stale "clean" is
+  forbidden.
+- **Endpoint resolution is daemon-first with embedded fallback** (D19):
+  `bed` probes the socket and falls back to `config.server` when the
+  daemon is absent or dead; fetch RPCs retry exactly once against the
+  embedded endpoint on daemon death (writes never blindly retried). The
+  daemon is invisible at both ends: identical outputs and on-disk state
+  whether present or absent.
 
 ## 9. Merge (M9/M10, v0.2.md D9-D11)
 
@@ -339,9 +481,83 @@ Unrelated histories (no merge base) fail naming the operation.
   checksum sweep + `integrity_check` + derived rebuild determinism —
   docs/release-0.1.md). The object store checksum sweep deliberately skips
   `.tmp-*` files: an atomic write killed mid-flight leaves its tmp file
-  unpublished, unreadable, and reaped by the next rename into that shard.
+  unpublished and unreadable; the GC's tmp reaper (§10.5) deletes those
+  past `--min-age`.
 
-## 10. Horizontal scale-out
+## 10.5. Object-store lifecycle (M13)
+
+`gardenbed-server gc` reclaims unreachable object files and stale
+`.tmp-*` staging files. **Mark**: a pure function of SQLite state — every
+ref tip, every stored changeset row (D14: rows and git-mapping rows are
+never collected in v0.2, so each row's blob references stay live), every
+certificate root tree, every `derived(kind='tree')` id, closed over
+parents, non-gitlink blob refs, and tree payloads. The live set
+materializes into a SQLite temp table (`gc_live`) on a dedicated
+connection, so RSS stays bounded at ten-million-object scale.
+
+**Sweep**: one walk over the 256 shard directories collects size, mtime,
+and a one-byte magic per file; a file is deletable when the mark proves
+it unreachable *and* its mtime is older than `--min-age` (default 24 h —
+the young-orphan grace). `.tmp-*` files are reaped under the same
+min-age gate. Deletion is a plain `unlink`: each is independent, so
+SIGKILL at any point leaves a sound store and the next gc converges
+(force mode wraps its unlinks in metadata transactions — see
+Locking below). `--dry-run` reports without deleting. `put_blob` refreshes
+the mtime of an already-stored identical blob, so a
+re-uploaded-but-not-yet-referenced blob restarts its grace period.
+
+**Locking**: `serve` and `import` hold a shared `flock` on
+`<root>/repo.lock` for their duration; root-mode `serve` additionally
+acquires the same shared lock per repository handle in `open_handle`
+(covering repositories created *after* startup — a single Log/PutBlob
+request opens the handle and holds the lock until LRU eviction drops
+it). `gc` takes the lock exclusive (non-blocking) — the default stance
+is offline-first, so gc against a running server or import fails with
+an actionable message. `--force` skips the lock and runs live under a
+two-sided transactional handshake on the metadata write lock (the
+`BEGIN IMMEDIATE` lock every changeset commit already takes):
+
+* **gc side**: the sweep unlinks in chunks, and each chunk's ingest
+  watermark re-check (changeset + ref row counts — a changeset that
+  landed after the mark may reference an object the mark classified as
+  an orphan, since `CreateChangeset` accepts blobs already on disk
+  without refreshing their mtime) happens *inside* the same
+  `BEGIN IMMEDIATE` transaction as that chunk's unlinks. A row cannot
+  land in the check→unlink gap: it either committed before the chunk
+  (the check sees it; the chunk is never entered and gc aborts with
+  zero unlinks after the abort point) or it waits on the lock and the
+  next chunk's check sees it.
+* **writer side**: `CreateChangeset` (and git import) re-verify, inside
+  the commit transaction under the same write lock, that every
+  referenced blob *and every tree the derivation stored* — its write
+  set, idempotent re-puts included — is still present, with plain
+  existence checks (no decoding; blobs and trees share one path shape
+  per content hash). The write set is the complete race surface: a
+  tree in the new root's closure that the derivation did not store is
+  an untouched subtree of an already-certified row, and the mark
+  closes over every row's tree payloads, so gc never sees it as an
+  orphan. The deterministic-replay shape stays covered — the replay
+  re-put exactly those subtrees (`put_tree` is idempotent and does not
+  refresh mtime, so a root-only check could still bless a changeset
+  whose intermediates a multi-chunk sweep had unlinked); the write set
+  names those intermediates. Verifying it keeps the check O(touched
+  directories), so commit latency stays independent of repository
+  size. Gitlink entries are exempt at the changes level (padded
+  upstream SHAs, never object files). If gc unlinked first, the commit
+  fails naming the missing object and the client re-uploads and
+  retries; if the row commits first, gc's in-transaction check sees
+  the ingest and aborts. Either order leaves the invariant standing:
+  an acknowledged changeset always has its full closure on disk.
+
+Unlinks before an abort stand (each was dead at a watermark that was
+still clean, committed chunk by chunk); the rest stay for the next run,
+and the report counts only the chunks that actually committed.
+`flock` has no FIFO fairness, so sustained short-lived shared holders
+could starve a single exclusive attempt; the gc CLI retries with
+exponential backoff for up to 60 s before failing with the actionable
+message.
+
+## 11. Horizontal scale-out
 
 The server tier scales horizontally by moving state off-box: metadata
 into PostgreSQL, objects into S3. Every replica is identical and

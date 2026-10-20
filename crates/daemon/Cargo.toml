@@ -3,3 +3,56 @@ name = "gardenbed-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+
+[lib]
+name = "gardenbed_daemon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gardenbed-daemon"
+path = "src/main.rs"
+
+[dependencies]
+gardenbed-model.workspace = true
+# Path deps until the orchestrator adds them to `[workspace.dependencies]`.
+gardenbed-store = { path = "../store" }
+gardenbed-protocol = { path = "../protocol" }
+clap = { version = "4", features = ["derive"] }
+notify = "8"
+prost = "0.14"
+thiserror = "2"
+tokio = { version = "1", default-features = false, features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "signal",
+    "sync",
+    "time",
+    "io-util",
+] }
+tokio-stream = { version = "0.1", default-features = false, features = ["net"] }
+tonic = { version = "0.14.6", default-features = false, features = [
+    "transport",
+    "server",
+    "router",
+    "codegen",
+    "channel",
+] }
+# Runtime dep: the generated code's default codec is `tonic_prost::ProstCodec`.
+tonic-prost = "0.14.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# The build fingerprint's digest (same oracle as crates/server).
+sha2 = "0.10"
+protox = "0.10"
+prost = "0.14"
+prost-types = "0.14"
+tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+gardenbed-harness = { path = "../harness" }
+prost-types = "0.14"
+tempfile = "3"

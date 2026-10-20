@@ -86,20 +86,54 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
 
         Command::Sparse { command } => run_sparse(cli, command).await,
 
+        Command::Sync => {
+            let report = gardenbed::queue::sync(&cli.state_dir).await?;
+            for id in &report.synced {
+                println!("synced {}", id.short());
+            }
+            match &report.failure {
+                None => {
+                    if report.synced.is_empty() {
+                        println!("nothing to sync — the queue is empty");
+                    } else {
+                        println!("synced {} commit(s), queue empty", report.synced.len());
+                    }
+                    Ok(0)
+                }
+                Some(e) => {
+                    println!("sync stopped: {e}");
+                    println!(
+                        "{} commit(s) still pending — run bed sync when online",
+                        report.remaining
+                    );
+                    Ok(1)
+                }
+            }
+        }
+
         Command::Status { full_scan } => {
             let bed = WorkingCopy::open(&cli.state_dir)?;
+            // The pending line comes first and works offline: the queue
+            // is purely local state.
+            let pending = bed.queue()?.count()?;
+            if pending > 0 {
+                println!("{pending} pending commit(s) not yet on the server — run bed sync");
+            }
             let sparse = bed.config().sparse.clone();
             if sparse.is_empty() {
                 println!("no sparse paths selected — add paths with `bed sparse add <path>`");
                 return Ok(0);
             }
             let treestate = bed.treestate()?;
-            let report = gardenbed::status::scan_status(
-                &bed.workspace_root(),
-                &sparse,
-                &treestate,
-                *full_scan,
-            )?;
+            let report = gardenbed::status::status_via_daemon(bed.dir(), *full_scan, || async {
+                gardenbed::status::scan_status(
+                    &bed.workspace_root(),
+                    &sparse,
+                    &treestate,
+                    *full_scan,
+                )
+            })
+            .await?;
             let rendered = report.render();
             if rendered.is_empty() {
                 println!("working copy is clean — nothing modified, deleted, or untracked.");
@@ -159,10 +193,14 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             Ok(0)
         }
 
-        Command::Rebase { new_parent } => {
+        Command::Rebase { new_parent, stack } => {
             let _bed = WorkingCopy::open(&cli.state_dir)?;
             CsOrRef::parse(new_parent)?;
-            let out = gardenbed::ops::rebase(&cli.state_dir, new_parent).await?;
+            let out = if *stack {
+                gardenbed::ops::rebase_stack(&cli.state_dir, new_parent).await?
+            } else {
+                gardenbed::ops::rebase(&cli.state_dir, new_parent).await?
+            };
             print!("{out}");
             Ok(0)
         }
@@ -206,6 +244,11 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             if !out.is_empty() {
                 print!("{out}");
             }
+            Ok(0)
+        }
+
+        Command::Mount { mountpoint } => {
+            gardenbed::ops::mount(&cli.state_dir, mountpoint).await?;
             Ok(0)
         }
     }

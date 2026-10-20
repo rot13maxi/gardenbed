@@ -34,6 +34,11 @@ unpublished drafts — a two-author work-in-progress set, a rebase pair,
 and one wholesale-rewrite stress file (6000 lines) the diff renderer
 must decline with its budget note.
 
+`seed` takes the repository's **shared `repo.lock`** for its whole run
+(the same lock `serve` and `gardenbed-server import` hold), so an offline
+`gardenbed-server gc` cannot interleave with the writes; a gc already
+holding the exclusive lock makes `seed` wait until it finishes.
+
 ## Pages
 
 | Route | Page |

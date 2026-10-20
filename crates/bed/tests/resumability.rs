@@ -76,13 +76,13 @@ async fn setup() -> World {
         .expect("generate never fails");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let server = dir.path().join("server");
+    let server = dir.path().join("server").join(common::REPO);
     let garden1 = dir.path().join("garden-one");
     let garden2 = dir.path().join("garden-two");
     fs::create_dir_all(&garden1).expect("garden one");
     fs::create_dir_all(&garden2).expect("garden two");
     let head = common::ingest(&history, &server);
-    let server = Server::spawn(&server).await;
+    let server = Server::spawn(server.parent().unwrap()).await;
     World {
         _dir: dir,
         garden1,
@@ -144,7 +144,45 @@ fn expected_paths(world: &World) -> Vec<String> {
         .collect()
 }
 
-/// Polls `GetStats` until `pred` fires; ~10 ms cadence, `timeout` cap.
+/// Deadline for [`await_counters`].
+///
+/// Both call sites' healthy waits measure ~110-120 ms (instrumented run:
+/// 106.7 ms for the quarter-fetch, 120.1 ms for the whole want-list), so
+/// 10 minutes is ~5,000x the healthy path — sized for the machine-load
+/// stall class in dogfood #16 (box in D-state), not for a slow product.
+/// The cap also has to sit under the 30-minute CI job timeout: a stuck run
+/// must fail with our "no progress"/"deadline" message before the job is
+/// killed with no diagnostic. It is never a skip — the helper keeps
+/// asserting on every poll until it fires.
+const AWAIT_COUNTERS_DEADLINE: Duration = Duration::from_secs(10 * 60);
+
+/// Polls `GetStats` until `pred` fires, with load-tolerant pacing.
+///
+/// Dogfood #16: the old shape slept a fixed 10 ms and gave up after a
+/// fixed 120 s. Under a machine-load stall (the box in D-state behind a
+/// ~500 GB corpus read storm) the server's counter cannot advance at all,
+/// so that cap declared a *test* failure where the product was healthy —
+/// and every 10 ms poll added more load precisely when the box had none
+/// to spare. Three changes, all test-infra only:
+///
+/// * **Progress-sensitive exponential backoff** 10 ms → 250 ms (doubling
+///   only while the counters sit still, reset to 10 ms the moment any
+///   counter moves). A fast transition is still caught at the tight
+///   cadence — cycle A kills a quarter of the way in, so a coarse poll
+///   would let the fetch finish first — while a genuinely stalled server
+///   is polled ~4×/s instead of 100×/s, so the helper stops competing
+///   with the I/O that is blocking it.
+/// * **A 10-minute deadline.** The measured healthy waits are ~110-120 ms
+///   (see [`AWAIT_COUNTERS_DEADLINE`]); 10 min is ~5,000× that and still
+///   under the 30-minute CI job timeout, so a stuck run fails with a
+///   diagnostic instead of being killed silently. It is not a skip: the
+///   helper always keeps asserting.
+/// * **Cause-distinguishing failure messages**: "no progress" names
+///   counters that never advanced past their start (a product stall),
+///   "deadline" names counters that advanced but never reached the target
+///   (a load/slow-path case). A silent skip is deliberately not an
+///   option: it would hide exactly the product stall this assertion
+///   exists to catch.
 async fn await_counters(
     world: &World,
     client: &gardenbed_protocol::client::GardenbedClient,
@@ -152,17 +190,42 @@ async fn await_counters(
     what: &str,
     timeout: Duration,
 ) {
+    /// Ceiling on the poll interval: ~4 GetStats/s while stalled.
+    const MAX_POLL: Duration = Duration::from_millis(250);
+    const FIRST_POLL: Duration = Duration::from_millis(10);
+
     let deadline = Instant::now() + timeout;
+    let mut poll = FIRST_POLL;
+    let (t_start, b_start) = world.server.counted(client).await;
+    let mut last = (t_start, b_start);
     loop {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(poll).await;
         let (t, b) = world.server.counted(client).await;
         if pred(t, b) {
             return;
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for {what}"
-        );
+        if (t, b) != last {
+            // Progress since the previous poll: a transition is underway,
+            // so keep watching closely. Backoff is for stalls only.
+            last = (t, b);
+            poll = FIRST_POLL;
+        } else {
+            poll = (poll * 2).min(MAX_POLL);
+        }
+        if Instant::now() >= deadline {
+            let (t, b) = (t - t_start, b - b_start);
+            if t == 0 && b == 0 {
+                panic!(
+                    "no progress after {timeout:?} waiting for {what}: \
+                     GetStats counters never advanced (get_tree {t}, get_blob {b}); \
+                     the server made no observable progress at all"
+                );
+            }
+            panic!(
+                "deadline after {timeout:?} waiting for {what}: counters advanced \
+                 (get_tree {t}, get_blob {b}) but the target was never reached"
+            );
+        }
     }
 }
 
@@ -189,7 +252,10 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
     let client = world.server.client().await;
     let (t0, b0) = world.server.counted(&client).await;
 
-    let (code, _, stderr) = bed(&world.garden1, &["clone", &world.server.http()]);
+    let (code, _, stderr) = bed(
+        &world.garden1,
+        &["clone", &format!("{}/garden", world.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
 
     // ---- cycle A: SIGKILL a quarter of the way through the blob fetch ----
@@ -200,7 +266,7 @@ async fn killed_mid_fetch_resumes_with_zero_duplicates() {
         &client,
         |_, b| b - b0 >= quarter.max(1),
         "the blob fetch to reach a quarter of the want-list",
-        Duration::from_secs(120),
+        AWAIT_COUNTERS_DEADLINE,
     )
     .await;
     kill(child).await;
@@ -259,7 +325,10 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
     let client = world.server.client().await;
     let (t0, b0) = world.server.counted(&client).await;
 
-    let (code, _, stderr) = bed(&world.garden2, &["clone", &world.server.http()]);
+    let (code, _, stderr) = bed(
+        &world.garden2,
+        &["clone", &format!("{}/garden", world.server.http())],
+    );
     assert_eq!(code, 0, "clone: {stderr}");
     let (t2, b2) = world.server.counted(&client).await;
     assert_eq!((t2, b2), (t0, b0), "clone itself fetches no objects");
@@ -273,7 +342,7 @@ async fn killed_after_fetch_phase_caches_everything_and_rerun_fetches_zero() {
         &client,
         |t, b| (t - t2) + (b - b2) >= want_total,
         "every distinct want id to have been requested",
-        Duration::from_secs(120),
+        AWAIT_COUNTERS_DEADLINE,
     )
     .await;
     // A short grace for the last fetch's cache write; fetching strictly

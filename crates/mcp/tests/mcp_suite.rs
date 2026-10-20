@@ -10,7 +10,7 @@
 //!   checked against `git diff-tree --name-status`, blame against
 //!   `git blame --first-parent`, `file` against `git show`.
 //! - **M7.2 zero-checkout** — the agent's sandbox (and the fixture tree)
-//!   contains no `.bed` directory before *or after* serving; all four
+//!   contains no `.bed` directory before *or after* serving; all five
 //!   tools answer from `--root` alone.
 //! - **M7.3 scripted QA agent** — the demo (the example's exact code
 //!   path) and the full ≥20-question canned suite pass at 100% against
@@ -150,7 +150,7 @@ fn m7_4_protocol_conformance_in_process() {
     assert_eq!(ping["id"], json!(2));
     assert_eq!(ping["result"], json!({}));
 
-    // tools/list: exactly the four tools, each with an object inputSchema;
+    // tools/list: exactly the five tools, each with an object inputSchema;
     // diff requires both sides (a headless tool has no working copy).
     let list = resp(handle_line(
         &repo,
@@ -161,7 +161,7 @@ fn m7_4_protocol_conformance_in_process() {
         .iter()
         .map(|t| t["name"].as_str().expect("name"))
         .collect();
-    assert_eq!(names, vec!["log", "diff", "blame", "file"]);
+    assert_eq!(names, vec!["log", "diff", "blame", "file", "copies"]);
     for t in tools {
         assert_eq!(t["inputSchema"]["type"], json!("object"), "for {t}");
         assert!(t["description"].is_string(), "for {t}");
@@ -170,6 +170,8 @@ fn m7_4_protocol_conformance_in_process() {
     assert_eq!(diff["inputSchema"]["required"], json!(["a", "b"]));
     let blame = tools.iter().find(|t| t["name"] == "blame").unwrap();
     assert_eq!(blame["inputSchema"]["required"], json!(["path"]));
+    let copies = tools.iter().find(|t| t["name"] == "copies").unwrap();
+    assert_eq!(copies["inputSchema"]["required"], json!(["cs"]));
     let log = tools.iter().find(|t| t["name"] == "log").unwrap();
     assert!(log["inputSchema"]["properties"]["limit"].is_object());
 
@@ -488,6 +490,101 @@ fn m7_1_parity_with_repo_engine_and_bed() {
     let _ = mcp.shutdown().expect("server exits");
 }
 
+// ---------------------------------------------------------------- copies
+
+#[test]
+fn copies_tool_answers_json_facts_and_errors() {
+    let fixture = gardenbed_mcp::qa::qualifying_fixture(12);
+    let repo = Repo::open(&fixture.root).expect("fixture repo opens");
+
+    // In-process: every changeset's tool answer must equal the repo's own
+    // cuttings entry, rendered as JSON.
+    for (i, (cs, _sha)) in fixture.mapping.iter().enumerate() {
+        let answer = handle_line(
+            &repo,
+            &json!({
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/call",
+                "params": { "name": "copies", "arguments": { "cs": cs.to_hex() } },
+            })
+            .to_string(),
+        );
+        let v = resp(answer);
+        assert!(v.get("error").is_none(), "copies answers at cs{i}");
+        assert!(
+            v["result"].get("isError").is_none(),
+            "copies succeeds at cs{i}"
+        );
+        let text = v["result"]["content"][0]["text"].as_str().expect("text");
+        let parsed: Value = serde_json::from_str(text).expect("copies answers JSON");
+        assert_eq!(parsed["changeset"], json!(cs.to_hex()));
+
+        let want = repo.copies(*cs).expect("repo cuttings");
+        let want_entries: Vec<Value> = want
+            .entries
+            .iter()
+            .map(|e| {
+                json!({
+                    "path": e.path,
+                    "from": e.src,
+                    "kind": match e.kind {
+                        gardenbed_derive::CuttingKind::Rename => "rename",
+                        gardenbed_derive::CuttingKind::Copy => "copy",
+                    },
+                })
+            })
+            .collect();
+        assert_eq!(
+            parsed["entries"],
+            json!(want_entries),
+            "tool JSON == Repo::copies at cs{i}"
+        );
+    }
+
+    // The cs argument is required.
+    let answer = handle_line(
+        &repo,
+        &json!({
+            "jsonrpc": "2.0", "id": 2,
+            "method": "tools/call",
+            "params": { "name": "copies", "arguments": {} },
+        })
+        .to_string(),
+    );
+    let v = resp(answer);
+    assert_eq!(v["result"]["isError"], json!(true));
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("copies needs a \"cs\" argument"),
+        "missing-cs error names the argument and the next step"
+    );
+
+    // An unknown changeset is an isError result, protocol stays up.
+    let answer = handle_line(
+        &repo,
+        &json!({
+            "jsonrpc": "2.0", "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "copies",
+                "arguments": { "cs": "f".repeat(64) }
+            },
+        })
+        .to_string(),
+    );
+    let v = resp(answer);
+    assert_eq!(v["result"]["isError"], json!(true));
+    assert!(
+        v["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("not found"),
+        "unknown cs names the missing changeset"
+    );
+}
+
 // ---------------------------------------------------------------- M7.2 zero checkout
 
 #[test]
@@ -508,7 +605,7 @@ fn m7_2_zero_checkout_all_tools_from_root_alone() {
         McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
     mcp.handshake().expect("handshake");
 
-    // All four tools answer — with the cwd holding nothing at all.
+    // All five tools answer — with the cwd holding nothing at all.
     let log = mcp
         .call_tool("log", json!({ "limit": 2 }))
         .expect("log call");
@@ -561,4 +658,99 @@ fn m7_3_scripted_qa_agent_answers_like_git() {
         report.summary()
     );
     assert_eq!(report.failed, 0, "QA: {}", report.summary());
+}
+
+// ---------------------------------------------------------------- line cap
+
+#[test]
+fn read_capped_line_bounds_and_frame_semantics() {
+    // Within the cap: the line is delivered, terminator stripped, EOF
+    // after it returns None.
+    let mut r = "hello\nworld".as_bytes();
+    let mut buf = String::new();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "hello");
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "world"); // EOF-terminated final line
+    assert_eq!(protocol::read_capped_line(&mut r, &mut buf).unwrap(), None);
+
+    // Empty input is a clean EOF, not an empty oversized line.
+    let mut r: &[u8] = b"";
+    assert_eq!(protocol::read_capped_line(&mut r, &mut buf).unwrap(), None);
+
+    // A lone newline is an in-cap empty line.
+    let mut r = "\n".as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "");
+
+    // Exactly cap bytes plus a newline is still in-cap.
+    let in_cap = format!("{}\n", "x".repeat(protocol::MAX_LINE_LEN));
+    let mut r = in_cap.as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf.len(), protocol::MAX_LINE_LEN);
+
+    // One byte past the cap: oversized, the whole line is skipped, and
+    // the following line is served intact.
+    let over = format!("{}\n{}\n", "y".repeat(protocol::MAX_LINE_LEN + 1), "after");
+    let mut r = over.as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(false)
+    );
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(true)
+    );
+    assert_eq!(buf, "after");
+
+    // Oversized with no trailing newline until EOF: skipped, then EOF.
+    let over_eof = "z".repeat(protocol::MAX_LINE_LEN + 1);
+    let mut r = over_eof.as_bytes();
+    assert_eq!(
+        protocol::read_capped_line(&mut r, &mut buf).unwrap(),
+        Some(false)
+    );
+    assert_eq!(protocol::read_capped_line(&mut r, &mut buf).unwrap(), None);
+}
+
+#[test]
+fn m7_4_oversized_line_answered_32600_and_server_keeps_serving() {
+    // A line past the 1 MiB cap must not be buffered without bound: the
+    // server answers -32600 bound to id null, skips the line, and the
+    // next request is served normally.
+    let fixture = gardenbed_mcp::qa::Fixture::build(2, 4);
+    let sandbox = tempfile::tempdir().expect("sandbox tempdir");
+    let mut mcp =
+        McpProcess::spawn(&mcp_bin(), &fixture.root, sandbox.path()).expect("gardenbed-mcp spawns");
+    mcp.handshake().expect("handshake");
+
+    let oversized = format!("{}\n", "q".repeat(protocol::MAX_LINE_LEN + 1));
+    let answer = mcp.raw(&oversized).expect("the oversized line is answered");
+    assert_eq!(answer["id"], json!(null));
+    assert_eq!(code(&answer), protocol::INVALID_REQUEST);
+
+    // The exact cap is still a (huge, unparseable) *line*: -32700, not
+    // the cap error — the boundary sits at cap+1.
+    let at_cap = format!("{}\n", "p".repeat(protocol::MAX_LINE_LEN));
+    let answer = mcp.raw(&at_cap).expect("the at-cap line is answered");
+    assert_eq!(code(&answer), protocol::PARSE_ERROR);
+
+    let ping = mcp
+        .raw(r#"{"jsonrpc":"2.0","id":88,"method":"ping"}"#)
+        .expect("the server keeps serving after an oversized line");
+    assert_eq!(ping["id"], json!(88));
+    assert_eq!(ping["result"], json!({}));
+    let _ = mcp.shutdown().expect("server exits");
 }

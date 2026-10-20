@@ -44,6 +44,11 @@ struct WorkingSet<'a> {
     /// swallowed the whole subtree (canonical path order sorts the write
     /// of `g` before the delete of `g/h`).
     written_files: HashSet<String>,
+    /// Every tree id `finish()` stored (including idempotent re-puts of
+    /// already-present objects). O(touched directories) — the derivation's
+    /// write set, the exact object surface a concurrent gc can race
+    /// against; the commit's last-chance verify re-checks exactly this.
+    written_trees: Vec<Id>,
 }
 
 impl<'a> WorkingSet<'a> {
@@ -63,6 +68,7 @@ impl<'a> WorkingSet<'a> {
             objects,
             open,
             written_files: HashSet::new(),
+            written_trees: Vec::new(),
         })
     }
 
@@ -201,14 +207,17 @@ impl<'a> WorkingSet<'a> {
 
     /// Serializes every open directory bottom-up, writing one tree object
     /// per changed directory, and returns the root tree id (`None` when the
-    /// root ends up empty).
-    fn finish(self) -> Result<Option<Id>, StoreError> {
+    /// root ends up empty) plus every tree id stored along the way (the
+    /// derivation's write set — idempotent re-puts included, since those
+    /// are exactly the orphan-replay ids a concurrent gc wants).
+    fn finish(self) -> Result<(Option<Id>, Vec<Id>), StoreError> {
         // Deepest paths first: children are re-encoded before their parents
         // read the children's new ids. A child's path is strictly longer
         // than its parent's, so a length sort is topologically safe.
         let mut dirs: Vec<String> = self.open.keys().cloned().collect();
         dirs.sort_by_key(|d| std::cmp::Reverse(d.len()));
 
+        let mut written_trees = self.written_trees;
         let mut done: HashMap<String, Option<Id>> = HashMap::with_capacity(dirs.len());
         for dir in dirs {
             let entries = self.open.get(&dir).expect("dir is open");
@@ -266,14 +275,17 @@ impl<'a> WorkingSet<'a> {
                 let bytes = tree.canonical_bytes().map_err(codec_err)?;
                 let id = tree.id().map_err(codec_err)?;
                 self.objects.put_tree(id, &bytes)?;
+                written_trees.push(id);
                 Some(id)
             };
             done.insert(dir, result);
         }
-        Ok(done
-            .get("")
-            .copied()
-            .expect("the root directory is always open"))
+        Ok((
+            done.get("")
+                .copied()
+                .expect("the root directory is always open"),
+            written_trees,
+        ))
     }
 }
 
@@ -296,8 +308,21 @@ pub(crate) fn apply_changeset(
     base: Option<Id>,
     cs: &gardenbed_model::Changeset,
 ) -> Result<Option<Id>, StoreError> {
+    Ok(apply_changeset_with_writes(objects, base, cs)?.0)
+}
+
+/// [`apply_changeset`] plus the derivation's write set: every tree id the
+/// application stored (idempotent re-puts included). Callers that commit
+/// the result re-verify exactly this set inside their commit transaction
+/// (the gc handshake's writer side) — it is O(touched directories), not
+/// O(closure), so commit cost stays independent of repository size.
+pub(crate) fn apply_changeset_with_writes(
+    objects: &dyn ObjectStore,
+    base: Option<Id>,
+    cs: &gardenbed_model::Changeset,
+) -> Result<(Option<Id>, Vec<Id>), StoreError> {
     if cs.changes.is_empty() {
-        return Ok(base);
+        return Ok((base, Vec::new()));
     }
     let mut ws = WorkingSet::new(objects, base)?;
     for c in &cs.changes {

@@ -21,6 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::str::FromStr;
 use tokio_stream::StreamExt as _;
 use tonic::Code;
 
@@ -67,8 +68,8 @@ const STARTING_REF_PROBES: [&str; 3] = [DEFAULT_REF, "master", "trunk"];
 /// names what was tried and — via the server's ref listing — what does
 /// exist, pointing at `--ref`.
 ///
-/// With `--repo` omitted the working copy is named `garden` (v0.1 servers are
-/// single-repo and offer no name discovery; a documented deviation).
+/// With `--repo` omitted and no URL path, the repository is `default` (the
+/// name a v0.1 root serves as; v0.2.md §5).
 pub async fn clone_with_ref(
     state_dir: &Path,
     server: &str,
@@ -77,12 +78,18 @@ pub async fn clone_with_ref(
     sparse: Vec<String>,
 ) -> Result<String, ClientError> {
     // ---- validation phase: nothing has been written yet ----
-    let repo = match repo {
-        Some(r) if !r.trim().is_empty() => r.trim().to_owned(),
-        Some(_) => {
+    // The clone URL addresses the repository (v0.2.md §5): an http(s) URL's
+    // path names it (`http://host:port/<repo>`; no path ⇒ `default`).
+    // `--repo` wins on conflict. The endpoint itself is the scheme +
+    // authority; the path never reaches the connection.
+    let (endpoint, url_repo) = split_repo_url(server)?;
+    let repo = match (repo, url_repo) {
+        (Some(r), _) if !r.trim().is_empty() => r.trim().to_owned(),
+        (Some(_), _) => {
             return Err(ClientError::ConfigInvalid("repo name is empty".into()));
         }
-        None => "default".to_owned(),
+        (None, Some(r)) => r,
+        (None, None) => "default".to_owned(),
     };
     let mut prefixes = Vec::with_capacity(sparse.len());
     for raw in &sparse {
@@ -95,7 +102,7 @@ pub async fn clone_with_ref(
     }
 
     // ---- connection and resolution: still no local state ----
-    let client = GardenbedClient::connect(server)
+    let client = GardenbedClient::connect(&endpoint)
         .await
         .map_err(|e| ClientError::Connect {
             server: server.to_owned(),
@@ -136,7 +143,7 @@ pub async fn clone_with_ref(
     }
 
     // ---- initialize local state ----
-    let mut bed = WorkingCopy::init(state_dir, server, &repo)?;
+    let mut bed = WorkingCopy::init(state_dir, &endpoint, &repo)?;
     bed.config_mut().sparse = prefixes;
     bed.config_mut().current_cs = Some(main.to_hex());
     bed.save_config()?;
@@ -148,6 +155,48 @@ pub async fn clone_with_ref(
          no files materialized — select paths with `bed sparse add <path>`\n",
         main.short()
     ))
+}
+
+/// Splits an http(s) clone URL into its endpoint and repository name:
+/// `http://host:port/<repo>` → `("http://host:port", Some("<repo>"))`.
+/// A trailing slash, query, or fragment is ignored; an empty or `/` path
+/// selects `None` (the `default` repository). `unix://` and every other
+/// scheme pass through untouched — only http(s) addresses repositories in
+/// the URL (the daemon socket is a machine-local transport, not an
+/// address).
+///
+/// A path of more than one segment (`http://host:port/a/b`) is refused:
+/// it cannot name a repository (repository names are single path-free
+/// segments), and silently treating it as `default` would send the server
+/// a name the user never typed.
+fn split_repo_url(server: &str) -> Result<(String, Option<String>), ClientError> {
+    let Ok(uri) = http::Uri::try_from(server) else {
+        return Ok((server.to_owned(), None)); // not a URL: pass through
+    };
+    match uri.scheme_str() {
+        Some("http" | "https") => {}
+        _ => return Ok((server.to_owned(), None)),
+    }
+    let path = uri.path().trim_matches('/');
+    let endpoint = || {
+        format!(
+            "{}://{}",
+            uri.scheme_str().unwrap_or("http"),
+            uri.authority().map(|a| a.as_str()).unwrap_or("")
+        )
+    };
+    if path.is_empty() {
+        return Ok((endpoint(), None));
+    }
+    if path.contains('/') {
+        return Err(ClientError::BadServerUrl {
+            server: server.to_owned(),
+            reason: "the URL path has more than one segment; a clone URL names at most \
+                     one repository (http://host:port/<repo>)"
+                .into(),
+        });
+    }
+    Ok((endpoint(), Some(path.to_owned())))
 }
 
 /// [`clone_with_ref`] without `--ref`: the starting ref is left to the
@@ -352,6 +401,228 @@ fn exclude_bed_state(plan: Vec<rpc::PlanFile>) -> (Vec<rpc::PlanFile>, Vec<Strin
     (kept, skipped)
 }
 
+/// Recognition of an "already landed" twin: a changeset on the new
+/// parent's side of the merge base whose message and post-image root tree
+/// both equal the replayed element's.
+///
+/// A hand-union lands a lane's final content on `main` as a NEW changeset
+/// (tree-equal, same message, no ancestry link). Replaying the lane over
+/// it hits the server's own-content check (`"<path>" was changed or
+/// deleted`) even though the result is already there; recognizing the twin
+/// turns that into a no-op resolution instead of a hand-union.
+///
+/// Cost: one `GetChangeset` per changeset on `parent`'s span above `base`
+/// — the visited set is exactly `ancestors(parent) \ ancestors(base)`,
+/// enforced by [`is_ancestor`] pruning at the frontier, so the merge base
+/// and its whole history are never expanded (a merge-carrying `main`
+/// cannot burn the budget on ancient history) — plus one `RootTree` for
+/// span changesets whose message matches a wanted one. O(`main`'s movement
+/// since the branch point) metadata reads, independent of history depth
+/// below the base. The walk is capped at [`TWIN_SCAN_CAP`] span
+/// changesets (overridable with `GARDENBED_TWIN_SCAN_CAP`, a positive
+/// integer, for tests and diagnostics); on a longer span the scan reports
+/// `truncated` and the caller logs it **immediately** — the note must be
+/// visible even when a truncation-induced miss turns into the server's
+/// ordinary conflict. A truncated scan can only miss a twin, never
+/// produce a wrong skip.
+///
+/// A twin found here is an *ancestor* of the new parent, not necessarily
+/// its tip; the caller's [`twin_still_current`] guard rejects a twin whose
+/// paths the new parent rewrote afterwards, and every resolution is
+/// reported, so the outcome is never silent.
+const TWIN_SCAN_CAP: usize = 4096;
+
+/// The effective scan cap: [`TWIN_SCAN_CAP`] unless
+/// `GARDENBED_TWIN_SCAN_CAP` names a positive integer (tests and
+/// diagnostics; invalid or zero values fall back to the default).
+fn twin_scan_cap() -> usize {
+    std::env::var("GARDENBED_TWIN_SCAN_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(TWIN_SCAN_CAP)
+}
+
+/// The twin scan's outcome: `(message, post-image tree) → changeset` plus
+/// whether the walk stopped at the cap before exhausting the new parent's
+/// span, and the cap in force (for the caller's note).
+struct TwinScan {
+    candidates: HashMap<(String, Option<Id>), Id>,
+    truncated: bool,
+    cap: usize,
+}
+
+async fn twin_candidates(
+    session: &Session,
+    repo: &str,
+    parent: Id,
+    base: Id,
+    wanted: &HashSet<String>,
+    command: &'static str,
+) -> Result<TwinScan, ClientError> {
+    let cap = twin_scan_cap();
+    let mut candidates: HashMap<(String, Option<Id>), Id> = HashMap::new();
+    let mut truncated = false;
+    let mut scanned = 0usize;
+    if wanted.is_empty() {
+        return Ok(TwinScan {
+            candidates,
+            truncated,
+            cap,
+        });
+    }
+    let mut stack = vec![parent];
+    let mut seen: HashSet<Id> = HashSet::new();
+    seen.insert(base); // the merge base and its history are not candidates
+    while let Some(cs_id) = stack.pop() {
+        if !seen.insert(cs_id) {
+            continue;
+        }
+        if scanned >= cap {
+            truncated = true;
+            break;
+        }
+        scanned += 1;
+        let cs = session.get_changeset(cs_id, command).await?;
+        if wanted.contains(&cs.message) {
+            let tree = session.root_tree(cs_id, command).await?;
+            candidates
+                .entry((cs.message.clone(), tree))
+                .or_insert(cs_id);
+        }
+        for p in &cs.parents {
+            if *p == base || seen.contains(p) {
+                // The merge base itself, or a node already visited.
+                seen.insert(*p);
+                continue;
+            }
+            if is_ancestor(session, repo, *p, base, command).await? {
+                // Below the branch point: not main's movement since it,
+                // and descending would wander through ancient history.
+                seen.insert(*p);
+                continue;
+            }
+            stack.push(*p);
+        }
+    }
+    Ok(TwinScan {
+        candidates,
+        truncated,
+        cap,
+    })
+}
+
+/// `a` is an ancestor of `b` (or the same changeset).
+async fn is_ancestor(
+    session: &Session,
+    repo: &str,
+    a: Id,
+    b: Id,
+    command: &'static str,
+) -> Result<bool, ClientError> {
+    session
+        .client
+        .is_ancestor(repo, a, b)
+        .await
+        .map_err(|status| ClientError::Rpc {
+            command,
+            code: status.code(),
+            message: status.message().to_owned(),
+        })
+}
+
+/// A candidate is a twin only when it lives on the new parent's side of
+/// the branch point: an ancestor of the *current* changeset with the same
+/// message and tree is shared history (the element's own id, or an earlier
+/// identical landing before the branch), not something main gained since.
+/// One `IsAncestor` per candidate that matched, so rare.
+async fn is_shared_history(
+    session: &Session,
+    repo: &str,
+    candidate: Id,
+    current: Id,
+    command: &'static str,
+) -> Result<bool, ClientError> {
+    is_ancestor(session, repo, candidate, current, command).await
+}
+
+/// True when `a` and `b` are the same path or one contains the other
+/// (a directory replacement touches every descendant, and vice versa).
+fn path_overlaps(a: &str, b: &str) -> bool {
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Whether a recognized twin still describes the new parent's state on the
+/// paths the lane touched. `twin == parent` is trivially current (the
+/// incident shape). Otherwise a later main changeset may have rewritten or
+/// reverted those paths: the twin was landed, but its content no longer
+/// stands on main, so skipping the element would be a silent loss — the
+/// caller then replays it (and the server's ordinary three-way rule decides
+/// whether that is a clean re-application or a hard conflict).
+///
+/// Cost: one `Diff(twin → parent)` only when a twin was found and the twin
+/// is not the parent itself — bounded by main's movement since the twin.
+async fn twin_still_current(
+    session: &Session,
+    twin: Id,
+    parent: Id,
+    touched: &HashSet<String>,
+    command: &'static str,
+) -> Result<bool, ClientError> {
+    if twin == parent {
+        return Ok(true);
+    }
+    let changes = session.diff(twin, parent, command).await?;
+    Ok(!changes.iter().any(|c| {
+        let src = c.src_path.as_deref().unwrap_or("");
+        touched
+            .iter()
+            .any(|t| path_overlaps(t, c.path.as_str()) || path_overlaps(t, src))
+    }))
+}
+
+/// Moves the working copy onto `target` the way `rebase`/`merge` do:
+/// re-plan the sparse selection at `target`, re-sync, record `current_cs`,
+/// and re-point the heads stack from `current`. Returns the
+/// materialization report tail (fetched counts, skipped `.bed` note, sync
+/// summary), which the caller prefixes with its own outcome line.
+async fn move_to_changeset(
+    bed: &mut WorkingCopy,
+    session: &Session,
+    current: Id,
+    target: Id,
+    command: &'static str,
+) -> Result<String, ClientError> {
+    let root = session.root_tree(target, command).await?;
+    let prefixes = bed.config().sparse.clone();
+    let (plan, stats) = rpc::plan_sparse(session, root, &prefixes).await?;
+    let (plan, bed_state) = exclude_bed_state(plan);
+    let treestate = bed.treestate()?;
+    let outcome = sync::sync_sparse(
+        &bed.workspace_root(),
+        &prefixes,
+        plan,
+        session.fetcher(),
+        &treestate,
+    )
+    .await?;
+    bed.config_mut().current_cs = Some(target.to_hex());
+    bed.save_config()?;
+    bed.heads().repoint(current, target)?;
+    Ok(format!(
+        "fetched {} tree(s), {} blob(s)\n{}{}\n",
+        stats.trees_fetched,
+        stats.blobs_fetched,
+        bed_state_note(&bed_state),
+        outcome.summarize(),
+    ))
+}
+
 /// The note naming what `exclude_bed_state` kept out of the repository.
 /// Empty when nothing was skipped; the list is capped so a repo shipping
 /// a large `.bed/` tree cannot flood one line.
@@ -382,6 +653,7 @@ fn bed_state_note(skipped: &[String]) -> String {
 /// an interrupted refresh is repaired by simply running switch again.
 pub async fn switch(state_dir: &Path, spec: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "switch")?;
     let parsed = crate::revspec::CsOrRef::parse(spec)?;
     let session = Session::open(&bed).await?;
     let cs = session.resolve(&parsed, "switch").await?;
@@ -496,18 +768,125 @@ pub async fn file(
 /// to the rebased one.
 pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
     let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
     let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
     let session = Session::open(&bed).await?;
+    let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "rebase").await?;
     let parent = session.resolve(&parsed, "rebase").await?;
 
+    // Twin recognition (the single-changeset form of the stack rule): when
+    // the changeset's exact result — same message, same post-image root
+    // tree — is already an ancestor of the new parent, it was landed by
+    // another route (a hand-union), and replaying it would either conflict
+    // with its own content or store a redundant copy. Move to the twin and
+    // say so; nothing is replayed.
+    let message = session.get_changeset(current, "rebase").await?.message;
+    let tree = session.root_tree(current, "rebase").await?;
+    let base = session
+        .client
+        .merge_base(&repo, current, parent)
+        .await
+        .map_err(|status| ClientError::Rpc {
+            command: "rebase",
+            code: status.code(),
+            message: status.message().to_owned(),
+        })?;
+    // Already there: the current changeset is an ancestor of the new
+    // parent (the merge base IS `current`), so a replay would store a
+    // redundant copy of content main already has. Git's own answer is
+    // "Current branch is up to date"; the working copy stays put.
+    if base == Some(current) {
+        return Ok(format!(
+            "already up to date — {} is an ancestor of {}; nothing to rebase\n",
+            current.short(),
+            parent.short(),
+        ));
+    }
+    let mut scan_cap = TWIN_SCAN_CAP;
+    let (twin, scan_truncated) = match base {
+        Some(base) => {
+            let scan = twin_candidates(
+                &session,
+                &repo,
+                parent,
+                base,
+                &HashSet::from([message.clone()]),
+                "rebase",
+            )
+            .await?;
+            let candidate = scan.candidates.get(&(message.clone(), tree)).copied();
+            let candidate = match candidate {
+                // A candidate the current changeset already descends from
+                // is shared history, not a landing main gained since.
+                Some(c) if is_shared_history(&session, &repo, c, current, "rebase").await? => None,
+                other => other,
+            };
+            scan_cap = scan.cap;
+            (candidate, scan.truncated)
+        }
+        None => (None, false),
+    };
+    if let Some(twin) = twin {
+        // The states are equal by construction (the twin's tree IS this
+        // changeset's tree) — the change is already on record under a
+        // different id. Confirm nothing after the twin rewrote the paths
+        // it landed: a later revert means the content no longer stands,
+        // so replay (and let the server's ordinary rule decide).
+        let touched: HashSet<String> = session
+            .get_changeset(current, "rebase")
+            .await?
+            .changes
+            .iter()
+            .flat_map(|c| std::iter::once(c.path.clone()).chain(c.src_path.clone()))
+            .collect();
+        if twin_still_current(&session, twin, parent, &touched, "rebase").await? {
+            // Land on the new parent, git's "patch already upstream —
+            // dropped" outcome: the branch ends at upstream, so a
+            // follow-up `bed publish` is a fast-forward no-op. In the
+            // incident shape the twin IS the new parent (the hand-union
+            // is main's tip); when main has moved past it, the twin is
+            // still an ancestor of the parent, so nothing the lane wrote
+            // is lost from main.
+            let materialized =
+                move_to_changeset(&mut bed, &session, current, parent, "rebase").await?;
+            return Ok(format!(
+                "already applied — {} {:?} is on {} as {} (tree-equal, same message)\n\
+                 nothing replayed; working copy moved to {}\n{}",
+                current.short(),
+                message,
+                parent.short(),
+                twin.short(),
+                parent.short(),
+                materialized,
+            ));
+        }
+        eprintln!(
+            "note: {} {:?} was landed as {}, but {} changed the same paths \
+             since; replaying instead of skipping",
+            current.short(),
+            message,
+            twin.short(),
+            parent.short(),
+        );
+    }
+    // Truncation only matters when this run still has to replay: the
+    // applied-twin path above returns early, so reaching this point means
+    // no twin was found OR the one that was found was rejected as stale.
+    // In both cases the run can hit the ordinary conflict, and the note
+    // explains the cap; when the twin DID apply the note is unreachable.
+    // The stack form applies the same rule (`first_suffix`).
+    if scan_truncated {
+        eprintln!(
+            "note: twin scan capped at {scan_cap} changesets on {} — \
+             an already-applied copy further back would surface as a conflict",
+            parent.short()
+        );
+    }
+
     // The replay is the server's decision; conflicts come back as a
     // FAILED_PRECONDITION whose message lists every conflicting path.
-    let rebased = match session
-        .client
-        .rebase(&bed.config().repo, current, parent)
-        .await
-    {
+    let rebased = match session.client.rebase(&repo, current, parent).await {
         Ok(id) => id,
         Err(status) => {
             return Err(ClientError::Rpc {
@@ -521,33 +900,13 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     // Move the working copy like `switch` does: plan the sparse selection at the rebased
     // changeset, then fetch + sync. `.bed`-shaded repo paths never reach
     // the state directory; say what was skipped.
-    let root = session.root_tree(rebased, "rebase").await?;
-    let prefixes = bed.config().sparse.clone();
-    let (plan, stats) = rpc::plan_sparse(&session, root, &prefixes).await?;
-    let (plan, bed_state) = exclude_bed_state(plan);
-    let treestate = bed.treestate()?;
-    let outcome = sync::sync_sparse(
-        &bed.workspace_root(),
-        &prefixes,
-        plan,
-        session.fetcher(),
-        &treestate,
-    )
-    .await?;
-    bed.config_mut().current_cs = Some(rebased.to_hex());
-    bed.save_config()?;
-    bed.heads().repoint(current, rebased)?;
-
+    let materialized = move_to_changeset(&mut bed, &session, current, rebased, "rebase").await?;
     Ok(format!(
-        "rebased {} onto {} as {}\n\
-         fetched {} tree(s), {} blob(s)\n{}{}\n",
+        "rebased {} onto {} as {}\n{}",
         current.short(),
         parent.short(),
         rebased.short(),
-        stats.trees_fetched,
-        stats.blobs_fetched,
-        bed_state_note(&bed_state),
-        outcome.summarize(),
+        materialized,
     ))
 }
 
@@ -655,6 +1014,295 @@ pub async fn merge(
     ))
 }
 
+/// `bed rebase --stack <new-parent>` — replay the whole first-parent
+/// chain from the merge base of (current, new parent) up to the current
+/// changeset, oldest first, onto the new parent.
+///
+/// The stack is walked with one `GetChangeset` per link and replayed via
+/// the same `Rebase` RPC the single form uses, so each step gets the
+/// server's conflict check against the tree it is applied to. A conflict
+/// anywhere aborts the entire stack: the RPC fails before the working
+/// copy moves, and the server has created nothing the chain depends on
+/// (each replay names its predecessor as parent, and the first failure
+/// stops the sequence before any later link exists). The working-copy
+/// move is the plain `rebase` move at the final tip.
+pub async fn rebase_stack(state_dir: &Path, new_parent: &str) -> Result<String, ClientError> {
+    let mut bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "rebase")?;
+    let parsed = crate::revspec::CsOrRef::parse(new_parent)?;
+    let session = Session::open(&bed).await?;
+    let current = session.resolve_current_cs(&bed, "rebase --stack").await?;
+    let parent = session.resolve(&parsed, "rebase --stack").await?;
+    let repo = bed.config().repo.clone();
+
+    // The chain current → base, exclusive, oldest first. A missing merge
+    // base (unrelated histories) refuses before anything is replayed.
+    let base = session
+        .client
+        .merge_base(&repo, current, parent)
+        .await
+        .map_err(|status| ClientError::Rpc {
+            command: "rebase --stack",
+            code: status.code(),
+            message: status.message().to_owned(),
+        })?
+        .ok_or(ClientError::ConfigInvalid(
+            "the current changeset and the new parent share no history — \
+             a stack rebase needs a merge base"
+                .into(),
+        ))?;
+    let mut chain: Vec<Id> = Vec::new();
+    let mut walk = current;
+    while walk != base {
+        chain.push(walk);
+        let cs = session.get_changeset(walk, "rebase --stack").await?;
+        let Some(next) = cs.parents.first().copied() else {
+            return Err(ClientError::ConfigInvalid(
+                "the merge base is not on the current changeset's first-parent \
+                 chain — a stack rebase replays first-parent history only"
+                    .into(),
+            ));
+        };
+        walk = next;
+    }
+    chain.reverse(); // oldest first: replay applies each link onto the last
+
+    // Nothing to replay: the current changeset is already an ancestor of
+    // the new parent (the merge base IS the current changeset). Git's
+    // "Current branch is up to date"; the working copy stays put.
+    if chain.is_empty() {
+        return Ok(format!(
+            "already up to date — {} is an ancestor of {}; nothing to rebase\n",
+            current.short(),
+            parent.short(),
+        ));
+    }
+
+    // Twin recognition before any replay. A hand-union lands a lane's
+    // final content on `main` as a NEW, tree-equal, same-message changeset
+    // with no ancestry link; replaying over it hits the server's own
+    // check ("<path> was changed or deleted") although the result is
+    // already there. Record, for every chain element, the message + root
+    // tree wanted, then match candidates on the new parent's span above
+    // the merge base. Equality is exact on BOTH: tree alone can coincide
+    // with an unrelated changeset (e.g. a revert pair), and message alone
+    // has nothing to do with content. A partial file overlap is NOT a twin
+    // and stays a hard conflict.
+    let mut wanted: HashSet<String> = HashSet::with_capacity(chain.len());
+    let mut messages: Vec<String> = Vec::with_capacity(chain.len());
+    let mut post_trees: Vec<Option<Id>> = Vec::with_capacity(chain.len());
+    for &cs_id in &chain {
+        let cs = session.get_changeset(cs_id, "rebase --stack").await?;
+        wanted.insert(cs.message.clone());
+        messages.push(cs.message);
+        post_trees.push(session.root_tree(cs_id, "rebase --stack").await?);
+    }
+    let scan = twin_candidates(&session, &repo, parent, base, &wanted, "rebase --stack").await?;
+    // Candidate twins, then the staleness guard: a twin is only skipped
+    // when nothing after it rewrote the paths its element touched. Because
+    // the last twin's post-image tree subsumes every earlier element's
+    // effect, its guard must cover every path those elements touched —
+    // not just its own delta — so the prefix skip is as strict as a full
+    // replay would be.
+    let mut resolved: Vec<Option<Id>> = Vec::with_capacity(chain.len());
+    // Elements whose candidate twin was rejected because the new parent
+    // changed the same paths afterwards; the note for them is printed once
+    // the twin set (and therefore subsumption) is known, so stderr never
+    // claims a replay for an element the output reports as subsumed.
+    let mut stale: Vec<(Id, usize, Id)> = Vec::new();
+    let mut prefix_paths: HashSet<String> = HashSet::new();
+    for (i, &cs_id) in chain.iter().enumerate() {
+        for c in &session
+            .get_changeset(cs_id, "rebase --stack")
+            .await?
+            .changes
+        {
+            prefix_paths.insert(c.path.clone());
+            if let Some(src) = &c.src_path {
+                prefix_paths.insert(src.clone());
+            }
+        }
+        let mut twin = scan
+            .candidates
+            .get(&(messages[i].clone(), post_trees[i]))
+            .copied()
+            .filter(|twin| *twin != cs_id);
+        if let Some(t) = twin
+            && is_shared_history(&session, &repo, t, current, "rebase --stack").await?
+        {
+            // Shared history: the chain element itself or an earlier
+            // identical landing the lane already contains — never a twin
+            // main gained since the branch.
+            twin = None;
+        }
+        if let Some(t) = twin
+            && !twin_still_current(&session, t, parent, &prefix_paths, "rebase --stack").await?
+        {
+            stale.push((cs_id, i, t));
+            twin = None;
+        }
+        resolved.push(twin);
+    }
+    // The LAST twinned element subsumes the whole prefix: its post-image
+    // tree is the cumulative lane state after that element, so every
+    // earlier element's effect is in it too — main already carries them.
+    // Replaying such a prefix is exactly what conflicts: the pre-image it
+    // was made against differs from main's already-final content on the
+    // same paths. Only the suffix AFTER the last twin replays.
+    let applied_through = resolved.iter().rposition(|r| r.is_some());
+    let first_suffix = applied_through.map_or(0, |k| k + 1);
+    // Now that subsumption is known, say what actually happens to each
+    // stale candidate: an element inside the skipped prefix is reported as
+    // subsumed (never as replayed); one in the replayed suffix replays.
+    for (cs_id, i, twin) in stale {
+        if i < first_suffix {
+            eprintln!(
+                "note: {} {:?} was landed as {}, but {} changed the same \
+                 paths since; it lies inside the prefix subsumed by a later \
+                 twin and is not replayed",
+                cs_id.short(),
+                messages[i],
+                twin.short(),
+                parent.short(),
+            );
+        } else {
+            eprintln!(
+                "note: {} {:?} was landed as {}, but {} changed the same \
+                 paths since; replaying instead of skipping",
+                cs_id.short(),
+                messages[i],
+                twin.short(),
+                parent.short(),
+            );
+        }
+    }
+
+    let mut notes: Vec<String> = Vec::new();
+    for i in 0..first_suffix {
+        match resolved[i] {
+            Some(twin) => notes.push(format!(
+                "  {} {:?} already applied as {} (tree-equal, same message)\n",
+                chain[i].short(),
+                messages[i],
+                twin.short(),
+            )),
+            None => {
+                let last = resolved[applied_through.expect("a prefix has a last twin")]
+                    .expect("the last twinned element is resolved");
+                notes.push(format!(
+                    "  {} {:?} already applied — subsumed by {} (tree-equal, same message)\n",
+                    chain[i].short(),
+                    messages[i],
+                    last.short(),
+                ));
+            }
+        }
+    }
+
+    // Replay the elements that are NOT already applied. Each step's parent
+    // is the previous step's result; the first step replays onto the
+    // requested new parent. `Rebase` is atomic per changeset, and a
+    // failure at step i means steps i+1.. were never created — but steps
+    // 1..i-1 WERE (and each twin resolution moved nothing). That is the
+    // abort contract: the working copy never moves (still at `current`),
+    // and the partially replayed prefix is ordinary server content no ref
+    // points at, not a divergence.
+    //
+    // The suffix replays onto the NEW PARENT (or the previous replay),
+    // never onto the twin: the twin may sit below later main changes,
+    // which a rebase must build on rather than discard.
+    //
+    // The cap note goes here — before the replay loop can return early
+    // via `?` — not into a success return: a miss caused by the cap
+    // surfaces as the ordinary conflict, and that failure is exactly the
+    // case the note explains. It is conditional on something still
+    // having to replay: when every element resolved as a twin the
+    // truncation hid nothing this run needed, so the conflict-form note
+    // would be a false alarm.
+    if scan.truncated && first_suffix < chain.len() {
+        eprintln!(
+            "note: twin scan capped at {} changesets on {} — \
+             an already-applied copy further back would surface as a conflict",
+            scan.cap,
+            parent.short()
+        );
+    }
+    let mut replayed: Vec<(Id, Id)> = Vec::with_capacity(chain.len() - first_suffix);
+    let mut onto = parent;
+    for &cs_id in &chain[first_suffix..] {
+        let rebased = session
+            .client
+            .rebase(&repo, cs_id, onto)
+            .await
+            .map_err(|status| ClientError::Rpc {
+                command: "rebase --stack",
+                code: status.code(),
+                message: status.message().to_owned(),
+            })?;
+        replayed.push((cs_id, rebased));
+        onto = rebased;
+    }
+    // Whole stack applied: nothing replays, and the working copy lands on
+    // the new parent — git's own "patch already upstream, dropped"
+    // outcome, the branch ends at upstream. In the incident shape the tip
+    // twin IS the new parent (the hand-union is main's tip), so this is
+    // the twin; when main has moved past it, landing on main keeps the
+    // lane on main's latest state while nothing the lane wrote is lost
+    // (the twin is an ancestor of main). Either way a follow-up
+    // `bed publish` is a fast-forward no-op, never a rewind.
+    let tip = if first_suffix < chain.len() {
+        onto
+    } else {
+        parent
+    };
+    let tip_twin = (first_suffix == chain.len())
+        .then(|| resolved[chain.len() - 1].expect("the whole prefix is resolved"));
+
+    // The working-copy move, exactly the single-rebase one, at the tip.
+    let materialized =
+        move_to_changeset(&mut bed, &session, current, tip, "rebase --stack").await?;
+
+    if replayed.is_empty() {
+        let tip_twin = tip_twin.expect("no replay means the whole chain resolved");
+        let cs = session.get_changeset(tip_twin, "rebase --stack").await?;
+        notes.insert(
+            0,
+            format!(
+                "stack already applied — {} change(s) tree-equal and same-message; \
+                 the tip's twin is {} {:?}\n",
+                chain.len(),
+                tip_twin.short(),
+                cs.message,
+            ),
+        );
+        notes.push(format!(
+            "nothing replayed; working copy moved to {}{}\n",
+            tip.short(),
+            if tip == tip_twin {
+                " (the tip's twin)"
+            } else {
+                " (the new parent, past the twin)"
+            },
+        ));
+        return Ok(format!("{}{}", notes.concat(), materialized));
+    }
+    let links: Vec<String> = replayed
+        .iter()
+        .map(|(_, rebased)| rebased.short())
+        .collect();
+    let replay_line = format!("  {}\n", links.join(" -> "));
+    Ok(format!(
+        "rebased {} change(s) onto {} as {}, skipped {} already applied\n{}{}{}",
+        replayed.len(),
+        parent.short(),
+        tip.short(),
+        first_suffix,
+        notes.concat(),
+        replay_line,
+        materialized,
+    ))
+}
+
 /// `bed publish` — fast-forward a ref to the working copy's current changeset.
 ///
 /// `ref_name = None` publishes `main` (the classic form). A named ref is the
@@ -670,6 +1318,7 @@ pub async fn publish(
     force: bool,
 ) -> Result<String, ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
+    refuse_pending(&bed, "publish")?;
     let session = Session::open(&bed).await?;
     let repo = bed.config().repo.clone();
     let current = session.resolve_current_cs(&bed, "publish").await?;
@@ -727,6 +1376,47 @@ fn require_current_cs(bed: &WorkingCopy) -> Result<(), ClientError> {
         .ok_or(ClientError::NoCurrentCs)
 }
 
+/// Refuses a mutating ref/head command while offline commits are queued:
+/// moving the working copy's base before the queue drains would strand
+/// the pending chain off the new history. Works offline (queue state is
+/// local). A clean queue is a no-op.
+fn refuse_pending(bed: &WorkingCopy, command: &'static str) -> Result<(), ClientError> {
+    let pending = bed.queue()?.count()?;
+    if pending > 0 {
+        return Err(ClientError::PendingCommits { command, pending });
+    }
+    Ok(())
+}
+
+/// Refuses a read command whose target changeset is a pending tip: the
+/// changeset itself is local, but its parents may only exist on the
+/// server, and these commands answer from the server's walk. With no
+/// explicit target the working copy's current changeset is the check.
+fn refuse_pending_target(bed: &WorkingCopy, cs: Option<&str>) -> Result<(), ClientError> {
+    let queue = bed.queue()?;
+    let pending = queue.count()?;
+    if pending == 0 {
+        return Ok(());
+    }
+    let target = match cs {
+        Some(spec) => crate::revspec::CsOrRef::parse(spec)?.as_id(),
+        None => bed
+            .config()
+            .current_cs
+            .as_deref()
+            .and_then(|hex| Id::from_str(hex).ok()),
+    };
+    if let Some(id) = target
+        && queue.contains(id)?
+    {
+        return Err(ClientError::PendingCs {
+            cs: id.short(),
+            pending,
+        });
+    }
+    Ok(())
+}
+
 /// Resolves the changeset a read command should answer at: an explicit
 /// `<cs-or-ref>` when given, else the working copy's current changeset.
 async fn resolve_target(
@@ -756,8 +1446,12 @@ pub async fn log(
     if cs.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending tip's parents may only exist on the server; log answers
+    // from the server's walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, cs)?;
     let session = Session::open(&bed).await?;
     let cs_id = resolve_target(&session, &bed, cs, "log").await?;
+
     let summaries = session.log(cs_id, limit.unwrap_or(0), "log").await?;
     let entries: Vec<LogEntry> = summaries.iter().map(log_entry_of).collect();
     Ok(render::render_log(&entries))
@@ -810,6 +1504,10 @@ pub async fn diff(
     if a.is_none() {
         require_current_cs(&bed)?;
     }
+    // A pending side's tree may only exist on the server; diff answers
+    // from the server's tree walk, so it cannot serve one yet.
+    refuse_pending_target(&bed, a)?;
+    refuse_pending_target(&bed, b)?;
 
     // The no-argument form is context-aware: local modifications beat the
     // committed-diff fallback. Explicit arguments never consult the
@@ -1314,4 +2012,70 @@ fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, ClientError
                 r.cs_id.len()
             ))
         })
+}
+
+/// `bed mount <mountpoint>` — mount the current changeset read-only.
+///
+/// The mount is a *snapshot*: it reflects `current_cs` at mount time and
+/// does not track later ref movement. This command stays in the
+/// foreground serving the filesystem; Ctrl-C (SIGINT/SIGTERM) unmounts
+/// cleanly and leaves an ordinary directory behind. All fetches flow
+/// through the same cache-first path every other command uses, so
+/// `.bed/objects` stays bounded by what the mount actually read.
+pub async fn mount(state_dir: &Path, mountpoint: &Path) -> Result<(), ClientError> {
+    let bed = WorkingCopy::open(state_dir)?;
+    require_current_cs(&bed)?;
+    if !crate::mount::fuse_available() {
+        return Err(ClientError::MountUnavailable);
+    }
+    let handle = crate::mount::mount(&bed, mountpoint).await?;
+    let cs = Id::from_str(bed.config().current_cs.as_deref().expect("checked"))
+        .map_err(|_| ClientError::NoCurrentCs)?;
+    eprintln!(
+        "mounted {} read-only at {} — Ctrl-C to unmount",
+        cs.short(),
+        mountpoint.display()
+    );
+    wait_for_shutdown().await;
+    handle
+        .unmount()
+        .map_err(|e| ClientError::MountUnmount { source: e })?;
+    Ok(())
+}
+
+/// Blocks until SIGINT or SIGTERM arrives (the mount's foreground loop).
+async fn wait_for_shutdown() {
+    let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
+    let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+    let (mut sigint, mut sigterm) = match (sigint, sigterm) {
+        (Ok(i), Ok(t)) => (i, t),
+        _ => {
+            // No signal API on this platform: park until killed. The
+            // MountHandle's Drop still unmounts when the process dies
+            // via the kernel's connection teardown.
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+    };
+    tokio::select! {
+        _ = sigint.recv() => {}
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::path_overlaps;
+
+    #[test]
+    fn path_overlaps_covers_equal_and_nested_paths_only() {
+        assert!(path_overlaps("a/b", "a/b"));
+        assert!(path_overlaps("a", "a/b"));
+        assert!(path_overlaps("a/b", "a"));
+        // Siblings and shared prefixes that are not components do not.
+        assert!(!path_overlaps("a/b", "a/c"));
+        assert!(!path_overlaps("ab", "a"));
+        assert!(!path_overlaps("", "a"));
+        assert!(!path_overlaps("a", ""));
+    }
 }
