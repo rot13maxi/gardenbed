@@ -51,6 +51,38 @@ fn profile_of(bin: &std::path::Path) -> &'static str {
     }
 }
 
+/// Restores one source file's bytes and mtime when dropped — including while
+/// unwinding. The mutation phases below write a probe into `crates/server/src`
+/// and must never leave it behind: a leftover probe (same mtime) changes the
+/// source digest and makes the NEXT run's oracle refuse a good tree, which
+/// accumulated one probe per aborted attempt (dogfood #28).
+struct SourceGuard {
+    path: PathBuf,
+    content: Vec<u8>,
+    mtime: std::time::SystemTime,
+}
+
+impl SourceGuard {
+    fn capture(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            content: fs::read(path).expect("source readable"),
+            mtime: path
+                .metadata()
+                .and_then(|m| m.modified())
+                .expect("source mtime"),
+        }
+    }
+}
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        let _ = fs::write(&self.path, &self.content);
+        let _ =
+            filetime::set_file_mtime(&self.path, filetime::FileTime::from_system_time(self.mtime));
+    }
+}
+
 fn server_src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -79,8 +111,12 @@ fn server_bin_refuses_stale_and_trusts_override() {
              The override contract itself is still checked below; unset \
              BED_SERVER_BIN to exercise the staleness guard."
         );
-        // The override contract is the one property that IS reachable in
-        // this configuration — never skip it.
+        // Both remaining phases are reachable with an override set:
+        // `hermetic_oracles` never calls server_bin() (it builds a synthetic
+        // binary over a COPY of the sources), and the passthrough check is
+        // the override contract itself. Never skip them: the release canary
+        // is the configuration that must pin the refusal texts.
+        hermetic_oracles();
         override_passthrough();
         return;
     }
@@ -203,16 +239,14 @@ fn stale_binary_is_refused_with_fix_command() {
     // mtime into the future: newer than any build artifact. This is the
     // only test binary that touches server mtimes, and the mtime is put
     // back before the assert returns.
+    // Armed before the touch: a panic anywhere below restores the mtime.
+    let _guard = SourceGuard::capture(&marker);
     let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(future))
         .expect("touch lib.rs");
-    let result = std::panic::catch_unwind(server_bin);
-    filetime::set_file_mtime(
-        &marker,
-        filetime::FileTime::from_system_time(original_mtime),
-    )
-    .expect("restore lib.rs mtime");
-    let panic = result.expect_err("the stale binary must be refused");
+    let panic = std::panic::catch_unwind(server_bin).expect_err("the stale binary must be refused");
+    drop(_guard);
+    let _ = original_mtime;
     let msg = panic_message(&panic);
     assert!(
         msg.contains("STALE") && msg.contains("cargo build -p gardenbed-server"),
@@ -245,20 +279,20 @@ fn tree_state_stale_binary_is_refused_even_with_fresh_mtime() {
     // would trip the mtime oracle before the digest one is reached, so
     // the old mtime is held immediately after the write; the point is
     // that ONLY the digest can catch this probe.
+    // Armed BEFORE the write, so content and mtime return on every path —
+    // a panic, an OOM, or a kill-unwind must never leave the probe behind.
+    // The restore target mtime is main.rs's stamp (above), not lib.rs's, so
+    // a previously poisoned mtime cannot be recaptured.
+    let guard = SourceGuard::capture(&marker);
     let mut probe = original.clone();
     probe.extend_from_slice(b"\n// tree-state staleness probe\n");
     fs::write(&marker, &probe).expect("probe written");
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(restore_mtime))
         .expect("mtime held");
     let result = std::panic::catch_unwind(server_bin);
-    // Restore content AND mtime BEFORE interpreting the result — net-zero,
-    // and self-healing for a poisoned mtime (restore_mtime comes from
-    // main.rs, not the marker). An aborted run must never leave the probe
-    // behind: one deposit per attempt used to poison every later digest
-    // check in the tree.
-    fs::write(&marker, &original).expect("lib.rs restored");
-    filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(restore_mtime))
-        .expect("mtime restored");
+    // Restore before interpreting the result so a wrong answer cannot leave
+    // the probe behind either.
+    drop(guard);
     let panic = result.expect_err("tree-state-stale binary must be refused");
     let msg = panic_message(&panic);
     assert!(
