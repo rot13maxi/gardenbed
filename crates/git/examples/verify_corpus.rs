@@ -142,15 +142,20 @@ fn main() {
     assert!(!root.as_os_str().is_empty(), "--root required");
     assert!(!mirror.as_os_str().is_empty(), "--git required");
 
+    // Resolve the layout the way the server does (finding #27): the
+    // database FILE is the discriminator, so a pre-rename corpus
+    // (`seedbed.sqlite3` + `loam/objects`) is read in place and a
+    // repository named `loam` is not mistaken for that layout.
+    let layout = gardenbed_server::resolve_layout(&root);
     let objects: Arc<dyn ObjectStore> =
-        Arc::new(FsObjectStore::open(&root).expect("objects opens"));
+        Arc::new(FsObjectStore::open(&layout.objects).expect("objects opens"));
     let metadata: Arc<dyn gardenbed_store::MetadataStore> = Arc::new(
-        SqliteMetadataStore::open(&root.join("metadata.sqlite3")).expect("metadata opens"),
+        SqliteMetadataStore::open(&layout.metadata).expect("metadata opens"),
     );
     let engine = Engine::new(objects, metadata.clone());
     // A second, read-only handle for sampling queries (WAL readers coexist).
     let ro = rusqlite::Connection::open_with_flags(
-        root.join("metadata.sqlite3"),
+        &layout.metadata,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     )
     .expect("read-only metadata opens");
