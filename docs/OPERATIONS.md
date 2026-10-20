@@ -54,60 +54,67 @@ of assuming (dogfood #26). Run this BEFORE the publish in 1.2: a divergence
 caught here costs nothing, while the same divergence caught at push time means
 the bed publish and export already happened and the push is rejected.
 
-Two facts decide how the check works:
+What can be checked mechanically, and what cannot:
 
-- The git twin of a bed changeset lives in the server's `git_map`, which
-  **import** writes. A bed-native landing tip has no row at all — the normal
-  case for a lane that never went through git.
+- `git_map` rows are written by **import** only. Export computes git SHAs but
+  records none, so a bed-native landing tip — and the state git is left in by
+  the previous landing's export+push — has no row.
 - The GitHub remote belongs to the bare mirror `/home/user/code/gardenbed`,
   not to the chain checkout (`/home/user/bed-land` is a bed working copy with
   no `.git`), so every git command here runs with `-C <mirror>`.
 
-The check therefore compares `origin/main` against the twin of the **nearest
-ancestor of bed `main` that has a mapping row** — for an imported or
-already-exported tip that is `main` itself, and for a bed-native tip it is the
-last state git ever saw. If `origin` has moved past that point, git-side
-commits arrived without import, which is exactly #26.
+So the chain keeps a **recorded landing tip**: `LANDED_BED_TIP` and
+`LANDED_GIT_SHA`, taken from §1.3's export report and mapping row at the end of
+the previous landing (the landing note is the record; the mapping TSV is the
+machine copy). The check compares `origin/main` against that recorded SHA. A
+mapping row for bed `main` exists only when `main` came from an import, and in
+that case its row is the authority instead.
 
 ```sh
 ROOT=/home/user/gardenbed/arb            # canonical bed root (repo "default")
 MIRROR=/home/user/code/gardenbed         # bare mirror; origin lives here
 
-# Nearest mapped ancestor of bed main (main itself when it was imported).
-# `cs` is a BLOB, so hex() must be case-folded.
-GIT_TWIN=""
-while read -r cs; do
-    GIT_TWIN=$(sqlite3 "$ROOT/metadata.sqlite3" \
-        "select git_sha from git_map where lower(hex(cs)) like lower('$cs%');")
-    [ -n "$GIT_TWIN" ] && break
-done < <(bed log --cs refs/heads/main --limit 500 \
-             | awk '/^[0-9a-f]{16}  / {print $1}')
+# The twin of bed main, when main itself was imported (exact ref join; `cs`
+# is a BLOB, so the hex comparison is case-folded).
+MAIN_TWIN=$(sqlite3 "$ROOT/metadata.sqlite3" \
+    "select g.git_sha from refs r join git_map g on g.cs = r.cs
+      where r.name = 'refs/heads/main';")
 
-# origin as it actually is right now, not a stale local ref
+# Otherwise fall back to the previous landing's record (see the note above).
+# Leaving it empty makes the check report "cannot verify" instead of guessing.
+: "${LANDED_GIT_SHA:=}"
+
+EXPECTED=${MAIN_TWIN:-$LANDED_GIT_SHA}
 REMOTE=$(git -C "$MIRROR" ls-remote origin refs/heads/main | awk '{print $1}')
 
-test -n "$GIT_TWIN" || {
-    echo "FAIL: no git-mapping row within 500 changesets of bed main"
-    echo "      nothing on this lineage was ever imported or exported;"
-    echo "      check the remote by hand before pushing"
+test -n "$EXPECTED" || {
+    echo "FAIL: cannot verify: bed main has no git_map row and no recorded"
+    echo "      landing SHA. Set LANDED_GIT_SHA from the landing note (the"
+    echo "      mapping row recorded by the last export), or import the mirror"
+    echo "      so main gains a row, then re-run."
     exit 1
 }
-test "$GIT_TWIN" = "$REMOTE" || {
-    echo "FAIL: origin/main $REMOTE is not the twin of bed main's last"
-    echo "      git-visible ancestor ($GIT_TWIN)"
-    echo "      git-side commits arrived without import (or bed moved without export)"
-    echo "      resolve before publishing: import the git commits, then re-union"
+test "$EXPECTED" = "$REMOTE" || {
+    echo "FAIL: origin/main $REMOTE is not the expected tip $EXPECTED"
+    echo "      git-side commits arrived without import (or bed moved without"
+    echo "      export/push). Resolve before publishing: import the git commits"
+    echo "      and re-union, or export and push the bed ones."
     exit 1
 }
-echo "OK: origin/main matches bed main's last git-visible twin ($REMOTE)"
+echo "OK: origin/main is the expected tip ($REMOTE)"
 ```
 
-The 500-change-set bound is deliberate: a bed-native tip deeper than that from
-its last export is unusual, and the loop says so instead of guessing. A failure
-means the two sides diverged: import the git commits (or export and push the
-bed ones), hand-re-union if both moved, and only then continue. `ls-remote` is
-the authority, not a stale local ref: the mirror's `main` is only as fresh as
-its last fetch.
+A failure means the two sides diverged: import the git commits (or export and
+push the bed ones), hand-re-union if both moved, and only then continue.
+`ls-remote` is the authority, not a stale local ref: the mirror's `main` is only
+as fresh as its last fetch.
+
+**Record the landing tip at the end of every chain** (§1.3 exports it, §1.4
+verifies the mapping row against the mirror): storing `(bed tip, git sha)` in
+the landing note is what makes the next pre-publish check possible without
+importing the mirror back. If the record is lost, either re-import the mirror
+(which writes `git_map` rows for the exported tip) or reconstruct the SHA from
+the exported repository with `git rev-parse main`.
 
 ### 1.2 Advance bed `main` — `bed publish`, plain CAS form
 
