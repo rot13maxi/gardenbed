@@ -74,10 +74,14 @@ fn server_bin_refuses_stale_and_trusts_override() {
     // actionable message instead of failing after mutating sources.
     if let Ok(path) = std::env::var("BED_SERVER_BIN") {
         eprintln!(
-            "skipping the {path} oracle proof: BED_SERVER_BIN is set, and an \
+            "skipping the oracle proof: BED_SERVER_BIN is set ({path}), and an \
              override is trusted as-is (the oracles are deliberately inactive). \
-             Unset BED_SERVER_BIN to exercise the staleness guard."
+             The override contract itself is still checked below; unset \
+             BED_SERVER_BIN to exercise the staleness guard."
         );
+        // The override contract is the one property that IS reachable in
+        // this configuration — never skip it.
+        override_passthrough();
         return;
     }
     hermetic_oracles();
@@ -91,6 +95,13 @@ fn server_bin_refuses_stale_and_trusts_override() {
         "server_bin returns a file: {}",
         bin.display()
     );
+    override_passthrough();
+}
+
+/// The override trusts the caller as-is: no source walk at all. Runs in both
+/// the normal and the canary (override-set) configuration.
+fn override_passthrough() {
+    let bin = server_bin();
     // The override trusts the caller: point it at the same binary and the
     // guard must not walk sources at all.
     //

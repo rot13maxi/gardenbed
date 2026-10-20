@@ -70,10 +70,14 @@ fn daemon_bin_refuses_tree_state_stale_and_trusts_override() {
     // message rather than turning a correct harness configuration into a red.
     if let Ok(path) = std::env::var("BED_DAEMON_BIN") {
         eprintln!(
-            "skipping the {path} oracle proof: BED_DAEMON_BIN is set, and an \
+            "skipping the oracle proof: BED_DAEMON_BIN is set ({path}), and an \
              override is trusted as-is (the oracles are deliberately inactive). \
-             Unset BED_DAEMON_BIN to exercise the staleness guard."
+             The override contract itself is still checked below; unset \
+             BED_DAEMON_BIN to exercise the staleness guard."
         );
+        // `override_passthrough` manages the variable itself and is the only
+        // coverage of the override contract — never skip it.
+        override_passthrough();
         return;
     }
     hermetic_oracles();
