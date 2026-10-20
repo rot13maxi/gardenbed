@@ -57,55 +57,57 @@ the bed publish and export already happened and the push is rejected.
 Two facts decide how the check works:
 
 - The git twin of a bed changeset lives in the server's `git_map`, which
-  **import** writes. A bed-native landing tip has no row until it has been
-  imported (or was itself imported).
+  **import** writes. A bed-native landing tip has no row at all — the normal
+  case for a lane that never went through git.
 - The GitHub remote belongs to the bare mirror `/home/user/code/gardenbed`,
   not to the chain checkout (`/home/user/bed-land` is a bed working copy with
   no `.git`), so every git command here runs with `-C <mirror>`.
 
-So the check is:
+The check therefore compares `origin/main` against the twin of the **nearest
+ancestor of bed `main` that has a mapping row** — for an imported or
+already-exported tip that is `main` itself, and for a bed-native tip it is the
+last state git ever saw. If `origin` has moved past that point, git-side
+commits arrived without import, which is exactly #26.
 
 ```sh
 ROOT=/home/user/gardenbed/arb            # canonical bed root (repo "default")
 MIRROR=/home/user/code/gardenbed         # bare mirror; origin lives here
 
-# `bed log` prints the message too; take the id from the first line only
-BED_MAIN=$(bed log --cs refs/heads/main --limit 1 | head -n 1 | awk '{print $1}')
-
-# bed main's git twin, straight from the metadata the server keeps.
-# `cs` is a BLOB (hex() must be case-folded); join the REF rather than
-# prefix-matching ids (a prefix can match several rows).
-GIT_TWIN=$(sqlite3 "$ROOT/metadata.sqlite3" \
-    "select g.git_sha from refs r join git_map g on g.cs = r.cs
-      where r.name = 'refs/heads/main';")
+# Nearest mapped ancestor of bed main (main itself when it was imported).
+# `cs` is a BLOB, so hex() must be case-folded.
+GIT_TWIN=""
+while read -r cs; do
+    GIT_TWIN=$(sqlite3 "$ROOT/metadata.sqlite3" \
+        "select git_sha from git_map where lower(hex(cs)) like lower('$cs%');")
+    [ -n "$GIT_TWIN" ] && break
+done < <(bed log --cs refs/heads/main --limit 500 \
+             | awk '/^[0-9a-f]{16}  / {print $1}')
 
 # origin as it actually is right now, not a stale local ref
 REMOTE=$(git -C "$MIRROR" ls-remote origin refs/heads/main | awk '{print $1}')
 
 test -n "$GIT_TWIN" || {
-    echo "FAIL: no git-mapping row for refs/heads/main ($BED_MAIN)"
-    echo "      only IMPORT writes git_map; if this tip was just imported and the"
-    echo "      row is missing, the import did not record its mapping — inspect it"
-    echo "      before continuing (do not assume a later export will add one)."
+    echo "FAIL: no git-mapping row within 500 changesets of bed main"
+    echo "      nothing on this lineage was ever imported or exported;"
+    echo "      check the remote by hand before pushing"
     exit 1
 }
 test "$GIT_TWIN" = "$REMOTE" || {
-    echo "FAIL: origin/main $REMOTE is not bed main's twin $GIT_TWIN"
+    echo "FAIL: origin/main $REMOTE is not the twin of bed main's last"
+    echo "      git-visible ancestor ($GIT_TWIN)"
     echo "      git-side commits arrived without import (or bed moved without export)"
     echo "      resolve before publishing: import the git commits, then re-union"
     exit 1
 }
-echo "OK: origin/main matches bed main's twin ($REMOTE)"
+echo "OK: origin/main matches bed main's last git-visible twin ($REMOTE)"
 ```
 
-A failure means the two sides diverged: import the git commits (or export and
-push the bed ones), hand-re-union if both moved, and only then continue.
-`ls-remote` is the authority, not a stale local ref: the mirror's `main` is only
-as fresh as its last fetch. Note what this check deliberately does **not** do:
-`export` does not write `git_map`, so a missing row after an export is a real
-inconsistency in the import that created the tip, not something the export
-repairs — the mapping TSV from §1.3 is the export-side record, and §1.4 checks
-it against the mirror.
+The 500-change-set bound is deliberate: a bed-native tip deeper than that from
+its last export is unusual, and the loop says so instead of guessing. A failure
+means the two sides diverged: import the git commits (or export and push the
+bed ones), hand-re-union if both moved, and only then continue. `ls-remote` is
+the authority, not a stale local ref: the mirror's `main` is only as fresh as
+its last fetch.
 
 ### 1.2 Advance bed `main` — `bed publish`, plain CAS form
 
