@@ -310,6 +310,15 @@ kill window deterministic (gate the server's `CreateChangeset` handler on a test
 or kill on a server-side marker that is provably before the state move) rather than
 racing a counter poll. Owner: unassigned (test-infra; #16/#19 class).
 
+**Second member of the same family (2026-10-20, found across three deployed-pair
+canary runs):** `crates/bed/tests/resumability.rs::killed_mid_fetch_resumes_with_zero_duplicates`
+rolled once in a 243-test run (242/1) and was green 2/2 solo and solo-green at
+33.99 s with no code change between the runs. Same mechanism class — a SIGKILL
+racing a window that the test observes through counters — so it is recorded here
+as family, not as a separate defect. Both tests share one eventual fix (a
+deterministic kill window, e.g. a server-side test hook), which is better taken
+as one consolidated change than per-test patching.
+
 ## Dogfood finding #26 (2026-10-19) — the chain has no divergence detection until push
 
 Git-native commits landed on `origin/main` while bed `main` stood still: three
