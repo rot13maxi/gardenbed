@@ -89,6 +89,31 @@ impl Drop for SourceGuard {
     }
 }
 
+/// Restores `marker`'s mtime to its untouched sibling `main.rs`'s stamp when it
+/// is NEWER — a stamp an aborted run left behind. Content is untouched; the
+/// phase's own guard handles that.
+fn heal_marker_stamp(src: &Path, marker: &Path) {
+    let Some(true_stamp) = src
+        .join("main.rs")
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+    else {
+        return;
+    };
+    let Ok(current) = marker.metadata().and_then(|m| m.modified()) else {
+        return;
+    };
+    if current > true_stamp {
+        let _ = filetime::set_file_mtime(marker, filetime::FileTime::from_system_time(true_stamp));
+        eprintln!(
+            "healed a poisoned source stamp on {} (an earlier aborted run left it \
+             newer than main.rs; restoring the true commit-time stamp)",
+            marker.display()
+        );
+    }
+}
+
 fn server_src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -238,6 +263,10 @@ fn hermetic_oracles() {
 fn stale_binary_is_refused_with_fix_command() {
     let src = server_src_dir();
     let marker = src.join("lib.rs");
+    // A stamp an ABORTED earlier run left in the future would make the very
+    // first server_bin() refuse (STALE) before any guard is armed, and the
+    // poison would be self-sustaining. Heal it against the untouched sibling.
+    heal_marker_stamp(&src, &marker);
     // Armed before the touch: a panic anywhere below restores the mtime.
     // The restore stamp is main.rs's (an untouched sibling), not lib.rs's own
     // — re-capturing a poisoned stamp would preserve the poison.

@@ -201,6 +201,11 @@ fn hermetic_oracles() {
 fn real_source_mutations() {
     let src = daemon_src_dir();
     let marker = src.join("lib.rs");
+    // Self-heal a stamp an ABORTED earlier run may have left in the future:
+    // the first daemon_bin() below legitimately refuses a source stamped
+    // after the binary, and without this the poison would be self-sustaining
+    // (this is the class the guards exist to prevent elsewhere).
+    heal_marker_stamp(&src, &marker);
     // Locate the fresh binary ONCE, before any mutation: the remedy test
     // needs a PATH (calling daemon_bin() on the stale state it builds
     // would panic by design).
@@ -253,19 +258,14 @@ fn real_source_mutations() {
         bin.display()
     );
     // mtime oracle on the real binary: a source stamped into the future.
-    let original_marker_mtime = marker
-        .metadata()
-        .and_then(|m| m.modified())
-        .expect("lib.rs stat");
+    // Armed BEFORE the touch so a panic (or a wrong answer) restores the
+    // stamp; the restore value comes from the untouched sibling main.rs.
+    let mtime_guard = Restore::capture(&src);
     let future = SystemTime::now() + Duration::from_secs(3600);
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(future))
         .expect("touch lib.rs");
     let result = std::panic::catch_unwind(daemon_bin);
-    filetime::set_file_mtime(
-        &marker,
-        filetime::FileTime::from_system_time(original_marker_mtime),
-    )
-    .expect("restore lib.rs mtime");
+    drop(mtime_guard);
     let panic = result.expect_err("the stale binary must be refused");
     let msg = panic_message(&panic);
     assert!(
@@ -441,15 +441,22 @@ struct Restore {
 }
 
 impl Restore {
+    /// Captures every source's content, with ONE restore stamp taken from the
+    /// untouched sibling `main.rs`. bed materializes all sources with
+    /// commit-time mtimes, so that stamp is the true one for all of them —
+    /// and, unlike each file's own stamp, it cannot be poisoned: a crashed
+    /// earlier run may have left `lib.rs` stamped NOW or in the future, and
+    /// re-capturing that would faithfully restore the poison (self-sustaining).
     fn capture(src: &Path) -> Self {
+        let single_stamp = src
+            .join("main.rs")
+            .metadata()
+            .and_then(|m| m.modified())
+            .expect("main.rs mtime is the true source stamp");
         let mut files = Vec::new();
         for path in walk(src) {
             let content = fs::read(&path).expect("source readable");
-            let mtime = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .expect("source mtime");
-            files.push((path, content, mtime));
+            files.push((path, content, single_stamp));
         }
         Self {
             files,
@@ -515,6 +522,32 @@ impl Drop for Restore {
 }
 
 /// Every regular file under `dir`, recursively.
+/// Restores `marker`'s mtime to its untouched sibling `main.rs`'s stamp when
+/// it is NEWER, i.e. poisoned by an aborted run. Content is left alone: a
+/// leftover probe is restored by the phase's own content guard, and this
+/// helper runs before anything is written.
+fn heal_marker_stamp(src: &Path, marker: &Path) {
+    let Some(true_stamp) = src
+        .join("main.rs")
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+    else {
+        return;
+    };
+    let Ok(current) = marker.metadata().and_then(|m| m.modified()) else {
+        return;
+    };
+    if current > true_stamp {
+        let _ = filetime::set_file_mtime(marker, filetime::FileTime::from_system_time(true_stamp));
+        eprintln!(
+            "healed a poisoned source stamp on {} (an earlier aborted run left it \
+             newer than main.rs; restoring the true commit-time stamp)",
+            marker.display()
+        );
+    }
+}
+
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
