@@ -421,7 +421,7 @@ fn run_export(
     let name = repo.unwrap_or(gardenbed_server::repos::DEFAULT_REPO);
     let set =
         gardenbed_server::repos::RepoSet::new(root, gardenbed_server::repos::DEFAULT_MAX_REPOS);
-    let dir = set.repo_dir_for(name)?;
+    let dir = set.existing_repo_dir_for(name)?;
     Repo::validate_layout(&dir)?;
     // Open the same stores the server would: a pre-rename root
     // (`seedbed.sqlite3` + `loam/objects`) must not be read as an empty

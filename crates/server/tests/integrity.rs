@@ -606,6 +606,9 @@ fn an_empty_root_still_initializes_as_the_current_layout() {
 fn pre_rename_store(root: &std::path::Path) {
     let loam = root.join("loam");
     std::fs::create_dir_all(loam.join("objects")).unwrap();
+    // Create the pre-rename database first: the FILE is the discriminator
+    // (a bare `loam/objects` is an ordinary repository store, not a layout).
+    drop(gardenbed_store::SqliteMetadataStore::open(&root.join("seedbed.sqlite3")).unwrap());
     // `Repo::open` resolves the pre-rename layout and writes real objects
     // (a bare `Repo::new` over fresh stores cannot resolve blob content).
     let repo = Repo::open(root).expect("pre-rename root opens");
@@ -761,5 +764,83 @@ fn moving_a_pre_rename_root_moves_the_real_store() {
     assert!(
         reopened.get_ref("main").unwrap().is_some(),
         "history must survive the move"
+    );
+}
+
+#[test]
+fn a_repository_named_loam_does_not_masquerade_as_the_pre_rename_layout() {
+    // `loam/objects` is a normal repository store, not proof of the
+    // pre-rename layout: keying on it made `default` resolve to the
+    // multi-repo root and hid every sibling from the served list.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    for name in ["alpha", "loam"] {
+        let repo_root = root.join(name);
+        std::fs::create_dir_all(&repo_root).unwrap();
+        let repo = Repo::open(&repo_root).expect("repository opens");
+        repo.put_blob(b"x").unwrap();
+        let head = commit(
+            &repo,
+            &changeset(
+                vec![],
+                vec![change("f", Op::Add, Some(b"x"), Mode::Regular, None)],
+                "seed",
+            ),
+        );
+        repo.cas_ref("main", None, head).unwrap();
+    }
+    let set = gardenbed_server::repos::RepoSet::new(&root, 8);
+    let served = set.served_names();
+    assert_eq!(
+        served,
+        vec!["alpha".to_owned(), "loam".to_owned()],
+        "both repositories must be served (a repo named loam is not the layout)"
+    );
+    // `default` is not a repository here and must not resolve to the root.
+    assert!(
+        set.existing_repo_dir_for("default").is_err(),
+        "default must not resolve to a multi-repo root"
+    );
+}
+
+#[test]
+fn exporting_an_unknown_repository_is_refused_not_created() {
+    // A mistyped `--repo` used to initialize an empty repository and export
+    // 0 commits with exit 0.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    let repo_root = root.join("alpha");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    let repo = Repo::open(&repo_root).expect("repository opens");
+    repo.put_blob(b"x").unwrap();
+    let head = commit(
+        &repo,
+        &changeset(
+            vec![],
+            vec![change("f", Op::Add, Some(b"x"), Mode::Regular, None)],
+            "seed",
+        ),
+    );
+    repo.cas_ref("main", None, head).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["export", "--root"])
+        .arg(&root)
+        .args(["--repo", "nope", "--into"])
+        .arg(dir.path().join("out.git"))
+        .output()
+        .expect("export runs");
+    assert!(
+        !out.status.success(),
+        "an unknown repository must be refused"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("not found") && stderr.contains("alpha"),
+        "the refusal names the served repositories: {stderr}"
+    );
+    assert!(
+        !root.join("nope").exists(),
+        "export must not create the unknown repository"
     );
 }
