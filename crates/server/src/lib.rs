@@ -219,15 +219,21 @@ impl std::fmt::Debug for Repo {
 /// The pre-rename layout is `<root>/loam/objects` +
 /// `<root>/seedbed.sqlite3`; the formats are identical (same schema, same
 /// envelopes), so the historical names are resolved rather than refused.
-struct Layout {
+pub struct Layout {
     /// Root passed to `FsObjectStore::open` (it appends `objects/`).
-    objects: std::path::PathBuf,
+    pub objects: std::path::PathBuf,
     /// The metadata database file.
-    metadata: std::path::PathBuf,
-    _private: (),
+    pub metadata: std::path::PathBuf,
 }
 
-fn resolve_layout(root: &Path) -> Layout {
+/// Where `root`'s stores live: the current layout, or the pre-rename
+/// (`seedbed.sqlite3` + `loam/objects`) layout the same data may still use.
+///
+/// Public because every one-shot administrative path (`import`, `export`,
+/// `gc`, `move`, the web/MCP entry points) must open the *same* stores the
+/// server would: hardcoding `metadata.sqlite3` against a pre-rename root
+/// silently opens an empty repository beside the real one.
+pub fn resolve_layout(root: &Path) -> Layout {
     // The pre-rename layout wins only when it is actually present: an empty
     // or fresh root must initialize as the current layout.
     let pre_rename =
@@ -237,13 +243,11 @@ fn resolve_layout(root: &Path) -> Layout {
         Layout {
             objects: root.to_path_buf(),
             metadata: root.join("metadata.sqlite3"),
-            _private: (),
         }
     } else {
         Layout {
             objects: root.join("loam"),
             metadata: root.join("seedbed.sqlite3"),
-            _private: (),
         }
     }
 }

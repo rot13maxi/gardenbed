@@ -593,3 +593,173 @@ fn an_empty_root_still_initializes_as_the_current_layout() {
     assert!(dir.path().join("objects").is_dir());
     assert!(repo.get_ref("main").unwrap().is_none());
 }
+
+// ------------------------------------------------- pre-rename layout (upstream)
+//
+// The pre-rename layout (`seedbed.sqlite3` + `loam/objects`) is the same store
+// under historical names. `Repo::open` resolves it; every OTHER entry point
+// must resolve it the same way, or it reads (and creates) an empty current
+// layout store beside the real one. These tests pin the entry points that had
+// drifted: export/import, gc's mark and sweep walk, and `move`.
+
+/// Builds a seeded pre-rename store under `root` and returns it.
+fn pre_rename_store(root: &std::path::Path) {
+    let loam = root.join("loam");
+    std::fs::create_dir_all(loam.join("objects")).unwrap();
+    // `Repo::open` resolves the pre-rename layout and writes real objects
+    // (a bare `Repo::new` over fresh stores cannot resolve blob content).
+    let repo = Repo::open(root).expect("pre-rename root opens");
+    // `commit` passes no inline blobs, so the content must be in the store.
+    repo.put_blob(b"pre-rename").unwrap();
+    let head = commit(
+        &repo,
+        &changeset(
+            vec![],
+            vec![change(
+                "f",
+                Op::Add,
+                Some(b"pre-rename"),
+                Mode::Regular,
+                None,
+            )],
+            "pre-rename seed",
+        ),
+    );
+    repo.cas_ref("main", None, head).unwrap();
+    // The seed must have gone to the historical paths, not a new store.
+    assert!(root.join("seedbed.sqlite3").is_file());
+    assert!(!root.join("metadata.sqlite3").exists());
+}
+
+#[test]
+fn exported_pre_rename_root_is_not_read_as_an_empty_repository() {
+    // `gardenbed-server export` used to hardcode `<dir>/metadata.sqlite3` and
+    // `<dir>/objects`, so a pre-rename root exported zero commits and left a
+    // shadow current-layout store behind.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    let repo_root = root.join("default");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    pre_rename_store(&repo_root);
+
+    let into = dir.path().join("out.git");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["export", "--root"])
+        .arg(&root)
+        .args(["--repo", "default", "--into"])
+        .arg(&into)
+        .output()
+        .expect("export runs");
+    assert!(
+        out.status.success(),
+        "export failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !stdout.starts_with("0 commits"),
+        "the pre-rename store must export its history, got: {stdout}"
+    );
+    // And it must not shadow the real store with an empty one.
+    assert!(
+        !repo_root.join("metadata.sqlite3").exists(),
+        "export created a shadow current-layout database beside seedbed.sqlite3"
+    );
+    assert!(
+        !repo_root.join("objects").exists(),
+        "export created a shadow current-layout object store beside loam/objects"
+    );
+}
+
+#[test]
+fn gc_mark_and_sweep_walk_the_pre_rename_object_store() {
+    // The mark used to read `<root>/metadata.sqlite3` and the sweep walked
+    // `<root>/objects`, so a pre-rename store reported 0 scanned / 0 live.
+    let dir = tempfile::tempdir().unwrap();
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    pre_rename_store(&repo_root);
+    let on_disk = walk_count(&repo_root.join("loam").join("objects"));
+    assert!(on_disk > 0, "the fixture has object files");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["gc", "--root"])
+        .arg(&repo_root)
+        .args(["--dry-run"])
+        .output()
+        .expect("gc runs");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    let scanned: u64 = text
+        .split("object(s) scanned")
+        .next()
+        .and_then(|s| s.trim().rsplit(' ').next())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert_eq!(
+        scanned, on_disk,
+        "gc must scan the pre-rename object store (report: {text})"
+    );
+    assert!(
+        text.contains(&format!("{on_disk} live")),
+        "every object must be live in the pre-rename mark (report: {text})"
+    );
+}
+
+/// Number of object files under an `objects/` root.
+fn walk_count(objects: &std::path::Path) -> u64 {
+    let mut n = 0u64;
+    let mut stack = vec![objects.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.file_name().is_some_and(|f| f != "pack") {
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+#[test]
+fn moving_a_pre_rename_root_moves_the_real_store() {
+    // `move` renamed only the current-layout names, so a pre-rename root
+    // produced an empty destination while printing "history byte-identical".
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("server");
+    std::fs::create_dir_all(&root).unwrap();
+    pre_rename_store(&root);
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .args(["move", "--root"])
+        .arg(&root)
+        .args(["--from", "default", "--into", "moved"])
+        .output()
+        .expect("move runs");
+    assert!(
+        out.status.success(),
+        "move failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let moved = root.join("moved");
+    assert!(
+        moved.join("seedbed.sqlite3").is_file() || moved.join("metadata.sqlite3").is_file(),
+        "the moved repository has no metadata store"
+    );
+    assert!(
+        walk_count(&moved.join("loam").join("objects")) > 0
+            || walk_count(&moved.join("objects")) > 0,
+        "the moved repository has no objects"
+    );
+    // The moved repository must open and keep its history.
+    let reopened = Repo::open(&moved).expect("moved repository opens");
+    assert!(
+        reopened.get_ref("main").unwrap().is_some(),
+        "history must survive the move"
+    );
+}

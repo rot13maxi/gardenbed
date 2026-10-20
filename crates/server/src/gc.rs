@@ -464,7 +464,7 @@ pub fn run(root: &Path, opts: Options, _lock: Option<&File>) -> Result<GcReport,
     let swept_clean = opts.dry_run || !mark.ingest_landed()?;
 
     walk_shards(
-        &root.join("objects"),
+        &mark.objects_root().join("objects"),
         cutoff,
         opts.dry_run,
         &mut stats,
@@ -605,6 +605,10 @@ pub struct Mark {
     /// [`WRITE_BATCH`]; empty once [`Mark::materialize`] returns, which is
     /// what makes the sweep's `gc_live` reads observe the complete mark.
     live_buf: Vec<[u8; 32]>,
+    /// The object-store root the mark was built for (the current layout
+    /// root, or the pre-rename `<root>/loam`): the sweep must walk the same
+    /// store the mark read.
+    objects_root: PathBuf,
 }
 
 impl Mark {
@@ -614,7 +618,13 @@ impl Mark {
     /// `repo.lock` (GC is the only writer); `false` is live mode, where
     /// [`Mark::ingest_landed`] guards the sweep.
     pub fn materialize(root: &Path, offline: bool) -> Result<Self, StoreError> {
-        let db = root.join("metadata.sqlite3");
+        // Resolve the layout the same way `Repo::open` does: a pre-rename
+        // root stores its database at `seedbed.sqlite3`, and reading the
+        // current-layout path there would open (and create) an empty shadow
+        // database beside the real one — a mark over no changesets.
+        let layout = crate::resolve_layout(root);
+        let db = layout.metadata.clone();
+        let objects_root = layout.objects.clone();
         // Read-write: force mode's sweep unlinks inside BEGIN IMMEDIATE
         // write transactions (see `unlink_in_write_tx`) — the same lock
         // a changeset commit takes, which is what makes the check→unlink
@@ -665,10 +675,18 @@ impl Mark {
             offline,
             watermark: 0,
             live_buf: Vec::new(),
+            objects_root,
         };
         mark.watermark = mark.read_generation()?;
         mark.build(root)?;
         Ok(mark)
+    }
+
+    /// The object-store root this mark was built for (the current layout
+    /// root, or the pre-rename `<root>/loam`); the sweep walks its
+    /// `objects/` subtree, exactly the store the mark read.
+    fn objects_root(&self) -> &Path {
+        &self.objects_root
     }
 
     /// Ingest generation: moves on any changeset or ref mutation. Used
@@ -877,7 +895,7 @@ impl Mark {
         // invariant (one queue entry per distinct tree) is preserved; the
         // extra memory is at most `WRITE_BATCH` ids (128 KiB), not the
         // edge count.
-        let objects = open_objects(root)?;
+        let objects = open_objects(&crate::resolve_layout(root).objects)?;
         let mut queue: VecDeque<Id> = VecDeque::new();
         let mut claim_buf: Vec<[u8; 32]> = Vec::with_capacity(WRITE_BATCH);
         for chunk in self.pending_tree_ids()?.chunks(WRITE_BATCH) {

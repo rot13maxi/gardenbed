@@ -423,8 +423,12 @@ fn run_export(
         gardenbed_server::repos::RepoSet::new(root, gardenbed_server::repos::DEFAULT_MAX_REPOS);
     let dir = set.repo_dir_for(name)?;
     Repo::validate_layout(&dir)?;
-    let objects = Arc::new(FsObjectStore::open(&dir)?);
-    let metadata = Arc::new(SqliteMetadataStore::open(&dir.join("metadata.sqlite3"))?);
+    // Open the same stores the server would: a pre-rename root
+    // (`seedbed.sqlite3` + `loam/objects`) must not be read as an empty
+    // current-layout repository, and must not be shadowed by one.
+    let layout = gardenbed_server::resolve_layout(&dir);
+    let objects = Arc::new(FsObjectStore::open(&layout.objects)?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&layout.metadata)?);
     let opts = gardenbed_git::ExportOptions { refs };
     let report = gardenbed_git::export_to_path(into, objects, metadata, &opts)?;
     if let Some(path) = mapping {
@@ -473,8 +477,9 @@ fn run_import(
     // import refuses to start while gc holds the lock — the same
     // contract serve already honors.
     let _lock = gardenbed_server::gc::lock_shared_blocking(&dir)?;
-    let objects = Arc::new(FsObjectStore::open(&dir)?);
-    let metadata = Arc::new(SqliteMetadataStore::open(&dir.join("metadata.sqlite3"))?);
+    let layout = gardenbed_server::resolve_layout(&dir);
+    let objects = Arc::new(FsObjectStore::open(&layout.objects)?);
+    let metadata = Arc::new(SqliteMetadataStore::open(&layout.metadata)?);
     let engine = gardenbed_derive::Engine::new(objects.clone(), metadata.clone());
     let opts = git_bridge::ImportOptions {
         detect_renames,

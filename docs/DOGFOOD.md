@@ -332,9 +332,47 @@ than assume.
 Mitigation (landed with this entry): the pre-publish step MUST compare
 `git ls-remote origin main` against the git twin of bed `main` (the
 git-mapping row for the bed tip) and refuse with a named error before anything
-moves — not discover the divergence at push time. Until that check is scripted
-into the chain, the operator runs it by hand as step 1.5. Second instance of
-this class on 2026-10-19 (the first was the same day's mid-sweep rewind).
+moves — not discover the divergence at push time. It is scripted into the
+runbook as step 1.1b ([OPERATIONS.md](OPERATIONS.md)), before the publish.
+Second instance of this class on 2026-10-19 (the first was the same day's
+mid-sweep rewind).
+
+## Dogfood finding #27 (2026-10-19) — "pre-rename layout opens in place" left every one-shot path behind
+
+The pre-rename-layout commit (`0ca2e4d2d`) taught `Repo::open`/`RepoSet` to
+resolve `<root>/seedbed.sqlite3` + `<root>/loam/objects` as the same store under
+historical names, and tested exactly that entry point. Every OTHER store open
+kept the current-layout paths, so on a pre-rename root (the shape of the
+pinned kernel corpus):
+
+- `gardenbed-server export` printed `0 commits … 0 ref(s)` and exited 0, then
+  **created** `<root>/metadata.sqlite3` + `<root>/objects` — an empty shadow
+  store. Because the resolver prefers the current layout whenever that file
+  exists, the shadow then hid the real history: a server on that root served
+  `no ref main`.
+- `gardenbed-server gc --dry-run` read the shadow database and failed with
+  `… is not a gardenbed repository`, after creating it; with the shadow gone it
+  scanned 0 objects (the sweep walked `<root>/objects`, the mark read
+  `metadata.sqlite3`).
+- `gardenbed-server import` wrote into the new shadow store, splitting one
+  repository across two stores.
+- `gardenbed-server move` took the legacy branch, whose rename list was
+  current-layout only: nothing moved, and it still printed `moved repository
+  … history byte-identical` (an empty destination beside the untouched
+  store).
+- A repository literally named `loam` in a multi-repo root was read as the
+  pre-rename layout (`loam/objects` matched), so the root served only
+  `default` and every sibling disappeared from the served list.
+
+Found by the re-union review of this sweep. Class: a layout-resolution rule was
+added to one entry point and not to the six others that open the same stores —
+the tests covered the rule, not its reach. Fix (landed with this entry): one
+public `resolve_layout`, used by `Repo::open`, `import`, `export`, `gc` (mark,
+sweep walk and closure walk), `move` (including the rename list), and
+`checkpoint`; the pre-rename predicate keys on the database file, not on a
+`loam/objects` directory, so a repo named `loam` stays a repo. Pinned by three
+subprocess-level tests in `crates/server/tests/integrity.rs` (export/import,
+gc scan+live counts, move keeps history) that fail on the pre-fix tree.
 
 ## Backlog — product fixes from dogfood findings
 
