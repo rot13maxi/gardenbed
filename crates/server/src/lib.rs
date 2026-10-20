@@ -44,6 +44,19 @@ pub mod repos;
 /// dogfood finding #12's core).
 pub const SRC_DIGEST: &str = env!("GARDENBED_SERVER_SRC_DIGEST");
 
+/// The fingerprint carried *inside the binary's bytes*, as a marker the
+/// test harness greps for in the located executable: `GARDENBED_SERVER_
+/// SRC_DIGEST:<hex>`. [`SRC_DIGEST`] alone is linked into any crate that
+/// reads it (the test binary!), so it cannot prove which tree the
+/// *located* `gardenbed-server` file was built from. Keeping the marker
+/// in this crate's rodata — and referencing it from the binary's `main`
+/// — puts the string inside `target/*/gardenbed-server`, where a
+/// different tree's binary will carry a different marker.
+pub const SRC_DIGEST_MARKER: &str = concat!(
+    "GARDENBED_SERVER_SRC_DIGEST:",
+    env!("GARDENBED_SERVER_SRC_DIGEST")
+);
+
 /// Largest blob accepted inline on `CreateChangeset` (1 MiB); larger bodies
 /// must be uploaded with `PutBlob` first (v0.1.md §5).
 pub const MAX_INLINE_BLOB_LEN: usize = 1 << 20;

@@ -98,21 +98,68 @@ pub fn bed_async(dir: &Path, args: &[&str]) -> tokio::process::Child {
 /// (dogfood finding #12). Two staleness oracles, both loud:
 ///
 /// * mtime: the binary must be no older than the newest source;
-/// * content digest: the binary's embedded build fingerprint
-///   (`gardenbed_server::SRC_DIGEST`, hashed by `crates/server/build.rs`)
-///   must equal the same digest computed over the *current* sources —
-///   mtime alone is blind to tree-state staleness (`bed switch`
-///   materializes sources with commit-time mtimes, so a binary built
-///   from different tree state can pass a fresh mtime).
+/// * content fingerprint read FROM THE BINARY'S OWN BYTES: the located
+///   executable must contain the marker
+///   `GARDENBED_SERVER_SRC_DIGEST:<hex>` (a `&'static str` in
+///   `gardenbed_server::SRC_DIGEST_MARKER`, referenced from the bin's
+///   `main` so it lands in rodata), and `<hex>` must equal the digest
+///   computed over the *current* sources.
+///
+/// The fingerprint must be read from the file: the crate's `SRC_DIGEST`
+/// const is linked into the **test** binary, so comparing it would always
+/// compare the working copy with itself and accept a binary built from
+/// other tree state — `bed switch` materializes sources with commit-time
+/// mtimes, so mtime alone cannot see that either.
 ///
 /// `BED_SERVER_BIN` overrides skip both — an externally provided binary
 /// is trusted as-is.
 pub fn server_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("BED_SERVER_BIN") {
+    locate_guarded_bin(&BinSpec {
+        name: "gardenbed-server",
+        override_var: "BED_SERVER_BIN",
+        crate_dir: "server",
+        digest_marker_prefix: DIGEST_MARKER_PREFIX_SERVER,
+        build_cmd: "cargo build -p gardenbed-server",
+    })
+}
+
+/// The `..`-free marker prefixes the build scripts' digest is embedded
+/// under; `locate_guarded_bin` scans the located binary for one of them.
+pub const DIGEST_MARKER_PREFIX_SERVER: &str = "GARDENBED_SERVER_SRC_DIGEST:";
+pub const DIGEST_MARKER_PREFIX_DAEMON: &str = "GARDENBED_DAEMON_SRC_DIGEST:";
+
+/// One sibling binary located by the harness: its name, the env override
+/// that bypasses the staleness oracles, the crate whose `src/` is the
+/// source of truth, and the marker prefix its build embeds.
+struct BinSpec {
+    name: &'static str,
+    override_var: &'static str,
+    /// Crate directory under `crates/` (its `src/` is hashed).
+    crate_dir: &'static str,
+    /// The prefix of the fingerprint marker embedded in the binary
+    /// (`GARDENBED_<CRATE>_SRC_DIGEST:`), directly followed by the hex.
+    digest_marker_prefix: &'static str,
+    /// The exact rebuild command the STALE panic text names.
+    build_cmd: &'static str,
+}
+
+/// The one implementation of the two-oracle staleness guard shared by
+/// `server_bin()` and `daemon_bin()`. The override in `spec.override_var`
+/// is trusted as-is (existence only); otherwise each present candidate is
+/// checked for mtime and tree-state freshness before being returned.
+fn locate_guarded_bin(spec: &BinSpec) -> PathBuf {
+    let BinSpec {
+        name,
+        override_var,
+        crate_dir,
+        digest_marker_prefix,
+        build_cmd,
+    } = *spec;
+    if let Ok(path) = std::env::var(override_var) {
         let path = PathBuf::from(path);
         assert!(
             path.is_file(),
-            "BED_SERVER_BIN points at {path:?}, not a file"
+            "{override_var} points at {path:?}, not a file"
         );
         return path;
     }
@@ -120,89 +167,182 @@ pub fn server_bin() -> PathBuf {
     let workspace_target = std::env::var("CARGO_TARGET_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| manifest.join("..").join("..").join("target"));
-    let server_src = manifest
+    let src = manifest
         .join("..")
-        .join("server")
+        .join(crate_dir)
         .join("src")
         .canonicalize()
-        .expect("crates/server/src exists next to crates/bed");
+        .unwrap_or_else(|e| panic!("crates/{crate_dir}/src exists next to crates/bed: {e}"));
     let profiles: &[&str] = if cfg!(debug_assertions) {
         &["debug", "release"]
     } else {
         &["release", "debug"]
     };
     for profile in profiles {
-        let candidate = workspace_target.join(profile).join("gardenbed-server");
+        let candidate = workspace_target.join(profile).join(name);
         if !candidate.is_file() {
             continue;
         }
-        let binary_age = candidate
-            .metadata()
-            .and_then(|m| m.modified())
-            .expect("gardenbed-server binary mtime");
-        let mut src_age = None;
-        for entry in walk_files(&server_src) {
-            let Ok(age) = entry.metadata().and_then(|m| m.modified()) else {
-                continue;
-            };
-            if src_age.is_none_or(|age0| age > age0) {
-                src_age = Some(age);
-            }
+        if let Err(msg) = check_binary_against_sources(
+            name,
+            crate_dir,
+            build_cmd,
+            digest_marker_prefix,
+            &candidate,
+            &src,
+            profile,
+        ) {
+            panic!("{msg}");
         }
-        let src_age = src_age.unwrap_or_else(|| {
-            panic!(
-                "no source files found under {} — staleness check is broken",
-                server_src.display()
-            )
-        });
-        assert!(
-            src_age <= binary_age,
-            "gardenbed-server binary under {} is STALE — it is older than \
-             crates/server sources (dogfood finding #12: `cargo test -p \
-             gardenbed` does not rebuild it). Rebuild first: `cargo build \
-             -p gardenbed-server`",
-            candidate.display()
-        );
-        assert!(
-            current_server_digest(&server_src) == gardenbed_server::SRC_DIGEST,
-            "gardenbed-server binary under {} was built from DIFFERENT \
-             server sources (its embedded build fingerprint does not match \
-             the working copy's crates/server/src — dogfood finding #12: \
-             mtimes look fresh but the tree changed under the binary, e.g. \
-             a bed switch). Rebuild first: `cargo build -p gardenbed-server`",
-            candidate.display()
-        );
         return candidate;
     }
     panic!(
-        "gardenbed-server binary not found under {} — run \
-         `cargo build -p gardenbed-server` first (or set BED_SERVER_BIN)",
+        "{name} binary not found under {} — run `{build_cmd}` first (or set \
+         {override_var})",
         workspace_target.display()
     )
 }
 
-/// The same digest `crates/server/build.rs` embeds: SHA-256 over
+/// Runs the two staleness oracles for one candidate binary against one
+/// source tree, returning the exact actionable message on refusal. Split
+/// out so the guard's regression tests can drive it with a controlled
+/// binary/source pair — the real workspace pair, or a copied tree whose
+/// mtimes are forced older than the binary — instead of mutating the
+/// sources every other test binary compiles against.
+pub fn check_binary_against_sources(
+    name: &str,
+    crate_dir: &str,
+    build_cmd: &str,
+    digest_marker_prefix: &str,
+    candidate: &Path,
+    src: &Path,
+    profile: &str,
+) -> Result<(), String> {
+    let crate_label = format!("crates/{crate_dir}");
+    // The STALE branch uses plain `build_cmd` (the sources are newer than
+    // the binary, so Cargo rebuilds). The DIFFERENT / markerless branches
+    // fire only when every source is OLDER than the binary — exactly the
+    // state in which Cargo considers the crate fresh and `build_cmd`
+    // would be a NO-OP. Touching a source first makes it newer, forcing
+    // the recompile. The profile suffix keeps the remedy aimed at the
+    // binary actually located (a debug build cannot cure a release file).
+    let force_rebuild_cmd = format!(
+        "touch {crate_label}/src/lib.rs && {build_cmd}{}",
+        if profile == "release" {
+            " --release"
+        } else {
+            ""
+        }
+    );
+    let binary_age = candidate
+        .metadata()
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("{name} binary mtime: {e}"))?;
+    let mut src_age = None;
+    for entry in walk_files(src) {
+        let Ok(age) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if src_age.is_none_or(|age0| age > age0) {
+            src_age = Some(age);
+        }
+    }
+    let src_age = src_age.ok_or_else(|| {
+        format!(
+            "no source files found under {} — staleness check is broken",
+            src.display()
+        )
+    })?;
+    if src_age > binary_age {
+        return Err(format!(
+            "{name} binary under {} is STALE — it is older than \
+             {crate_label} sources (dogfood finding #12: `cargo test -p \
+             gardenbed` does not rebuild it). Rebuild first: `{build_cmd}`",
+            candidate.display()
+        ));
+    }
+    // The fingerprint MUST come from the located file. `SRC_DIGEST` is
+    // compiled into this test binary (from the working copy), so a
+    // comparison against it would be a no-op that accepts a binary built
+    // from other tree state.
+    let embedded = embedded_digest_of(candidate, digest_marker_prefix).ok_or_else(|| {
+        format!(
+            "{name} binary under {} carries no {digest_marker_prefix} \
+             marker — it cannot be checked against {crate_label} sources. \
+             Rebuild first (from the workspace root): `{force_rebuild_cmd}`",
+            candidate.display()
+        )
+    })?;
+    if current_src_digest(src) != embedded {
+        return Err(format!(
+            "{name} binary under {} was built from DIFFERENT \
+             {crate_label} sources (the fingerprint embedded in its own \
+             bytes does not match the working copy's {crate_label}/src — \
+             dogfood finding #12: mtimes look fresh but the tree changed \
+             under the binary, e.g. a bed switch). Rebuild first (from \
+             the workspace root): `{force_rebuild_cmd}`",
+            candidate.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the build fingerprint out of a binary's bytes: the 64 lowercase
+/// hex chars directly after `marker_prefix` (`GARDENBED_<CRATE>_SRC_
+/// DIGEST:`), as embedded by the crate's `build.rs` and referenced from
+/// the bin's `main` via `SRC_DIGEST_MARKER`. `None` when the marker is
+/// absent (an old or hand-built binary).
+pub fn embedded_digest_of(binary: &Path, marker_prefix: &str) -> Option<String> {
+    let bytes = std::fs::read(binary).ok()?;
+    let needle = marker_prefix.as_bytes();
+    let mut at = 0;
+    while let Some(rel) = find_bytes(&bytes[at..], needle) {
+        let start = at + rel + needle.len();
+        let end = start + 64;
+        if end <= bytes.len() {
+            let hex = &bytes[start..end];
+            if hex.iter().all(|b| b.is_ascii_hexdigit()) {
+                return Some(String::from_utf8_lossy(hex).into_owned());
+            }
+        }
+        at = start;
+    }
+    None
+}
+
+/// `memchr`-free substring search over the (≤ a few hundred MiB) binary;
+/// `windows` is linear enough at this scale and keeps the test helper
+/// dependency-free.
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The same digest `crates/{server,daemon}/build.rs` embed: SHA-256 over
 /// (sorted rel-path, length, content) of every file under `src/` —
 /// deterministic, independent of readdir order and mtimes.
-fn current_server_digest(server_src: &Path) -> String {
+pub fn current_src_digest(src: &Path) -> String {
     use std::collections::BTreeMap;
 
     use sha2::{Digest, Sha256};
 
-    let manifest = server_src
+    let crate_root = src
         .parent()
-        .expect("server src has a parent (crates/server)");
+        .expect("a crate's src has a parent (crates/<name>)");
     let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
-    for path in walk_files(server_src) {
+    for path in walk_files(src) {
         let rel = path
-            .strip_prefix(manifest)
-            .expect("file under crates/server");
+            .strip_prefix(crate_root)
+            .expect("file under the crate root");
         files.insert(
             rel.to_path_buf(),
             std::fs::read(&path).expect("src readable"),
         );
     }
-    assert!(!files.is_empty(), "no server sources to hash");
+    assert!(
+        !files.is_empty(),
+        "no sources to hash under {}",
+        src.display()
+    );
     let mut hasher = Sha256::new();
     for (rel, content) in &files {
         hasher.update(rel.to_string_lossy().as_bytes());
@@ -217,7 +357,7 @@ fn current_server_digest(server_src: &Path) -> String {
 }
 
 /// Every regular file under `dir`, recursively (test-fixture scale:
-/// `crates/server/src` is a few dozen files).
+/// a crate's `src` is a few dozen files).
 fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -489,36 +629,21 @@ pub struct Daemon {
 
 /// Locates the built `gardenbed-daemon` binary. Order: the
 /// `BED_DAEMON_BIN` override, then the workspace `target/{debug,release}`
-/// directory. Panics with actionable advice when absent.
+/// directory. Panics with actionable advice when absent — and, unless the
+/// override is used, when the binary is stale by either oracle the server
+/// guard applies (`locate_guarded_bin`): mtime, and the
+/// `GARDENBED_DAEMON_SRC_DIGEST:<hex>` fingerprint read from the located
+/// file's own bytes and compared with the current sources. A stale daemon
+/// has produced a spurious 4 MiB test failure; dogfood finding #12's
+/// class. `BED_DAEMON_BIN` bypasses both oracles.
 pub fn daemon_bin() -> PathBuf {
-    if let Ok(path) = std::env::var("BED_DAEMON_BIN") {
-        let path = PathBuf::from(path);
-        assert!(
-            path.is_file(),
-            "BED_DAEMON_BIN points at {path:?}, not a file"
-        );
-        return path;
-    }
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR")); // crates/bed
-    let workspace_target = std::env::var("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| manifest.join("..").join("..").join("target"));
-    let profiles: &[&str] = if cfg!(debug_assertions) {
-        &["debug", "release"]
-    } else {
-        &["release", "debug"]
-    };
-    for profile in profiles {
-        let candidate = workspace_target.join(profile).join("gardenbed-daemon");
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    panic!(
-        "gardenbed-daemon binary not found under {} — run \
-         `cargo build --workspace` first (or set BED_DAEMON_BIN)",
-        workspace_target.display()
-    )
+    locate_guarded_bin(&BinSpec {
+        name: "gardenbed-daemon",
+        override_var: "BED_DAEMON_BIN",
+        crate_dir: "daemon",
+        digest_marker_prefix: DIGEST_MARKER_PREFIX_DAEMON,
+        build_cmd: "cargo build -p gardenbed-daemon",
+    })
 }
 
 impl Daemon {

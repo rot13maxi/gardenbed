@@ -125,6 +125,11 @@ impl std::fmt::Display for ExportReport {
 /// git repository at `git_dir` (created as a bare SHA-1 repository when
 /// missing; an existing bare SHA-1 repository is accepted as-is).
 ///
+/// A non-bare existing target is refused before anything is written: its
+/// index and worktree would be left on the old HEAD while the ref moved,
+/// staging the whole checkout as deletions (dogfood #11). Updating them is
+/// deliberately out of scope — use a bare mirror (or export elsewhere).
+///
 /// Blobs are read from `objects`, changesets and refs from `metadata`.
 /// The pack, index, loose refs and `HEAD` are written natively; no git
 /// subprocess runs. Every mapped changeset's computed SHA is asserted
@@ -861,9 +866,17 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
         )));
     }
     if !repo.is_bare() {
+        // Refuse before a byte is written (dogfood #11): advancing the ref
+        // of a non-bare repository leaves its index and worktree on the
+        // old HEAD, staging the whole checkout as deletions. Updating
+        // index/worktree is the sanctioned no-go; refuse, loudly.
+        let worktree = repo
+            .workdir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| git_dir.display().to_string());
         return Err(ExportError::Git(format!(
-            "the target repository is not bare (worktree at {:?})",
-            repo.workdir().map(|p| p.display().to_string())
+            "the target repository is not bare (worktree at {worktree}); \
+             use a bare target (git init --bare) or export elsewhere"
         )));
     }
     Ok(())

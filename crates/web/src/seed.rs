@@ -69,6 +69,14 @@ enum Edit {
 
 /// Seeds the demo history unless the repository already carries refs.
 ///
+/// Every write goes through [`Repo`] (`create_changeset` carries the
+/// write-set verify handshake; `cas_ref` publishes `main`), so the caller
+/// owns concurrency: a caller seeding an on-disk repository **must hold
+/// the shared `repo.lock`** (`gardenbed_server::gc::lock_shared_blocking`)
+/// for the whole call, exactly like `gardenbed-server import` — an
+/// offline `gardenbed-server gc` takes the exclusive lock and refuses to
+/// interleave. The `gardenbed-web seed` binary does this.
+///
 /// * `Ok(Some(tip))` — history was written and `main` now points at
 ///   `tip`.
 /// * `Ok(None)` — refs already existed; nothing was touched

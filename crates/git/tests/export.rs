@@ -1338,3 +1338,113 @@ fn export_roundtrips_multi_mib_chunked_blobs_sha_exact() {
         }
     }
 }
+
+/// Dogfood #11: an existing NON-BARE target is refused loudly, naming the
+/// worktree and the remedy — and the refusal happens before anything is
+/// written (no pack file, no ref move, clean index/worktree). The old
+/// failure mode advanced the ref via fast-import and left the index and
+/// worktree describing the previous HEAD, staging the mirror's entire
+/// content as deletions until `git reset --hard`.
+#[test]
+fn export_into_a_non_bare_worktree_is_refused_untouched() {
+    let fx = Fixture::generate(
+        42011,
+        &GenOptions {
+            commits: 6,
+            ..Default::default()
+        },
+    );
+    import_fixture(&fx);
+
+    // A real non-bare repository with its own commit and worktree file.
+    let target = fx.dir.path().join("mirror");
+    std::fs::create_dir_all(&target).expect("mirror dir");
+    git_out(&target, &["init", "-q", "--object-format=sha1"], b"");
+    std::fs::write(target.join("checked-in.txt"), b"prior mirror content\n")
+        .expect("worktree file");
+    git_out(&target, &["add", "checked-in.txt"], b"");
+    git_out(
+        &target,
+        &[
+            "-c",
+            "user.name=Mirror Owner",
+            "-c",
+            "user.email=mirror@example.com",
+            "commit",
+            "-q",
+            "-m",
+            "mirror baseline",
+        ],
+        b"",
+    );
+    let before_head = rev_ref(&target, "HEAD").expect("baseline commit");
+    let before_config = std::fs::read(target.join(".git/config")).expect("config");
+    let before_files = tree_listing(&target.join(".git"));
+
+    let (objects, metadata, _engine) = open_stores(&fx.garden);
+    let err = export_to_path(&target, objects, metadata, &ExportOptions::default())
+        .expect_err("a non-bare target must be refused");
+
+    // The message names the worktree and the remedy ("use a bare target").
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not bare"),
+        "the refusal says the target is not bare: {msg}"
+    );
+    assert!(
+        msg.contains(&target.display().to_string()),
+        "the refusal names the worktree path: {msg}"
+    );
+    assert!(
+        msg.contains("bare target"),
+        "the refusal names the remedy: {msg}"
+    );
+
+    // Nothing moved: byte-identical .git, same ref, clean worktree/index.
+    // The listing is compared BEFORE `git status` runs — status may
+    // refresh the index stat cache and rewrite `.git/index`.
+    assert_eq!(
+        std::fs::read(target.join(".git/config")).expect("config after"),
+        before_config,
+        "config untouched"
+    );
+    assert_eq!(
+        tree_listing(&target.join(".git")),
+        before_files,
+        "no pack, index, ref or object appeared under .git"
+    );
+    assert_eq!(
+        rev_ref(&target, "HEAD").as_deref(),
+        Some(before_head.as_str())
+    );
+    let status = git_out(&target, &["status", "--porcelain"], b"");
+    assert!(
+        status.is_empty(),
+        "index/worktree untouched: {:?}",
+        String::from_utf8_lossy(&status)
+    );
+}
+
+/// Every file under `dir`: sorted `(relative path, length)` pairs —
+/// lengths catch an in-place rewrite, and any new pack/ref/object shows
+/// up as a new entry.
+fn tree_listing(dir: &Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("listing readable") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let len = path.metadata().expect("stat").len();
+                out.push((
+                    path.strip_prefix(dir).expect("under dir").to_path_buf(),
+                    len,
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
+}
