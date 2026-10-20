@@ -54,13 +54,44 @@ of assuming (dogfood #26). Run this BEFORE the publish in 1.2: a divergence
 caught here costs nothing, while the same divergence caught at push time means
 the bed publish and export already happened and the push is rejected.
 
+The twin comes from the server's own mapping row, not a previous export's TSV —
+the mapping file only covers commits that export has already emitted, so on a
+fresh landing it has no row for the current main (verified: no mapping file
+existed at all before this check was scripted).
+
+`git_map` is written by **import**, not by publish: a bed-native landing tip
+has no twin until it has been exported at least once. So the useful placement
+is two-sided:
+
+- **Before the publish**, when bed `main` is git-native or was just imported:
+  the check must pass (the tip has a twin and origin agrees) — this catches the
+  divergence in #26 before anything moves.
+- **On a freshly imported landing tip with no row**, the check reports
+  "no git-mapping row", which is expected, not a failure: continue to export
+  (§1.3), then re-run the check before the push (§1.5) — the row exists after
+  import and the ref join now has both sides.
+
 ```sh
-# bed main's CURRENT tip (before the landing publish) and its git twin
-BED_MAIN=$(bed log --cs refs/heads/main --limit 1 | awk '{print $1}')
-GIT_TWIN=$(awk -v t="$BED_MAIN" 'index($1,t)==1 {print $2}' \
-    /home/user/bed-land/landing-mapping.tsv)
-REMOTE=$(git ls-remote origin main | awk '{print $1}')
-test -n "$GIT_TWIN" || { echo "FAIL: no mapping row for bed main $BED_MAIN"; exit 1; }
+ROOT=/home/user/gardenbed/arb            # canonical bed root (repo "default")
+# `bed log` prints the message too; take the id from the first line only
+BED_MAIN=$(bed log --cs refs/heads/main --limit 1 | head -n 1 | awk '{print $1}')
+
+# bed main's git twin, straight from the metadata the server keeps.
+# `cs` is a BLOB, so hex() must be case-folded; join the REF rather than
+# prefix-matching ids (a prefix can match several rows).
+GIT_TWIN=$(sqlite3 "$ROOT/metadata.sqlite3" \
+    "select g.git_sha from refs r join git_map g on g.cs = r.cs
+      where r.name = 'refs/heads/main';")
+
+# origin as it actually is right now, not a possibly stale local ref
+REMOTE=$(git ls-remote origin refs/heads/main | awk '{print $1}')
+
+test -n "$GIT_TWIN" || {
+    echo "FAIL: no git-mapping row for refs/heads/main ($BED_MAIN)"
+    echo "      only IMPORT writes git_map: a bed-native tip has no twin yet,"
+    echo "      so run the export in 1.3 first and re-run this check"
+    exit 1
+}
 test "$GIT_TWIN" = "$REMOTE" || {
     echo "FAIL: origin/main $REMOTE is not bed main's twin $GIT_TWIN"
     echo "      git-side commits arrived without import (or bed moved without export)"
@@ -70,10 +101,11 @@ test "$GIT_TWIN" = "$REMOTE" || {
 echo "OK: origin/main matches bed main's twin ($REMOTE)"
 ```
 
-A failure here means the two sides diverged: import the git commits (or export
-and push the bed ones), hand-re-union if both moved, and only then continue.
-`ls-remote` is the authority, not a stale local ref: the mirror's `main` is only
-as fresh as its last fetch.
+Run from the chain checkout (so `origin` is the GitHub remote) with `bed`
+pointed at the canonical server. A failure here means the two sides diverged:
+import the git commits (or export and push the bed ones), hand-re-union if both
+moved, and only then continue. `ls-remote` is the authority, not a stale local
+ref: the mirror's `main` is only as fresh as its last fetch.
 
 ### 1.2 Advance bed `main` — `bed publish`, plain CAS form
 
@@ -214,7 +246,7 @@ server can also move `main` on a `--ref` publish).
 
 ```sh
 gardenbed-server export --root /home/user/gardenbed/arb --repo default \
-    --into /home/user/code/gardenbed --mapping /home/user/bed-land/landing-mapping.tsv
+    --into /home/user/code/gardenbed --mapping /home/user/land-mappings/landing.map
 # 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
 git -C /home/user/code/gardenbed fsck --strict
 ```
@@ -265,12 +297,14 @@ is ref-level:
 
 ```sh
 # main's bed changeset id as published in §1.2 (short id is enough: prefix match)
-TIP=<64-hex-or-8+-hex id of main>
+TIP=<64-hex-or-8+-hex id of main, from `bed log --cs refs/heads/main --limit 1 | head -n 1`>
 test -n "$TIP" || { echo "FAIL: TIP is empty (no bed tip to check)"; exit 1; }
 
-# the mapping writes "<changeset id>\t<git sha>" per exported commit
-ROW=$(awk -v t="$TIP" 'index($1,t)==1 {print $2}' \
-    /home/user/bed-land/landing-mapping.tsv)
+# the mapping writes "<changeset id>\t<git sha>" per exported commit; set MAP
+# to the same file you passed to export in 1.3 (the chain uses
+# /home/user/land-mappings/<landing>.map)
+MAP=/home/user/land-mappings/landing.map
+ROW=$(awk -v t="$TIP" 'index($1,t)==1 {print $2}' "$MAP")
 
 if [ -z "$ROW" ]; then
     echo "FAIL: no mapping row for $TIP (export did not reach bed main?)"
@@ -314,7 +348,7 @@ there and are not published to GitHub).
 
 ```sh
 /home/user/bed-lanes/cargo-gate cargo build --workspace --bins --release
-install -m 755 target/release/{bed,gardenbed-server,gardenbed-daemon,gardenbed-web,gardenbed-mcp} \
+install -m 755 target/release/{bed,gardenbed-server,gardenbed-daemon,gardenbed-web,gardenbed-mcp,gardenbed-ab} \
     ~/.local/bin/
 ```
 

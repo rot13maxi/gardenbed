@@ -379,10 +379,16 @@ impl RepoSet {
     /// `seedbed.sqlite3`/`loam/objects/`) rather than being a multi-repo
     /// root. Such a root serves as repository [`DEFAULT_REPO`].
     pub fn is_legacy_root(root: &Path) -> bool {
+        // The pre-rename layout is `<root>/seedbed.sqlite3` + `<root>/loam/objects`.
+        // The database file is the discriminator: a *repository named* `loam`
+        // in a current-layout multi-repo root also has `<root>/loam/objects`,
+        // and treating that as a single-repository root hid every sibling
+        // (dogfood: the sweep's re-union review). Requiring the database keeps
+        // both shapes unambiguous, and an objects-only pre-rename store is not
+        // a shape this migration ever produced.
         root.join("metadata.sqlite3").is_file()
             || root.join("objects").is_dir()
             || root.join("seedbed.sqlite3").is_file()
-            || root.join("loam").join("objects").is_dir()
     }
 
     /// The directory of repository `name` (`root/name`; the legacy root
@@ -442,7 +448,6 @@ impl RepoSet {
         dir.join("metadata.sqlite3").is_file()
             || dir.join("objects").is_dir()
             || dir.join("seedbed.sqlite3").is_file()
-            || dir.join("loam").join("objects").is_dir()
     }
 
     /// The names currently held open (for logs and tests).
@@ -843,16 +848,40 @@ impl RepoSet {
                 name: to.to_owned(),
                 source: ServerError::Store(gardenbed_store::StoreError::Io(e.to_string())),
             })?;
-            for entry in [
-                "objects",
-                "metadata.sqlite3",
-                "metadata.sqlite3-wal",
-                "metadata.sqlite3-shm",
-                "git-mirror.git",
-            ] {
-                let src = root.join(entry);
-                if src.exists() {
-                    do_rename(&src, &to_dir.join(entry))?;
+            // Move whichever store shape the root actually holds. The
+            // pre-rename names are the same data; moving only the current
+            // names left the real store behind and produced an empty
+            // destination that still reported "history byte-identical"
+            // (sweep re-union review, finding #27).
+            let layout = crate::resolve_layout(root);
+            let objects_rel = layout
+                .objects
+                .strip_prefix(root)
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|_| PathBuf::from("objects"));
+            let mut entries: Vec<PathBuf> = vec![
+                PathBuf::from("metadata.sqlite3"),
+                PathBuf::from("metadata.sqlite3-wal"),
+                PathBuf::from("metadata.sqlite3-shm"),
+                PathBuf::from("seedbed.sqlite3"),
+                PathBuf::from("seedbed.sqlite3-wal"),
+                PathBuf::from("seedbed.sqlite3-shm"),
+                PathBuf::from("git-mirror.git"),
+            ];
+            entries.push(objects_rel);
+            entries.push(PathBuf::from("objects"));
+            for entry in entries {
+                let src = root.join(&entry);
+                if src.exists() && !to_dir.join(&entry).exists() {
+                    if let Some(parent) = to_dir.join(&entry).parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| RepoResolveError::Open {
+                            name: to.to_owned(),
+                            source: ServerError::Store(gardenbed_store::StoreError::Io(
+                                e.to_string(),
+                            )),
+                        })?;
+                    }
+                    do_rename(&src, &to_dir.join(&entry))?;
                 }
             }
             Ok(to_dir)
@@ -871,7 +900,7 @@ impl RepoSet {
     /// server) and drops the connection again before returning.
     fn checkpoint(dir: &Path, name: &str) -> Result<(), RepoResolveError> {
         use gardenbed_store::SqliteMetadataStore;
-        let db = dir.join("metadata.sqlite3");
+        let db = crate::resolve_layout(dir).metadata;
         if !db.is_file() {
             return Ok(()); // objects-only repository: nothing to checkpoint
         }
