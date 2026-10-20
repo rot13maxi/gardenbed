@@ -366,13 +366,22 @@ pinned kernel corpus):
 
 Found by the re-union review of this sweep. Class: a layout-resolution rule was
 added to one entry point and not to the six others that open the same stores —
-the tests covered the rule, not its reach. Fix (landed with this entry): one
-public `resolve_layout`, used by `Repo::open`, `import`, `export`, `gc` (mark,
-sweep walk and closure walk), `move` (including the rename list), and
-`checkpoint`; the pre-rename predicate keys on the database file, not on a
-`loam/objects` directory, so a repo named `loam` stays a repo. Pinned by three
-subprocess-level tests in `crates/server/tests/integrity.rs` (export/import,
-gc scan+live counts, move keeps history) that fail on the pre-fix tree.
+the tests covered the rule, not its reach. Two residuals the same review caught
+after the first fix: `resolve_layout` still keyed on `loam/objects`, so a
+multi-repo root containing a repository named `loam` resolved `default` to the
+root itself (empty `default/` store, 0-commit export); and `export --repo
+<typo>` still created the unknown repository (a fresh empty store) and exited 0.
+The discriminator is now the database file only, and `export` uses
+`existing_repo_dir_for` (refuses with the served list instead of creating).
+
+Fix (landed with this entry): one public `resolve_layout`, used by
+`Repo::open`, `import`, `export`, `gc` (mark, sweep walk and closure walk),
+`move` (including the rename list), and `checkpoint`; the pre-rename predicate
+keys on the database file, not on a `loam/objects` directory, so a repo named
+`loam` stays a repo. Pinned by five subprocess-level tests in
+`crates/server/tests/integrity.rs` (export, gc scan+live counts, move keeps
+history, `loam`-named sibling stays served, unknown `--repo` refused), all of
+which fail on the pre-fix tree.
 
 ## Backlog — product fixes from dogfood findings
 

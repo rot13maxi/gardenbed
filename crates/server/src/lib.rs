@@ -236,8 +236,15 @@ pub struct Layout {
 pub fn resolve_layout(root: &Path) -> Layout {
     // The pre-rename layout wins only when it is actually present: an empty
     // or fresh root must initialize as the current layout.
-    let pre_rename =
-        root.join("seedbed.sqlite3").is_file() || root.join("loam").join("objects").is_dir();
+    //
+    // The DATABASE FILE is the discriminator, not `loam/objects`: a sibling
+    // repository literally named `loam` in a multi-repo root also has
+    // `<root>/loam/objects`, and treating that as this root's pre-rename
+    // layout makes `default` resolve to the multi-repo root itself — creating
+    // an empty `default/` store and silently exporting 0 commits (found in
+    // the sweep's re-union review). An objects-only pre-rename store is not a
+    // shape this migration ever produced.
+    let pre_rename = root.join("seedbed.sqlite3").is_file();
     let current = !pre_rename || root.join("metadata.sqlite3").is_file();
     if current {
         Layout {

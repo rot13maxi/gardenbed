@@ -741,7 +741,22 @@ impl RepoSet {
         Ok(self.repo_dir(name))
     }
 
-    /// Moves repository `from` to name `to` (`gardenbed-server move`):
+    /// Like [`RepoSet::repo_dir_for`], but the directory must already hold a
+    /// repository. Administrative callers that must never create one (export)
+    /// use this: an unknown name otherwise becomes a freshly initialized
+    /// empty repository that exports 0 commits and exits 0.
+    pub fn existing_repo_dir_for(&self, name: &str) -> Result<PathBuf, RepoResolveError> {
+        let dir = self.repo_dir_for(name)?;
+        if !Self::is_repo_dir(&dir) {
+            return Err(RepoResolveError::NotFound {
+                name: name.to_owned(),
+                served: self.served_list(),
+            });
+        }
+        Ok(dir)
+    }
+
+    /// Moves repository `from` to name `to` (`gardenbed-server move`):    /// Moves repository `from` to name `to` (`gardenbed-server move`):
     /// the two renames — `<root>/<from>` → `<root>/<to>` — plus the mirror.
     /// Both stores are path-free and self-contained, so history is
     /// byte-identical after the move (M11.4). Refuses unless `from` exists,
