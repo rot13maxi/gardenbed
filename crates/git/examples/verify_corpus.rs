@@ -149,9 +149,8 @@ fn main() {
     let layout = gardenbed_server::resolve_layout(&root);
     let objects: Arc<dyn ObjectStore> =
         Arc::new(FsObjectStore::open(&layout.objects).expect("objects opens"));
-    let metadata: Arc<dyn gardenbed_store::MetadataStore> = Arc::new(
-        SqliteMetadataStore::open(&layout.metadata).expect("metadata opens"),
-    );
+    let metadata: Arc<dyn gardenbed_store::MetadataStore> =
+        Arc::new(SqliteMetadataStore::open(&layout.metadata).expect("metadata opens"));
     let engine = Engine::new(objects, metadata.clone());
     // A second, read-only handle for sampling queries (WAL readers coexist).
     let ro = rusqlite::Connection::open_with_flags(
