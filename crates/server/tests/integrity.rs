@@ -789,6 +789,29 @@ fn a_repository_named_loam_does_not_masquerade_as_the_pre_rename_layout() {
         );
         repo.cas_ref("main", None, head).unwrap();
     }
+    // The resolver must also agree: a repository named `loam` is a
+    // current-layout repository, so its own root resolves to
+    // `loam/metadata.sqlite3` + `loam/objects`, never to `loam/` as this
+    // repository's object root (the regression the predicate fix closed).
+    let layout = gardenbed_server::resolve_layout(&root.join("loam"));
+    assert_eq!(
+        layout.metadata,
+        root.join("loam").join("metadata.sqlite3"),
+        "a repo named loam resolves its own database"
+    );
+    assert_eq!(
+        layout.objects,
+        root.join("loam"),
+        "a repo named loam resolves its own object root"
+    );
+    // And the multi-repo root itself is not a repository.
+    let root_layout = gardenbed_server::resolve_layout(&root);
+    assert_eq!(
+        root_layout.metadata,
+        root.join("metadata.sqlite3"),
+        "a multi-repo root resolves to the current layout, not to loam/"
+    );
+
     let set = gardenbed_server::repos::RepoSet::new(&root, 8);
     let served = set.served_names();
     assert_eq!(
