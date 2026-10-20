@@ -63,14 +63,20 @@ struct SourceGuard {
 }
 
 impl SourceGuard {
-    fn capture(path: &Path) -> Self {
+    /// Captures `path`'s content, but takes the RESTORE mtime from `stamp_from`
+    /// — never from `path` itself. A crashed earlier run may have left the
+    /// marker stamped NOW (or in the future); re-capturing that value would
+    /// faithfully restore the poison, making the guard self-sustaining. The
+    /// passed stamp is an untouched sibling source (`main.rs`), whose
+    /// commit-time mtime is the true one.
+    fn capture(path: &Path, stamp_from: &Path) -> Self {
         Self {
             path: path.to_path_buf(),
             content: fs::read(path).expect("source readable"),
-            mtime: path
+            mtime: stamp_from
                 .metadata()
                 .and_then(|m| m.modified())
-                .expect("source mtime"),
+                .expect("stamp source mtime"),
         }
     }
 }
@@ -226,27 +232,21 @@ fn hermetic_oracles() {
 /// `server_bin()` refuses a binary older than `crates/server` sources
 /// with a panic naming the fix command. Touching one source file into
 /// the future is the oracle: the guard must refuse while it is newer
-/// than any build artifact. The touch restores the original mtime —
-/// net-zero filesystem change (content is never modified; mtime is put
-/// back exactly), or the test would poison every later run.
+/// than any build artifact. The guard restores mtime from the untouched
+/// sibling `main.rs` — never from the marker itself, whose stamp may already
+/// be poisoned by an earlier crashed run (see `SourceGuard::capture`).
 fn stale_binary_is_refused_with_fix_command() {
     let src = server_src_dir();
     let marker = src.join("lib.rs");
-    let original_mtime = marker
-        .metadata()
-        .and_then(|m| m.modified())
-        .expect("crates/server/src/lib.rs stat");
-    // mtime into the future: newer than any build artifact. This is the
-    // only test binary that touches server mtimes, and the mtime is put
-    // back before the assert returns.
     // Armed before the touch: a panic anywhere below restores the mtime.
-    let _guard = SourceGuard::capture(&marker);
+    // The restore stamp is main.rs's (an untouched sibling), not lib.rs's own
+    // — re-capturing a poisoned stamp would preserve the poison.
+    let _guard = SourceGuard::capture(&marker, &src.join("main.rs"));
     let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
     filetime::set_file_mtime(&marker, filetime::FileTime::from_system_time(future))
         .expect("touch lib.rs");
     let panic = std::panic::catch_unwind(server_bin).expect_err("the stale binary must be refused");
     drop(_guard);
-    let _ = original_mtime;
     let msg = panic_message(&panic);
     assert!(
         msg.contains("STALE") && msg.contains("cargo build -p gardenbed-server"),
@@ -283,7 +283,7 @@ fn tree_state_stale_binary_is_refused_even_with_fresh_mtime() {
     // a panic, an OOM, or a kill-unwind must never leave the probe behind.
     // The restore target mtime is main.rs's stamp (above), not lib.rs's, so
     // a previously poisoned mtime cannot be recaptured.
-    let guard = SourceGuard::capture(&marker);
+    let guard = SourceGuard::capture(&marker, &src.join("main.rs"));
     let mut probe = original.clone();
     probe.extend_from_slice(b"\n// tree-state staleness probe\n");
     fs::write(&marker, &probe).expect("probe written");
