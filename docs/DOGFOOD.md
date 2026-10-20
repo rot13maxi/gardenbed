@@ -383,10 +383,11 @@ Fix (landed with this entry): one public `resolve_layout`, used by
 `Repo::open`, `import`, `export`, `gc` (mark, sweep walk and closure walk),
 `move` (including the rename list), and `checkpoint`; the pre-rename predicate
 keys on the database file, not on a `loam/objects` directory, so a repo named
-`loam` stays a repo. Pinned by five subprocess-level tests in
-`crates/server/tests/integrity.rs` (export, gc scan+live counts, move keeps
-history, `loam`-named sibling stays served, unknown `--repo` refused), all of
-which fail on the pre-fix tree.
+`loam` stays a repo. Pinned by six tests in `crates/server/tests/integrity.rs`
+— four subprocess-level (export, gc scan + live counts, move keeps history,
+unknown `--repo` refused) and two in-process (`loam`-named sibling stays
+served, bare `loam/objects` root refused) — each of which fails on the pre-fix
+tree (mutation-verified for the two predicate tests).
 
 ## Backlog — product fixes from dogfood findings
 
