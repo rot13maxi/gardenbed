@@ -171,12 +171,12 @@ to rebase` and leave the working copy put; if you are on an older binary, check
 
 **When `main` already carries the lane's content (the hand-union / twin case).**
 What the replay does is decided per written path by `check_write`
-(`crates/server/src/lib.rs:1127-1170`): a path whose desired (mode, blob)
+(`crates/server/src/lib.rs`): a path whose desired (mode, blob)
 already equals the new parent's entry returns early and is accepted; a path
 whose (mode, blob) differs between the new parent and the pre-image is refused
 (`"<path>" was changed or deleted`); a path the element deletes or renames is
-refused by `check_removal` (`crates/server/src/lib.rs:1116-1125`) when the new
-parent's copy is missing or differs from the pre-image. `rebase --stack` aborts
+refused by `check_removal` (same file) when the new parent's copy is missing
+or differs from the pre-image. `rebase --stack` aborts
 before any publish if a link refuses. Three shapes:
 
 1. **Prefix twin** — `main`'s tip is the lane's earlier state (same tree, same
@@ -187,10 +187,9 @@ before any publish if a link refuses. Three shapes:
    it independently), or the element deletes/renames a path `main` changed.
    The replay refuses and the stack aborts; nothing is published. The exact
    text depends on the change kind: a write refuses with `"<path>" was changed
-   or deleted` (`check_write`,
-   `crates/server/src/lib.rs:1127-1170`), while a delete or a rename source
-   refuses with `removal of missing or changed path "<path>"` (`check_removal`,
-   `crates/server/src/lib.rs:1123`). This is the layered same-path shape the
+   or deleted` (`check_write`), while a delete or a rename source refuses with
+   `removal of missing or changed path "<path>"` (`check_removal`) — both in
+   `crates/server/src/lib.rs`. This is the layered same-path shape the
    lanes hit (the finding recorded as DOGFOOD #23). A merely *partial* overlap
    is not this case: if the paths main did not touch are unchanged since the
    merge base, their writes pass (verified: a two-path element whose first path
@@ -252,7 +251,7 @@ git -C /home/user/code/gardenbed fsck --strict
 ```
 
 Export writes **every ref in the metadata store** unless `--ref <glob>` narrows
-it (`crates/git/src/export.rs:140-152`; the sample line's `2 ref(s)` is
+it (the ref selection in `export_to_path`, `crates/git/src/export.rs`; the sample line's `2 ref(s)` is
 `main` plus a lane ref). That is why the publish in §1.2 comes first: the
 exported `refs/heads/main` is whatever bed `main` is at export time. Export
 before publishing and the mirror's `main` still points at the previous landing,
@@ -442,13 +441,13 @@ forms:
     rebase this changeset onto the new lane/test (`bed rebase lane/test`) and publish again
   ```
 
-  The server-side refusal (`ServerError::PublishRewind`, computed at
-  `crates/server/src/lib.rs:873-879`) also counts the changesets that would
-  fall off, but `bed publish` maps every `FailedPrecondition` to the
-  fast-forward message above (`crates/bed/src/ops.rs:1340-1365`), so the operator
-  never sees the count. There is no log route today: the server logs only
+  The server-side refusal (`ServerError::PublishRewind`, built by
+  `Repo::publish` in `crates/server/src/lib.rs`) also counts the changesets
+  that would fall off, but `bed publish` maps every `FailedPrecondition` to the
+  fast-forward message above (the `FailedPrecondition` arm of `publish` in
+  `crates/bed/src/ops.rs`), so the operator never sees the count. There is no log route today: the server logs only
   `log::debug!("request rpc={rpc} repo={repo}")` per RPC
-  (`crates/server/src/lib.rs:1305`), not refusal payloads. The observable
+  (`Repo::repo_guard`, `crates/server/src/lib.rs`), not refusal payloads. The observable
   analogue is `import --allow-rewind`'s warning, which does print the count.
   Use `--force` only for a deliberate rewrite (replayed stack, re-union), and
   say why in the landing note.
