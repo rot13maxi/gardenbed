@@ -844,3 +844,28 @@ fn exporting_an_unknown_repository_is_refused_not_created() {
         "export must not create the unknown repository"
     );
 }
+
+#[test]
+fn a_bare_loam_objects_root_is_refused_not_shadowed() {
+    // A root holding only `loam/objects` is not the pre-rename layout (the
+    // database file is the discriminator). It has foreign content, so opening
+    // it must refuse rather than create an empty current-layout store beside
+    // it — the same shadowing class as `resolve_layout`'s loam clause.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("loam").join("objects")).unwrap();
+    let error = Repo::open(dir.path()).expect_err("a bare loam/objects root must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("refusing to create an empty repository"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        !dir.path().join("metadata.sqlite3").exists(),
+        "opening created a shadow database"
+    );
+    assert!(
+        !dir.path().join("objects").exists(),
+        "opening created a shadow object store"
+    );
+}

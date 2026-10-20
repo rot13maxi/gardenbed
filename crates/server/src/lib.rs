@@ -293,8 +293,10 @@ impl Repo {
     pub fn validate_layout(root: &Path) -> Result<(), ServerError> {
         // An empty or partially created root is fine: `open` initializes it.
         let has_current = root.join("metadata.sqlite3").is_file() || root.join("objects").is_dir();
-        let has_pre_rename =
-            root.join("seedbed.sqlite3").is_file() || root.join("loam").join("objects").is_dir();
+        // The DATABASE FILE is the discriminator, matching `resolve_layout`:
+        // a bare `loam/objects` is an ordinary repository store (a repo
+        // literally named `loam`), not proof of the pre-rename layout.
+        let has_pre_rename = root.join("seedbed.sqlite3").is_file();
         if !has_current && !has_pre_rename && root.is_dir() {
             // Directories the server owns (locks, mirrors, tmp) do not make
             // this a repository; anything else means the caller pointed at
@@ -316,8 +318,8 @@ impl Repo {
             if !foreign.is_empty() {
                 return Err(ServerError::Invalid(format!(
                     "{} holds neither metadata.sqlite3 + objects/ nor the pre-rename \
-                     seedbed.sqlite3 + loam/objects — refusing to create an empty repository \
-                     beside existing data",
+                     seedbed.sqlite3 (with loam/objects) — refusing to create an empty \
+                     repository beside existing data",
                     root.display()
                 )));
             }
