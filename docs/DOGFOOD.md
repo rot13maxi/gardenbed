@@ -330,10 +330,15 @@ import; both directions are legitimate shapes, so the chain must check rather
 than assume.
 
 Mitigation (landed with this entry): the pre-publish step MUST compare
-`git ls-remote origin main` against the git twin of bed `main` (the
-git-mapping row for the bed tip) and refuse with a named error before anything
-moves — not discover the divergence at push time. It is scripted into the
-runbook as step 1.1b ([OPERATIONS.md](OPERATIONS.md)), before the publish.
+`git ls-remote origin main` against the tip git is expected to hold and refuse
+with a named error before anything moves — not discover the divergence at push
+time. Two sources, in order: bed `main`'s exact `git_map` row when `main`
+itself came from an import, otherwise the tip recorded at the end of the
+previous chain (the export report and mapping row). With neither the check
+reports "cannot verify" rather than guessing. It is scripted into the runbook
+as step 1.1b ([OPERATIONS.md](OPERATIONS.md)), before the publish, and every
+chain now ends by recording that tip. Structural follow-up (not done here):
+`export` could write `git_map` rows, which would remove the record-keeping.
 Second instance of this class on 2026-10-19 (the first was the same day's
 mid-sweep rewind).
 
