@@ -332,7 +332,7 @@ future gate should too:
 * YAML parses: `python3 -c "import yaml; yaml.safe_load(open(f))"` for
   both files.
 * Schema and expression lint: `actionlint` with
-  [`actionlint.yaml`](../actionlint.yaml) (which declares the two custom
+  [`.github/actionlint.yaml`](../.github/actionlint.yaml) (which declares the two custom
   self-hosted labels `fuse` and `kernel-corpus`) and `shellcheck` for
   every embedded `run:` script.
 * The push-path Playwright job's exact command sequence (`npm ci`,
