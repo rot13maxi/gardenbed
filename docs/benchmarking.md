@@ -418,8 +418,9 @@ In rough order of value per unit of work:
    touches a *different* file versus the *same* file (conflict path).
    The former is the intended case; the latter measures conflict
    detection and the retry contract.
-4. **A real corpus.** The synthetic numbers above are a shape, not a
-   scale test. The kernel corpus is now directly usable: the pre-rename
+4. **More real-corpus slices.** Full kernel measurements are already
+   recorded in §5; broaden them across slices and selection sizes. The
+   kernel corpus is directly usable: the pre-rename
    layout (`seedbed.sqlite3` + `loam/objects`) opens in place, and
    `gardenbed-ab fixture --source ...` builds a bounded slice from any
    repository. First measurement on the real 1.48M-commit store, one
@@ -440,9 +441,8 @@ In rough order of value per unit of work:
    Gardenbed needs a running server (or a daemon) while Git does not.
    Any honest CI comparison has to charge Gardenbed for the server.
 8. **Offline queue** (dimension 10). `bed commit` with the server down,
-   N commits, then `bed sync`; compare with Git's "you cannot commit
-   history without a remote" workflow, which is really a workflow
-   comparison rather than a timing one.
+   N commits, then `bed sync`; compare with Git's local commit followed by
+   push. This is a workflow comparison as well as a timing one.
 
 Do **not** build: a single-clone packfile-size comparison (Git wins and
 it does not bear on the claim), or a LAN throughput benchmark (same

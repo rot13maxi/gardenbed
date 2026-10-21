@@ -1,9 +1,9 @@
 # gardenbed CLI reference
 
-Generated from the real `--help` output of the v0.1.0 binaries (`bed`,
-`gardenbed-server`, `gardenbed-mcp`); every example is a verified
-invocation from `demo/run-v0.1.sh`, [docs/quickstart.md](quickstart.md),
-or the recorded demo run.
+Reference for the current CLI, including the unreleased v0.2 feature wave.
+Workspace package versions still report `0.1.0`; that does not limit the
+commands to the tagged v0.1 release. Examples draw on the demo scripts,
+[quickstart](quickstart.md), and recorded demo runs.
 
 ## Conventions
 

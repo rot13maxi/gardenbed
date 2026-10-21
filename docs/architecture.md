@@ -1,8 +1,10 @@
-# gardenbed architecture — v0.1
+# Gardenbed architecture — current implementation
 
 Gardenbed has a central repository server, a sparse working-copy client,
 and an MCP service. The server stores immutable content-addressed objects
-and SQLite metadata. Derived trees, blame, and ancestry data support queries.
+and SQLite metadata by default, with PostgreSQL/S3 backends available for
+scale-out (§11). Derived trees, blame, and ancestry data support queries.
+See [current status](status.md) for implemented scope and outstanding work.
 
 Use the standard terms in [Terminology](terminology.md). Repository storage uses `objects/` and `metadata.sqlite3`.
 
@@ -30,7 +32,7 @@ gardenbed-mcp ──in-process Repo (same service layer, no RPC)──┘
 
 `crates/protocol/proto/gardenbed.proto` — with
 [docs/canonical-encoding.md](canonical-encoding.md), it *is* the published
-protocol (D4). The tonic service `Gardenbed` exposes 17 RPCs; every
+protocol (D4). The tonic service `Gardenbed` exposes 18 RPCs; every
 request carries `repo` — the field selects the repository it applies to
 (wire format from day one, v0.1.md §1; load-bearing since multi-repo
 serving, v0.2.md §5).
@@ -41,7 +43,7 @@ serving, v0.2.md §5).
 | changesets | `GetChangeset`, `PutBlob` (client-stream), `CreateChangeset` | blob bytes move **only** through `PutBlob` (> 1 MiB, header frame first) or `CreateChangeset.inline_blobs` (≤ 1 MiB) |
 | graph + queries | `MergeBase`, `IsAncestor`, `Diff` (stream), `Log` (stream), `Blame` (stream) | blob content never rides on Diff/Log |
 | refs | `ListRefs`, `GetRef`, `CasRef` | `GetRef` doubles as the shared revspec resolver (see §2) |
-| write ops | `Rebase`, `Publish` | server-side replay and fast-forward CAS |
+| write ops | `Rebase`, `Publish`, `Merge` | server-side replay, fast-forward CAS, and two-parent merge |
 | debug | `GetStats` | per-repo request counters (e.g. the zero-duplicate-fetch proofs) |
 
 Wire conventions mirrored from the canonical encoding: `Op`/`Mode`
@@ -60,7 +62,8 @@ request (singleflighted), keeps per-repository stats, and caps open
 handles with `--max-repos` (LRU eviction of idle handles; a v0.1 root
 with stores at the top level serves unchanged as the repository named
 `default`). Every handler resolves its request's `repo` field through
-`RepoSet::resolve` — the one seam where authentication slots in later.
+`RepoSet::resolve`; `GardenbedService::authorize` checks optional token
+permissions before repository access.
 
 `Repo` wires one repository's stores and holds the semantics every
 surface shares — the `bed` binary's gRPC service and `gardenbed-mcp` call
@@ -69,7 +72,7 @@ the same methods, which is why MCP and CLI answers agree by construction
 
 **Subcommands** (binary): `serve` (default — gRPC on `--addr`,
 default `127.0.0.1:9418`; `--max-repos` caps open repositories),
-`import` and `export` (both take `--repo NAME`), `move` (renames a
+`import` and `export` (both take `--repo NAME`), `gc` (offline mark/sweep), `move` (renames a
 repository — an offline operation: it checkpoints the repository's WAL,
 carries the sidecar files, and refuses while a server holds the root's
 `gardenbed.lock`; see [docs/cli.md](cli.md)). The bound address is
@@ -220,6 +223,8 @@ WAL), 5 s busy timeout:
 | `refs` | `name TEXT PK, cs BLOB NOT NULL` | full ref names (`refs/heads/main`); moved only by CAS |
 | `git_map` | `git_sha TEXT PK, cs BLOB NOT NULL UNIQUE` | the git↔changeset bijection; import skips mapped history, export reads it back |
 | `derived` | `kind, cs, bytes, PK(kind, cs)` | the four caches above |
+| `validated_changesets_v1` | `cs BLOB PK, root_tree BLOB NOT NULL` | immutable publication certificates; see [validation.md](validation.md) |
+| `git_raw_commit` | `cs BLOB PK, data BLOB NOT NULL` | compressed original Git commit bytes when model reconstruction is insufficient |
 
 `cas_ref` performs its read-and-compare inside one `BEGIN IMMEDIATE`
 transaction — a ref swap is a single atomic compare-and-swap. The import
@@ -404,7 +409,7 @@ bed ──unix socket── gardenbed-daemon ──gRPC── gardenbed-server
   `.bed/objects`, write-through after each upstream fetch) —
   cross-working-copy dedup falls out of content addressing.
 - **Write RPCs are peer-uid-gated**: `SO_PEERCRED` is checked before
-  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`; any uid other
+  `PutBlob`/`CreateChangeset`/`CasRef`/`Rebase`/`Publish`/`Merge`; any uid other
   than the daemon's owner is refused.
 - **Sidecar**: `Ping`, and `Register(state_dir) → generation counter` —
   a recursive watch on the working-copy root (excluding `.bed` and
@@ -598,7 +603,7 @@ decisions, schema, error semantics — is
 
 | contract | document |
 |---|---|
-| scope (what is Out) | v0.1.md §1 — the Out table is contractual |
+| current scope and open work | [status.md](status.md); v0.2.md §1 (v0.1.md §1 is historical) |
 | byte-level object identity | canonical-encoding.md (D1) |
 | RPC surface | `crates/protocol/proto/gardenbed.proto` (D4) |
 | rebase/publish semantics | v0.1.md D5, §M5.3 |
