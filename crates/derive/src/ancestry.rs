@@ -404,44 +404,30 @@ fn ancestors_naive(metadata: &dyn MetadataStore, start: Id) -> Result<HashSet<Id
     Ok(visited)
 }
 
-/// The naive merge base: intersect both ancestor sets (one BFS per side)
-/// and pick deterministically — newest committer seconds, tie-broken by
+/// The naive merge base: the deterministic first of ALL maximal common
+/// ancestors ([`merge_bases_all_impl`], git's `merge-base --all`
+/// semantics) — newest committer seconds first, tie-broken by
 /// descending id bytes.
 ///
-/// `git merge-base` returns "the best common ancestor"; when several are
-/// equally best (criss-cross merges) git's choice is implementation-defined,
-/// so this deterministic rule is Gardenbed's documented answer. On v0.1
-/// histories (redundant merges over a linear mainline) the maximal common
-/// ancestor is unique and both agree exactly.
+/// Maximality is REQUIRED, not cosmetic: ranking the raw common set by
+/// timestamp can surface a dominated ancestor first (a same-second
+/// commit, or a skewed clock stamping an old commit newer than its
+/// descendant), and merging over a non-maximal base mis-anchors the
+/// 3-way walk (spurious conflicts on disjoint-line edits). DAG
+/// ancestry dominates timestamps: the candidate set is filtered to
+/// the maximal ones BEFORE the deterministic order picks one.
 ///
-/// Note the selection rule alone already determines the answer: a maximal
-/// filter (dropping common ancestors that are proper ancestors of another
-/// common one) can never reject the first candidate in the newest-first
-/// order — it is only ever tested against candidates kept *after* it — so
-/// the historical per-candidate ancestry scan was unobservable dead work
-/// (and O(candidates × history) besides). It is deliberately absent.
+/// `git merge-base` returns "the best common ancestor"; when several
+/// are equally best (criss-cross merges) git's choice is
+/// implementation-defined, so this deterministic rule is Gardenbed's
+/// documented answer. On histories with a unique maximal common
+/// ancestor both agree exactly.
 fn merge_base_naive_impl(
     metadata: &dyn MetadataStore,
     a: Id,
     b: Id,
 ) -> Result<Option<Id>, StoreError> {
-    if a == b {
-        return Ok(Some(a));
-    }
-    let anc_a = ancestors_naive(metadata, a)?;
-    let anc_b = ancestors_naive(metadata, b)?;
-    let mut candidates: Vec<(u64, Id)> = Vec::new();
-    for c in anc_a.intersection(&anc_b) {
-        let (cs, _) = metadata.get_changeset(*c)?.ok_or(StoreError::NotFound)?;
-        candidates.push((cs.committer.time_secs, *c));
-    }
-    // Newest committer seconds first, tie-broken by descending id bytes —
-    // the same deterministic order the historical maximal filter consumed.
-    candidates.sort_by(|x, y| {
-        y.0.cmp(&x.0)
-            .then_with(|| y.1.as_bytes().cmp(x.1.as_bytes()))
-    });
-    Ok(candidates.first().map(|&(_, c)| c))
+    Ok(merge_bases_all_impl(metadata, a, b)?.into_iter().next())
 }
 
 /// All maximal common ancestors of `a` and `b` — git's
@@ -686,8 +672,9 @@ impl Engine {
         self.merge_base_naive(a, b)
     }
 
-    /// The naive merge base (common-ancestor intersection + maximal
-    /// filter); see the module docs for the tie-breaking rule.
+    /// The naive merge base: the deterministic first of the maximal
+    /// common ancestors; see [`Engine::merge_bases_all`] for the
+    /// ordering rule and why maximality must precede it.
     pub fn merge_base_naive(&self, a: Id, b: Id) -> Result<Option<Id>, StoreError> {
         merge_base_naive_impl(&*self.metadata, a, b)
     }
