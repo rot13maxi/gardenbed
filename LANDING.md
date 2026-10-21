@@ -1,4 +1,9 @@
-# feat/merge landing procedure (pre-staged; RE-CHECK PENDING EXTENSION, holds for p5)
+# feat/merge landing procedure — historical record
+
+Status: superseded; merge core and integration (M9/M10) have landed. The
+pre-stage, hold, and freeze instructions below record the 2026-10-17 landing
+and are not current operational instructions. Use [docs/OPERATIONS.md](docs/OPERATIONS.md)
+for the active runbook and [docs/status.md](docs/status.md) for current scope.
 
 History: p8 approved the re-check at 24d4a3d9babfbaf1 on 2026-10-17 (git
 30b9a9b, pre-union stack onto a22af3d). p8 then decided A-amended: pre-stage

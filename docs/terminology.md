@@ -12,18 +12,19 @@ of project-specific metaphors to understand an operation or error.
 | Server | The `gardenbed-server` process serving a repository |
 | Working copy | Local files and their `.bed/` state directory |
 | Changeset | An immutable record of file changes, parents, and metadata |
-| Commit | The operation that creates a changeset on the server |
+| Commit | The operation that creates a changeset, queued locally when the server is unreachable |
 | Sparse paths | Repository-relative prefixes selected for local materialization |
 | Object store | Content-addressed blobs and trees in `objects/` |
 | Metadata database | Changesets, refs, Git mappings, and validation records in `metadata.sqlite3` |
 | Derived data | Rebuildable trees, blame, ancestry, and path summaries |
 | Git bridge | Import/export support in the `gardenbed-git` crate |
-| Local daemon | A planned filesystem watcher and shared cache |
+| Local daemon | Optional filesystem watcher and shared cache (`gardenbed-daemon`) |
 
 A commit and publication are separate operations. `bed commit` records work
 on the server; `bed publish` fast-forwards `main` to the current changeset.
-An unpublished changeset is already stored on the server. Publication does
-not perform a content merge.
+An online commit is stored on the server before publication. Offline commits
+remain local until `bed sync` uploads them. Publication does not perform a
+content merge.
 
 ## Commands
 
@@ -35,12 +36,16 @@ not perform a content merge.
 | `bed commit` | Create a changeset from local changes |
 | `bed rebase` | Replay the current changeset onto another parent |
 | `bed publish` | Fast-forward `main` to the current changeset |
+| `bed merge` | Create a two-parent merge changeset |
+| `bed sync` | Upload queued offline commits |
+| `bed mount` | Mount the current changeset as a read-only FUSE filesystem |
 | `bed status/log/diff/file/blame` | Inspect local changes or repository history |
 
 Use `--state-dir` for the local state directory and `clone --sparse` to record
 initial path selections. `clone --sparse` does not fetch working files;
 `bed sparse add` does. `sparse remove` changes the selection and keeps files.
-`rebase` currently replays one changeset, not an entire stack.
+`rebase` replays one changeset by default; `rebase --stack` replays the
+first-parent stack since the merge base (see [CLI reference](cli.md)).
 
 ## Writing and naming rules
 

@@ -50,9 +50,12 @@ repository — see the design doc):
 
 ```sh
 docker compose -f tools/scale/compose.yaml run --rm server \
-    import --from https://example.com/repo.git \
+    import --from /path/to/local/repo.git \
     --storage /etc/gardenbed/storage.toml
 ```
+
+Scaled imports require a local Git path accessible inside the container
+(bind-mount it for the command above); URL imports require local storage mode.
 
 ## Scaling the replica count
 
@@ -96,47 +99,17 @@ export GARDENBED_TEST_S3_PATH_STYLE=1
 (The compose file publishes Postgres on host port 55432 and MinIO on
 55900, so the same running compose stack serves those URLs.)
 
-## Build context: git worktree vs bed checkout (cutover plan)
+## Build context
 
-`compose.yaml` builds the server image from `build.context: ../..` —
-the repository root. Today that context is the git worktree
-`/home/user/code/gardenbed-scale` (the scale-out lane's checkout), and
-containers must keep building from git while the bed dogfood migration
-settles: the git mirror `/home/user/code/gardenbed` stays authoritative
-for container builds until we decide otherwise.
+`compose.yaml` resolves `build.context: ../..` relative to the compose file,
+so it builds the repository checkout containing `tools/scale/`. Run the
+commands above from that checkout's root. `demo/run-scaled.sh` likewise
+resolves the compose file from its own location.
 
-Practical consequences, for now:
-
-- Invoke compose from the git worktree
-  (`cd /home/user/code/gardenbed-scale && docker compose -f
-  tools/scale/compose.yaml …`). The context path is relative to
-  `compose.yaml`, so invoking it from a bed checkout would build from
-  bed-materialized files — untested and not desired yet.
-- The bed checkout (`~/code/gb-glm`) is a *consumer* of the stack:
-  `bed clone http://127.0.0.1:9418` against the published ports works
-  regardless of where the images were built.
-- Keep `feat/scale-out` mirrored: commits land in bed, then are
-  exported/pushed to the git branch before any compose-based
-  verification that needs fresh code in the image.
-
-A future cutover of the compose paths to the git mirror (or a bed
-checkout) would touch:
-
-1. `compose.yaml` — `build.context` stays `../..`; only the invocation
-   directory changes (run it from `/home/user/code/gardenbed`, whose
-   branch `feat/scale-out` mirrors bed's).
-2. `Dockerfile.server` — no change expected; it copies from the context
-   root and builds with cargo.
-3. CI parity-test services — the same compose file backs the live
-   parity/scale test envs; CI currently uses the git checkout's context
-   and needs the mirrored branch up to date.
-4. The demo (`demo/run-scaled.sh`) — it derives the compose invocation
-   from its own location; run it from the git worktree, or teach it a
-   `GARDENBED_SCALE_COMPOSE_DIR` override when cutover happens.
-
-Decision deferred to the workspace owner (see dogfood notes): until
-then, treat the git mirror as the single source of truth for anything
-that builds a container.
+The original scale-out lane used `/home/user/code/gardenbed-scale` during
+landing. That path and the `feat/scale-out` mirror instructions were staging
+notes, not deployment prerequisites. For the current dogfood deployment and
+Git/bed synchronization procedure, use [OPERATIONS.md](../../docs/OPERATIONS.md).
 
 ## Teardown
 

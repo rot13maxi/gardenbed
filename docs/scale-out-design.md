@@ -55,7 +55,7 @@ tier. Only the storage seams do.
   identical, and the same image ships `mc` (bucket creator,
   healthcheck).
 - **D5 — Postgres schema mirrors the SQLite schema one-to-one.** Same
-  five tables, same columns, BLOB→`bytea`, PK/UNIQUE preserved. Keeping
+  six tables (including raw imported commits), same columns, BLOB→`bytea`, PK/UNIQUE preserved. Keeping
   the two in lockstep makes parity bugs visible in backend-parity
   tests instead of in production.
 - **D6 — CAS in Postgres is one `UPDATE ... WHERE` — no advisory locks.**
@@ -139,8 +139,8 @@ local mode — clone the repository locally and import the path).
   std channel. No tokio blocking primitive runs on the calling thread,
   so calls are panic-free from inside any tokio context (a tonic
   handler under `#[tokio::main]`, say).
-- **Schema (D5):** same five tables (`changesets`,
-  `validated_changesets_v1`, `refs`, `git_map`, `derived`); `id`/`cs`/
+- **Schema (D5):** same six tables (`changesets`,
+  `validated_changesets_v1`, `refs`, `git_map`, `derived`, `git_raw_commit`); `id`/`cs`/
   `root_tree` `bytea`, `git_sha` `text`, `canonical`/`bytes` `bytea`.
   `refs.cs` carries no FK to changesets — SQLite has none either (a CAS
   may point a ref at an id before its changeset row lands).
@@ -173,7 +173,7 @@ local mode — clone the repository locally and import the path).
   trait calls. Opening HEADs a probe key to fail fast on unreachable
   endpoints or missing buckets.
 - **Key layout:** identical 2-level sharding: S3 key `<2hex>/<62hex>`.
-  Same envelope (GBLO1 magic + raw_len + one zstd frame) for blobs and
+  Same GBLO1/GBLO2 envelopes as the filesystem backend for blobs and
   bare canonical bytes for trees — byte-identical payloads to what
   FsObjectStore writes, so a repository can move between fs and S3.
 - **`put` / immutability:** conditional put (`If-None-Match: *`,

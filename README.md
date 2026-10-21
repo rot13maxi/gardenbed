@@ -192,13 +192,15 @@ per-repository roles, and Git import/export.
 
 Writes need a connection to the server, except `bed commit`, which
 queues locally when the server is unreachable and replays with
-`bed sync`. Garbage collection of unreferenced objects is not on main
-yet (in review). Authentication is optional
+`bed sync`. Garbage collection of unreferenced objects is implemented
+(`gardenbed-server gc`, offline by default). Authentication is optional
 (`gardenbed-server serve --auth auth.toml`; without it the server is
 open). Blame follows first-parent history and renames; copy detection
 is exact-blob only. Git roundtrips preserve commit IDs for supported
-histories; signed commits, non-UTF-8 metadata, and other exceptions are
-documented in [Git interoperability limits](docs/divergences.md).
+histories; exceptions are documented in
+[Git interoperability limits](docs/divergences.md). Imported
+signed commits and non-UTF-8 commit metadata are preserved verbatim by the
+current bridge; non-UTF-8 paths and pre-canonical tree modes remain limited.
 
 For horizontal scale-out, the server can instead run as N stateless
 replicas with metadata in PostgreSQL and objects in S3: pass
@@ -220,6 +222,7 @@ limits.
 ## Development and documentation
 
 ```sh
+cargo build --workspace --bins
 cargo test --workspace
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
@@ -234,6 +237,7 @@ how they fit together.
 - [Durable publication validation](docs/validation.md)
 - [Landing-chain operations](docs/OPERATIONS.md)
 - [Design and verification plan](docs/v0.1.md)
+- [Current implementation status and open work](docs/status.md)
 - [Changelog](CHANGELOG.md)
 
 Gardenbed draws on Scion, Sapling/Mononoke, and Jujutsu. The original
