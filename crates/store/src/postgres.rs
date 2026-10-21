@@ -12,7 +12,10 @@
 //! CAS (decision D6) is a single guarded `UPDATE ... WHERE` on the
 //! existing-ref path (rowcount 1 ⇔ won) and
 //! `INSERT ... ON CONFLICT DO NOTHING` on the create path, re-reading
-//! the current value for the Conflict report. No advisory locks.
+//! the current value for the Conflict report. No advisory locks on the
+//! data path — the ONE advisory lock the store takes is
+//! transaction-scoped, held only around schema DDL at `open()` (see
+//! [`SCHEMA_LOCK_KEY`]); no trait call ever waits on it.
 //!
 //! Async bridging: `tokio-postgres` is async while the traits are sync,
 //! so the store owns a dedicated driver thread running a private
@@ -40,8 +43,10 @@ use tokio_postgres::NoTls;
 /// Schema (D5): same five tables as SQLite, BLOB→`bytea`. `refs.cs`
 /// carries no FK to changesets — SQLite has none either (a CAS may point
 /// a ref at an id before its changeset row lands). `CREATE TABLE IF NOT
-/// EXISTS` on every open, exactly like SQLite; first schema cut, no
-/// migrations yet.
+/// EXISTS` on every open, exactly like SQLite — but under the open-time
+/// advisory lock (see [`PostgresMetadataStore::open`]), because unlike
+/// SQLite's single-writer database the same fresh schema can be opened
+/// concurrently by many replicas.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS changesets (
     id        bytea PRIMARY KEY,
@@ -80,6 +85,13 @@ const MIGRATIONS: &str = "
 ALTER TABLE changesets ADD COLUMN IF NOT EXISTS arrived BIGSERIAL;
 ";
 
+/// Advisory-lock key for schema initialization (see
+/// [`PostgresMetadataStore::open`]). A fixed 64-bit constant, database-
+/// scoped by Postgres itself; only another application choosing the same
+/// arbitrary number on the same database could collide — the value is
+/// random to keep that accidental.
+const SCHEMA_LOCK_KEY: i64 = 0x2A61_D8E3_4B7C_59F1;
+
 /// The PostgreSQL (metadata) metadata store.
 ///
 /// Connections come from a `deadpool-postgres` pool sized to the CPU
@@ -117,9 +129,37 @@ impl PostgresMetadataStore {
                 .map_err(|e| StoreError::Db(format!("postgres pool: {e}")))?;
             // One connection up front: fail fast on unreachable servers
             // (instead of at the first trait call) and create the schema.
-            let conn = pool.get().await.map_err(pg_err)?;
-            conn.batch_execute(SCHEMA).await.map_err(pg_err)?;
-            conn.batch_execute(MIGRATIONS).await.map_err(pg_err)?;
+            // Schema DDL runs inside ONE transaction holding a
+            // transaction-scoped advisory lock on a fixed key, so N
+            // replicas racing `open()` on a fresh database serialize:
+            // the first runs the DDL, every later opener finds the
+            // tables already in place (the DDL is `IF NOT EXISTS`
+            // -guarded) and its own batch is a no-op. Without the
+            // lock, concurrent `CREATE TABLE IF NOT EXISTS` both pass
+            // the catalog check and both insert into `pg_type`, so one
+            // loses the race with a duplicate-key error on
+            // `pg_type_typname_nsp_index` (SQLSTATE 23505 — observed
+            // 6/7-fail on a fresh parallel parity run). The lock is
+            // transaction-scoped (`pg_advisory_xact_lock`), so it is
+            // released at COMMIT/ROLLBACK even if the process dies
+            // mid-DDL — no leak, and the transaction rolls a
+            // half-written schema cut back. It is cluster-scoped, so
+            // it also serializes across replicas (a process-local
+            // mutex cannot), and ordinary pooled trait calls take no
+            // advisory locks, so CAS traffic is unaffected. Any new
+            // schema amendment joins `MIGRATIONS` (or a later
+            // migration block) inside this same transaction, keeping
+            // ALL DDL on one connection under one lock.
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            let lock = tx
+                .query_one("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
+                .await
+                .map_err(pg_err)?;
+            drop(lock);
+            tx.batch_execute(SCHEMA).await.map_err(pg_err)?;
+            tx.batch_execute(MIGRATIONS).await.map_err(pg_err)?;
+            tx.commit().await.map_err(pg_err)?;
             Ok::<Pool, StoreError>(pool)
         })?;
         Ok(PostgresMetadataStore { pool, driver })
