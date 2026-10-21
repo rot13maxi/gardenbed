@@ -792,10 +792,7 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         })
     }
 
-    fn raw_tree_model_id(
-        &self,
-        git_tree_sha: [u8; 20],
-    ) -> Result<Option<Option<Id>>, StoreError> {
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
         let pool = self.pool.clone();
         self.driver.block_on(async move {
             let conn = pool.get().await.map_err(pg_err)?;
@@ -862,9 +859,7 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                     let prev_model: Vec<u8> = row.get(1);
                     let prev_bytes =
                         zstd::bulk::decompress(&prev_frame, crate::sqlite::MAX_RAW_TREE)
-                            .map_err(|e| {
-                                StoreError::Corrupt(format!("raw tree frame: {e}"))
-                            })?;
+                            .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
                     if prev_bytes.as_slice() == bytes && prev_model == model_payload {
                         tx.rollback().await.map_err(pg_err)?;
                         Ok(())

@@ -400,13 +400,11 @@ pub fn export_to_path(
             let raw = metadata.raw_commit(*id).map_err(ExportError::from)?;
             let tree_sha = match raw.as_deref() {
                 Some(raw_bytes) => {
-                    let root_sha = raw_tree_header(raw_bytes).ok_or_else(|| {
-                        ExportError::Changeset {
+                    let root_sha =
+                        raw_tree_header(raw_bytes).ok_or_else(|| ExportError::Changeset {
                             id: id.to_hex(),
-                            detail: "the raw commit bytes carry no parseable tree header"
-                                .into(),
-                        }
-                    })?;
+                            detail: "the raw commit bytes carry no parseable tree header".into(),
+                        })?;
                     match metadata.raw_tree(root_sha).map_err(ExportError::from)? {
                         Some(bytes) => {
                             TreeRenderer {
@@ -670,14 +668,13 @@ impl TreeRenderer<'_> {
         }
         // Recurse: pair raw entries with the model subtree's entries by
         // name to resolve non-raw children.
-        let entries = crate::gtree::parse_tree_raw(&bytes).map_err(|detail| {
-            ExportError::Changeset {
+        let entries =
+            crate::gtree::parse_tree_raw(&bytes).map_err(|detail| ExportError::Changeset {
                 id: model_tree
                     .map(|t| t.to_hex())
                     .unwrap_or_else(|| "empty".into()),
                 detail: format!("captured raw tree does not parse: {detail}"),
-            }
-        })?;
+            })?;
         let model_entries: Vec<gardenbed_model::TreeEntry> = match model_tree {
             Some(id) => self
                 .engine
@@ -687,9 +684,9 @@ impl TreeRenderer<'_> {
                 .unwrap_or_default(),
             None => Vec::new(),
         };
-        let metadata = self.metadata.ok_or_else(|| ExportError::Other(
-            "raw-tree emission requires the metadata store".into(),
-        ))?;
+        let metadata = self.metadata.ok_or_else(|| {
+            ExportError::Other("raw-tree emission requires the metadata store".into())
+        })?;
         for e in &entries {
             if e.kind != crate::gtree::GKind::Dir {
                 continue; // blobs are pushed by the blob phase (identity)
@@ -697,11 +694,14 @@ impl TreeRenderer<'_> {
             let child_sha = *e.oid.as_bytes();
             match metadata.raw_tree(child_sha).map_err(ExportError::from)? {
                 Some(child_bytes) => {
+                    // Pair by the lossy name (the model holds lossy
+                    // names; the importer's collision guard proved the
+                    // lossy names unique per directory).
+                    let lossy_name = String::from_utf8_lossy(&e.name).into_owned();
                     let child_model = model_entries
                         .iter()
                         .find(|me| {
-                            me.kind == gardenbed_model::TreeKind::Dir
-                                && me.name.as_bytes() == e.name.as_slice()
+                            me.kind == gardenbed_model::TreeKind::Dir && me.name == lossy_name
                         })
                         .and_then(|me| me.tree);
                     self.emit_raw_tree(child_sha, child_bytes, child_model, depth + 1)?;
@@ -710,11 +710,11 @@ impl TreeRenderer<'_> {
                     // Non-divergent child: the canonical render (through
                     // the model) reproduces its original SHA — emit it
                     // via the normal path so the pack stays complete.
+                    let lossy_name = String::from_utf8_lossy(&e.name).into_owned();
                     let child_model = model_entries
                         .iter()
                         .find(|me| {
-                            me.kind == gardenbed_model::TreeKind::Dir
-                                && me.name.as_bytes() == e.name.as_slice()
+                            me.kind == gardenbed_model::TreeKind::Dir && me.name == lossy_name
                         })
                         .and_then(|me| me.tree)
                         .ok_or_else(|| ExportError::Changeset {

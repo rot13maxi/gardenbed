@@ -740,10 +740,7 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .transpose()
     }
 
-    fn raw_tree_model_id(
-        &self,
-        git_tree_sha: [u8; 20],
-    ) -> Result<Option<Option<Id>>, StoreError> {
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
         let conn = self.read_conn()?;
         let model: Option<Vec<u8>> = conn
             .query_row(

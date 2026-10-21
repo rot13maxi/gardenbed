@@ -876,10 +876,395 @@ fn pre_canonical_100664_mode_fixups_import_via_raw_fallback() {
     let (objects, metadata, _) = open_stores(&garden);
     let exported = b._dir.path().join("raw-mode-export.git");
     let roundtrip = gardenbed_git::export_to_path(
-        &exported, objects, metadata, &gardenbed_git::ExportOptions::default(),
-    ).expect("raw non-canonical tree modes must export SHA-exact");
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("raw non-canonical tree modes must export SHA-exact");
     for sha in [&c1, &c2, &c3, &c4] {
         assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha));
     }
     gardenbed_harness::git_fsck(&exported).expect("exported raw-mode history is valid");
+}
+
+/// Non-UTF-8 path bytes (latin-1 `café` with `\xe9`): the model keeps a
+/// lossy name (`caf\u{FFFD}`) for querying, the raw tree preserves the
+/// original bytes, and the export must reproduce the original SHA —
+/// byte-exact history without silent name mangling.
+#[test]
+fn non_utf8_path_bytes_capture_and_roundtrip() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"latin-1 named\n");
+    // A tree entry name with the raw byte \xe9 (not valid UTF-8).
+    let name: &[u8] = b"caf\xe9.txt";
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"100644 ");
+    bytes.extend_from_slice(name);
+    bytes.push(0);
+    bytes.extend_from_slice(&hex_bytes(&blob));
+    let tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &bytes,
+    );
+    let c1 = b.commit_tree(&tree, &[], "latin-1 filename\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the raw-name tree");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("non-UTF-8 names import via raw-tree capture")
+    };
+    assert_eq!(report.commits_new, 1);
+    assert!(
+        report.raw_trees_captured >= 1,
+        "the non-UTF-8 tree is captured: {}",
+        report.raw_trees_captured
+    );
+
+    // The model path is the lossy decode (queryable), never the raw bytes.
+    let (objects, metadata, engine) = open_stores(&garden);
+    let root = engine
+        .derive_tree(metadata.cs_for_git(&c1).unwrap().unwrap())
+        .expect("derive")
+        .expect("root");
+    let flat = engine.flatten_tree(Some(root)).expect("flatten");
+    assert_eq!(flat.len(), 1);
+    assert_eq!(
+        flat[0].0, "caf\u{FFFD}.txt",
+        "the model holds the lossy name for queries"
+    );
+
+    // Export: SHA-exact, because the raw tree row carries the bytes.
+    let exported = b._dir.path().join("non-utf8-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("non-UTF-8 history exports SHA-exact");
+    assert!(
+        roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1),
+        "the commit SHA roundtrips"
+    );
+    assert!(
+        roundtrip.raw_trees_emitted >= 1,
+        "the raw tree is emitted verbatim: {}",
+        roundtrip.raw_trees_emitted
+    );
+    gardenbed_harness::git_fsck(&exported).expect("exported raw-name history is valid");
+}
+
+/// Two sibling names whose lossy UTF-8 decodings collide (`a\xff` and
+/// `a\xfe` both become `a\u{FFFD}`) cannot live in one model tree: the
+/// import must refuse loudly, never silently conflate two files. The
+/// refusal comes from whichever guard fires first — the model-building
+/// duplicate-path check (diff classification) or the raw-tree capture
+/// walk's collision guard (divergent trees) — both loud, both before
+/// anything is ingested.
+#[test]
+fn lossy_sibling_name_collision_refuses_loudly() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"content\n");
+    let mut bytes = Vec::new();
+    for name in [&b"a\xff"[..], &b"a\xfe"[..]] {
+        bytes.extend_from_slice(b"100644 ");
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_bytes(&blob));
+    }
+    let tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &bytes,
+    );
+    let _c1 = b.commit_tree(&tree, &[], "colliding siblings\n");
+
+    let garden = b._dir.path().join("garden");
+    let (objects, metadata, engine) = open_stores(&garden);
+    let err = import_from_path(
+        &b.repo,
+        objects.clone(),
+        metadata.clone(),
+        engine,
+        &Default::default(),
+    )
+    .expect_err("the colliding-siblings tree must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate path") || msg.contains("collide after lossy UTF-8 decoding"),
+        "the refusal names the collision: {msg}"
+    );
+
+    // Nothing was ingested: the store stays empty of changesets.
+    let rows = common::sql_scalar(&garden, "SELECT count(*) FROM changesets");
+    assert_eq!(rows, 0, "a refused import stores no changesets");
+}
+
+/// A tampered raw-tree row (direct DB edit — the only path that can
+/// produce one, since `put_raw_tree` checks the hash): the export's
+/// per-tree SHA assertion must refuse loudly, never emit wrong bytes.
+#[test]
+fn tampered_raw_tree_row_refuses_at_export() {
+    let b = Builder::new();
+
+    let old = b.blob(b"old content\n");
+    let t1 = b.raw_tree(&[("100664", &old, "file.txt")]);
+    let c1 = b.commit_tree(&t1, &[], "old world\n");
+    let _ = c1;
+
+    let garden = b._dir.path().join("garden");
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import with raw-tree capture succeeds");
+    }
+
+    // Tamper: replace the captured row's bytes with a decompressible
+    // frame whose bytes hash elsewhere (same shape as the row's frame).
+    {
+        let conn =
+            rusqlite::Connection::open(garden.join("metadata.sqlite3")).expect("open metadata");
+        let frame: Vec<u8> = conn
+            .query_row("SELECT data FROM git_raw_tree", [], |r| r.get(0))
+            .expect("the captured row exists");
+        let mut decoded = zstd::bulk::decompress(&frame, 256 * 1024 * 1024).expect("decode");
+        decoded.extend_from_slice(b"tampered");
+        let tampered = zstd::bulk::compress(&decoded, 3).expect("re-encode");
+        conn.execute(
+            "UPDATE git_raw_tree SET data = ?1",
+            rusqlite::params![tampered],
+        )
+        .expect("tamper");
+    }
+
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("tampered-export.git");
+    let err = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect_err("a tampered raw-tree row must refuse the export");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("a tampered or corrupt row") || msg.contains("tampered"),
+        "the refusal names the tampered row: {msg}"
+    );
+}
+
+/// A native changeset committed on top of imported pre-canonical history
+/// (the bed flow over raw-captured commits): the export must still
+/// reproduce the imported SHAs for the old commits and emit the native
+/// child — raw capture must not break the incremental path.
+#[test]
+fn native_changeset_on_raw_captured_history_exports() {
+    let b = Builder::new();
+
+    let old = b.blob(b"old content\n");
+    let t1 = b.raw_tree(&[("100664", &old, "file.txt")]);
+    let c1 = b.commit_tree(&t1, &[], "old world\n");
+
+    let garden = b._dir.path().join("garden");
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds");
+    }
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        let cs1 = metadata.cs_for_git(&c1).unwrap().expect("mapped");
+
+        // A native child: the bed flow — plain Modify through the model
+        // API, validated and stored like the server does.
+        let child = Changeset {
+            parents: vec![cs1],
+            changes: vec![gardenbed_model::Change {
+                path: "file.txt".into(),
+                op: Op::Modify,
+                blob: Some(blob_id(b"native edit\n")),
+                src_path: None,
+                mode: Mode::Regular,
+            }],
+            message: "native child\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        engine.certify_history(cs1).expect("certify parent");
+        objects.put_blob(b"native edit\n").expect("blob");
+        let cs_child = child.id().expect("canonical");
+        let root = engine.validated_tree_for_new(&child).expect("derive tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_child, &child, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&child, root, &rows, None, None, None)
+            .expect("put changeset");
+        // Export walks refs: move main onto the native child (the bed
+        // publish flow) so both commits are reachable.
+        let won = metadata
+            .cas_ref("refs/heads/main", Some(cs1), cs_child)
+            .expect("cas");
+        assert!(
+            matches!(won, gardenbed_store::RefCas::Won { .. }),
+            "the ref must move onto the native child"
+        );
+    }
+
+    // Export: the imported commit keeps its SHA (raw tree), the child
+    // exports after it (parents before children).
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("native-child-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("native-on-raw history exports");
+    assert!(
+        roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1),
+        "the imported pre-canonical commit keeps its SHA"
+    );
+    assert_eq!(roundtrip.commits.len(), 2, "import + native child");
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Regression (found in review): two ordinary, header-reconstructable
+/// commits sharing the SAME non-canonical root tree in one import. The
+/// second commit inserts no new raw-tree row (the walk's memo decides
+/// the shared root once), but the root still DIVERGES — raw-commit
+/// capture must be forced from the divergence flag, never from the row
+/// count, or the second commit exports with a canonical tree SHA and
+/// breaks SHA-exactness.
+#[test]
+fn two_commits_sharing_noncanonical_root_export_exact() {
+    let b = Builder::new();
+
+    // One 100664 root tree; two commits point at it (git allows
+    // metadata-only commits with the same tree).
+    let old = b.blob(b"shared content\n");
+    let t1 = b.raw_tree(&[("100664", &old, "file.txt")]);
+    let c1 = b.commit_tree(&t1, &[], "first commit on the shared tree\n");
+    let c2 = b.commit_tree(&t1, &[&c1], "second commit, same tree, headers fine\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 2);
+    // ONE row (the shared root decided once), but BOTH commits diverged.
+    assert_eq!(
+        report.raw_trees_captured, 1,
+        "the shared root is captured exactly once"
+    );
+
+    // Both commits export SHA-exact — the memo hit must not demote the
+    // second commit to canonical reconstruction.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("shared-root-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("both commits export");
+    for sha in [&c1, &c2] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} must export SHA-exact"
+        );
+    }
+    assert_eq!(roundtrip.commits.len(), 2);
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Nested non-UTF-8 directory names: a non-UTF-8 dir entry whose subtree
+/// contains a divergent grandchild (100664 file inside it). The capture
+/// walk and the export both pair raw dir entries with model subtrees by
+/// the LOSSY name (the model holds `d\u{FFFD}/…`), and the association
+/// must resolve after the collision guard — otherwise the divergent
+/// grandchild loses its model association and export cannot render the
+/// canonical siblings.
+#[test]
+fn nested_non_utf8_dir_with_divergent_grandchild_roundtrips() {
+    let b = Builder::new();
+
+    let deep = b.blob(b"deep content\n");
+    let plain = b.blob(b"plain sibling\n");
+
+    // Inner tree: 100664 file `inner.txt` (divergent grandchild).
+    let mut inner = Vec::new();
+    inner.extend_from_slice(b"100664 inner.txt\0");
+    inner.extend_from_slice(&hex_bytes(&deep));
+    let inner_tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &inner,
+    );
+
+    // Outer tree: non-UTF-8 dir name `d\xe9` containing the inner tree,
+    // plus a canonical sibling file.
+    let dir_name: &[u8] = b"d\xe9";
+    let mut outer = Vec::new();
+    // git tree order: `d\xe9/` sorts before `plain.txt`.
+    outer.extend_from_slice(b"40000 ");
+    outer.extend_from_slice(dir_name);
+    outer.push(0);
+    outer.extend_from_slice(&hex_bytes(&inner_tree));
+    outer.extend_from_slice(b"100644 plain.txt\0");
+    outer.extend_from_slice(&hex_bytes(&plain));
+    let outer_tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &outer,
+    );
+    let c1 = b.commit_tree(&outer_tree, &[], "nested non-utf8 dir\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the nested trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("nested non-UTF-8 dirs import via raw capture")
+    };
+    assert_eq!(report.commits_new, 1);
+    assert!(
+        report.raw_trees_captured >= 2,
+        "the non-UTF-8 outer tree AND the 100664 inner tree are captured: {}",
+        report.raw_trees_captured
+    );
+
+    // Export: SHA-exact through the nested raw rows.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("nested-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("nested non-UTF-8 history exports SHA-exact");
+    assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1));
+    gardenbed_harness::git_fsck(&exported).expect("exported nested history is valid");
 }

@@ -95,8 +95,8 @@ pub(crate) fn parse_tree_raw(data: &[u8]) -> Result<Vec<RawEntry>, String> {
         let oid = GitOid::from_bytes(raw);
         // Same classification as `map_mode` (type bits decide the kind);
         // unsupported modes are the loud parse errors they always were.
-        let (kind, _) = map_mode(&mode)
-            .ok_or_else(|| format!("unsupported tree entry mode {mode:?}"))?;
+        let (kind, _) =
+            map_mode(&mode).ok_or_else(|| format!("unsupported tree entry mode {mode:?}"))?;
         out.push(RawEntry {
             mode,
             name,
@@ -106,41 +106,6 @@ pub(crate) fn parse_tree_raw(data: &[u8]) -> Result<Vec<RawEntry>, String> {
         pos = nul + 21;
     }
     Ok(out)
-}
-
-/// Renders a git tree body from [`RawEntry`]s **verbatim**: original mode
-/// strings, original name bytes, git's entry order (directories compare
-/// as `name + "/"`). This is the inverse of [`parse_tree_raw`] and the
-/// byte source for verbatim raw-tree export.
-///
-/// The export's canonical path ([`crate::export`]'s `TreeRenderer`)
-/// already emits this same entry order; the only intended difference
-/// between a verbatim render and a canonical render is mode strings and
-/// name bytes — which is exactly what raw capture preserves.
-pub(crate) fn render_raw(entries: &[RawEntry]) -> Vec<u8> {
-    // Sort the way git stores tree entries: name bytes, directories as
-    // name + "/".
-    let mut sorted: Vec<&RawEntry> = entries.iter().collect();
-    sorted.sort_by(|a, b| {
-        let mut ka = a.name.clone();
-        let mut kb = b.name.clone();
-        if a.kind == GKind::Dir {
-            ka.push(b'/');
-        }
-        if b.kind == GKind::Dir {
-            kb.push(b'/');
-        }
-        ka.cmp(&kb)
-    });
-    let mut out = Vec::new();
-    for e in sorted {
-        out.extend_from_slice(e.mode.as_bytes());
-        out.push(b' ');
-        out.extend_from_slice(&e.name);
-        out.push(b'\0');
-        out.extend_from_slice(e.oid.as_bytes());
-    }
-    out
 }
 
 /// Renders the tree body the **canonical export** would produce from

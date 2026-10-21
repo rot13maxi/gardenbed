@@ -114,8 +114,8 @@ mod options;
 // `difftree` above: random bytes into the reader must never panic and
 // never trust a declared length. Not part of the stabilized surface.
 pub mod pack;
-mod report;
 mod rawtree;
+mod report;
 mod resolve;
 mod transform;
 

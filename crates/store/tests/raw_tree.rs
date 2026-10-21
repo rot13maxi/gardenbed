@@ -82,7 +82,9 @@ fn raw_tree_checks(store: &dyn MetadataStore) {
     );
 
     // Idempotent re-put with identical bytes and association.
-    store.put_raw_tree(key, Some(id_of(1)), &body).expect("re-put");
+    store
+        .put_raw_tree(key, Some(id_of(1)), &body)
+        .expect("re-put");
 
     // Same bytes, different model association: the row would silently
     // change meaning — loud refusal.

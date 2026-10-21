@@ -340,10 +340,7 @@ impl MetadataStore for MemoryStore {
         self.read(|s| s.raw_trees.get(&git_tree_sha).map(|(b, _)| b.clone()))
     }
 
-    fn raw_tree_model_id(
-        &self,
-        git_tree_sha: [u8; 20],
-    ) -> Result<Option<Option<Id>>, StoreError> {
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
         self.read(|s| s.raw_trees.get(&git_tree_sha).map(|(_, m)| *m))
     }
 

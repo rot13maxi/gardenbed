@@ -82,12 +82,20 @@ impl RawTreeCapture {
     /// rows through `metadata` (additive, pre-transaction).
     ///
     /// `derived_root` is the changeset's derived tree (the model truth
-    /// the association resolves against). Returns the number of raw-tree
-    /// rows captured for this commit's tree closure — nonzero exactly
-    /// when the root diverges, in which case the caller forces
-    /// raw-commit capture so the export reads the original root SHA from
-    /// the commit's `tree` header (a commit whose root tree diverges must
-    /// carry its original bytes, even when every header reconstructs).
+    /// the association resolves against).
+    ///
+    /// Returns `(root_diverged, rows_inserted)`:
+    ///
+    /// * `root_diverged` — the ORIGINAL root tree's canonical render
+    ///   differs (mode bytes, non-UTF-8 names, or a divergent subtree),
+    ///   **including when a memo hit decided it in an earlier commit**
+    ///   (a second metadata-only commit reusing the same non-canonical
+    ///   root inserts no new row but still diverges). The caller forces
+    ///   raw-commit capture from this flag alone — never from the row
+    ///   count — so the export reads the original root SHA from the
+    ///   commit's `tree` header in every reuse.
+    /// * `rows_inserted` — new rows this call wrote (the report metric;
+    ///   memo hits and idempotent re-puts contribute zero).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_commit_tree(
         &mut self,
@@ -97,10 +105,19 @@ impl RawTreeCapture {
         derived_root: Option<gardenbed_model::Id>,
         metadata: &dyn MetadataStore,
         sha_hex: &str,
-    ) -> Result<usize, ImportError> {
+    ) -> Result<(bool, usize), ImportError> {
         let mut rows = 0usize;
-        self.capture_subtree(repo, engine, root, derived_root, metadata, sha_hex, 0, &mut rows)?;
-        Ok(rows)
+        let diverged = self.capture_subtree(
+            repo,
+            engine,
+            root,
+            derived_root,
+            metadata,
+            sha_hex,
+            0,
+            &mut rows,
+        )?;
+        Ok((diverged, rows))
     }
 
     /// The recursive worker: decides one subtree, capturing when divergent.
@@ -139,12 +156,12 @@ impl RawTreeCapture {
         }
 
         // Read the original tree object bytes verbatim.
-        let obj = repo
-            .find_object(crate::graph::gix_id(tree))
-            .map_err(|e| ImportError::Object {
-                oid: sha_hex.to_owned(),
-                detail: format!("cannot read tree {}: {e}", tree.to_hex()),
-            })?;
+        let obj =
+            repo.find_object(crate::graph::gix_id(tree))
+                .map_err(|e| ImportError::Object {
+                    oid: sha_hex.to_owned(),
+                    detail: format!("cannot read tree {}: {e}", tree.to_hex()),
+                })?;
         if obj.kind != gix::object::Kind::Tree {
             return Err(ImportError::Object {
                 oid: sha_hex.to_owned(),
@@ -218,12 +235,14 @@ impl RawTreeCapture {
         // preserves).
         let mut any_diverged = false;
         for e in entries.iter().filter(|e| e.kind == GKind::Dir) {
+            // Pair raw and model entries by the LOSSY name: the model
+            // holds lossy names for non-UTF-8 directories, and the
+            // sibling-collision guard above already proved the lossy
+            // names are unique within this directory.
+            let lossy_name = String::from_utf8_lossy(&e.name).into_owned();
             let child_model = model_entries
                 .iter()
-                .find(|me| {
-                    me.kind == gardenbed_model::TreeKind::Dir
-                        && me.name.as_bytes() == e.name.as_slice()
-                })
+                .find(|me| me.kind == gardenbed_model::TreeKind::Dir && me.name == lossy_name)
                 .and_then(|me| me.tree);
             let diverged = self.capture_subtree(
                 repo,

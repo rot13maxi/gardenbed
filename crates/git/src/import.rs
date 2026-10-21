@@ -213,7 +213,7 @@ pub fn import_from_path(
             // ingest transaction below (crash-orphan-safe: a row is only
             // consumed when a captured commit's tree header names it).
             let (root, written_trees) = engine.validated_tree_for_new_with_writes(&cs)?;
-            let raw_tree_rows = raw_tree_capture.capture_commit_tree(
+            let (root_diverged, raw_tree_rows) = raw_tree_capture.capture_commit_tree(
                 &repo,
                 &engine,
                 raw.tree,
@@ -222,14 +222,16 @@ pub fn import_from_path(
                 &sha_hex,
             )?;
             report.raw_trees_captured += raw_tree_rows as u64;
-            let raw_capture = if reconstructed == raw_bytes && raw_tree_rows == 0 {
+            let raw_capture = if reconstructed == raw_bytes && !root_diverged {
                 None
             } else {
-                // Unreconstructable headers, or a divergent root tree:
-                // the original commit bytes carry what the model cannot
-                // — extra headers, and the original root SHA in the
-                // `tree` header (which the export resolves through
-                // raw-tree rows).
+                // Unreconstructable headers, or a divergent root tree
+                // (even one whose rows were memo-decided or already
+                // stored by an earlier commit — divergence is semantic,
+                // not a row count): the original commit bytes carry what
+                // the model cannot — extra headers, and the original
+                // root SHA in the `tree` header (which the export
+                // resolves through raw-tree rows).
                 Some(raw_bytes.as_slice())
             };
             // Batched ingest: the changeset row, the git mapping and the
