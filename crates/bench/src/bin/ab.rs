@@ -287,6 +287,7 @@ struct Measure {
     code: Option<i32>,
 }
 
+#[cfg(unix)]
 fn timeval_ms(t: libc::timeval) -> f64 {
     t.tv_sec as f64 * 1000.0 + t.tv_usec as f64 / 1000.0
 }
@@ -329,32 +330,53 @@ fn run_measured_to(cmd: &mut Command, log: &Path, capture: Option<&Path>) -> Mea
             };
         }
     };
-    let pid = child.id() as libc::pid_t;
-    let mut status: libc::c_int = 0;
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
-    let wall = t0.elapsed().as_secs_f64() * 1000.0;
-    // No `Child::wait`: the process was reaped above; dropping the handle
-    // only closes the stdio files.
-    drop(child);
-    if rc < 0 {
-        append_log(
-            log,
-            &format!("wait4 failed: {}\n", std::io::Error::last_os_error()),
-        );
-        return Measure {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        let mut status: libc::c_int = 0;
+        let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
+        let wall = t0.elapsed().as_secs_f64() * 1000.0;
+        // No `Child::wait`: the process was reaped above; dropping the
+        // handle only closes the stdio files.
+        drop(child);
+        if rc < 0 {
+            append_log(
+                log,
+                &format!("wait4 failed: {}\n", std::io::Error::last_os_error()),
+            );
+            return Measure {
+                wall_ms: wall,
+                ..Measure::default()
+            };
+        }
+        let exited = libc::WIFEXITED(status);
+        Measure {
             wall_ms: wall,
-            ..Measure::default()
-        };
+            user_ms: timeval_ms(ru.ru_utime),
+            sys_ms: timeval_ms(ru.ru_stime),
+            max_rss_kb: ru.ru_maxrss as u64,
+            ok: exited && libc::WEXITSTATUS(status) == 0,
+            code: exited.then(|| libc::WEXITSTATUS(status)),
+        }
     }
-    let exited = libc::WIFEXITED(status);
-    Measure {
-        wall_ms: wall,
-        user_ms: timeval_ms(ru.ru_utime),
-        sys_ms: timeval_ms(ru.ru_stime),
-        max_rss_kb: ru.ru_maxrss as u64,
-        ok: exited && libc::WEXITSTATUS(status) == 0,
-        code: exited.then(|| libc::WEXITSTATUS(status)),
+    #[cfg(not(unix))]
+    {
+        // No rusage accounting on Windows: wall time only, exit status
+        // from `wait`.
+        drop(child.stdin.take());
+        let status = child.wait().ok();
+        let wall = t0.elapsed().as_secs_f64() * 1000.0;
+        let (ok, code) = match status {
+            Some(s) => (s.success(), s.code()),
+            None => (false, None),
+        };
+        Measure {
+            wall_ms: wall,
+            ok,
+            code,
+            ..Measure::default()
+        }
     }
 }
 
@@ -843,6 +865,7 @@ fn tail_of(log: &Path, bytes: usize) -> String {
 }
 
 /// Free bytes on the filesystem holding `path` (0 when unknowable).
+#[cfg(unix)]
 fn free_bytes(path: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt as _;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
@@ -851,6 +874,13 @@ fn free_bytes(path: &Path) -> Option<u64> {
         return None;
     }
     Some(st.f_bavail * st.f_frsize)
+}
+
+/// Windows has no statvfs; disk free space is not essential to the
+/// report, so the answer is "unknown".
+#[cfg(not(unix))]
+fn free_bytes(_path: &Path) -> Option<u64> {
+    None
 }
 
 fn human(n: u64) -> String {

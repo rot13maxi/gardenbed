@@ -516,22 +516,10 @@ fn fsync_dir(dir: &Path) -> Result<(), StoreError> {
 /// Sets a path's mtime (and atime) to now without opening it for write —
 /// the GC young-orphan grace restarts on re-upload of identical content.
 fn touch_mtime(path: &Path) -> Result<(), StoreError> {
-    rustix::fs::utimensat(
-        rustix::fs::CWD,
-        path,
-        &rustix::fs::Timestamps {
-            last_access: rustix::fs::Timespec {
-                tv_sec: 0,
-                tv_nsec: rustix::fs::UTIME_NOW,
-            },
-            last_modification: rustix::fs::Timespec {
-                tv_sec: 0,
-                tv_nsec: rustix::fs::UTIME_NOW,
-            },
-        },
-        rustix::fs::AtFlags::empty(),
-    )
-    .map_err(|e| StoreError::Io(e.to_string()))
+    // The platform crate maps the same semantics onto utimensat (Unix) or
+    // SetFileTime (Windows); UTIME_NOW's "now, without opening for write"
+    // contract is preserved on both.
+    gardenbed_platform::touch_mtime(path).map_err(|e| StoreError::Io(e.to_string()))
 }
 
 fn io_err(e: std::io::Error) -> StoreError {

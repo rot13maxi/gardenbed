@@ -1691,16 +1691,13 @@ fn observe_working_bytes(root: &Path, rel: &str) -> Result<Option<(Vec<u8>, Mode
     if meta.is_dir() {
         return Ok(None); // replaced by a directory: a deletion
     }
-    use std::os::unix::ffi::OsStrExt as _;
     if meta.file_type().is_symlink() {
-        let bytes = fs::read_link(&on_disk)?.as_os_str().as_bytes().to_vec();
+        let bytes = crate::status::link_target_bytes(&fs::read_link(&on_disk)?);
         return Ok(Some((bytes, Mode::Symlink)));
     }
-    use std::os::unix::fs::PermissionsExt as _;
-    let mode = if meta.permissions().mode() & 0o111 != 0 {
-        Mode::Exec
-    } else {
-        Mode::Regular
+    let mode = match crate::status::mode_of(&meta) {
+        1 => Mode::Exec,
+        _ => Mode::Regular,
     };
     Ok(Some((fs::read(&on_disk)?, mode)))
 }
@@ -2024,26 +2021,34 @@ fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, ClientError
 /// `.bed/objects` stays bounded by what the mount actually read.
 pub async fn mount(state_dir: &Path, mountpoint: &Path) -> Result<(), ClientError> {
     let bed = WorkingCopy::open(state_dir)?;
-    require_current_cs(&bed)?;
-    if !crate::mount::fuse_available() {
-        return Err(ClientError::MountUnavailable);
+    #[cfg(unix)]
+    {
+        if !crate::mount::fuse_available() {
+            return Err(ClientError::MountUnavailable);
+        }
+        let handle = crate::mount::mount(&bed, mountpoint).await?;
+        let cs = Id::from_str(bed.config().current_cs.as_deref().expect("checked"))
+            .map_err(|_| ClientError::NoCurrentCs)?;
+        eprintln!(
+            "mounted {} read-only at {} — Ctrl-C to unmount",
+            cs.short(),
+            mountpoint.display()
+        );
+        wait_for_shutdown().await;
+        handle
+            .unmount()
+            .map_err(|e| ClientError::MountUnmount { source: e })?;
+        Ok(())
     }
-    let handle = crate::mount::mount(&bed, mountpoint).await?;
-    let cs = Id::from_str(bed.config().current_cs.as_deref().expect("checked"))
-        .map_err(|_| ClientError::NoCurrentCs)?;
-    eprintln!(
-        "mounted {} read-only at {} — Ctrl-C to unmount",
-        cs.short(),
-        mountpoint.display()
-    );
-    wait_for_shutdown().await;
-    handle
-        .unmount()
-        .map_err(|e| ClientError::MountUnmount { source: e })?;
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        let _ = (state_dir, mountpoint);
+        Err(ClientError::MountUnavailable)
+    }
 }
 
 /// Blocks until SIGINT or SIGTERM arrives (the mount's foreground loop).
+#[cfg(unix)]
 async fn wait_for_shutdown() {
     let sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt());
     let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());

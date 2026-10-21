@@ -32,7 +32,6 @@
 use std::collections::HashSet;
 use std::fs;
 use std::fs::Metadata;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::time::UNIX_EPOCH;
 
@@ -456,10 +455,7 @@ fn observe(root: &Path, rel: &str) -> Result<Option<Observed>, ClientError> {
     }
     let is_symlink = meta.is_symlink();
     let content: Vec<u8> = if is_symlink {
-        fs::read_link(root.join(rel))?
-            .as_os_str()
-            .as_bytes()
-            .to_vec()
+        link_target_bytes(&fs::read_link(root.join(rel))?)
     } else {
         fs::read(root.join(rel))?
     };
@@ -473,6 +469,20 @@ fn observe(root: &Path, rel: &str) -> Result<Option<Observed>, ClientError> {
         size: meta.len() as i64,
         mtime_ns: mtime_ns(&meta),
     }))
+}
+
+/// A symlink's content is its target path's bytes — the same identity a
+/// Unix checkout records. Windows stores link targets as UTF-16; the
+/// UTF-8 encoding keeps blob ids identical for the same target string.
+#[cfg(unix)]
+pub(crate) fn link_target_bytes(target: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+pub(crate) fn link_target_bytes(target: &std::path::Path) -> Vec<u8> {
+    target.to_string_lossy().into_owned().into_bytes()
 }
 
 /// The treestate's clock: file mtime as nanoseconds since the Unix epoch
@@ -491,7 +501,7 @@ pub fn mtime_ns(meta: &Metadata) -> i64 {
 /// The working file's mode as a §4 code: 1 (exec) when any execute bit is
 /// set, else 0 (regular). Symlink (2) and gitlink (3) rows are classified
 /// by their metadata shape in [`check_tracked`]; a scan never writes them.
-fn mode_of(meta: &Metadata) -> i64 {
+pub(crate) fn mode_of(meta: &Metadata) -> i64 {
     #[cfg(unix)]
     {
         let bits = std::os::unix::fs::PermissionsExt::mode(&meta.permissions());

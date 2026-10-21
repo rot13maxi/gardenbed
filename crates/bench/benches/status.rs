@@ -20,7 +20,6 @@ mod world;
 
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -61,7 +60,7 @@ fn setup() -> World {
                 blob_id: blob_id(&content),
                 mode: MODE_REGULAR,
                 size: content.len() as i64,
-                mtime_ns: md.mtime_nsec(),
+                mtime_ns: gardenbed::status::mtime_ns(&md),
                 hint: HINT_VERIFIED,
             })
             .expect("row upserted");

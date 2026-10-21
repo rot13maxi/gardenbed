@@ -73,15 +73,8 @@ pub fn cache_root() -> PathBuf {
 
 /// This process's uid (0 on non-unix).
 pub fn current_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        // SAFETY: `getuid` takes no arguments and cannot fail.
-        unsafe { libc::getuid() }
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
+    // The platform crate's uid (unix getuid; Windows account RID).
+    gardenbed_platform::current_uid()
 }
 
 #[cfg(test)]

@@ -73,15 +73,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                     std::process::exit(2);
                 });
-            let cache = cache.unwrap_or_else(gardenbed_daemon::paths::cache_root);
-            let proxy = gardenbed_daemon::proxy::ProxyService::new(&upstream, &cache)?;
-            let sidecar = gardenbed_daemon::sidecar::SidecarService::new();
-            println!(
-                "gardenbed-daemon serving {} (upstream {upstream}, cache {})",
-                socket.display(),
-                cache.display()
-            );
-            gardenbed_daemon::unix::serve(&socket, proxy, sidecar).await
+            #[cfg(unix)]
+            {
+                let cache = cache.unwrap_or_else(gardenbed_daemon::paths::cache_root);
+                let proxy = gardenbed_daemon::proxy::ProxyService::new(&upstream, &cache)?;
+                let sidecar = gardenbed_daemon::sidecar::SidecarService::new();
+                println!(
+                    "gardenbed-daemon serving {} (upstream {upstream}, cache {})",
+                    socket.display(),
+                    cache.display()
+                );
+                gardenbed_daemon::unix::serve(&socket, proxy, sidecar).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (socket, cache);
+                eprintln!(
+                    "error: the daemon requires Unix domain sockets, which this \
+                     platform (Windows) does not provide; run it on Unix, or talk \
+                     to the server directly over http"
+                );
+                std::process::exit(2);
+            }
         }
     }
 }

@@ -1,0 +1,31 @@
+[package]
+name = "gardenbed-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "gardenbed_platform"
+path = "src/lib.rs"
+
+[dependencies]
+gardenbed-model.workspace = true
+thiserror = "2"
+# Cross-platform mtime refresh (utimensat on Unix, SetFileTime on
+# Windows): the fs store's gc young-orphan grace restarts on re-upload of
+# identical content. Already a workspace-known version (bed dev-deps).
+filetime = "0.2"
+
+# The fd-anchored Unix primitives (flock, statat discipline) stay on
+# rustix; Windows uses std handles plus the kernel32 FFI in `lock`.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+# The NT handle-anchored primitives (NtCreateFile with RootDirectory,
+# reparse-point-aware opens) use std-only types plus bitflags for the
+# access/create-options words.
+[target.'cfg(windows)'.dependencies]
+bitflags = "2"
+
+[dev-dependencies]
+tempfile = "3"

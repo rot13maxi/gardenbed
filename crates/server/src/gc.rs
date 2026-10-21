@@ -65,7 +65,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::fs::{self, File};
 use std::io;
-use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime};
@@ -146,11 +145,10 @@ pub fn lock_exclusive(root: &Path) -> Result<File, LockError> {
         .truncate(false)
         .open(&path)
         .map_err(LockError::Io)?;
-    let fd = file.as_fd();
-    match rustix::fs::flock(fd, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+    match gardenbed_platform::try_lock_file_exclusive(&file) {
         Ok(()) => Ok(file),
-        Err(rustix::io::Errno::WOULDBLOCK) => Err(LockError::Held),
-        Err(e) => Err(LockError::Io(io::Error::from(e))),
+        Err(gardenbed_platform::LockError::Held) => Err(LockError::Held),
+        Err(gardenbed_platform::LockError::Io(e)) => Err(LockError::Io(e)),
     }
 }
 
@@ -168,9 +166,12 @@ pub fn lock_shared_blocking(root: &Path) -> Result<File, LockError> {
         .truncate(false)
         .open(&path)
         .map_err(LockError::Io)?;
-    let fd = file.as_fd();
-    rustix::fs::flock(fd, rustix::fs::FlockOperation::LockShared)
-        .map_err(|e| LockError::Io(io::Error::from(e)))?;
+    gardenbed_platform::lock_file_shared(&file).map_err(|e| LockError::Io(match e {
+        gardenbed_platform::LockError::Held => {
+            io::Error::other("shared lock refused by an exclusive holder")
+        }
+        gardenbed_platform::LockError::Io(e) => e,
+    }))?;
     Ok(file)
 }
 

@@ -117,6 +117,7 @@ const ROOT_INO: u64 = 1;
 /// `fusermount3` answers. Integration tests gate on this so CI runners
 /// without FUSE skip the mount suite with a clear message instead of
 /// failing; where FUSE *is* available the tests run and must pass.
+#[cfg(unix)]
 pub fn fuse_available() -> bool {
     Path::new("/dev/fuse").exists()
         && std::process::Command::new("fusermount3")
@@ -126,6 +127,14 @@ pub fn fuse_available() -> bool {
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
+}
+
+/// FUSE mounts are Unix-only. Windows has no FUSE; `bed mount` reports
+/// this directly instead of trying (and failing obscurely) to serve a
+/// filesystem.
+#[cfg(not(unix))]
+pub fn fuse_available() -> bool {
+    false
 }
 
 /// A live virtualized checkout.

@@ -27,6 +27,13 @@ use gardenbed_daemon::daemon_sidecar_client::DaemonSidecarClient;
 /// disabled (`GARDENBED_DAEMON` set to empty). Same rules as the daemon's
 /// own `paths::socket_path`.
 pub fn socket_path() -> Option<PathBuf> {
+    // The daemon is Unix-only (unix-socket transport). On Windows there
+    // is nothing to probe: every session goes to the server directly.
+    #[cfg(not(unix))]
+    {
+        return None;
+    }
+    #[cfg(unix)]
     if let Ok(value) = std::env::var("GARDENBED_DAEMON") {
         return if value.is_empty() {
             None
@@ -34,7 +41,10 @@ pub fn socket_path() -> Option<PathBuf> {
             Some(PathBuf::from(value))
         };
     }
-    Some(default_socket_path())
+    #[cfg(unix)]
+    {
+        Some(default_socket_path())
+    }
 }
 
 /// The default socket path, ignoring `GARDENBED_DAEMON`.
@@ -57,17 +67,9 @@ fn tmp_fallback() -> PathBuf {
     base.join(format!("gardenbed-{}", current_uid()))
 }
 
-/// This process's uid (0 on non-unix).
+/// This process's uid (the platform crate's: unix getuid, Windows RID).
 fn current_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        // SAFETY: `getuid` takes no arguments and cannot fail.
-        unsafe { libc::getuid() }
-    }
-    #[cfg(not(unix))]
-    {
-        0
-    }
+    gardenbed_platform::current_uid()
 }
 
 /// The sidecar conversation, all of it: connect to the daemon's sidecar

@@ -54,7 +54,6 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -136,14 +135,16 @@ pub enum RootLockError {
 /// a serving server does not queue behind a finite offline operation.
 pub fn try_lock_root_shared(root: &Path) -> Result<File, RootLockError> {
     open_lock_file(root).and_then(|file| {
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockShared) {
+        // flock on Unix, LockFileEx on Windows: the platform crate keeps
+        // the "contention means refuse, never queue" contract identical.
+        match gardenbed_platform::try_lock_file_shared(&file) {
             Ok(()) => Ok(file),
-            Err(rustix::io::Errno::WOULDBLOCK) => Err(RootLockError::Held {
+            Err(gardenbed_platform::LockError::Held) => Err(RootLockError::Held {
                 mode: "exclusive (an offline move or gc is likely running)",
             }),
-            Err(e) => Err(RootLockError::Io {
+            Err(gardenbed_platform::LockError::Io(source)) => Err(RootLockError::Io {
                 path: root.join(ROOT_LOCK),
-                source: std::io::Error::from(e),
+                source,
             }),
         }
     })
@@ -157,46 +158,54 @@ pub fn try_lock_root_shared(root: &Path) -> Result<File, RootLockError> {
 /// the WAL and the SHM.
 pub fn try_lock_root_exclusive(root: &Path) -> Result<File, RootLockError> {
     open_lock_file(root).and_then(|file| {
-        match rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+        match gardenbed_platform::try_lock_file_exclusive(&file) {
             Ok(()) => Ok(file),
-            Err(rustix::io::Errno::WOULDBLOCK) => Err(RootLockError::Held {
+            Err(gardenbed_platform::LockError::Held) => Err(RootLockError::Held {
                 mode: "shared (a server is likely serving this root)",
             }),
-            Err(e) => Err(RootLockError::Io {
+            Err(gardenbed_platform::LockError::Io(source)) => Err(RootLockError::Io {
                 path: root.join(ROOT_LOCK),
-                source: std::io::Error::from(e),
+                source,
             }),
         }
     })
 }
 
-/// Opens (creating when absent, mode 0600) the root's lockfile. A
-/// directory occupying the lockfile path fails with a plain I/O error
+/// Opens (creating when absent, mode 0600 on Unix) the root's lockfile.
+/// A directory occupying the lockfile path fails with a plain I/O error
 /// naming the collision — `ROOT_LOCK` is a reserved repository name, so
-/// this only happens when the root was built by hand.
+/// this only happens when the root was built by hand. Windows has no
+/// mode bits; a created file's inherited ACL already restricts it to
+/// the creating user.
 fn open_lock_file(root: &Path) -> Result<File, RootLockError> {
     let path = root.join(ROOT_LOCK);
-    std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| RootLockError::Io {
-            path: path.clone(),
-            source: if e.kind() == std::io::ErrorKind::IsADirectory {
-                std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "a directory occupies the lockfile path {} — remove it                          (this name is reserved; repositories cannot be named {ROOT_LOCK})",
-                        path.display()
-                    ),
-                )
-            } else {
-                e
-            },
-        })
+    #[cfg(unix)]
+    let open = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).truncate(false).read(true).write(true).mode(0o600);
+        o
+    };
+    #[cfg(not(unix))]
+    let open = {
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).truncate(false).read(true).write(true);
+        o
+    };
+    open.open(&path).map_err(|e| RootLockError::Io {
+        path: path.clone(),
+        source: if e.kind() == std::io::ErrorKind::IsADirectory {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "a directory occupies the lockfile path {} — remove it                          (this name is reserved; repositories cannot be named {ROOT_LOCK})",
+                    path.display()
+                ),
+            )
+        } else {
+            e
+        },
+    })
 }
 
 /// Why a repo name failed to resolve: not a legal name

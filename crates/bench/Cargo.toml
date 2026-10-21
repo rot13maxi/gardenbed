@@ -18,7 +18,6 @@ gardenbed-server = { path = "../server" }
 gardenbed = { path = "../bed" }
 tempfile = "3"
 parking_lot = "0.12.5"
-libc = "0.2"
 serde_json = "1"
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
@@ -28,6 +27,11 @@ tokio = { version = "1", default-features = false, features = [
     "process",
     "io-util",
 ] }
+
+# Unix only: `gardenbed-ab`'s child accounting (wait4/rusage) and disk
+# free-space (statvfs). Windows arms report wall time only.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 # No charts/HTML reports: `cargo bench` prints the numbers; the M8 report

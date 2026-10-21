@@ -1,0 +1,74 @@
+# The Windows portability gate.
+#
+# Scope, stated plainly: this workflow proves the workspace *compiles*
+# for Windows and that the platform-portable test subset *passes* there.
+# It is not a full runtime validation — the bed integration suite spawns
+# gardenbed-server/daemon binaries and exercises Unix-domain-socket
+# paths, FUSE mounts, and cross-device (/dev/shm) staging that are
+# Unix-only by design; those suites stay on the ubuntu CI lane. What this
+# lane guards is the portability seam itself: every crate must link for
+# x86_64-pc-windows-msvc, and the tests whose contracts are
+# platform-neutral (model, store formats, the platform crate's Windows
+# arms) must pass on a real Windows kernel.
+#
+# The msvc target (not gnu) is used: it is the toolchain real Windows
+# users build with, and the local cross-check lane (x86_64-pc-windows-gnu
+# via mingw) cannot link msvc.
+
+name: windows
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: windows-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    name: check (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      # The full workspace (lib + bins + tests + benches) must typecheck
+      # for Windows. Unix-only modules (fuser mount, UDS daemon) are
+      # cfg-gated out with actionable runtime errors on the Windows side,
+      # so this is a whole-graph compile check, not a subset.
+      - run: cargo check --workspace --all-targets
+
+  test:
+    name: test (portable subset)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      # Platform-neutral contracts only: the object model's codec and
+      # chunking math, the store's container formats, and the platform
+      # crate's Windows arms themselves (handle-anchored stat, LockFileEx
+      # locks, uid). The bed/server/daemon integration suites need the
+      # Unix daemon/FUSE surfaces and stay on ubuntu.
+      #
+      # bed's library unit tests (treestate, ignore, revspec) are
+      # Unix-clean too, but `cargo test -p gardenbed --lib` on Windows
+      # pulls the daemon-sidecar test wiring; scoped until that seam has
+      # a Windows test story.
+      - run: cargo test -p gardenbed-model
+      - run: cargo test -p gardenbed-store
+      - run: cargo test -p gardenbed-platform

@@ -17,6 +17,9 @@ gardenbed-model.workspace = true
 # Path deps until the orchestrator adds them to `[workspace.dependencies]`.
 gardenbed-store = { path = "../store" }
 gardenbed-protocol = { path = "../protocol" }
+# The platform seam: uid for the per-user socket/cache paths (unix
+# getuid; Windows account RID).
+gardenbed-platform = { path = "../platform" }
 clap = { version = "4", features = ["derive"] }
 notify = "8"
 prost = "0.14"

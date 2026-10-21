@@ -207,8 +207,8 @@ pub async fn sync_sparse(
             path: path.clone(),
             blob_id: file.blob,
             mode: file.mode_code(),
-            size: meta.st_size,
-            mtime_ns: meta.st_mtime * 1_000_000_000 + meta.st_mtime_nsec as i64,
+            size: meta.size,
+            mtime_ns: meta.mtime_ns,
             hint: HINT_VERIFIED,
         });
     }

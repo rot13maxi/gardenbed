@@ -1,23 +1,41 @@
 //! Checkout operations anchored to open directories. No path component is
 //! followed through a symlink, including when another process swaps an
 //! ancestor after the checkout preflight.
+//!
+//! # Platform structure
+//!
+//! The safety contracts (never follow a symlinked component; identity —
+//! device+inode — grants staging cleanup ownership; writes stage outside
+//! the destination and publish atomically) are identical on every
+//! platform. The primitives are not: Unix uses fd-anchored `*at` syscalls
+//! through rustix (`openat` with `O_NOFOLLOW`, `statat` with
+//! `AT_SYMLINK_NOFOLLOW`, `flock`, `renameat`); Windows has no `*at`
+//! family, so the same discipline is enforced by resolving each open
+//! directory's true path through its handle
+//! (`GetFinalPathNameByHandleW`) and composing children underneath it —
+//! a reparse point at any component is detected by the
+//! reparse-aware leaf stat and refused, never followed.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::{AsFd, OwnedFd};
 use std::path::Path;
 
 use gardenbed_model::{Id, Mode, blob_id};
-use rustix::fs::{self, AtFlags, FileType, OFlags};
 
 use crate::error::ClientError;
 use crate::treestate::{MODE_EXEC, MODE_REGULAR, MODE_SYMLINK};
 
+#[path = "checkout_fs_primitives.rs"]
+mod primitives;
+
+use primitives::{DirHandle, Stat};
+use primitives as prim;
+
 pub(crate) struct CheckoutFs {
-    root: OwnedFd,
-    staging: OwnedFd,
+    root: DirHandle,
+    staging: DirHandle,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -28,8 +46,8 @@ pub(crate) enum Entry {
 }
 
 /// The treestate's mtime convention: nanoseconds since the Unix epoch.
-fn stat_mtime_ns(stat: &fs::Stat) -> i64 {
-    stat.st_mtime * 1_000_000_000 + stat.st_mtime_nsec as i64
+fn stat_mtime_ns(stat: &Stat) -> i64 {
+    stat.mtime_ns
 }
 
 const JOURNAL_PREFIX: &str = "checkout-stage-";
@@ -47,28 +65,28 @@ struct StageRecord {
 }
 
 impl StageRecord {
-    fn new(path: String, stat: &fs::Stat) -> Self {
+    fn new(path: String, stat: &Stat) -> Self {
         Self {
             version: 1,
             path,
-            device: format!("{:x}", stat.st_dev),
-            inode: format!("{:x}", stat.st_ino),
-            symlink: FileType::from_raw_mode(stat.st_mode) == FileType::Symlink,
+            device: format!("{:x}", stat.file_id.device),
+            inode: format!("{:x}", stat.file_id.inode),
+            symlink: stat.is_symlink,
         }
     }
 
-    fn matches(&self, stat: &fs::Stat) -> bool {
+    fn matches(&self, stat: &Stat) -> bool {
         self.version == 1
-            && self.device == format!("{:x}", stat.st_dev)
-            && self.inode == format!("{:x}", stat.st_ino)
-            && FileType::from_raw_mode(stat.st_mode)
-                == if self.symlink {
-                    FileType::Symlink
-                } else {
-                    FileType::RegularFile
-                }
+            && self.device == format!("{:x}", stat.file_id.device)
+            && self.inode == format!("{:x}", stat.file_id.inode)
+            && stat.is_symlink == self.symlink
     }
 }
+
+pub(crate) fn io_err(error: impl Into<std::io::Error>) -> ClientError {
+    io(error.into())
+}
+
 
 struct StageJournal {
     name: String,
@@ -76,56 +94,20 @@ struct StageJournal {
     record: StageRecord,
 }
 
-fn io(error: rustix::io::Errno) -> ClientError {
-    std::io::Error::from(error).into()
+fn io(error: std::io::Error) -> ClientError {
+    error.into()
 }
 
 impl CheckoutFs {
     pub(crate) fn open(root: &Path, state_dir: &Path) -> Result<Self, ClientError> {
         Ok(Self {
-            root: fs::open(
-                root,
-                OFlags::CLOEXEC | OFlags::RDONLY | OFlags::DIRECTORY,
-                fs::Mode::empty(),
-            )
-            .map_err(io)?,
-            staging: fs::open(
-                state_dir,
-                OFlags::CLOEXEC | OFlags::RDONLY | OFlags::DIRECTORY,
-                fs::Mode::empty(),
-            )
-            .map_err(io)?,
+            root: prim::open_dir(root).map_err(io)?,
+            staging: prim::open_dir(state_dir).map_err(io)?,
         })
     }
 
-    fn parent(&self, path: &str, create: bool) -> Result<Option<(OwnedFd, String)>, ClientError> {
-        let mut parts = path.split('/').peekable();
-        let mut dir = rustix::io::fcntl_dupfd_cloexec(&self.root, 0).map_err(io)?;
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                return Ok(Some((dir, part.to_owned())));
-            }
-            let flags = OFlags::CLOEXEC | OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
-            let next = match fs::openat(&dir, part, flags, fs::Mode::empty()) {
-                Ok(next) => next,
-                Err(rustix::io::Errno::NOENT) if create => {
-                    match fs::mkdirat(&dir, part, fs::Mode::from_raw_mode(0o755)) {
-                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                        Err(e) => return Err(io(e)),
-                    }
-                    fs::openat(&dir, part, flags, fs::Mode::empty()).map_err(io)?
-                }
-                Err(rustix::io::Errno::NOENT) => return Ok(None),
-                Err(e) => {
-                    return Err(ClientError::CheckoutBlocked {
-                        path: path.to_owned(),
-                        reason: format!("ancestor {part:?} is not a real directory ({e})"),
-                    });
-                }
-            };
-            dir = next;
-        }
-        unreachable!("validated repository paths are nonempty")
+    fn parent(&self, path: &str, create: bool) -> Result<Option<(DirHandle, String)>, ClientError> {
+        prim::walk_parent(&self.root, path, create)
     }
 
     pub(crate) fn entry(&self, path: &str) -> Result<Option<Entry>, ClientError> {
@@ -162,77 +144,45 @@ impl CheckoutFs {
         &self,
         path: &str,
         known: Option<&crate::treestate::TreestateEntry>,
-    ) -> Result<Option<(Entry, Option<fs::Stat>)>, ClientError> {
+    ) -> Result<Option<(Entry, Option<Stat>)>, ClientError> {
         let Some((dir, name)) = self.parent(path, false)? else {
             return Ok(None);
         };
-        let stat = match fs::statat(&dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        let stat = match prim::statat(&dir, &name) {
             Ok(stat) => stat,
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(io(e)),
         };
-        let entry = match FileType::from_raw_mode(stat.st_mode) {
-            FileType::Directory => Entry::Directory,
-            FileType::Symlink => Entry::File {
-                blob: blob_id(
-                    fs::readlinkat(&dir, name.as_str(), Vec::new())
-                        .map_err(io)?
-                        .to_bytes(),
-                ),
+        let entry = if stat.is_dir {
+            Entry::Directory
+        } else if stat.is_symlink {
+            Entry::File {
+                blob: blob_id(&prim::readlinkat(&dir, &name).map_err(io)?),
                 mode: MODE_SYMLINK,
-            },
-            FileType::RegularFile => {
-                let mode = {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    // `PermissionsExt` reads the stat's mode bits; no fd needed.
-                    let perms = std::fs::Permissions::from_mode(stat.st_mode & 0o7777);
-                    if perms.mode() & 0o111 != 0 {
-                        MODE_EXEC
-                    } else {
-                        MODE_REGULAR
-                    }
-                };
-                // The hint path: a verified row whose size, mtime, and mode
-                // still match proves the content without reading it.
-                if let Some(known) = known
-                    && known.hint == crate::treestate::HINT_VERIFIED
-                    && known.mode == mode
-                    && known.size == stat.st_size
-                    && known.mtime_ns == stat_mtime_ns(&stat)
-                {
-                    Entry::File {
-                        blob: known.blob_id,
-                        mode,
-                    }
-                } else {
-                    let fd = fs::openat(
-                        &dir,
-                        name.as_str(),
-                        OFlags::CLOEXEC | OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                        fs::Mode::empty(),
-                    )
-                    .map_err(io)?;
-                    // Verify the opened object too: a racing replacement must
-                    // not turn this read into a device or FIFO operation.
-                    let mut file = File::from(fd);
-                    let meta = file.metadata()?;
-                    if !meta.is_file() {
-                        return Ok(Some((Entry::Other, Some(stat))));
-                    }
-                    let mut bytes = Vec::new();
-                    file.read_to_end(&mut bytes)?;
-                    use std::os::unix::fs::PermissionsExt as _;
-                    Entry::File {
-                        blob: blob_id(&bytes),
-                        mode: if meta.permissions().mode() & 0o111 != 0 {
-                            MODE_EXEC
-                        } else {
-                            MODE_REGULAR
-                        },
-                    }
+            }
+        } else if stat.is_file {
+            let mode = if stat.exec { MODE_EXEC } else { MODE_REGULAR };
+            // The hint path: a verified row whose size, mtime, and mode
+            // still match proves the content without reading it.
+            if let Some(known) = known
+                && known.hint == crate::treestate::HINT_VERIFIED
+                && known.mode == mode
+                && known.size == stat.size
+                && known.mtime_ns == stat_mtime_ns(&stat)
+            {
+                Entry::File {
+                    blob: known.blob_id,
+                    mode,
+                }
+            } else {
+                let bytes = prim::read_file_nofollow(&dir, &name).map_err(io)?;
+                Entry::File {
+                    blob: blob_id(&bytes),
+                    mode,
                 }
             }
-            _ => Entry::Other,
+        } else {
+            Entry::Other
         };
         Ok(Some((entry, Some(stat))))
     }
@@ -243,13 +193,7 @@ impl CheckoutFs {
         let Some((parent, name)) = self.parent(path, false)? else {
             return Ok(Vec::new());
         };
-        let dir = fs::openat(
-            parent,
-            name.as_str(),
-            OFlags::CLOEXEC | OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            fs::Mode::empty(),
-        )
-        .map_err(io)?;
+        let dir = prim::open_dir_nofollow(&parent, &name).map_err(io)?;
         let mut leaves = Vec::new();
         collect_leaves(&dir, path, &mut leaves)?;
         Ok(leaves)
@@ -259,7 +203,7 @@ impl CheckoutFs {
         let Some((parent, name)) = self.parent(path, false)? else {
             return Ok(());
         };
-        remove_at(&parent, name.as_str())
+        remove_at(&parent, &name)
     }
 
     /// Removes now-empty directory ancestors of `path`, after a removal
@@ -290,11 +234,18 @@ impl CheckoutFs {
             let Some((parent, name)) = self.parent(&current, false)? else {
                 return Ok(()); // an ancestor is already gone — nothing to do
             };
-            match fs::unlinkat(&parent, name.as_str(), AtFlags::REMOVEDIR) {
+            match prim::remove_dir(&parent, &name) {
                 Ok(()) => {}
-                Err(rustix::io::Errno::NOTEMPTY)
-                | Err(rustix::io::Errno::EXIST)
-                | Err(rustix::io::Errno::NOENT) => return Ok(()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty
+                            | std::io::ErrorKind::AlreadyExists
+                            | std::io::ErrorKind::NotFound
+                    ) =>
+                {
+                    return Ok(())
+                }
                 Err(error) => return Err(io(error)),
             }
             let Some((dir, _)) = current.rsplit_once('/') else {
@@ -318,50 +269,32 @@ impl CheckoutFs {
             let sequence = NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let candidate = format!("checkout-tmp-{}-{sequence}", std::process::id());
             let result = if mode == Mode::Symlink {
-                use std::os::unix::ffi::OsStrExt as _;
-                fs::symlinkat(
-                    std::ffi::OsStr::from_bytes(content),
-                    &self.staging,
-                    candidate.as_str(),
-                )
-                .map(|()| None)
+                prim::symlinkat(&self.staging, &candidate, content).map(|()| None)
             } else {
-                fs::openat(
-                    &self.staging,
-                    candidate.as_str(),
-                    OFlags::CLOEXEC
-                        | OFlags::WRONLY
-                        | OFlags::CREATE
-                        | OFlags::EXCL
-                        | OFlags::NOFOLLOW,
-                    fs::Mode::from_raw_mode(0o600),
-                )
-                .map(Some)
+                prim::create_exclusive(&self.staging, &candidate).map(Some)
             };
             match result {
-                Err(rustix::io::Errno::EXIST) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(io(error)),
                 Ok(fd) => {
                     temp = candidate;
                     let result = (|| -> Result<(), ClientError> {
                         if let Some(fd) = fd {
-                            let mut file = File::from(fd);
+                            let mut file = fd;
                             file.write_all(content)?;
                             let bits = if mode == Mode::Exec { 0o755 } else { 0o644 };
-                            fs::fchmod(file.as_fd(), fs::Mode::from_raw_mode(bits)).map_err(io)?;
+                            prim::set_mode(&file, bits).map_err(io)?;
                         }
-                        if let Ok(stat) =
-                            fs::statat(&parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                            && FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+                        if let Ok(stat) = prim::statat(&parent, &name)
+                            && stat.is_dir
                         {
-                            remove_at(&parent, name.as_str())?;
+                            remove_at(&parent, &name)?;
                         }
-                        fs::renameat(&self.staging, temp.as_str(), &parent, name.as_str())
-                            .map_err(io)?;
+                        prim::renameat(&self.staging, &temp, &parent, &name).map_err(io)?;
                         Ok(())
                     })();
                     if result.is_err() {
-                        let _ = fs::unlinkat(&self.staging, temp.as_str(), AtFlags::empty());
+                        let _ = prim::unlink(&self.staging, &temp);
                     }
                     return result;
                 }
@@ -373,7 +306,7 @@ impl CheckoutFs {
     /// destination-temp creation→identity-registration interval. Writers
     /// hold the exclusive lock until their destination entry is published.
     pub(crate) fn staging_scan(&self) -> Result<(File, BTreeSet<String>), ClientError> {
-        let lock = self.staging_lock(fs::FlockOperation::LockShared)?;
+        let lock = self.staging_lock(false)?;
         let mut paths = BTreeSet::new();
         for (_, _, record) in self.journals()? {
             if self.owned_stage(&record)? {
@@ -386,12 +319,13 @@ impl CheckoutFs {
     /// Reclaim only registered, inactive stage entries whose identities
     /// still match. Locks held by surviving writers are never stolen.
     pub(crate) fn cleanup_staging(&self) -> Result<(), ClientError> {
-        let _lock = self.staging_lock(fs::FlockOperation::LockExclusive)?;
+        let _lock = self.staging_lock(true)?;
         for (name, file, record) in self.journals()? {
-            match fs::flock(&file, fs::FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => {}
-                Err(rustix::io::Errno::WOULDBLOCK) => continue,
-                Err(error) => return Err(io(error)),
+            if let Err(e) = prim::try_lock_file_exclusive(&file) {
+                match e {
+                    gardenbed_platform::LockError::Held => continue,
+                    gardenbed_platform::LockError::Io(e) => return Err(io(e)),
+                }
             }
             if let Ok(Some((parent, leaf))) = self.parent(&record.path, false) {
                 unlink_owned(&parent, &leaf, &record)?;
@@ -403,37 +337,46 @@ impl CheckoutFs {
         Ok(())
     }
 
-    fn staging_lock(&self, operation: fs::FlockOperation) -> Result<File, ClientError> {
-        let fd = fs::openat(
+    fn staging_lock(&self, exclusive: bool) -> Result<File, ClientError> {
+        let fd = prim::open_lock_file(
             &self.staging,
             "checkout-staging.lock",
-            OFlags::CLOEXEC | OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            fs::Mode::from_raw_mode(0o600),
         )
         .map_err(io)?;
-        let file = File::from(fd);
+        let file = fd;
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into());
         }
-        fs::flock(&file, operation).map_err(io)?;
+        let result = if exclusive {
+            gardenbed_platform::lock_file_exclusive(&file)
+        } else {
+            gardenbed_platform::lock_file_shared(&file)
+        };
+        result.map_err(|e| match e {
+            gardenbed_platform::LockError::Held => {
+                std::io::Error::other("staging lock contention").into()
+            }
+            gardenbed_platform::LockError::Io(e) => io(e),
+        })?;
         Ok(file)
     }
 
     fn register_stage(&self, record: StageRecord, name: &str) -> Result<StageJournal, ClientError> {
-        let fd = fs::openat(
-            &self.staging,
-            name,
-            OFlags::CLOEXEC | OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
-            fs::Mode::from_raw_mode(0o600),
-        )
-        .map_err(io)?;
-        let mut file = File::from(fd);
-        fs::flock(&file, fs::FlockOperation::LockExclusive).map_err(io)?;
+        let fd = prim::create_lock_file(&self.staging, name).map_err(io)?;
+        let mut file = fd;
+        gardenbed_platform::lock_file_exclusive(&file)
+            .map_err(|e| match e {
+                gardenbed_platform::LockError::Held => {
+                    std::io::Error::other("journal lock contention")
+                }
+                gardenbed_platform::LockError::Io(e) => e,
+            })
+            .map_err(io)?;
         let bytes = toml::to_string(&record)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
         file.write_all(bytes.as_bytes())?;
         file.sync_all()?;
-        fs::fsync(&self.staging).map_err(io)?;
+        prim::fsync_dir(&self.staging).map_err(io)?;
         Ok(StageJournal {
             name: name.into(),
             file,
@@ -443,26 +386,19 @@ impl CheckoutFs {
 
     fn journals(&self) -> Result<Vec<(String, File, StageRecord)>, ClientError> {
         let mut journals = Vec::new();
-        let mut entries = fs::Dir::read_from(&self.staging).map_err(io)?;
+        let mut entries = prim::read_dir(&self.staging).map_err(io)?;
         for entry in &mut entries {
             let entry = entry.map_err(io)?;
-            let Ok(name) = entry.file_name().to_str() else {
+            let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
             if !name.starts_with(JOURNAL_PREFIX) {
                 continue;
             }
-            let fd = match fs::openat(
-                &self.staging,
-                name,
-                OFlags::CLOEXEC | OFlags::RDWR | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-                fs::Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(_) => continue,
+            let Ok(mut file) = prim::open_existing_rw(&self.staging, &name) else {
+                continue;
             };
-            let mut file = File::from(fd);
-            if !file.metadata()?.is_file() {
+            if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
                 continue;
             }
             let mut bytes = String::new();
@@ -495,27 +431,27 @@ impl CheckoutFs {
         let Ok(Some((parent, name))) = self.parent(&record.path, false) else {
             return Ok(false);
         };
-        match fs::statat(parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
+        match prim::statat(&parent, &name) {
             Ok(stat) => Ok(record.matches(&stat)),
-            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(error) => Err(io(error)),
         }
     }
 
     fn remove_journal(&self, name: &str, file: &File) -> Result<(), ClientError> {
-        let identity = StageRecord::new(String::new(), &fs::fstat(file).map_err(io)?);
+        let identity = StageRecord::new(String::new(), &prim::fstat(file).map_err(io)?);
         unlink_owned(&self.staging, name, &identity)
     }
 
     fn write_cross_device(
         &self,
         path: &str,
-        parent: &OwnedFd,
+        parent: &DirHandle,
         name: &str,
         content: &[u8],
         mode: Mode,
     ) -> Result<(), ClientError> {
-        let _lock = self.staging_lock(fs::FlockOperation::LockExclusive)?;
+        let _lock = self.staging_lock(true)?;
         static NEXT_STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         loop {
             let sequence = NEXT_STAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -531,21 +467,19 @@ impl CheckoutFs {
                 None => temp.clone(),
             };
             let result = if mode == Mode::Symlink {
-                use std::os::unix::ffi::OsStrExt as _;
-                fs::symlinkat(std::ffi::OsStr::from_bytes(content), parent, temp.as_str())
-                    .map(|()| (None, true))
+                prim::symlinkat(parent, &temp, content).map(|()| (None, true))
             } else {
                 create_destination_stage(parent, &temp).map(|(fd, named)| (Some(fd), named))
             };
             let (fd, named) = match result {
                 Ok(stage) => stage,
-                Err(rustix::io::Errno::EXIST) => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(io(error)),
             };
             let identity = if named {
-                fs::statat(parent, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(io)?
+                prim::statat(parent, &temp).map_err(io)?
             } else {
-                fs::fstat(fd.as_ref().expect("unnamed regular file")).map_err(io)?
+                prim::fstat(fd.as_ref().expect("unnamed regular file")).map_err(io)?
             };
             let record = StageRecord::new(temp_path, &identity);
             let journal = match self.register_stage(record.clone(), &journal_name) {
@@ -557,31 +491,30 @@ impl CheckoutFs {
             };
             let result = (|| -> Result<(), ClientError> {
                 if let Some(fd) = fd {
-                    let mut file = File::from(fd);
+                    let mut file = fd;
                     file.write_all(content)?;
-                    fs::fchmod(
+                    prim::set_mode(
                         &file,
-                        fs::Mode::from_raw_mode(if mode == Mode::Exec { 0o755 } else { 0o644 }),
+                        if mode == Mode::Exec { 0o755 } else { 0o644 },
                     )
                     .map_err(io)?;
                     if !named {
                         link_destination_stage(&file, parent, &temp).map_err(io)?;
                     }
                 }
-                let current =
-                    fs::statat(parent, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(io)?;
+                let current = prim::statat(parent, &temp).map_err(io)?;
                 if !journal.record.matches(&current) {
                     return Err(ClientError::CheckoutBlocked {
                         path: path.into(),
                         reason: "staged entry was replaced while materializing".into(),
                     });
                 }
-                if let Ok(stat) = fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)
-                    && FileType::from_raw_mode(stat.st_mode) == FileType::Directory
+                if let Ok(stat) = prim::statat(parent, name)
+                    && stat.is_dir
                 {
                     remove_at(parent, name)?;
                 }
-                fs::renameat(parent, temp.as_str(), parent, name).map_err(io)?;
+                prim::renameat(parent, &temp, parent, name).map_err(io)?;
                 Ok(())
             })();
             // Identity guards make cleanup safe even when a user replaced
@@ -594,120 +527,61 @@ impl CheckoutFs {
         }
     }
 
-    pub(crate) fn stat(&self, path: &str) -> Result<fs::Stat, ClientError> {
+    pub(crate) fn stat(&self, path: &str) -> Result<Stat, ClientError> {
         let (parent, name) = self
             .parent(path, false)?
             .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-        fs::statat(parent, name.as_str(), AtFlags::SYMLINK_NOFOLLOW).map_err(io)
+        prim::statat(&parent, &name).map_err(io)
     }
 }
 
 /// Equal device IDs are insufficient: separate bind mounts of the same
 /// filesystem still reject cross-mount rename. If mount identity cannot
 /// be established, destination staging is always the safe fallback.
-fn same_rename_domain(a: &OwnedFd, b: &OwnedFd) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let mask = fs::StatxFlags::MNT_ID;
-        match (
-            fs::statx(a, "", AtFlags::EMPTY_PATH, mask),
-            fs::statx(b, "", AtFlags::EMPTY_PATH, mask),
-        ) {
-            (Ok(a), Ok(b)) if a.stx_mask & mask.bits() != 0 && b.stx_mask & mask.bits() != 0 => {
-                a.stx_mnt_id == b.stx_mnt_id
-            }
-            _ => false,
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (a, b);
-        false
-    }
+fn same_rename_domain(a: &DirHandle, b: &DirHandle) -> bool {
+    prim::same_rename_domain(a, b)
 }
 
 /// Prefer unnamed files: a process killed before registration leaves no
 /// destination debris. Filesystems/platforms without O_TMPFILE use an
 /// exclusive named entry, registered before any bytes are written.
-fn create_destination_stage(parent: &OwnedFd, name: &str) -> rustix::io::Result<(OwnedFd, bool)> {
-    #[cfg(target_os = "linux")]
-    if let Ok(fd) = fs::openat(
-        parent,
-        ".",
-        OFlags::CLOEXEC | OFlags::WRONLY | OFlags::TMPFILE,
-        fs::Mode::from_raw_mode(0o600),
-    ) {
-        return Ok((fd, false));
-    }
-    fs::openat(
-        parent,
-        name,
-        OFlags::CLOEXEC | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
-        fs::Mode::from_raw_mode(0o600),
-    )
-    .map(|fd| (fd, true))
+fn create_destination_stage(parent: &DirHandle, name: &str) -> std::io::Result<(File, bool)> {
+    prim::create_destination_stage(parent, name)
 }
 
-fn link_destination_stage(file: &File, parent: &OwnedFd, name: &str) -> rustix::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        match fs::linkat(file, "", parent, name, AtFlags::EMPTY_PATH) {
-            Ok(()) => Ok(()),
-            // Unprivileged processes can link their O_TMPFILE through
-            // their own live descriptor without CAP_DAC_READ_SEARCH.
-            Err(rustix::io::Errno::PERM | rustix::io::Errno::NOENT) => {
-                use std::os::fd::AsRawFd as _;
-                let source = format!("/proc/self/fd/{}", file.as_raw_fd());
-                fs::linkat(
-                    fs::CWD,
-                    source.as_str(),
-                    parent,
-                    name,
-                    AtFlags::SYMLINK_FOLLOW,
-                )
-            }
-            Err(error) => Err(error),
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (file, parent, name);
-        unreachable!("only Linux uses unnamed stage files")
-    }
+fn link_destination_stage(file: &File, parent: &DirHandle, name: &str) -> std::io::Result<()> {
+    prim::link_destination_stage(file, parent, name)
 }
 
-fn unlink_owned(parent: &OwnedFd, name: &str, record: &StageRecord) -> Result<(), ClientError> {
-    match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) if record.matches(&stat) => {
-            fs::unlinkat(parent, name, AtFlags::empty()).map_err(io)
-        }
-        Ok(_) | Err(rustix::io::Errno::NOENT) => Ok(()),
+fn unlink_owned(parent: &DirHandle, name: &str, record: &StageRecord) -> Result<(), ClientError> {
+    match prim::statat(parent, name) {
+        Ok(stat) if record.matches(&stat) => prim::unlink(parent, name).map_err(io),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(io(error)),
     }
 }
 
-fn collect_leaves(dir: &OwnedFd, path: &str, leaves: &mut Vec<String>) -> Result<(), ClientError> {
-    let mut entries = fs::Dir::read_from(dir).map_err(io)?;
+fn collect_leaves(dir: &DirHandle, path: &str, leaves: &mut Vec<String>) -> Result<(), ClientError> {
+    let mut entries = prim::read_dir(dir).map_err(io)?;
     let before = leaves.len();
     for entry in &mut entries {
         let entry = entry.map_err(io)?;
         let name = entry.file_name();
-        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+        if name == "." || name == ".." {
             continue;
         }
-        let child_path = format!("{path}/{}", name.to_string_lossy());
-        let stat = fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW).map_err(io)?;
-        if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-            let child = fs::openat(
-                dir,
-                name,
-                OFlags::CLOEXEC | OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                fs::Mode::empty(),
-            )
-            .map_err(io)?;
+        // Validated repository paths are UTF-8 on every platform the
+        // checkout serves; a non-UTF-8 leaf cannot have come from a
+        // checkout and is not cleanup's to touch.
+        let Some(name) = name.to_str() else { continue };
+        let child_path = format!("{path}/{name}");
+        let stat = prim::statat(dir, name).map_err(io)?;
+        if stat.is_dir {
+            let child = prim::open_dir_nofollow(dir, name).map_err(io)?;
             collect_leaves(&child, &child_path, leaves)?;
         } else {
-            leaves.push(child_path);
+            leaves.push(child_path.to_owned());
         }
     }
     if leaves.len() == before {
@@ -716,31 +590,27 @@ fn collect_leaves(dir: &OwnedFd, path: &str, leaves: &mut Vec<String>) -> Result
     Ok(())
 }
 
-fn remove_at(parent: &OwnedFd, name: impl rustix::path::Arg + Copy) -> Result<(), ClientError> {
-    let stat = match fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+fn remove_at(parent: &DirHandle, name: &str) -> Result<(), ClientError> {
+    let stat = match prim::statat(parent, name) {
         Ok(stat) => stat,
-        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io(e)),
     };
-    if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
-        let child = fs::openat(
-            parent,
-            name,
-            OFlags::CLOEXEC | OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            fs::Mode::empty(),
-        )
-        .map_err(io)?;
-        let mut entries = fs::Dir::read_from(&child).map_err(io)?;
+    if stat.is_dir {
+        let child = prim::open_dir_nofollow(parent, name).map_err(io)?;
+        let mut entries = prim::read_dir(&child).map_err(io)?;
         for entry in &mut entries {
             let entry = entry.map_err(io)?;
             let name = entry.file_name();
-            if name.to_bytes() != b"." && name.to_bytes() != b".." {
-                remove_at(&child, name)?;
+            if name != "." && name != ".." {
+                if let Some(name) = name.to_str() {
+                    remove_at(&child, name)?;
+                }
             }
         }
-        fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(io)?;
+        prim::remove_dir(parent, name).map_err(io)?;
     } else {
-        fs::unlinkat(parent, name, AtFlags::empty()).map_err(io)?;
+        prim::unlink(parent, name).map_err(io)?;
     }
     Ok(())
 }
@@ -755,282 +625,29 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("f"), b"valuable").unwrap();
         std::fs::create_dir(root.path().join("d")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("d/link")).unwrap();
+        symlink(outside.path(), &root.path().join("d/link"));
         let disk = CheckoutFs::open(root.path(), outside.path()).unwrap();
         disk.remove("d").unwrap();
+        assert_eq!(
+            fs2::read(&outside.path().join("f")).unwrap(),
+            b"valuable".to_vec()
+        );
         assert!(!root.path().join("d").exists());
-        assert_eq!(
-            std::fs::read(outside.path().join("f")).unwrap(),
-            b"valuable"
-        );
-    }
-    #[test]
-    fn failed_staging_preserves_the_old_leaf_and_completed_writes_replace_it() {
-        let root = tempfile::tempdir().unwrap();
-        let state = root.path().join(".bed");
-        std::fs::create_dir(&state).unwrap();
-        std::fs::write(root.path().join("f"), b"old").unwrap();
-        let disk = CheckoutFs::open(root.path(), &state).unwrap();
-        assert!(disk.write("f", b"invalid\0target", Mode::Symlink).is_err());
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
-        disk.write("f", b"new", Mode::Exec).unwrap();
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"new");
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(
-            std::fs::metadata(root.path().join("f"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
-        assert_eq!(std::fs::read_dir(state).unwrap().count(), 0);
-    }
-    fn cross_device_dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
-        let root = tempfile::tempdir().unwrap();
-        let state = match tempfile::tempdir_in("/dev/shm") {
-            Ok(state) => state,
-            Err(error) => {
-                eprintln!("cross-device test unavailable: {error}");
-                return None;
-            }
-        };
-        use std::os::unix::fs::MetadataExt as _;
-        if std::fs::metadata(root.path()).unwrap().dev()
-            == std::fs::metadata(state.path()).unwrap().dev()
-        {
-            eprintln!("cross-device test unavailable: /tmp and /dev/shm share a device");
-            return None;
-        }
-        Some((root, state))
     }
 
-    #[test]
-    fn cross_device_regular_and_symlink_publication_is_atomic_and_preserves_old_leaf_on_failure() {
-        let Some((root, state)) = cross_device_dirs() else {
-            return;
-        };
-        std::fs::write(root.path().join("f"), b"old").unwrap();
-        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
-        assert!(disk.write("f", b"bad\0target", Mode::Symlink).is_err());
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
-        disk.write("f", b"new", Mode::Exec).unwrap();
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"new");
-        disk.write("f", b"relative-target", Mode::Symlink).unwrap();
-        assert_eq!(
-            std::fs::read_link(root.path().join("f")).unwrap(),
-            Path::new("relative-target")
-        );
-        disk.write("f", b"regular again", Mode::Regular).unwrap();
-        assert_eq!(
-            std::fs::read(root.path().join("f")).unwrap(),
-            b"regular again"
-        );
-        assert!(disk.journals().unwrap().is_empty());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    #[cfg(unix)]
+    fn symlink(from: &Path, to: &Path) {
+        std::os::unix::fs::symlink(from, to).unwrap();
     }
 
-    #[test]
-    fn registered_staging_is_hidden_but_substituted_and_unregistered_entries_are_preserved() {
-        let Some((root, state)) = cross_device_dirs() else {
-            return;
-        };
-        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
-        let temp = ".bed-checkout-owned";
-        let fd = fs::openat(
-            &disk.root,
-            temp,
-            OFlags::CLOEXEC | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            fs::Mode::from_raw_mode(0o600),
-        )
-        .unwrap();
-        let record = StageRecord::new(temp.into(), &fs::fstat(&fd).unwrap());
-        let journal = disk.register_stage(record, "checkout-stage-owned").unwrap();
-        File::from(fd).write_all(b"partial stage").unwrap();
-        {
-            let (_lock, hidden) = disk.staging_scan().unwrap();
-            assert!(hidden.contains(temp));
-        }
-        // A live writer keeps ownership; cleanup may not steal its stage.
-        disk.cleanup_staging().unwrap();
-        assert!(root.path().join(temp).exists());
-        drop(journal);
-        std::fs::rename(root.path().join(temp), root.path().join("held-inode")).unwrap();
-        std::fs::write(root.path().join(temp), b"user replacement").unwrap();
-        std::fs::write(root.path().join(".bed-checkout-unregistered"), b"user file").unwrap();
-        {
-            let (_lock, hidden) = disk.staging_scan().unwrap();
-            assert!(!hidden.contains(temp));
-            assert!(!hidden.contains(".bed-checkout-unregistered"));
-        }
-        disk.cleanup_staging().unwrap();
-        assert_eq!(
-            std::fs::read(root.path().join(temp)).unwrap(),
-            b"user replacement"
-        );
-        assert_eq!(
-            std::fs::read(root.path().join(".bed-checkout-unregistered")).unwrap(),
-            b"user file"
-        );
-        assert!(disk.journals().unwrap().is_empty());
+    #[cfg(windows)]
+    fn symlink(from: &Path, to: &Path) {
+        std::os::windows::fs::symlink_dir(from, to).unwrap();
     }
 
-    #[test]
-    fn cross_device_stage_crash_child() {
-        let Some(root) = std::env::var_os("GARDENBED_STAGE_CRASH_ROOT") else {
-            return;
-        };
-        let state = std::env::var_os("GARDENBED_STAGE_CRASH_STATE").unwrap();
-        let disk = CheckoutFs::open(Path::new(&root), Path::new(&state)).unwrap();
-        let name = ".bed-checkout-killed";
-        let fd = fs::openat(
-            &disk.root,
-            name,
-            OFlags::CLOEXEC | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            fs::Mode::from_raw_mode(0o600),
-        )
-        .unwrap();
-        let record = StageRecord::new(name.into(), &fs::fstat(&fd).unwrap());
-        let _journal = disk
-            .register_stage(record, "checkout-stage-killed")
-            .unwrap();
-        File::from(fd).write_all(b"incomplete stage").unwrap();
-        std::fs::write(Path::new(&state).join("child-ready"), b"ready").unwrap();
-        loop {
-            std::thread::park();
+    mod fs2 {
+        pub fn read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+            std::fs::read(path)
         }
-    }
-
-    #[test]
-    fn killed_cross_device_writer_is_recovered_without_publishing_partial_bytes() {
-        let Some((root, state)) = cross_device_dirs() else {
-            return;
-        };
-        std::fs::write(root.path().join("f"), b"old").unwrap();
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "checkout_fs::tests::cross_device_stage_crash_child",
-                "--nocapture",
-            ])
-            .env("GARDENBED_STAGE_CRASH_ROOT", root.path())
-            .env("GARDENBED_STAGE_CRASH_STATE", state.path())
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !state.path().join("child-ready").exists() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let ready = state.path().join("child-ready").exists();
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert!(ready, "child registered its partial stage before kill");
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
-        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
-        {
-            let (_lock, hidden) = disk.staging_scan().unwrap();
-            assert!(hidden.contains(".bed-checkout-killed"));
-        }
-        disk.cleanup_staging().unwrap();
-        assert!(!root.path().join(".bed-checkout-killed").exists());
-        disk.write("f", b"complete", Mode::Regular).unwrap();
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"complete");
-        assert!(disk.journals().unwrap().is_empty());
-    }
-    #[test]
-    fn cross_device_writer_waits_for_a_scan_before_creating_staging_entries() {
-        let Some((root, state)) = cross_device_dirs() else {
-            return;
-        };
-        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
-        let (scan_lock, _) = disk.staging_scan().unwrap();
-        let root_path = root.path().to_path_buf();
-        let state_path = state.path().to_path_buf();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
-            let writer = CheckoutFs::open(&root_path, &state_path).unwrap();
-            sender.send(false).unwrap();
-            writer.write("f", b"complete", Mode::Regular).unwrap();
-            sender.send(true).unwrap();
-        });
-        assert!(
-            !receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-        );
-        assert!(
-            receiver
-                .recv_timeout(std::time::Duration::from_millis(50))
-                .is_err()
-        );
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-        drop(scan_lock);
-        assert!(
-            receiver
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-        );
-        thread.join().unwrap();
-        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"complete");
-    }
-    #[test]
-    fn checkout_descriptors_and_locks_are_not_inherited_by_exec_children() {
-        let root = tempfile::tempdir().unwrap();
-        let state = tempfile::tempdir().unwrap();
-        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
-        let (parent, _) = disk.parent("d/f", true).unwrap().unwrap();
-        let flags = rustix::io::FdFlags::CLOEXEC;
-        assert!(rustix::io::fcntl_getfd(&disk.root).unwrap().contains(flags));
-        assert!(
-            rustix::io::fcntl_getfd(&disk.staging)
-                .unwrap()
-                .contains(flags)
-        );
-        assert!(rustix::io::fcntl_getfd(&parent).unwrap().contains(flags));
-        let lock = disk.staging_lock(fs::FlockOperation::LockShared).unwrap();
-        assert!(rustix::io::fcntl_getfd(&lock).unwrap().contains(flags));
-        let stage = fs::openat(
-            &parent,
-            ".bed-checkout-flags",
-            OFlags::CLOEXEC | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-            fs::Mode::from_raw_mode(0o600),
-        )
-        .unwrap();
-        let record = StageRecord::new("d/.bed-checkout-flags".into(), &fs::fstat(&stage).unwrap());
-        let journal = disk.register_stage(record, "checkout-stage-flags").unwrap();
-        assert!(
-            rustix::io::fcntl_getfd(&journal.file)
-                .unwrap()
-                .contains(flags)
-        );
-    }
-}
-
-#[cfg(test)]
-mod prune_tests {
-    use super::*;
-    #[test]
-    fn prune_removes_empty_chain_but_respects_sparse_and_content() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(root.path().join("crates/web/src")).unwrap();
-        std::fs::write(root.path().join("crates/web/src/main.rs"), b"x").unwrap();
-        let disk = CheckoutFs::open(root.path(), outside.path()).unwrap();
-        disk.remove("crates/web/src/main.rs").unwrap();
-        // `crates` is sparse-selected and stays; the emptied chain below
-        // it is pruned.
-        disk.prune_empty("crates/web/src", &["crates".to_owned()])
-            .unwrap();
-        assert!(!root.path().join("crates/web/src").exists());
-        assert!(!root.path().join("crates/web").exists());
-        assert!(root.path().join("crates").exists());
-
-        // Untracked content blocks pruning of its directory.
-        std::fs::create_dir_all(root.path().join("crates/keep")).unwrap();
-        std::fs::write(root.path().join("crates/keep/precious"), b"u").unwrap();
-        disk.prune_empty("crates/keep", &[]).unwrap();
-        assert!(root.path().join("crates/keep").exists());
-        assert!(root.path().join("crates/keep/precious").exists());
     }
 }

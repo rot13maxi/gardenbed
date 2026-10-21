@@ -16,6 +16,7 @@ pub mod daemon;
 pub mod error;
 pub mod heads;
 pub mod ignore;
+#[cfg(unix)]
 pub mod mount;
 pub mod ops;
 pub mod queue;

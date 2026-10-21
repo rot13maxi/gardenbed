@@ -588,10 +588,7 @@ fn read_working(root: &Path, rel: &str) -> Result<Option<WorkingFile>, ClientErr
     }
     let is_symlink = meta.is_symlink();
     let content: Vec<u8> = if is_symlink {
-        std::os::unix::ffi::OsStrExt::as_bytes(std::ffi::OsStr::new(&std::fs::read_link(
-            root.join(rel),
-        )?))
-        .to_vec()
+        crate::status::link_target_bytes(&std::fs::read_link(root.join(rel))?)
     } else {
         std::fs::read(root.join(rel))?
     };

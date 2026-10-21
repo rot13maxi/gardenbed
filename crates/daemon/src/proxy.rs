@@ -341,6 +341,7 @@ fn transport_dead(status: &Status) -> bool {
 /// Read RPCs are open to any local peer (the socket directory is 0700
 /// anyway); this gate is applied to write RPCs, where a second lock on the
 /// door costs nothing.
+#[cfg(unix)]
 pub fn peer_uid_ok<T>(request: &Request<T>) -> Result<(), Status> {
     let info = request
         .extensions()
@@ -358,6 +359,17 @@ pub fn peer_uid_ok<T>(request: &Request<T>) -> Result<(), Status> {
         )
     })?;
     check_peer_uid(cred.uid())
+}
+
+/// Windows has no SO_PEERCRED and no unix sockets — and the daemon
+/// refuses to serve there at startup — so this arm is unreachable; a
+/// write that somehow arrives is refused rather than trusted.
+#[cfg(not(unix))]
+pub fn peer_uid_ok<T>(_request: &Request<T>) -> Result<(), Status> {
+    Err(Status::permission_denied(
+        "the daemon requires Unix domain sockets (unavailable on this \
+         platform); the write was refused",
+    ))
 }
 
 /// The credential decision itself: a peer uid other than the daemon's own

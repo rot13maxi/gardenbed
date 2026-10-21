@@ -30,9 +30,11 @@ gardenbed-protocol = { path = "../protocol" }
 # .gitignore pattern matching for untracked-file discovery (status/commit).
 # Same version the `gix` dependency in crates/git already locks.
 gix-glob = "0.29.0"
-rustix = { version = "1", features = ["fs"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+# The platform seam: fd/handle-anchored stat, locks, link-target bytes,
+# mtime refresh — the same rustix calls Unix used before, one Windows arm.
+gardenbed-platform = { path = "../platform" }
 serde = { version = "1", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 tokio = { version = "1", default-features = false, features = [
     "rt-multi-thread",
@@ -43,21 +45,23 @@ tokio = { version = "1", default-features = false, features = [
     "time",
     "process",
     "io-util",
-    # `bed mount`'s foreground loop waits on SIGINT/SIGTERM.
+    # `bed mount`'s foreground loop waits on SIGINT/SIGTERM (Unix).
     "signal",
 ] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", default-features = false, features = ["transport", "channel"] }
 toml = "1"
-fuser = "0.18.0"
 parking_lot = "0.12.5"
 
-# Unix only: `bed` restores the default SIGPIPE disposition at startup so
-# a closed pipe (`bed log | head`) dies silently like git, not with a
-# `failed printing to stdout` panic (Rust ignores SIGPIPE by default).
-# Windows has no SIGPIPE; nothing to restore there.
+# Unix only: the checkout primitives' fd-anchored syscalls, the FUSE
+# mount, and the SIGPIPE restore (a closed pipe like `bed log | head`
+# dies silently like git; Windows has no SIGPIPE). Windows implements
+# the same contracts through the platform crate's NT handles.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1", features = ["fs"] }
+fuser = "0.18.0"
+
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }

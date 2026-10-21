@@ -49,9 +49,9 @@ tonic = { version = "0.14.6", default-features = false, features = [
     "channel",
 ] }
 toml = "1"
-# The root advisory lock (repos::ROOT_LOCK): flock via rustix, the same
-# primitive the working-copy staging journal uses.
-rustix = { version = "1", features = ["fs"] }
+# The root advisory lock (repos::ROOT_LOCK) and the repo.lock contract:
+# flock on Unix, LockFileEx on Windows, via the platform crate.
+gardenbed-platform = { path = "../platform" }
 
 [dev-dependencies]
 gardenbed-harness = { path = "../harness" }
