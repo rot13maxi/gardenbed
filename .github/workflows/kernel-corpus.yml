@@ -194,13 +194,19 @@ jobs:
       # is used — both are scratch, and the corpus is untouched either way.
       - name: Scratch metadata copy (per-run mktemp; corpus stays pristine)
         run: |
-          set -eu
           meta_size=$(stat -c%s "$KERNEL_META")
           # 20% headroom over the DB size for the WAL the open will write.
+          # Units: stat is bytes, so the free-space check MUST also be
+          # bytes — `df -PB1` reports available space in 1-byte blocks
+          # (POSIX -P output otherwise reports 512- or 1024-byte blocks
+          # depending on the df flavor; the original bug compared
+          # 1K-blocks to bytes, off by ~1024x: a 2 MiB-free /dev/shm
+          # read as 2048 "bytes" and the 1 MiB metadata wrongly went to
+          # temp disk). Every comparison and message below is bytes.
           need=$(( meta_size + meta_size / 5 ))
           shm_free=0
           if [ -d /dev/shm ] && [ -w /dev/shm ]; then
-            shm_free=$(df -P /dev/shm | awk 'NR==2 {print $4}')
+            shm_free=$(df -PB1 /dev/shm | awk 'NR==2 {print $4}')
           fi
           if [ "$shm_free" -ge "$need" ]; then
             SCRATCH=$(mktemp -d /dev/shm/kernel-corpus-run.XXXXXX)
