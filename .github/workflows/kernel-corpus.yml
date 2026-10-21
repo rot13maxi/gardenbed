@@ -1,0 +1,152 @@
+# Kernel real-corpus gate — self-hosted, externally provisioned.
+#
+# The kernel corpus (docs/corpora.md: linux.git mirror 8.6 GiB packed,
+# linux-gb store 89 GiB / 10.36M objects) CANNOT be downloaded on every
+# CI run: the GitHub-hosted runners have neither the disk nor the
+# bandwidth (84+ GiB of objects, plus a multi-hour import to build the
+# store from scratch — docs/corpora.md records 278 commits/s post-fix,
+# i.e. ~1.5 h for 1.48M commits, before the 89 GiB of object writes).
+# The perf job therefore keeps its existing `--skip kernel_` (unchanged
+# default; nothing in that job is weakened by this file).
+#
+# This workflow is the honest alternative: a SELF-HOSTED gate that runs
+# only where the corpus already exists, provisioned outside CI and
+# declared via repository variables. It is manual
+# (workflow_dispatch-only): the operator with the corpus host runs it on
+# demand or from their own scheduler; it never fires on push, so it adds
+# nothing to the push gate and cannot silently weaken any default.
+#
+# Provisioning contract (all three must exist before running):
+#
+#   vars.KERNEL_GB_ROOT   directory of the bed-format kernel store
+#                         (default on the dev box:
+#                         /home/user/.corpora/linux-gb — layout resolved
+#                         by the server's own resolve_layout, so it holds
+#                         the metadata DB + loam/ objects)
+#   vars.KERNEL_GIT_MIRROR  bare git mirror of torvalds/linux at the
+#                         pinned HEAD (docs/corpora.md's table records
+#                         the pin; the oracle comparisons diff against it)
+#   runner label           the job runs on [self-hosted, linux,
+#                         kernel-corpus] — attaching that label to a host
+#                         IS the explicit opt-in. With no such runner the
+#                         job queues forever (Actions semantics), which is
+#                         the safe failure: nothing runs, nothing passes
+#                         vacuously.
+#
+# What the gate runs (all bounded, all release-mode, all real-corpus):
+#
+#   1. kernel_export_spot_check (crates/git/tests/kernel_spot.rs) — the
+#      M17.3 native-export spot check against the real store. The test
+#      itself decides the expected outcome FROM THE CORPUS STATE, not
+#      from this workflow: against the currently pinned v0.1 store (no
+#      raw captures) the expected outcome is a loud refusal at the first
+#      pre-canonical 100664 tree mode; against a corpus re-imported with
+#      raw-tree capture (the M18.5 fidelity work, when it lands and the
+#      corpus is re-imported) the SAME test takes the success arm with
+#      bijection + sampled SHA parity — no workflow change needed,
+#      because this gate asserts the test's verdict against whatever
+#      corpus vars.KERNEL_GB_ROOT names. The metadata is opened from a
+#      scratch COPY (GARDENBED_KERNEL_META) because opening writes WAL
+#      pragmas — the corpus store stays pristine; the copy is made to
+#      /dev/shm here so the multi-GiB copy is fast and ephemeral.
+#   2. corpus_ripgrep_* equivalents for the kernel side are NOT here:
+#      those are the perf job's bounded import gates on a cloneable
+#      corpus. This workflow only runs the tests that genuinely require
+#      the multi-GB kernel fixtures.
+#   3. The gc full-scale measurement (docs/status.md's open work; the
+#      v0.2 M13.6 budget is explicit: < 60 min cold, RSS <= 1 GiB on the
+#      10.36M-object store) is deliberately NOT run here yet: the
+#      mark-batching work has not re-measured the kernel corpus, so
+#      fresh evidence does not exist. The measurement workstream is
+#      closing that evidence gap; once a recorded kernel-scale run
+#      exists, adding `gc --dry-run` here is a small follow-up. Running
+#      it before evidence exists would fabricate a number, not gate one.
+#
+# Durability stays ON: the fsync toggle is never set (the same rule as
+# ci.yml's other jobs). The scratch metadata copy is the only write, and
+# it is disposable by construction.
+#
+# Anti-vacuous-pass rules, same shape as the FUSE job in ci.yml:
+#   * the runner label is the opt-in;
+#   * a preflight step fails the run if the declared corpus paths do not
+#     exist or are not the expected layout (a mislabeled or half-provisioned
+#     host fails LOUDLY, it does not skip);
+#   * the test is invoked with -- --ignored --exact, so name drift in the
+#     test itself (a rename that makes the filter match nothing) fails
+#     with "no tests match" instead of passing vacuously.
+
+name: kernel-corpus
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_gb_root:
+        description: "Kernel bed-store root (defaults to vars.KERNEL_GB_ROOT)"
+        required: false
+        type: string
+      kernel_git_mirror:
+        description: "Bare git mirror path (defaults to vars.KERNEL_GIT_MIRROR)"
+        required: false
+        type: string
+
+concurrency:
+  group: kernel-corpus-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  kernel-corpus:
+    name: kernel real-corpus gate (self-hosted)
+    runs-on: [self-hosted, linux, kernel-corpus]
+    timeout-minutes: 120
+    env:
+      KERNEL_GB_ROOT: ${{ inputs.kernel_gb_root || vars.KERNEL_GB_ROOT }}
+      KERNEL_GIT_MIRROR: ${{ inputs.kernel_git_mirror || vars.KERNEL_GIT_MIRROR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90.0"
+      # Preflight: the provisioning contract must hold BEFORE anything
+      # runs. A missing corpus, a non-directory, or a mirror without the
+      # pinned refs fails here with the exact missing thing named — the
+      # alternative (letting the tests fail deep inside a store open) is
+      # the same failure with a worse message, and a silent skip is not
+      # possible: these paths have no defaults on a runner.
+      - name: Preflight — the corpus must be provisioned and readable
+        run: |
+          set -eu
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+          test -n "$KERNEL_GB_ROOT" || fail "KERNEL_GB_ROOT is empty (set vars.KERNEL_GB_ROOT or the workflow input)"
+          test -n "$KERNEL_GIT_MIRROR" || fail "KERNEL_GIT_MIRROR is empty (set vars.KERNEL_GIT_MIRROR or the workflow input)"
+          test -d "$KERNEL_GB_ROOT" || fail "kernel store root '$KERNEL_GB_ROOT' is not a directory"
+          test -d "$KERNEL_GB_ROOT/loam" || fail "kernel store root '$KERNEL_GB_ROOT' has no loam/ objects tree (not a bed store layout?)"
+          test -f "$KERNEL_GIT_MIRROR/HEAD" || fail "git mirror '$KERNEL_GIT_MIRROR' is not a bare repository (no HEAD)"
+          git -C "$KERNEL_GIT_MIRROR" rev-parse --verify refs/heads/master \
+            || fail "git mirror '$KERNEL_GIT_MIRROR' has no refs/heads/master (corpora.md pins master)"
+          # The store must actually be the kernel-sized one: 10.36M
+          # objects over ~89 GiB (docs/corpora.md). A path pointing at a
+          # synthetic or partial store fails the contract.
+          objs=$(find "$KERNEL_GB_ROOT/loam" -type f | head -2000001 | wc -l)
+          test "$objs" -gt 1000000 || fail "kernel store has only $objs object files under loam/ (docs/corpora.md records 10,360,644 — a partial or synthetic store does not satisfy this gate)"
+          echo "preflight OK: store=$KERNEL_GB_ROOT mirror=$KERNEL_GIT_MIRROR"
+      # Scratch metadata copy: SqliteMetadataStore::open writes WAL/schema
+      # pragmas, so the test must never open the corpus metadata in place
+      # (kernel_spot.rs's own contract; GARDENBED_KERNEL_META redirects it
+      # to this copy). /dev/shm keeps the multi-GiB copy fast and makes it
+      # vanish with the runner's tmpfs.
+      - name: Scratch metadata copy (corpus store stays pristine)
+        run: |
+          set -eu
+          mkdir -p /dev/shm/kernel-corpus-run
+          cp "$KERNEL_GB_ROOT/seedbed.sqlite3" /dev/shm/kernel-corpus-run/meta.sqlite3
+          echo "scratch metadata: $(du -h /dev/shm/kernel-corpus-run/meta.sqlite3 | cut -f1)"
+      - name: Run the kernel export spot check (release, real corpus)
+        env:
+          GARDENBED_KERNEL_GB: ${{ env.KERNEL_GB_ROOT }}
+          GARDENBED_KERNEL_META: /dev/shm/kernel-corpus-run/meta.sqlite3
+        run: >-
+          cargo test --release -p gardenbed-git --test kernel_spot
+          kernel_export_spot_check -- --ignored --exact --nocapture
+      - name: Cleanup scratch copy
+        if: always()
+        run: rm -rf /dev/shm/kernel-corpus-run
