@@ -397,12 +397,9 @@ jobs:
   #     run against a fresh per-run Postgres database the suite creates
   #     itself.
   #
-  # Opt-in on PRs: the job carries `live-services` in its name and only
-  # the nightly schedule runs it unconditionally; a PR (or a
-  # workflow_dispatch run) can add it with `[live-services]` in the PR
-  # title or body, or by pushing the branch label `live-services`.
-  # Nothing here weakens the default gate: without the label, PRs run
-  # everything they ran before.
+  # Nightly schedule and manual dispatch run this job. A PR opts in
+  # with `[live-services]` in its title; PR bodies and labels are not
+  # inspected. Other PRs retain the ordinary push/PR gate.
   #
   # The two-process gRPC half of scale.rs spawns the server binary from
   # the target dir (the same dogfood #12/#17 class), so the bins are
@@ -538,11 +535,12 @@ jobs:
   # path (listing, byte fidelity, EROFS, concurrency, unmount) had NO
   # automated run at all. This nightly job runs the suite on a
   # self-hosted runner that has FUSE (runs-on: [self-hosted, linux,
-  # fuse]): the runner LABEL is the explicit opt-in — a repository admin
-  # attaches the label to a host that demonstrably has /dev/fuse and
-  # fusermount3, and the job is skipped (not failed) when no such runner
-  # exists, because GitHub Actions queues—rather than fails—jobs whose
-  # runner labels match nothing. The job still does not override the
+  # fuse]). Enable it with repository variable ENABLE_FUSE_TESTS=true
+  # only after provisioning that runner with /dev/fuse and fusermount3.
+  # Without the variable the job is skipped, so an unconfigured runner
+  # cannot leave every nightly/manual workflow queued indefinitely.
+  # If enabled without a matching runner, Actions queues the job: that
+  # is an explicit setup error. The job still does not override the
   # tests' own availability gate: if the labeled host lacks FUSE, the
   # tests skip AND the summary step below fails the job with a clear
   # message (a mislabeled runner is a configuration bug, not a green
@@ -553,7 +551,9 @@ jobs:
   # clone and serve through the real bed and gardenbed-server binaries.
   fuse-mount:
     name: FUSE mount suite (nightly)
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: >-
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+      && vars.ENABLE_FUSE_TESTS == 'true'
     runs-on: [self-hosted, linux, fuse]
     timeout-minutes: 30
     steps:

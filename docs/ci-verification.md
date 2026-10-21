@@ -10,7 +10,7 @@ Two workflows own the coverage:
 
 | Workflow | Trigger | Jobs |
 |---|---|---|
-| [ci.yml](../.github/workflows/ci.yml) | push/PR + nightly schedule | fmt, clippy, test, perf, fuzz-smoke, playwright, demo (push); fuzz-campaign, release-canary, live-services, fuse-mount (nightly) |
+| [ci.yml](../.github/workflows/ci.yml) | push/PR + nightly schedule | fmt, clippy, test, perf, fuzz-smoke, playwright, demo (push); fuzz-campaign, release-canary, live-services (nightly/manual); fuse-mount (enabled self-hosted runner) |
 | [kernel-corpus.yml](../.github/workflows/kernel-corpus.yml) | manual (`workflow_dispatch`) | kernel real-corpus gate (self-hosted runner) |
 
 ## Tier 1 — every push and PR (blocking)
@@ -240,11 +240,13 @@ automated run at all.
 The nightly `fuse-mount` job runs the suite on
 `runs-on: [self-hosted, linux, fuse]`:
 
-* The **runner label is the opt-in**. A repository admin attaches the
-  `fuse` label to a self-hosted host that demonstrably has `/dev/fuse`
-  and `fusermount3`. With no such runner, GitHub Actions *queues* the
-  job rather than failing it — the safe outcome: nothing runs, nothing
-  passes vacuously, the pending job is visible in the UI.
+* A repository admin first provisions a self-hosted host with the
+  `fuse` label, `/dev/fuse`, and `fusermount3`, then sets repository
+  variable **`ENABLE_FUSE_TESTS=true`**. The nightly/manual job is
+  skipped while the variable is unset or false. This keeps ordinary
+  nightly/manual runs from waiting indefinitely for an unconfigured
+  self-hosted runner. Enabling the variable without a matching runner
+  queues the job; disable it again until the runner is available.
 * The job adds its own preflight that fails loudly if the labeled host
   lacks `/dev/fuse` or a fusermount binary — a mislabeled runner is a
   configuration bug and shows up as a red run, not a green skip.

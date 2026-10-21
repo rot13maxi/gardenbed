@@ -20,7 +20,7 @@ Implementation status and completion of verification targets are separate.
 | Diff rendering (M19) | Recorded renames, exact-blob pairing, gitlink pointer hunks; `crates/bed/tests/render_patch.rs`. Similarity-based moved-and-edited pairing and combined merge diffs remain outside scope. |
 | Additional client features | Read-only snapshot FUSE mount; lane refs; stack rebase and already-applied twin recognition. See [CLI reference](cli.md). |
 | Authentication | Optional bearer tokens with per-repository read/write/admin roles; server/bed auth suites. Originally deferred in the plan, now implemented. |
-| Scale-out | PostgreSQL metadata, S3 objects, stateless replicas, compose stack and demo; [scale-out design](scale-out-design.md). Live-service verification is opt-in. |
+| Scale-out | PostgreSQL metadata, S3 objects, stateless replicas, compose stack and demo; [scale-out design](scale-out-design.md). Nightly/manual CI gates cover live services; local suites are opt-in. |
 | Web interface | Embedded read-only UI, browse/blame/diffs/search and worker review; [web guide](web.md), Rust API tests and Playwright suite in `e2e/`. |
 | Benchmarks | Paired Gardenbed/Git harness and recorded synthetic/kernel measurements; [benchmarking](benchmarking.md). Broader sweeps remain open. |
 
@@ -41,7 +41,7 @@ not a fresh verification of the current checkout.
   1.16M-live-id synthetic store; it did not re-measure the 10.36M-object kernel
   corpus. The original M13 kernel time/RSS target needs separate evidence; see
   [the backlog record](DOGFOOD.md#backlog--product-fixes-from-dogfood-findings).
-- **Crash-test determinism:** dogfood #25 remains unassigned. The commit kill
+- **Crash-test determinism:** dogfood #25 remains open. The commit kill
   window and a resumability kill window race counter polling; deterministic
   server-side synchronization is the recorded fix direction. See
   [DOGFOOD.md](DOGFOOD.md).
@@ -59,14 +59,26 @@ not a fresh verification of the current checkout.
 
 ## Verification coverage
 
-[CI](../.github/workflows/ci.yml) runs formatting, clippy, workspace tests,
-release-mode ignored budget tests, fuzz smoke, and the v0.1 demo on pushes to
-main and PRs. It builds workspace binaries before integration tests. Fuzz
-smoke runs a selected target list and is `continue-on-error`; it is not a
-blocking full fuzz campaign. Kernel corpus tests are explicitly skipped in CI.
+[CI](../.github/workflows/ci.yml) defines blocking push/PR jobs for
+formatting, clippy, workspace tests, release-mode ignored budgets,
+bounded selected fuzz smoke, Playwright against the built web binary,
+and the v0.1 demo. Workspace binaries are built before integration tests.
+The extended fuzz campaign runs nightly and on manual dispatch; the
+pack-reader target starts without a committed seed corpus. Kernel corpus
+tests remain excluded from the ordinary push/PR budget job.
 
-The nightly/manual release canary runs release-mode GC chaos, the commit p50
-size-independence budget, and the v0.2 acceptance demo. PostgreSQL/S3 tests
-require their live-service environment variables; scale integration additionally
-requires `GARDENBED_SCALE_TEST=1`. FUSE integration depends on host support.
-Playwright tests exist but are not invoked by the current CI workflow.
+Nightly/manual jobs also cover the release canary and live PostgreSQL/S3:
+cold concurrent schema initialization, backend parity, and replica
+correctness. A PR can request the live-service job with `[live-services]`
+in its title. The live jobs reject skipped or zero-test runs. Local live
+suites still require their documented environment variables, including
+`GARDENBED_SCALE_TEST=1` for replica integration.
+
+FUSE CI requires a provisioned `[self-hosted, linux, fuse]` runner and
+repository variable `ENABLE_FUSE_TESTS=true`; it is skipped until enabled.
+The separate [kernel workflow](../.github/workflows/kernel-corpus.yml)
+is manual and requires an externally provisioned corpus and runner. It
+uses a private metadata copy and asserts that the selected test ran.
+These workflow definitions do not claim a remote FUSE or kernel run has
+occurred. See [CI verification](ci-verification.md) for prerequisites,
+local evidence, and the exact gates.
