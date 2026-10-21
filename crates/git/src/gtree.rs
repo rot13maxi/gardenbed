@@ -213,10 +213,14 @@ pub(crate) fn map_mode(mode: &str) -> Option<(GKind, Option<Mode>)> {
         "160000" => Some((GKind::File, Some(Mode::Gitlink))),
         _ => {
             // Non-canonical file modes (e.g. `100664` written by very old
-            // git): any 100xxxx mode is a blob; the exec bit decides.
+            // git): any 100xxx mode is a blob, and the OWNER exec bit
+            // alone decides — git itself normalizes 100654/100645 to
+            // 100644 and only 100744 to 100755 (verified against git
+            // 2.43: `git add` of such trees reports 100644). Group and
+            // other exec bits are dropped, exactly like git.
             let m = i32::from_str_radix(mode, 8).ok()?;
             if m & 0o170_000 == 0o100_000 {
-                let mode = if m & 0o111 != 0 {
+                let mode = if m & 0o100 != 0 {
                     Mode::Exec
                 } else {
                     Mode::Regular
@@ -265,8 +269,13 @@ mod tests {
         assert_eq!(map_mode("400"), Some((GKind::Dir, None)));
         assert_eq!(map_mode("120000"), Some((GKind::File, Some(Mode::Symlink))));
         assert_eq!(map_mode("160000"), Some((GKind::File, Some(Mode::Gitlink))));
-        // Ancient non-canonical mode: exec bit decides.
+        // Ancient non-canonical modes: the OWNER exec bit decides
+        // (git normalizes 100654/100645 → 100644, 100744 → 100755;
+        // group/other bits alone never make a file executable).
         assert_eq!(map_mode("100664"), Some((GKind::File, Some(Mode::Regular))));
+        assert_eq!(map_mode("100654"), Some((GKind::File, Some(Mode::Regular))));
+        assert_eq!(map_mode("100645"), Some((GKind::File, Some(Mode::Regular))));
+        assert_eq!(map_mode("100744"), Some((GKind::File, Some(Mode::Exec))));
         assert_eq!(map_mode("100777"), Some((GKind::File, Some(Mode::Exec))));
         assert_eq!(map_mode("42"), None);
     }

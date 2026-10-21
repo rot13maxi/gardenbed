@@ -1268,3 +1268,303 @@ fn nested_non_utf8_dir_with_divergent_grandchild_roundtrips() {
     assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1));
     gardenbed_harness::git_fsck(&exported).expect("exported nested history is valid");
 }
+
+/// Owner-bit mode rule (review finding 2): git normalizes pre-canonical
+/// blob modes by the OWNER exec bit only — 100654 and 100645 become
+/// 100644, only 100744 becomes 100755 (oracle:
+/// /tmp/gardenbed-todo/mode-oracle/results.json). The model must agree:
+/// group/other exec bits alone do NOT make a file Exec. A native child
+/// of such a commit must export 100644, not 100755 — the model mode is
+/// what leaks into natively-created history.
+#[test]
+fn group_exec_bit_modes_map_to_regular_and_native_children_export_644() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"mode probe\n");
+    let t1 = b.raw_tree(&[("100654", &blob, "f")]);
+    let c1 = b.commit_tree(&t1, &[], "group-exec pre-canonical mode\n");
+    // 100745: other-exec — also Regular by the owner-bit rule, and by
+    // git's own normalization.
+    let t2 = b.raw_tree(&[("100645", &blob, "g")]);
+    let c2 = b.commit_tree(&t2, &[&c1], "other-exec pre-canonical mode\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 2);
+
+    // The MODEL trees must classify both as Regular (flat paths f, g).
+    // The model drops no entries here, so the derived tree contains
+    // both files; the model mode is observable through the derived
+    // rows' blob modes.
+    let (_objects, metadata, _engine) = open_stores(&garden);
+    let cs2 = metadata.cs_for_git(&c2).unwrap().expect("c2 mapped");
+    let cs = metadata.get_changeset(cs2).unwrap().expect("present").0;
+    let f_mode = cs
+        .changes
+        .iter()
+        .find(|c| c.path == "g")
+        .expect("path g in the model")
+        .mode;
+    assert_eq!(f_mode, Mode::Regular, "100645 (other-exec) maps to Regular");
+    let cs1 = metadata.cs_for_git(&c1).unwrap().expect("c1 mapped");
+    let cs1d = metadata.get_changeset(cs1).unwrap().expect("present").0;
+    let f1_mode = cs1d
+        .changes
+        .iter()
+        .find(|c| c.path == "f")
+        .expect("path f in the model")
+        .mode;
+    assert_eq!(
+        f1_mode,
+        Mode::Regular,
+        "100654 (group-exec) maps to Regular"
+    );
+
+    // A native descendant of c2 re-modifies f: its exported mode must
+    // be 100644 (the model says Regular), never 100755.
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        let child = Changeset {
+            parents: vec![cs2],
+            changes: vec![gardenbed_model::Change {
+                path: "f".into(),
+                op: Op::Modify,
+                blob: Some(blob_id(b"native edit\n")),
+                src_path: None,
+                mode: Mode::Regular,
+            }],
+            message: "native child of other-exec history\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        engine.certify_history(cs2).expect("certify parent");
+        objects.put_blob(b"native edit\n").expect("blob");
+        let cs_child = child.id().expect("canonical");
+        let root = engine.validated_tree_for_new(&child).expect("derive tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_child, &child, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&child, root, &rows, None, None, None)
+            .expect("put changeset");
+        let won = metadata
+            .cas_ref("refs/heads/main", Some(cs2), cs_child)
+            .expect("cas");
+        assert!(matches!(won, gardenbed_store::RefCas::Won { .. }));
+    }
+
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("mode-native-child-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("native-on-group-exec history exports");
+    assert_eq!(roundtrip.commits.len(), 3, "two imports + native child");
+    for sha in [&c1, &c2] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} keeps its SHA through raw capture"
+        );
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+
+    // The exported native child carries f as 100644 — the observable
+    // mode in any downstream clone (run against the EXPORT, not the
+    // source repo).
+    let mut cmd = Command::new("git");
+    cmd.current_dir(&exported)
+        .arg("ls-tree")
+        .arg("refs/heads/main")
+        .arg("--")
+        .arg("f");
+    hermetic(&mut cmd);
+    let out = cmd.output().expect("ls-tree runs");
+    assert!(out.status.success(), "ls-tree failed");
+    let modes = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        modes.starts_with("100644"),
+        "the native child exports f as 100644, not 100755: {modes}"
+    );
+}
+
+/// Empty directories (review finding 3): the model drops them, the raw
+/// tree keeps them. A commit whose tree carries an empty dir DIVERGES
+/// from the canonical render of what the model derives, so the capture
+/// predicate must fire (root diverged ⇒ raw commit captured ⇒ SHA-exact
+/// roundtrip). The old predicate compared against render_canonical of
+/// the RAW entries — which preserves the empty-dir entry — so it said
+/// "no divergence," nothing was captured, and export refused loudly.
+#[test]
+fn empty_dir_commit_roundtrips_sha_exact() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"file next to the empty dir\n");
+    let empty = b.raw_tree(&[]); // the empty dir's own tree object
+    let root = b.raw_tree(&[("40000", &empty, "d"), ("100644", &blob, "f.txt")]);
+    let c1 = b.commit_tree(&root, &[], "commit with an empty directory\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 1);
+    assert!(
+        report.raw_trees_captured >= 2,
+        "the root AND the empty dir's tree are captured: {}",
+        report.raw_trees_captured
+    );
+
+    // Export: SHA-exact through the raw rows (the empty dir survives).
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("empty-dir-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("empty-dir history exports SHA-exact");
+    assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1));
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Memo-upgrade regression (review finding 3, follow-up): in ONE import
+/// batch, c0 has the EMPTY root tree, c1 adds only an empty directory
+/// `d` (whose child is that same empty-tree SHA), and c2 returns to the
+/// empty root. The empty-tree SHA is first memoized as a canonical ROOT
+/// (c0: byte-exact, no row); c1's walk then needs it as a ROW — the
+/// captured parent names `d` and the export walk resolves dir entries
+/// through raw-tree rows. A forced-child capture must UPGRADE the stale
+/// no-row memo decision, not be suppressed by it; c2's memo hit (now
+/// "captured") must force c2's own raw-commit capture so it too exports
+/// SHA-exact.
+#[test]
+fn empty_tree_sha_memo_upgrade_from_canonical_root_to_dropped_child() {
+    let b = Builder::new();
+
+    let empty = b.raw_tree(&[]);
+    let root_with_d = b.raw_tree(&[("40000", &empty, "d")]);
+    let c0 = b.commit_tree(&empty, &[], "c0: empty root\n");
+    let c1 = b.commit_tree(&root_with_d, &[&c0], "c1: add empty dir d\n");
+    let c2 = b.commit_tree(&empty, &[&c1], "c2: back to empty root\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 3);
+    // The empty-tree SHA: one row (upgraded when c1's `d` needs it),
+    // plus c1's root carrying `d` — the exact count is the row upgrade
+    // (empty tree) + the parent (root with d); c0 and c2 add nothing.
+    assert_eq!(
+        report.raw_trees_captured, 2,
+        "empty-tree row upgraded from the no-row root decision + the root with d"
+    );
+
+    // ALL THREE commits export SHA-exact.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("empty-tree-upgrade-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("the empty-tree memo-upgrade history exports SHA-exact");
+    assert_eq!(roundtrip.commits.len(), 3);
+    for sha in [&c0, &c1, &c2] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} must export SHA-exact"
+        );
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Empty-dir-only ROOT commit (review finding 3): a root whose tree
+/// contains only empty directories — git's diff sees no blobs, so the
+/// classifier produces an empty diff. The model legitimately derives
+/// the empty tree (it drops empty dirs); the raw-tree capture walk
+/// preserves the directories so the commit exports SHA-exact. The old
+/// guard refused this shape ("produced no diff although its tree is not
+/// empty") because it counted RAW tree entries; it now refuses only
+/// when the root's FILE closure is non-empty — a genuinely unexpected
+/// empty diff (real files git somehow did not report) still refuses.
+#[test]
+fn empty_dir_only_root_commit_roundtrips_sha_exact() {
+    let b = Builder::new();
+
+    // Nested empty dirs: d/ contains only an empty dir e/.
+    let empty = b.raw_tree(&[]);
+    let d_tree = b.raw_tree(&[("40000", &empty, "e")]);
+    let root = b.raw_tree(&[("40000", &d_tree, "d")]);
+    let c0 = b.commit_tree(&root, &[], "root with only nested empty dirs\n");
+    // Metadata reuse on the same root: a second commit pointing at the
+    // same tree must also export SHA-exact (memo decisions are reused,
+    // no double rows).
+    let c1 = b.commit_tree(&root, &[&c0], "same tree again\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("an empty-dir-only root imports — its file closure is empty")
+    };
+    assert_eq!(report.commits_new, 2);
+    // Rows: the empty tree `e`, the dir tree `d` (contains e), and the
+    // root (contains d) — all captured; the second commit adds none.
+    assert_eq!(
+        report.raw_trees_captured, 3,
+        "e + d + root captured once: {}",
+        report.raw_trees_captured
+    );
+
+    // Both commits export SHA-exact through the raw rows.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("empty-root-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("the empty-dir-only-root history exports SHA-exact");
+    assert_eq!(roundtrip.commits.len(), 2);
+    for sha in [&c0, &c1] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} must export SHA-exact"
+        );
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}

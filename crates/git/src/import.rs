@@ -610,7 +610,17 @@ fn build_changes(
                 }
             }
             None => {
-                if !git_objects.tree_entries(node.tree, sha_hex)?.is_empty() {
+                // Empty-diff root: the model derives an empty tree. That
+                // is only consistent with git when the root's FILE
+                // closure is empty — git's diff sees no blobs — which
+                // holds for the truly-empty tree AND for a tree of only
+                // empty directories (the model drops empty dirs, so its
+                // derivation is the same empty tree; the raw capture
+                // walk preserves the dirs for SHA-exact export). Any
+                // actual file entry with an empty diff is an
+                // inconsistency git cannot produce: refuse loudly.
+                let has_files = !git_objects.flatten_tree(node.tree, sha_hex)?.is_empty();
+                if has_files {
                     return Err(ImportError::Diff {
                         sha: sha_hex.to_owned(),
                         detail: "root commit produced no diff although its tree is not empty"
@@ -1145,14 +1155,29 @@ mod raw_fallback_tests {
     }
 
     /// Exotic file modes git's `canon_mode` collapses (e.g. `100675` ≡
-    /// `100644`) but Gardenbed's mode table distinguishes become a
-    /// mode-only Modify carrying the new mode and the unchanged blob.
+    /// `100644`: 0o675 has no owner exec bit) are a **no-op** under the
+    /// owner-bit mode rule — git itself reports no diff for the
+    /// transition. Modes the rule distinguishes (owner exec flips, e.g.
+    /// `100775` → `100644`) become a mode-only Modify carrying the new
+    /// mode and the unchanged blob.
     #[test]
-    fn exotic_modes_distinguished_by_the_model_become_modifies() {
+    fn exotic_modes_collapse_like_git_and_owner_exec_flips_modify() {
         let r = Repo::new();
         let b = r.blob(b"same\n");
-        let parent = r.tree(&[("100675", &b, "f")]); // exec bit set ⇒ Exec
-        let child = r.tree(&[("100644", &b, "f")]); // ⇒ Regular
+        // 100675 → 100644: no owner exec bit on either side ⇒ both
+        // Regular ⇒ zero-change changeset (git's own view).
+        let parent = r.tree(&[("100675", &b, "f")]);
+        let child = r.tree(&[("100644", &b, "f")]);
+        let changes = diff_trees(&r, &parent, &child, RAW_DIFF_LEAF_CAP).expect("diffs");
+        assert!(
+            changes.is_empty(),
+            "100675 → 100644 is a normalization no-op, got {changes:?}"
+        );
+
+        // 100775 (owner exec) → 100644: a genuine mode flip the model
+        // distinguishes — mode-only Modify, child's mode wins.
+        let parent = r.tree(&[("100775", &b, "f")]);
+        let child = r.tree(&[("100644", &b, "f")]);
         let changes = diff_trees(&r, &parent, &child, RAW_DIFF_LEAF_CAP).expect("diffs");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].op, Op::Modify);

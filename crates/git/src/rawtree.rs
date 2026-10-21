@@ -16,12 +16,18 @@
 //! verbatim, so the export can emit them SHA-exact.
 //!
 //! The walk memoizes per git tree SHA (subtrees shared across commits are
-//! decided once) and only descends into subtrees whose rendered bytes
-//! differ — a mode fixup in one directory never re-reads the rest of the
-//! tree. The model-tree association for a captured git tree is resolved
-//! by walking the DERIVED tree of the changeset being imported along the
-//! same path (the derived tree is the model's truth; the association is
-//! what lets the export seed a canonical render with raw bytes).
+//! decided once) and visits EVERY directory entry of every tree it
+//! reads — the walk is a closure over the commit's tree, so a divergent
+//! subtree anywhere below forces capture of every ancestor on its path
+//! (their bytes embed the child's original SHA), and a model-dropped
+//! empty directory forces a row for the dropped child (the export
+//! resolves captured parents' dir entries through raw rows). Non-dir
+//! (blob/gitlink) entries are not descended — they are identities the
+//! pack preserves exactly. The model-tree association for a captured
+//! git tree is resolved by walking the DERIVED tree of the changeset
+//! being imported along the same path (the derived tree is the model's
+//! truth; the association is what lets the export seed a canonical
+//! render with raw bytes).
 //!
 //! # Lossy sibling-name collisions (loud refusal)
 //!
@@ -116,6 +122,7 @@ impl RawTreeCapture {
             sha_hex,
             0,
             &mut rows,
+            false,
         )?;
         Ok((diverged, rows))
     }
@@ -134,6 +141,7 @@ impl RawTreeCapture {
         sha_hex: &str,
         depth: usize,
         rows: &mut usize,
+        force_row: bool,
     ) -> Result<bool, ImportError> {
         if depth > MAX_RAW_TREE_DEPTH {
             return Err(ImportError::Object {
@@ -147,6 +155,40 @@ impl RawTreeCapture {
             // distinct model trees sharing one git tree SHA cannot happen
             // (same bytes → same normalized model tree), so the memo is
             // sound.
+            //
+            // One upgrade exception (empty-dir fidelity): a tree earlier
+            // decided "no row" — e.g. the EMPTY tree as a canonical ROOT
+            // (c0's empty root renders byte-exact) — can later be
+            // referenced by a captured ancestor as a model-dropped
+            // CHILD (c1's empty dir `d`). The export walks captured
+            // trees by name and needs a row for every dir entry they
+            // name, so the stale no-row decision must be upgraded: the
+            // row is written now (the bytes are identical; the row is
+            // additive and idempotent) and the memo flipped.
+            if force_row && decided.is_none() {
+                let obj = repo.find_object(crate::graph::gix_id(tree)).map_err(|e| {
+                    ImportError::Object {
+                        oid: sha_hex.to_owned(),
+                        detail: format!("cannot read tree {}: {e}", tree.to_hex()),
+                    }
+                })?;
+                if obj.kind != gix::object::Kind::Tree {
+                    return Err(ImportError::Object {
+                        oid: sha_hex.to_owned(),
+                        detail: format!(
+                            "expected a tree object for {}, found {:?}",
+                            tree.to_hex(),
+                            obj.kind
+                        ),
+                    });
+                }
+                metadata
+                    .put_raw_tree(*tree.as_bytes(), model_tree, &obj.data)
+                    .map_err(ImportError::from)?;
+                *rows += 1;
+                self.memo.insert(tree, Some(model_tree));
+                return Ok(true);
+            }
             return Ok(decided.is_some());
         }
         if *rows >= RAW_TREE_ROW_CAP {
@@ -240,10 +282,22 @@ impl RawTreeCapture {
             // sibling-collision guard above already proved the lossy
             // names are unique within this directory.
             let lossy_name = String::from_utf8_lossy(&e.name).into_owned();
-            let child_model = model_entries
+            let paired_model = model_entries
                 .iter()
                 .find(|me| me.kind == gardenbed_model::TreeKind::Dir && me.name == lossy_name)
                 .and_then(|me| me.tree);
+            // A raw Dir entry with NO model counterpart is a model-dropped
+            // directory (the model drops empty dirs): the canonical render
+            // of what the model derives cannot contain this entry, so this
+            // parent diverges — AND the export, walking the captured
+            // parent's entries by name, needs a ROW for the dropped child.
+            // `force_row` guarantees one even when an earlier decision
+            // (e.g. the empty tree decided "no row" as c0's canonical
+            // root) would otherwise suppress it.
+            let (child_model, dropped_here) = match paired_model {
+                Some(model) => (Some(model), false),
+                None => (None, true),
+            };
             let diverged = self.capture_subtree(
                 repo,
                 engine,
@@ -253,8 +307,9 @@ impl RawTreeCapture {
                 sha_hex,
                 depth + 1,
                 rows,
+                dropped_here,
             )?;
-            any_diverged |= diverged;
+            any_diverged |= diverged || dropped_here;
         }
 
         // Simplest sound predicate: if any child diverged, this tree
@@ -287,14 +342,16 @@ impl RawTreeCapture {
             |e: &crate::gtree::RawEntry| Some(*e.oid.as_bytes()),
         );
         match canonical {
-            Some(rendered) if rendered == obj.data => {
+            Some(rendered) if rendered == obj.data && !force_row => {
                 // Byte-exact: no row; the memo records "decided, no row".
                 self.memo.insert(tree, None);
                 Ok(false)
             }
             _ => {
-                // Divergent (mode bytes, non-UTF-8 name, or an
-                // unrepresentable rendering): capture verbatim.
+                // Divergent (mode bytes, non-UTF-8 name, an
+                // unrepresentable rendering), or a model-dropped child
+                // whose row a captured ancestor's export walk needs:
+                // capture verbatim.
                 metadata
                     .put_raw_tree(*tree.as_bytes(), model_tree, &obj.data)
                     .map_err(ImportError::from)?;

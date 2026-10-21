@@ -2,11 +2,13 @@
 
 Status: **deferred, not waived.** This is the reproducible procedure for
 the ±20% kernel-segment import gate that `todo/fidelity` (raw-tree
-capture) must eventually run on a quiet host. The shared 16-core box is
-not quiet (documented load 28–230 in docs/v0.2.md §M18.5 history:
-4–8 commits/s for identical inputs, ±100% run-to-run variance — a
-35–70× contention factor), so a wall-clock gate run now would measure
-the co-tenants, not the code.
+capture) must run on a quiet host before the gate can be called closed.
+Load history: docs/v0.2.md §M18.5 records 28–230 during the original
+baseline crisis (4–8 commits/s for identical inputs, ±100% run-to-run
+variance); current shared-box load is far lower (observed ~0.6–2.6 on
+the 16-core box, 2026-10-21), so the quiet-window criteria below may
+now be satisfiable — verify with the sampling procedure instead of
+assuming either the old contention or present quiet.
 
 ## What is gated
 
@@ -62,16 +64,28 @@ M18.5, recorded on the quiet box). Raw-tree capture adds, per commit:
 
 ## Pass criteria
 
-- mean(B) ≥ 0.8 × mean(A) on the 1,000-commit segment (the ±20% gate),
-- AND mean(B) within ±20% of 278 commits/s when the box is otherwise
-  idle-class quiet (the recorded baseline).
-- Report both ratios; if the two criteria disagree, the box was not
-  quiet — rerun, do not average.
+- mean(B) ≥ 0.8 × mean(A) on the 1,000-commit segment (the ±20% gate).
+- ALSO report mean(B) against the recorded 278 commits/s baseline — as
+  a DISCLOSED comparison, not a pass/fail arm: the baseline was
+  measured under different matching semantics (a full resume over an
+  existing corpus slice — 619,487 commits / 2,230 s — versus this
+  gate's fresh limited-snapshot workload), so the two numbers are not
+  directly comparable without stating those semantics.
+- If mean(B) ≥ 0.8 × mean(A) but the historical comparison is outside
+  ±20%, that is NOT proof the box was noisy: the baseline and gate
+  workloads differ (resume vs fresh snapshot, warm caches, object
+  counts). Disclose the exact matching semantics of both sides,
+  measure both ratios, and INVESTIGATE the actual difference (profile
+  the capture walk, count captured rows, check io) — do not rerun
+  indefinitely and do not wave the discrepancy off as noise.
+- The gate is closed only on actual measured data from a
+  coordinator-scheduled exclusive window; a procedure alone never
+  closes it.
 
 ## If the gate cannot run (current state)
 
-Record precisely: "quiet-host window unavailable (shared box, load
-28–230 documented); raw-tree capture is exercised and verified
+Record precisely: "quiet-host window unavailable (load criteria above
+not met at sampling time); raw-tree capture is exercised and verified
 functionally (see the fidelity test suite: 100664 mode fixups, non-UTF-8
 paths, nested dirs, shared-root reuse — all SHA-exact at export), and
 the capture cost per commit is bounded by the memoized walk plus one

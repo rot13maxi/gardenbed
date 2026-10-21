@@ -155,8 +155,11 @@ pub trait MetadataStore: Send + Sync {
     ///
     /// Immutability: re-putting the same git SHA with identical bytes and
     /// the same model association is an idempotent no-op; different bytes
-    /// or a different association is a [`StoreError::ImmutabilityViolation`].
-    /// The bytes must SHA-1 to `git_tree_sha` — anything else is
+    /// or a different association is a [`StoreError::Invalid`] naming the
+    /// git SHA (the row is keyed by a 20-byte git tree SHA, not a model
+    /// [`Id`](gardenbed_model::Id), so the violation is reported as
+    /// `Invalid` rather than `ImmutabilityViolation`). The bytes must
+    /// SHA-1 to `git_tree_sha` — anything else is also
     /// [`StoreError::Invalid`] (the row is content-addressed by its key).
     fn put_raw_tree(
         &self,

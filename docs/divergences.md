@@ -110,11 +110,25 @@ mapping recorded. The native export asserts every computed SHA against
 the git-mapping table (D20): for such commits the raw bytes' tree header
 disagrees with the derived tree, and the export **fails loudly**
 (`ExportError::Changeset`) instead of diverging silently. The
-**raw-tree capture** that would make these exports verbatim is gated on
-the kernel import throughput gate: it is implemented only if capturing
-sparse raw tree bytes keeps a kernel-segment import within ±20% of the
-recorded 278 commits/s. Until then the behavior is: loud refusal on
-export, exact import.
+**raw-tree capture** (`todo/fidelity`) now makes these exports
+verbatim: divergent subtrees (pre-canonical mode bytes, non-UTF-8
+names) are captured as raw rows keyed by their original git SHA, and a
+divergent root forces raw-commit capture — the export emits the
+original bytes SHA-exact (`two_commits_sharing_noncanonical_root_export_exact`,
+`nested_non_utf8_dir_with_divergent_grandchild_roundtrips`).
+
+**Owner-bit mode rule (v0.2 fidelity fix):** git normalizes
+pre-canonical blob modes by the **owner exec bit alone** — `100654` and
+`100645` become `100644`, only `100744` becomes `100755` (verified
+against the git oracle; group/other exec bits are dropped). The
+importer's mode table now applies the same rule. **Compatibility:**
+stores imported before this fix hold `Mode::Exec` on paths whose only
+exec bits were group/other — a mode git itself reports as `100644`.
+Affected stores are retired by **re-import**; existing mappings and
+canonical changeset ids are never rewritten in place (re-import
+recomputes them; changeset ids change only on commits whose trees carry
+such modes). The kernel corpus is unaffected (it carries `100664`, no
+exec bits at all).
 
 **Why not fixed outright:** re-canonicalizing historical trees would
 rewrite git object identity (the raw tree SHAs are what corpus pins
