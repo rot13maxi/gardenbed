@@ -324,3 +324,88 @@ async fn bed_merge_refuses_dirty_working_copy_without_storing() {
     );
     w.server.shutdown().await;
 }
+
+#[tokio::test]
+async fn bed_merge_octopus_two_targets_creates_three_parent_merge() {
+    let mut w = setup().await;
+    // A third line of work: clone `other`, diverge, publish under a
+    // named ref (NOT main — main stays as theirs' base for the merge
+    // base computation... actually each target needs its own ref).
+    let other = w._dir.path().join("other");
+    fs::create_dir_all(&other).expect("other dir");
+    let (code, _, stderr) = bed(&other, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "clone other: {stderr}");
+    let (code, out, stderr) = bed(&other, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse add other: {stderr}\n{out}");
+
+    // Diverge both targets from the shared base on DISJOINT files:
+    // theirs edits notes.txt, other adds a new file, mine stays put
+    // (so ours is the base — every round fast-forwards content in).
+    commit_file(&w.theirs, "notes.txt", "notes theirs\n", "theirs edit");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "theirs publish: {stderr}");
+    commit_file(&other, "extra.txt", "extra other\n", "other adds");
+    let (code, _, stderr) = bed(&other, &["publish", "--ref", "todo/other"]);
+    assert_eq!(code, 0, "other publish: {stderr}");
+
+    // Octopus: two targets in one bed merge.
+    let (code, out, stderr) = bed(&w.mine, &["merge", "main", "todo/other"]);
+    assert_eq!(code, 0, "bed merge octopus: {stderr}\n{out}");
+
+    // First-round fast-forward (ours was the base): the first target
+    // REPLACES ours as the first parent, exactly like git-merge-octopus
+    // ("Fast-forwarding to: t1" → parents = [t1, t2], ours not a
+    // parent). Content-wise both targets' work is in.
+    let merged = current_cs(&w.mine);
+    let cs = w.repo.get_changeset(merged).expect("merged cs");
+    assert_eq!(cs.parents.len(), 2, "octopus parents: {cs:?}");
+    let t1 = w.repo.get_ref("main").expect("main ref").expect("main set");
+    let t2 = w
+        .repo
+        .get_ref("todo/other")
+        .expect("other ref")
+        .expect("todo/other set");
+    assert_eq!(cs.parents, vec![t1, t2], "FF octopus parents = [t1, t2]");
+    // Both targets' work is present in the working copy.
+    let notes = fs::read_to_string(w.mine.join("notes.txt")).expect("notes");
+    assert_eq!(notes, "notes theirs\n", "theirs' edit landed");
+    let extra = fs::read_to_string(w.mine.join("extra.txt")).expect("extra");
+    assert_eq!(extra, "extra other\n", "other's add landed");
+    w.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn bed_merge_octopus_conflict_refuses_naming_round() {
+    let mut w = setup().await;
+    let other = w._dir.path().join("other");
+    fs::create_dir_all(&other).expect("other dir");
+    let (code, _, stderr) = bed(&other, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "clone other: {stderr}");
+    let (code, out, stderr) = bed(&other, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse add other: {stderr}\n{out}");
+
+    // Both targets edit the SAME lines of doc.txt differently: the
+    // first round merges, the second conflicts (or the first does —
+    // either way the refusal must name the round and the path).
+    commit_file(&w.theirs, "doc.txt", "theirs version\n", "theirs edit");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "theirs publish: {stderr}");
+    commit_file(&other, "doc.txt", "other version\n", "other edit");
+    let (code, _, stderr) = bed(&other, &["publish", "--ref", "todo/other"]);
+    assert_eq!(code, 0, "other publish: {stderr}");
+
+    let before = current_cs(&w.mine);
+    let (code, _out, stderr) = bed(&w.mine, &["merge", "main", "todo/other"]);
+    assert_ne!(code, 0, "conflicting octopus must fail");
+    assert!(
+        stderr.contains("octopus merge refused"),
+        "error names the octopus refusal: {stderr}"
+    );
+    assert!(stderr.contains("doc.txt"), "error names the path: {stderr}");
+    // Nothing stored, nothing moved.
+    assert_eq!(before, current_cs(&w.mine), "no local state move");
+    let log = w.repo.log(before, 100).expect("log");
+    let merges: Vec<_> = log.iter().filter(|(_, cs)| cs.parents.len() >= 2).collect();
+    assert!(merges.is_empty(), "no octopus stored: {merges:?}");
+    w.server.shutdown().await;
+}

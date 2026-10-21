@@ -103,7 +103,9 @@ fn fixture(snapshots: &[BTreeMap<&'static str, File>]) -> (Engine, Vec<Id>) {
 }
 
 fn files(list: &[(&'static str, &'static str)]) -> BTreeMap<&'static str, File> {
-    list.iter().map(|(p, c)| (*p, (*c, Mode::Regular))).collect()
+    list.iter()
+        .map(|(p, c)| (*p, (*c, Mode::Regular)))
+        .collect()
 }
 
 fn flat_files(engine: &Engine, cs: Id) -> BTreeMap<String, (Mode, Id)> {
@@ -160,7 +162,10 @@ fn git_repo(snapshots: &[BTreeMap<&'static str, File>]) -> (tempfile::TempDir, V
                 git(dir_path, &["update-index", "--chmod=-x", "--", path]);
             }
         }
-        git(dir_path, &["commit", "-q", "--allow-empty", "-m", &format!("cs {i}")]);
+        git(
+            dir_path,
+            &["commit", "-q", "--allow-empty", "-m", &format!("cs {i}")],
+        );
         let sha = String::from_utf8(
             git_cmd(dir_path, &["rev-parse", "HEAD"])
                 .output()
@@ -259,8 +264,7 @@ fn run_case(case: &Case) {
             assert!(
                 !git.conflicted,
                 "{}: git conflicted (paths {:?}) but gardenbed merged cleanly",
-                case.name,
-                git.conflicted_paths
+                case.name, git.conflicted_paths
             );
             // Derivation invariant: apply(changes, tree(ours)).
             let merged_cs = gardenbed_model::Changeset {
@@ -447,6 +451,152 @@ fn rename_matrix_matches_git() {
             ours: 1,
             theirs: 2,
             expect: Ok(vec![("one.txt", "one\ntwo\n")]),
+        },
+        // ---- clean: CROSS-DIRECTORY rename on one side, edit at the
+        // source on the other — the edit must land at the destination
+        // (dirB/g), the source (dirA/f) gone. Anchors in both dirs
+        // keep the directories alive so the move crosses levels.
+        Case {
+            name: "cross-dir-rename-vs-edit",
+            snapshots: vec![
+                files(&[
+                    ("dirA/f", "line one\nline two\nline three\nline four\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                ]),
+                files(&[
+                    ("dirB/g", "line one\nline two\nline three\nline four\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                ]),
+                files(&[
+                    ("dirA/f", "line one\nline two\nEDIT BY THEIRS\nline four\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                ]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(vec![(
+                "dirB/g",
+                "line one\nline two\nEDIT BY THEIRS\nline four\n",
+            )]),
+        },
+        // ---- conflict: CROSS-DIRECTORY rename/delete (ours moves
+        // dirA/f to dirB/g, theirs deletes dirA/f). Git refuses with
+        // CONFLICT (rename/delete) naming both endpoints.
+        Case {
+            name: "cross-dir-rename-delete",
+            snapshots: vec![
+                files(&[
+                    ("dirA/f", "line one\nline two\nline three\nline four\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                ]),
+                files(&[
+                    ("dirB/g", "line one\nline two\nline three\nline four\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                ]),
+                files(&[("dirA/keep", "anchorA\n"), ("dirB/keep", "anchorB\n")]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Err(vec!["dirA/f", "dirB/g"]),
+        },
+        // ---- clean: rename on one side, EDIT at the source on the
+        // other, REVERSED (theirs renames, ours edits) — the edit must
+        // land at the destination and the source must be GONE.
+        Case {
+            name: "edit-vs-rename-reversed",
+            snapshots: vec![
+                files(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                files(&[("f.txt", "one\ntwo\nEDIT BY OURS\nfour\nfive\n")]),
+                files(&[("one.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(vec![("one.txt", "one\ntwo\nEDIT BY OURS\nfour\nfive\n")]),
+        },
+        // ---- clean: a file renamed INTO a directory with its own
+        // name (A → A/sub) while the other side EDITS the file A.
+        // Git merges clean: the edit lands at A/sub, nothing else.
+        // The path-mask trap: A is the source FILE's path, and the
+        // destination directory is also named A — the rename must not
+        // be suppressed by the path overlap, and the consumed FILE
+        // entry must not taint the DIRECTORY container.
+        Case {
+            name: "rename-into-own-dir-vs-edit",
+            snapshots: vec![
+                files(&[("A", "line one\nline two\nline three\n")]),
+                files(&[("A/sub", "line one\nline two\nline three\n")]),
+                files(&[("A", "line one\nEDITED\nline three\n")]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(vec![("A/sub", "line one\nEDITED\nline three\n")]),
+        },
+        // ---- clean: BOTH sides rename A → A/sub (same destination)
+        // and each adds a DISTINCT file under the new A directory.
+        // Git merges clean with all three files: A/sub plus both
+        // extras. The trap: skipping the whole directory A (because a
+        // rename's source path is A) would silently drop one side's
+        // extra file.
+        Case {
+            name: "rename-into-own-dir-both-sides-with-extras",
+            snapshots: vec![
+                files(&[("A", "line one\nline two\nline three\n")]),
+                files(&[
+                    ("A/sub", "line one\nline two\nline three\n"),
+                    ("A/oursExtra", "ours\n"),
+                ]),
+                files(&[
+                    ("A/sub", "line one\nline two\nline three\n"),
+                    ("A/theirsExtra", "theirs\n"),
+                ]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(vec![
+                ("A/sub", "line one\nline two\nline three\n"),
+                ("A/oursExtra", "ours\n"),
+                ("A/theirsExtra", "theirs\n"),
+            ]),
+        },
+        // ---- conflict: CROSS-DIRECTORY rename/rename 1-to-2 (both
+        // sides move dirA/f to different directories). Git refuses
+        // with CONFLICT (rename/rename) naming source + both dests.
+        Case {
+            name: "cross-dir-rename-rename-1to2",
+            snapshots: vec![
+                files(&[
+                    ("dirA/f", "line one\nline two\nline three\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                    ("dirC/keep", "anchorC\n"),
+                ]),
+                files(&[
+                    ("dirB/g", "line one\nline two\nline three\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                    ("dirC/keep", "anchorC\n"),
+                ]),
+                files(&[
+                    ("dirC/h", "line one\nline two\nline three\n"),
+                    ("dirA/keep", "anchorA\n"),
+                    ("dirB/keep", "anchorB\n"),
+                    ("dirC/keep", "anchorC\n"),
+                ]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Err(vec!["dirA/f", "dirB/g", "dirC/h"]),
         },
     ];
     for case in &cases {

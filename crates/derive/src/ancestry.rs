@@ -439,11 +439,7 @@ fn merge_base_naive_impl(
 /// A criss-cross history yields two or more; anything with a unique
 /// best base yields exactly one. Empty when the histories are
 /// unrelated.
-fn merge_bases_all_impl(
-    metadata: &dyn MetadataStore,
-    a: Id,
-    b: Id,
-) -> Result<Vec<Id>, StoreError> {
+fn merge_bases_all_impl(metadata: &dyn MetadataStore, a: Id, b: Id) -> Result<Vec<Id>, StoreError> {
     if a == b {
         return Ok(vec![a]);
     }

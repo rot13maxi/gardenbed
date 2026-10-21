@@ -180,7 +180,10 @@ async fn octopus_folds_sequentially_with_octopus_parents() {
     let cs = client.get_changeset(repo, merged).await.expect("readable");
     let mut expected_parents = vec![ours];
     expected_parents.extend(targets.iter().copied());
-    assert_eq!(cs.parents, expected_parents, "octopus parents (ours, t1..t3)");
+    assert_eq!(
+        cs.parents, expected_parents,
+        "octopus parents (ours, t1..t3)"
+    );
 
     // The merged tree carries every side's file.
     let root_tree = client
@@ -189,11 +192,7 @@ async fn octopus_folds_sequentially_with_octopus_parents() {
         .expect("root tree")
         .expect("non-empty tree");
     let tree = client.get_tree(repo, root_tree).await.expect("tree");
-    let mut names: Vec<&str> = tree
-        .entries
-        .iter()
-        .map(|e| e.name.as_str())
-        .collect();
+    let mut names: Vec<&str> = tree.entries.iter().map(|e| e.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(
         names,
@@ -241,7 +240,11 @@ async fn octopus_skips_up_to_date_targets() {
         .expect("octopus merges");
     let cs = client.get_changeset(repo, merged).await.expect("readable");
     // t1 skipped: parents are (pre, t2) — NOT (pre, t1, t2).
-    assert_eq!(cs.parents, vec![pre, targets[1]], "up-to-date target skipped from parents");
+    assert_eq!(
+        cs.parents,
+        vec![pre, targets[1]],
+        "up-to-date target skipped from parents"
+    );
 
     // Every target up to date: up_to_date answer, nothing stored.
     // (Two up-to-date targets: t0 merged into pre above, and pre
@@ -398,10 +401,7 @@ async fn octopus_refuses_on_any_conflict_with_round_and_paths() {
 
     // Nothing was stored: ours' history is unchanged — no octopus
     // changeset is reachable from ours.
-    let mut stream = client
-        .log(repo, ours, 0)
-        .await
-        .expect("log opens");
+    let mut stream = client.log(repo, ours, 0).await.expect("log opens");
     let mut saw_octopus = false;
     while let Some(item) = stream.next().await {
         let summary = item.expect("log item ok");
@@ -409,10 +409,7 @@ async fn octopus_refuses_on_any_conflict_with_round_and_paths() {
             saw_octopus = true;
         }
     }
-    assert!(
-        !saw_octopus,
-        "no octopus changeset was stored on refusal"
-    );
+    assert!(!saw_octopus, "no octopus changeset was stored on refusal");
     server.shutdown().await;
 }
 
@@ -532,7 +529,11 @@ async fn octopus_matches_git_tree_on_clean_fold() {
     g(&["add", "."]);
     g(&["commit", "-qm", "ours"]);
     // t1..t3 off the root
-    for (name, content) in [("target_t1", "t1\n"), ("target_t2", "t2\n"), ("target_t3", "t3\n")] {
+    for (name, content) in [
+        ("target_t1", "t1\n"),
+        ("target_t2", "t2\n"),
+        ("target_t3", "t3\n"),
+    ] {
         g(&["checkout", "-q", "HEAD~1"]);
         std::fs::write(gdir.path().join(name), content).unwrap();
         g(&["add", "."]);
@@ -540,7 +541,14 @@ async fn octopus_matches_git_tree_on_clean_fold() {
         g(&["branch", "-f", name]);
     }
     g(&["checkout", "-q", "main"]);
-    g(&["merge", "-m", "octopus", "target_t1", "target_t2", "target_t3"]);
+    g(&[
+        "merge",
+        "-m",
+        "octopus",
+        "target_t1",
+        "target_t2",
+        "target_t3",
+    ]);
 
     let listing = {
         let mut cmd = std::process::Command::new("git");

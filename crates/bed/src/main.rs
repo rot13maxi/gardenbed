@@ -227,7 +227,7 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
             }
             let out = gardenbed::ops::merge(
                 &cli.state_dir,
-                &targets,
+                targets,
                 message.as_deref(),
                 author.as_deref(),
             )

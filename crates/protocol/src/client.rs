@@ -530,10 +530,7 @@ impl GardenbedClient {
             committer: Some(pb::IdentityMsg::from(committer)),
         };
         let mut inner = self.inner.clone();
-        let resp = inner
-            .merge_octopus(self.request(req))
-            .await?
-            .into_inner();
+        let resp = inner.merge_octopus(self.request(req)).await?.into_inner();
         Ok((wire_id(&resp.id, "MergeOctopusResp.id")?, resp.up_to_date))
     }
 

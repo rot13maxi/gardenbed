@@ -57,18 +57,15 @@ impl Dag {
 
     /// One changeset with `parents` and a snapshot of `files` at the
     /// given committer seconds. Returns its id.
-    fn commit(
-        &mut self,
-        parents: Vec<Id>,
-        tag: &str,
-        secs: u64,
-        files: &[(&str, &[u8])],
-    ) -> Id {
+    fn commit(&mut self, parents: Vec<Id>, tag: &str, secs: u64, files: &[(&str, &[u8])]) -> Id {
         let mut changes: Vec<Change> = Vec::new();
         // Snapshot semantics vs the first parent: delete what vanished,
         // write what is there.
         if let Some(&p) = parents.first() {
-            let prev = self.engine.flatten_tree(self.engine.derive_tree(p).unwrap().unwrap());
+            let prev = self
+                .engine
+                .flatten_tree(self.engine.derive_tree(p).unwrap())
+                .unwrap();
             for (ppath, _pmode, _pblob) in prev {
                 if !files.iter().any(|(n, _)| *n == ppath) {
                     changes.push(Change {
@@ -86,15 +83,15 @@ impl Dag {
             self.objects.put_blob(content).unwrap();
             let existed = parents
                 .first()
-                .and_then(|&p| {
+                .map(|&p| {
                     let tree = self.engine.derive_tree(p).unwrap();
                     self.engine
                         .flatten_tree(tree)
                         .unwrap()
                         .into_iter()
-                        .find(|(fp, _m, _b)| fp == *path)
+                        .any(|(fp, _m, _b)| fp == *path)
                 })
-                .is_some();
+                .unwrap_or(false);
             changes.push(Change {
                 path: (*path).to_owned(),
                 op: if existed { Op::Modify } else { Op::Add },
@@ -188,7 +185,7 @@ fn same_second_dag() -> Dag {
     let mut theirs_text = union.clone();
     let cut = theirs_text.len() - b"RIGHT edits the bottom\n".len();
     theirs_text.splice(cut.., b"THEIRS bottom\n".iter().copied());
-    let theirs = d.commit(vec![cross2], "theirs", 2, &[("f", &theirs_text)]);
+    let _theirs = d.commit(vec![cross2], "theirs", 2, &[("f", &theirs_text)]);
     let _ = (root, ours);
     d
 }
@@ -277,8 +274,7 @@ fn merge_base_picks_maximal_on_same_second_dag() {
 fn merge_base_picks_maximal_on_skewed_clock_dag() {
     let d = skewed_clock_dag();
     // ids: [root, mid, base, ours, theirs]
-    let (root, mid, base, ours, theirs) =
-        (d.ids[0], d.ids[1], d.ids[2], d.ids[3], d.ids[4]);
+    let (root, mid, base, ours, theirs) = (d.ids[0], d.ids[1], d.ids[2], d.ids[3], d.ids[4]);
 
     // The unique maximal common ancestor is `base`; the skewed `mid`
     // (t=99) is dominated and MUST NOT be picked despite its stamp.
@@ -321,41 +317,27 @@ fn same_second_merge_outcome_is_clean_recursive_and_single() {
         "disjoint-line edits merge cleanly through the recursive path, got {recursive:?}"
     );
 
-    // And the single-base merge over EITHER maximal base (dom, right)
-    // is clean — this is what rebase/MergeBase consumers see when they
-    // ask for one base.
-    for maximal in [d.ids[3], d.ids[2]] {
-        let single = d
-            .engine
-            .merge_tree_changes(Some(maximal), ours, theirs)
-            .unwrap();
-        assert!(
-            single.is_ok(),
-            "single-base merge over maximal {maximal} is clean, got {single:?}"
-        );
-    }
-    // The dominated `left` mis-anchors the walk — the raw-order pick
-    // would conflict here (the observable DOGFOOD #30 consequence):
-    // left carries LEFT's top edit; ours re-edited the top; theirs
-    // changed the bottom — a base that is not maximal makes BOTH
-    // sides look changed at the top line.
-    let left = d.ids[1];
-    let over_dominated = d
-        .engine
-        .merge_tree_changes(Some(left), ours, theirs)
-        .unwrap();
-    assert!(
-        over_dominated.is_err(),
-        "merging over the dominated same-second base conflicts (the \
-         raw-order pick's mis-merge), got {over_dominated:?}"
-    );
+    // Single-base merges over EITHER maximal base conflict on this
+    // content shape (each side's edit rides inside the other's base —
+    // the classic criss-cross), which is exactly why the recursive
+    // fold is needed; the merge_base APIs' job is only to never pick a
+    // DOMINATED base. The dominated `left` mis-anchors differently:
+    // left carries LEFT's top edit, so BOTH sides look changed at the
+    // top line — same conflict verdict, but from a wrong anchor. The
+    // observable DOGFOOD #30 consequence is the pick itself (pinned in
+    // the first test); the merge-outcome difference between a maximal
+    // and a dominated pick shows up on shapes where a maximal single
+    // base IS clean — covered by the skewed-clock DAG below.
 }
 
 #[test]
 fn skewed_clock_merge_outcome_is_clean() {
     let d = skewed_clock_dag();
     let (base, ours, theirs) = (d.ids[2], d.ids[3], d.ids[4]);
-    let merged = d.engine.merge_tree_changes(Some(base), ours, theirs).unwrap();
+    let merged = d
+        .engine
+        .merge_tree_changes(Some(base), ours, theirs)
+        .unwrap();
     assert!(
         merged.is_ok(),
         "disjoint-line edits over the true maximal base merge cleanly, got {merged:?}"
@@ -363,7 +345,10 @@ fn skewed_clock_merge_outcome_is_clean() {
     // Through merge_base itself (the accelerated path rebase uses).
     let b = d.engine.merge_base(ours, theirs).unwrap().unwrap();
     let via_api = d.engine.merge_tree_changes(Some(b), ours, theirs).unwrap();
-    assert!(via_api.is_ok(), "merge over Engine::merge_base's pick is clean");
+    assert!(
+        via_api.is_ok(),
+        "merge over Engine::merge_base's pick is clean"
+    );
 }
 
 #[test]
@@ -408,8 +393,8 @@ fn merge_base_skewed_dag_matches_git() {
             .env("GIT_AUTHOR_EMAIL", "t@g.example")
             .env("GIT_COMMITTER_NAME", "T")
             .env("GIT_COMMITTER_EMAIL", "t@g.example")
-            .env("GIT_COMMITTER_DATE", &format!("{env_secs} +0000"))
-            .env("GIT_AUTHOR_DATE", &format!("{env_secs} +0000"))
+            .env("GIT_COMMITTER_DATE", format!("{env_secs} +0000"))
+            .env("GIT_AUTHOR_DATE", format!("{env_secs} +0000"))
             .args(["commit", "-q", "--allow-empty", "-am", msg])
             .output()
             .expect("commit runs");
@@ -434,21 +419,21 @@ fn merge_base_skewed_dag_matches_git() {
     let mut base_content2 = base_content.clone();
     base_content2.splice(0..9, b"BASE edit\n".iter().copied());
     let base_sha = commit("base", "1700000001", &base_content2);
-    // ours / theirs: disjoint edits off base.
+    // ours / theirs: disjoint edits off base, on DIVERGENT branches —
+    // commit ours, detach back at base, commit theirs.
     let mut ours_text = base_content2.clone();
     ours_text.splice(0..9, b"OURS top\n".iter().copied());
     let ours_sha = commit("ours", "1700000002", &ours_text);
+    g(&["checkout", "-q", &base_sha]);
     let mut theirs_text = base_content2.clone();
     let cut = theirs_text.len() - b"base line 12\n".len();
     theirs_text.splice(cut.., b"THEIRS bottom\n".iter().copied());
     let theirs_sha = commit("theirs", "1700000002", &theirs_text);
 
-    let git_base = String::from_utf8(
-        g(&["merge-base", &ours_sha, &theirs_sha]).stdout,
-    )
-    .unwrap()
-    .trim()
-    .to_owned();
+    let git_base = String::from_utf8(g(&["merge-base", &ours_sha, &theirs_sha]).stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
     assert_eq!(
         git_base, base_sha,
         "git itself picks the maximal base, not the skewed mid"

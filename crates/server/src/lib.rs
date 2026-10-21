@@ -1192,7 +1192,6 @@ impl Repo {
         Ok(acc.unwrap_or_default())
     }
 
-
     /// A snapshot of the request counters, sorted by name.
     pub fn stats(&self) -> BTreeMap<String, u64> {
         self.stats.snapshot()

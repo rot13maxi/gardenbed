@@ -259,10 +259,7 @@ fn git_union_tree(dir: &tempfile::TempDir, path: &str, content: &[u8]) -> String
 /// `git commit-tree <tree> -p <p1> -p <p2> -m <msg>` with a fixed
 /// identity, returning the commit sha.
 fn echo_commit_tree(dir: &tempfile::TempDir, tree: &str, parents: &[&str], msg: &str) -> String {
-    let mut args: Vec<String> = vec![
-        "commit-tree".into(),
-        tree.into(),
-    ];
+    let mut args: Vec<String> = vec!["commit-tree".into(), tree.into()];
     for p in parents {
         args.push("-p".into());
         args.push((*p).to_owned());
@@ -324,11 +321,16 @@ fn merge_bases_all_matches_git_on_criss_cross() {
     let theirs_edit = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nY8\n".to_vec();
     let union = b"A1\nl2\nl3\nl4\nl5\nl6\nl7\nB8\n".to_vec();
 
-    let (engine, _base, a, b, _m1, _m2, ours, theirs) = criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit,
-    );
+    let (engine, _base, a, b, _m1, _m2, ours, theirs) =
+        criss_cross("f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit);
     let (gdir, shas) = git_criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit, &union,
+        "f.txt",
+        &base,
+        &a_edit,
+        &b_edit,
+        &ours_edit,
+        &theirs_edit,
+        &union,
     );
 
     // gardenbed: two maximal bases (m1, m2), in the deterministic order.
@@ -342,10 +344,7 @@ fn merge_bases_all_matches_git_on_criss_cross() {
     // git parity: `git merge-base --all ours theirs` names the same two.
     let git_bases = git_out(gdir.path(), &["merge-base", "--all", "ours", "theirs"])
         .expect("git merge-base --all succeeds");
-    let git_lines: Vec<&str> = std::str::from_utf8(&git_bases)
-        .unwrap()
-        .lines()
-        .collect();
+    let git_lines: Vec<&str> = std::str::from_utf8(&git_bases).unwrap().lines().collect();
     assert_eq!(git_lines.len(), 2, "git also finds two bases");
     assert!(git_lines.contains(&shas[0].as_str()));
     assert!(git_lines.contains(&shas[1].as_str()));
@@ -366,11 +365,16 @@ fn recursive_criss_cross_classification_matches_git() {
     let theirs_edit = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nY8\n".to_vec();
     let union = b"A1\nl2\nl3\nl4\nl5\nl6\nl7\nB8\n".to_vec();
 
-    let (engine, _base, _a, b, _m1, _m2, ours, theirs) = criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit,
-    );
+    let (engine, _base, _a, b, _m1, _m2, ours, theirs) =
+        criss_cross("f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit);
     let (gdir, _shas) = git_criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit, &union,
+        "f.txt",
+        &base,
+        &a_edit,
+        &b_edit,
+        &ours_edit,
+        &theirs_edit,
+        &union,
     );
 
     // Sanity: the single-base tie-break (v0.2 behavior) merges this
@@ -378,9 +382,7 @@ fn recursive_criss_cross_classification_matches_git() {
     // picks `b` (newest committer seconds of the two maximal bases),
     // which sees ours' top-line edit as a base change and theirs'
     // bottom-line edit as the only side change.
-    let single = engine
-        .merge_tree_changes(Some(b), ours, theirs)
-        .unwrap();
+    let single = engine.merge_tree_changes(Some(b), ours, theirs).unwrap();
     assert!(single.is_ok(), "single-base b tie-break merges cleanly");
 
     // git's recursive answer: CONFLICT.
@@ -390,9 +392,7 @@ fn recursive_criss_cross_classification_matches_git() {
     // gardenbed recursive: CONFLICT, naming the path.
     let recursive = engine.merge_tree_changes_recursive(ours, theirs).unwrap();
     match recursive {
-        Ok(changes) => panic!(
-            "recursive merge was clean ({changes:?}) but git conflicted"
-        ),
+        Ok(changes) => panic!("recursive merge was clean ({changes:?}) but git conflicted"),
         Err(conflicts) => {
             assert!(
                 conflicts.iter().any(|c| c == "f.txt"),
@@ -446,11 +446,16 @@ fn recursive_clean_criss_cross_matches_git_content() {
         v
     };
 
-    let (engine, _base, _a, _b, _m1, _m2, ours, theirs) = criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit,
-    );
+    let (engine, _base, _a, _b, _m1, _m2, ours, theirs) =
+        criss_cross("f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit);
     let (gdir, _shas) = git_criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit, &union,
+        "f.txt",
+        &base,
+        &a_edit,
+        &b_edit,
+        &ours_edit,
+        &theirs_edit,
+        &union,
     );
 
     let git = git_merge_tree(gdir.path(), "ours", "theirs").expect("git merge-tree runs");
@@ -572,9 +577,8 @@ fn recursive_merge_is_deterministic_across_runs() {
     let ours_edit = b"X1\nl2\nl3\nl4\nl5\nl6\nl7\nB8\n".to_vec();
     let theirs_edit = b"l1\nl2\nl3\nl4\nl5\nl6\nl7\nY8\n".to_vec();
 
-    let (engine, _base, _a, _b, _m1, _m2, ours, theirs) = criss_cross(
-        "f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit,
-    );
+    let (engine, _base, _a, _b, _m1, _m2, ours, theirs) =
+        criss_cross("f.txt", &base, &a_edit, &b_edit, &ours_edit, &theirs_edit);
     let first = engine.merge_tree_changes_recursive(ours, theirs).unwrap();
     let second = engine.merge_tree_changes_recursive(ours, theirs).unwrap();
     assert_eq!(first, second, "repeated recursive merges are identical");
