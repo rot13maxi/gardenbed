@@ -230,6 +230,7 @@ fn assert_schema_complete(base: &str, schema: &str) {
         "derived",
         "git_map",
         "git_raw_commit",
+        "git_raw_tree",
         "refs",
         "validated_changesets_v1",
     ];
