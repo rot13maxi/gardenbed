@@ -306,3 +306,146 @@ async fn daemon_streams_blob_over_4mib() {
     daemon.kill().await;
     server.shutdown().await;
 }
+
+/// The daemon's cache must not leak objects across repositories. This is
+/// the cross-repository half of [`daemon_cache_hit_respects_repo_scope`]:
+/// that test only exercises a token denied on the *same* repo (a
+/// repo-scope denial), which the daemon's `ListRefs` probe already
+/// catches. Here both repos exist on the same server and the token is
+/// authorized for the asked repo — only the *object* is missing from it:
+///
+/// 1. repo `alpha` holds object X; repo `beta` (same server, different
+///    content) does not.
+/// 2. a wildcard token warms the daemon's shared cache with alpha's
+///    objects (trees and blobs).
+/// 3. a beta-scoped token asks `GetBlob`/`GetTree` for alpha's X with
+///    `repo=beta`: `ListRefs(beta)` authorizes (the token is valid for
+///    beta), but the origin read is NotFound — beta does not have X.
+///
+/// The daemon must return NotFound, not alpha's cached bytes: the cache
+/// is keyed by content id alone, so without a repo membership record it
+/// would hand beta a blob it never stored (a cross-repo object leak).
+/// Asserted per hit type (blob, then tree) through a raw client on the
+/// daemon's socket, so the exact RPC — not a whole `bed clone` — is the
+/// unit under test.
+#[tokio::test]
+async fn daemon_cache_does_not_leak_objects_across_repos() {
+    use gardenbed_protocol::client::GardenbedClient;
+    use tokio_stream::StreamExt as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("server");
+    let daemon_root = dir.path().join("daemon");
+
+    // Two repositories with disjoint content: alpha's blob bytes (and
+    // therefore tree ids) are nothing like beta's, so "beta has alpha's
+    // object" can only ever be true through the daemon's shared cache.
+    let alpha_history = generate(7, &GenOptions::default());
+    let beta_history = generate(9, &GenOptions::default());
+    ingest(&alpha_history, &root.join("alpha"));
+    ingest(&beta_history, &root.join("beta"));
+
+    // Warm token: wildcard (may fetch alpha). Beta token: read on beta
+    // only — authorized for the *asked* repo, denied on alpha.
+    let auth_path = dir.path().join("auth.toml");
+    fs::write(
+        &auth_path,
+        "[tokens.\"warm-token\"]\nrepos = [\"*\"]\nrole = \"write\"\n\
+         [tokens.\"beta-token\"]\nrepos = [\"beta\"]\nrole = \"read\"\n",
+    )
+    .expect("auth.toml written");
+    let mut server = Server::spawn_with_auth(&root, &auth_path).await;
+    let mut daemon = Daemon::spawn(&daemon_root, &server.http()).await;
+
+    // Warm the shared cache with alpha's trees and blobs via a real
+    // tokened clone + sparse materialization through the daemon.
+    let alpha_wc = dir.path().join("alpha-wc");
+    fs::create_dir_all(&alpha_wc).expect("alpha working-copy dir");
+    let (code, out, err) = bed_via_daemon_with_token(
+        &daemon,
+        &alpha_wc,
+        &["clone", &format!("{}/alpha", server.http())],
+        "warm-token",
+    );
+    assert_eq!(code, 0, "alpha clone warms the cache: {err}\n{out}");
+    let (code, out, err) = bed_via_daemon_with_token(
+        &daemon,
+        &alpha_wc,
+        &["sparse", "add", "."],
+        "warm-token",
+    );
+    assert_eq!(code, 0, "alpha sparse materializes: {err}\n{out}");
+
+    // Pick one of alpha's blobs and one of its trees from the head
+    // changeset — both are now in the daemon's shared cache.
+    let head = alpha_history.changesets.len() - 1;
+    let files = gardenbed_harness::generator::files_at(&alpha_history, head);
+    let (blob_id, _) = files
+        .values()
+        .find(|(_, mode)| *mode == gardenbed_model::Mode::Regular)
+        .expect("alpha's head has a regular file")
+        .clone();
+
+    let alpha_repo = gardenbed_server::Repo::open(&root.join("alpha")).expect("alpha repo opens");
+    let root_tree = alpha_repo
+        .root_tree(alpha_history.head)
+        .expect("alpha head tree")
+        .expect("alpha head has files");
+
+    // The beta-token client, straight onto the daemon's socket: asking
+    // for alpha's blob under repo `beta` must NOT return alpha's bytes.
+    let daemon_client =
+        GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+            .await
+            .expect("client connects to the daemon socket")
+            .with_token("beta-token");
+
+    // Blob leak check: alpha's blob id, repo beta.
+    let err = daemon_client
+        .get_blob("beta", blob_id)
+        .await
+        .expect_err("alpha's blob is not beta's; the daemon must not serve it");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "the daemon answers NotFound, not cached cross-repo bytes: {err}"
+    );
+
+    // Tree leak check: alpha's root tree id, repo beta.
+    let err = daemon_client
+        .get_tree("beta", root_tree)
+        .await
+        .expect_err("alpha's tree is not beta's; the daemon must not serve it");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "the daemon answers NotFound, not cached cross-repo bytes: {err}"
+    );
+
+    // Control: the same ids ARE servable for repo alpha through the same
+    // daemon (a beta denial must not have poisoned the alpha entries).
+    let warm_client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+        .await
+        .expect("client reconnects to the daemon socket")
+        .with_token("warm-token");
+    let mut blob_stream = warm_client
+        .get_blob("alpha", blob_id)
+        .await
+        .expect("alpha's own blob still serves through the daemon");
+    let mut served = Vec::new();
+    while let Some(chunk) = blob_stream.next().await {
+        served.extend_from_slice(&chunk.expect("alpha blob chunk").data);
+    }
+    assert_eq!(
+        served,
+        alpha_history.blob(&blob_id).expect("alpha blob content"),
+        "alpha's blob round-trips for alpha"
+    );
+    warm_client
+        .get_tree("alpha", root_tree)
+        .await
+        .expect("alpha's own tree still serves through the daemon");
+
+    daemon.kill().await;
+    server.shutdown().await;
+}
