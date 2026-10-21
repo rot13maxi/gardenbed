@@ -41,12 +41,216 @@
 //! of immutable inputs — wiped and rebuilt caches reproduce
 //! byte-identical merges (M9.4).
 
+use std::collections::{HashMap, HashSet};
+
 use gardenbed_model::{Change, Id, Mode, Op, Tree, TreeEntry, TreeKind};
 use gardenbed_store::{ObjectStore, StoreError};
 
 use crate::Engine;
 use crate::apply::MAX_TREE_DEPTH;
 use crate::xdiff;
+
+/// One side's detected rename at a directory level: `src` was removed
+/// and `dst` added, carrying either the identical blob (exact rename)
+/// or a similar one (scored rename). `src_mode` is the source entry's
+/// mode — rename detection requires the same mode class on both ends
+/// (a regular→exec flip is a mode change riding the rename; a class
+/// flip to symlink/gitlink is not a rename candidate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SideRename {
+    /// Removed path (repo-relative).
+    pub(crate) src: String,
+    /// Added path (repo-relative).
+    pub(crate) dst: String,
+    /// Blob at the destination.
+    pub(crate) dst_blob: Id,
+    /// Mode at the destination.
+    pub(crate) dst_mode: Mode,
+    /// The source entry in the BASE tree (pre-rename).
+    pub(crate) src_base: TreeEntry,
+    /// Similarity score in percent (100 = identical bytes).
+    pub(crate) score: u32,
+}
+
+/// Detects one side's renames at one directory level of the tree walk.
+///
+/// Inputs are the level's (base, side) entry tables keyed by name.
+/// A rename requires the source absent from the side, present in the
+/// base, and the destination present on the side, absent from the base,
+/// with matching mode class (Regular/Exec both count as files).
+///
+/// Resolution order matches git's `diffcore_rename` shape, restricted
+/// to file leaves:
+/// 1. **Exact renames** — destination blob id equals the source's.
+///    Each source pairs with the lexicographically first exact
+///    destination (git prefers lower stage/path order too); ties on
+///    the destination side pick the first source in path order.
+/// 2. **Scored renames** — remaining candidates are scored by
+///    line-based similarity (`similarity_score`) and paired greedily
+///    best-first; a pair must clear [`MIN_RENAME_SCORE`] (git's
+///    default 50%).
+///
+/// Both passes are bounded by [`MAX_RENAME_CANDIDATES`] per side per
+/// level; beyond that bound the surplus candidates stay unpaired (the
+/// walk then treats them as plain delete/add, the rename-blind
+/// behavior) — the same shape as git's `diff.renameLimit` falling back.
+fn detect_side_renames(
+    objects: &dyn ObjectStore,
+    base_entries: &HashMap<String, TreeEntry>,
+    side_entries: &HashMap<String, TreeEntry>,
+) -> Result<Vec<SideRename>, StoreError> {
+    let mut adds: Vec<(&String, &TreeEntry)> = Vec::new();
+    let mut dels: Vec<(&String, &TreeEntry)> = Vec::new();
+    for (path, entry) in side_entries {
+        if !base_entries.contains_key(path) {
+            adds.push((path, entry));
+        }
+    }
+    for (path, entry) in base_entries {
+        if !side_entries.contains_key(path) {
+            dels.push((path, entry));
+        }
+    }
+    if adds.is_empty() || dels.is_empty() {
+        return Ok(Vec::new());
+    }
+    adds.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    dels.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    if adds.len() * dels.len() > MAX_RENAME_CANDIDATES.saturating_mul(MAX_RENAME_CANDIDATES) {
+        return Ok(Vec::new()); // bounded: too many candidates to score
+    }
+
+    let files_only = |e: &TreeEntry| {
+        e.kind == TreeKind::File && e.mode != Mode::Symlink && e.mode != Mode::Gitlink
+    };
+
+    // Pass 1: exact renames (blob id equality).
+    let mut used_dsts: HashSet<&String> = HashSet::new();
+    let mut used_srcs: HashSet<&String> = HashSet::new();
+    let mut found: Vec<SideRename> = Vec::new();
+    for (dp, de) in &adds {
+        if !files_only(de) {
+            continue;
+        }
+        // First unused source with the identical blob, in path order.
+        for (sp, se) in &dels {
+            if used_srcs.contains(sp) || !files_only(se) {
+                continue;
+            }
+            if se.blob == de.blob {
+                used_srcs.insert(sp);
+                used_dsts.insert(dp);
+                found.push(SideRename {
+                    src: (*sp).clone(),
+                    dst: (*dp).clone(),
+                    dst_blob: de.blob.expect("file entry carries a blob"),
+                    dst_mode: de.mode,
+                    src_base: (*se).clone(),
+                    score: 100,
+                });
+                break;
+            }
+        }
+    }
+
+    // Pass 2: scored renames over the leftovers.
+    let open_adds: Vec<(&String, &TreeEntry)> = adds
+        .iter()
+        .filter(|(p, _)| !used_dsts.contains(*p))
+        .cloned()
+        .collect();
+    let open_dels: Vec<(&String, &TreeEntry)> = dels
+        .iter()
+        .filter(|(p, _)| !used_srcs.contains(*p))
+        .cloned()
+        .collect();
+    if !open_adds.is_empty() && !open_dels.is_empty() {
+        let mut pairs: Vec<(u32, usize, usize)> = Vec::new(); // (score, di, ai)
+        for (di, (_sp, se)) in open_dels.iter().enumerate() {
+            if !files_only(se) {
+                continue;
+            }
+            let src_content = objects.get_blob(se.blob.expect("file entry carries a blob"))?;
+            for (ai, (_dp, de)) in open_adds.iter().enumerate() {
+                if !files_only(de) {
+                    continue;
+                }
+                let Some(score) = similarity_score(
+                    src_content.as_deref(),
+                    objects
+                        .get_blob(de.blob.expect("file entry carries a blob"))?
+                        .as_deref(),
+                ) else {
+                    continue;
+                };
+                if score >= MIN_RENAME_SCORE {
+                    pairs.push((score, di, ai));
+                }
+            }
+        }
+        // Best score first; ties resolved deterministically by
+        // (dst path, src path) byte order.
+        pairs.sort_by(|x, y| {
+            y.0.cmp(&x.0).then_with(|| {
+                let xd = open_adds[x.2].0.as_bytes();
+                let yd = open_adds[y.2].0.as_bytes();
+                xd.cmp(yd)
+                    .then_with(|| open_dels[x.1].0.as_bytes().cmp(open_dels[y.1].0.as_bytes()))
+            })
+        });
+        let mut taken_dst: HashSet<usize> = HashSet::new();
+        let mut taken_src: HashSet<usize> = HashSet::new();
+        for (score, di, ai) in pairs {
+            if taken_dst.contains(&ai) || taken_src.contains(&di) {
+                continue;
+            }
+            taken_dst.insert(ai);
+            taken_src.insert(di);
+            let (sp, se) = open_dels[di];
+            let (dp, de) = open_adds[ai];
+            found.push(SideRename {
+                src: (*sp).clone(),
+                dst: (*dp).clone(),
+                dst_blob: de.blob.expect("file entry carries a blob"),
+                dst_mode: de.mode,
+                src_base: (*se).clone(),
+                score,
+            });
+        }
+    }
+    found.sort_by(|a, b| a.src.as_bytes().cmp(b.src.as_bytes()));
+    Ok(found)
+}
+
+/// Minimum similarity for a scored rename (git's default `-M50%`).
+const MIN_RENAME_SCORE: u32 = 50;
+/// Bound on adds/dels considered per directory level (git's
+/// `diff.renameLimit` default is 1000; we keep the same order).
+const MAX_RENAME_CANDIDATES: usize = 1000;
+
+/// Line-based similarity between two blobs, in percent (0..=100):
+/// `100 * common_lines / max(lines_a, lines_b)` where common lines are
+/// the unchanged half of the line diff — git's `diffcore_rename`
+/// estimate for text files. `None` when either side is past the xdiff
+/// bounds (no score, never a mis-detected rename).
+fn similarity_score(a: Option<&[u8]>, b: Option<&[u8]>) -> Option<u32> {
+    let a = a.unwrap_or(&[]);
+    let b = b.unwrap_or(&[]);
+    if a.is_empty() || b.is_empty() {
+        return None; // an empty side has no lines to share
+    }
+    let ra = xdiff::split_records(a);
+    let rb = xdiff::split_records(b);
+    let max = ra.len().max(rb.len());
+    if max == 0 {
+        return None;
+    }
+    let diff = xdiff::diff_lines(&ra, &rb)?;
+    let removed = diff.changed_old.iter().filter(|c| **c).count();
+    let added = diff.changed_new.iter().filter(|c| **c).count();
+    let common = ra.len().saturating_sub(removed).min(rb.len().saturating_sub(added));
+    Some((100 * common as u64 / max as u64) as u32)
+}
 
 /// The outcome of one 3-way file merge.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,8 +579,85 @@ fn changed_paths_opts(
 
 /// One directory level of the walk: merges ours' entries against base
 /// and theirs, appending changes vs ours and conflicts.
+///
+/// Rename-aware (the v0.3 merge lane): before the per-entry rules run,
+/// each side's (deleted, added) file pairs at this level are screened
+/// for renames ([`detect_side_renames`]). Detected renames participate
+/// as moves — a rename on one side against an edit at the source path
+/// on the other merges the edit into the destination; two sides
+/// renaming the same source to different destinations, or one side
+/// renaming what the other deleted, are conflicts (git's
+/// `rename/rename` and `rename/delete`). Rename detection at this
+/// level concerns only THIS directory's entries; a path moved into a
+/// different directory appears here as this level's (delete, add)
+/// pair, which is exactly the shape the screening consumes.
 #[allow(clippy::too_many_arguments)]
 fn merge_dir(
+    engine: &Engine,
+    b_tree: &Tree,
+    o_tree: &Tree,
+    t_tree: &Tree,
+    dir: &str,
+    changes: &mut Vec<Change>,
+    conflicts: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), StoreError> {
+    // Fast path: nothing was deleted or added on either side at this
+    // level — pure in-place edits need no rename screening.
+    let b_map: HashMap<&str, &TreeEntry> =
+        b_tree.entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let o_map: HashMap<&str, &TreeEntry> =
+        o_tree.entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let t_map: HashMap<&str, &TreeEntry> =
+        t_tree.entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let ours_missing_in_base = b_map.keys().any(|k| !o_map.contains_key(k));
+    let ours_new = o_map.keys().any(|k| !b_map.contains_key(k));
+    let theirs_missing_in_base = b_map.keys().any(|k| !t_map.contains_key(k));
+    let theirs_new = t_map.keys().any(|k| !b_map.contains_key(k));
+    let mut ours_renames: Vec<SideRename> = Vec::new();
+    let mut theirs_renames: Vec<SideRename> = Vec::new();
+    if ours_missing_in_base && ours_new {
+        let base_owned: HashMap<String, TreeEntry> = b_map
+            .iter()
+            .map(|(k, v)| (k.to_string(), (*v).clone()))
+            .collect();
+        let side_owned: HashMap<String, TreeEntry> = o_map
+            .iter()
+            .map(|(k, v)| (k.to_string(), (*v).clone()))
+            .collect();
+        ours_renames = detect_side_renames(&*engine.objects, &base_owned, &side_owned)?;
+    }
+    if theirs_missing_in_base && theirs_new {
+        let base_owned: HashMap<String, TreeEntry> = b_map
+            .iter()
+            .map(|(k, v)| (k.to_string(), (*v).clone()))
+            .collect();
+        let side_owned: HashMap<String, TreeEntry> = t_map
+            .iter()
+            .map(|(k, v)| (k.to_string(), (*v).clone()))
+            .collect();
+        theirs_renames = detect_side_renames(&*engine.objects, &base_owned, &side_owned)?;
+    }
+    if !ours_renames.is_empty() || !theirs_renames.is_empty() {
+        return merge_dir_rename_aware(
+            engine,
+            b_tree,
+            o_tree,
+            t_tree,
+            dir,
+            &ours_renames,
+            &theirs_renames,
+            changes,
+            conflicts,
+            depth,
+        );
+    }
+    merge_dir_plain(engine, b_tree, o_tree, t_tree, dir, changes, conflicts, depth)
+}
+
+/// The rename-blind per-level walk (the v0.2 behavior, now the
+/// fallback when no renames were detected on either side).
+fn merge_dir_plain(
     engine: &Engine,
     b_tree: &Tree,
     o_tree: &Tree,
@@ -402,6 +683,224 @@ fn merge_dir(
         merge_entry(engine, eb, eo, et, dir, name, changes, conflicts, depth)?;
     }
     Ok(())
+}
+
+/// The rename-aware per-level walk: `ours_renames`/`theirs_renames`
+/// are this level's detected moves (already screened by
+/// [`merge_dir`]); every other entry merges by the ordinary rules.
+#[allow(clippy::too_many_arguments)]
+fn merge_dir_rename_aware(
+    engine: &Engine,
+    b_tree: &Tree,
+    o_tree: &Tree,
+    t_tree: &Tree,
+    dir: &str,
+    ours_renames: &[SideRename],
+    theirs_renames: &[SideRename],
+    changes: &mut Vec<Change>,
+    conflicts: &mut Vec<String>,
+    depth: usize,
+) -> Result<(), StoreError> {
+    // Index the renames by source and by destination.
+    let ours_by_src: HashMap<&str, &SideRename> =
+        ours_renames.iter().map(|r| (r.src.as_str(), r)).collect();
+    let theirs_by_src: HashMap<&str, &SideRename> =
+        theirs_renames.iter().map(|r| (r.src.as_str(), r)).collect();
+    let ours_by_dst: HashMap<&str, &SideRename> =
+        ours_renames.iter().map(|r| (r.dst.as_str(), r)).collect();
+    let theirs_by_dst: HashMap<&str, &SideRename> =
+        theirs_renames.iter().map(|r| (r.dst.as_str(), r)).collect();
+
+    // Names to walk: base ∪ ours ∪ theirs (all three levels' names).
+    let mut names: Vec<&str> = b_tree
+        .entries
+        .iter()
+        .chain(o_tree.entries.iter())
+        .chain(t_tree.entries.iter())
+        .map(|e| e.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+
+    // A name consumed by a rename rule is skipped in the plain walk.
+    let mut consumed: HashSet<&str> = HashSet::new();
+
+    // ---- rename/rename (same source, different destinations): the
+    // 1-to-2 conflict. Git reports CONFLICT (rename/rename) and names
+    // source + both destinations.
+    for (src, or_) in &ours_by_src {
+        if let Some(tr) = theirs_by_src.get(src) {
+            if or_.dst != tr.dst {
+                let src_path = join(dir, src);
+                conflicts.push(src_path.clone());
+                conflicts.push(join(dir, &or_.dst));
+                conflicts.push(join(dir, &tr.dst));
+                consumed.insert(src.as_ref());
+                consumed.insert(or_.dst.as_ref());
+                consumed.insert(tr.dst.as_ref());
+            }
+        }
+    }
+
+    for name in &names {
+        if consumed.contains(name) {
+            continue;
+        }
+        let eb = b_tree.entries.iter().find(|e| e.name == *name);
+        let eo = o_tree.entries.iter().find(|e| e.name == *name);
+        let et = t_tree.entries.iter().find(|e| e.name == *name);
+        let path = join(dir, name);
+
+        // ---- rename/delete: one side renamed the source, the other
+        // deleted it (and did not re-add at the destination). Git:
+        // CONFLICT (rename/delete), the renamed copy left in the tree
+        // and both endpoints reported. Gardenbed refuses with both
+        // endpoints named.
+        if let Some(or_) = ours_by_src.get(name) {
+            // Ours renamed `name` -> or_.dst. Theirs deleted `name`?
+            // A theirs rename FROM the same source is not a delete
+            // (the 1-to-2 case above already consumed different
+            // destinations; the same destination merges below).
+            if et.is_none()
+                && eb.is_some()
+                && !theirs_by_dst.contains_key(or_.dst.as_str())
+                && !theirs_by_src.contains_key(name)
+            {
+                conflicts.push(path.clone());
+                conflicts.push(join(dir, &or_.dst));
+                consumed.insert(or_.dst.as_ref());
+                continue;
+            }
+        }
+        if let Some(tr) = theirs_by_src.get(name) {
+            if eo.is_none()
+                && eb.is_some()
+                && !ours_by_dst.contains_key(tr.dst.as_str())
+                && !ours_by_src.contains_key(name)
+            {
+                conflicts.push(path.clone());
+                conflicts.push(join(dir, &tr.dst));
+                consumed.insert(tr.dst.as_ref());
+                continue;
+            }
+        }
+
+        // ---- rename vs edit at the source path (ours renamed, theirs
+        // edited the same source content): the edit merges INTO the
+        // destination via a 3-way content merge over (base content at
+        // src, ours' dst content, theirs' src content). Theirs leaving
+        // the source UNCHANGED is not this case — the plain rules at
+        // both endpoints already express ours' rename (deleted source,
+        // added destination).
+        if let Some(or_) = ours_by_src.get(name) {
+            if et.is_some() && !entries_eq(et, eb) {
+                if let Some(dst_entry) = o_tree.entries.iter().find(|e| e.name == or_.dst) {
+                    let dst_path = join(dir, &or_.dst);
+                    merge_rename_edit(
+                        engine,
+                        &or_.src_base,
+                        dst_entry,
+                        et.expect("checked above"),
+                        eo,
+                        &dst_path,
+                        changes,
+                        conflicts,
+                    )?;
+                    consumed.insert(or_.dst.as_ref());
+                    continue;
+                }
+            }
+        }
+        if let Some(tr) = theirs_by_src.get(name) {
+            if eo.is_some() && !entries_eq(eo, eb) {
+                if let Some(dst_entry) = t_tree.entries.iter().find(|e| e.name == tr.dst) {
+                    let dst_path = join(dir, &tr.dst);
+                    merge_rename_edit(
+                        engine,
+                        &tr.src_base,
+                        eo.expect("checked above"),
+                        dst_entry,
+                        eo,
+                        &dst_path,
+                        changes,
+                        conflicts,
+                    )?;
+                    consumed.insert(tr.dst.as_ref());
+                    continue;
+                }
+            }
+        }
+
+        // ---- both sides renamed the same source to the SAME
+        // destination: a 3-way content merge at the destination with
+        // the source's base entry as the base (the rename's common
+        // ancestor — without it the destination looks like add/add).
+        if let Some(or_) = ours_by_dst.get(name) {
+            if let Some(tr) = theirs_by_dst.get(name) {
+                if or_.src == tr.src {
+                    if let (Some(dst_o), Some(dst_t)) = (
+                        o_tree.entries.iter().find(|e| e.name == *name),
+                        t_tree.entries.iter().find(|e| e.name == *name),
+                    ) {
+                        merge_rename_edit(
+                            engine,
+                            &or_.src_base,
+                            dst_o,
+                            dst_t,
+                            eo,
+                            &path,
+                            changes,
+                            conflicts,
+                        )?;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // ---- a rename destination colliding with a path the other
+        // side has or added (rename/rename 2-to-1, or rename onto an
+        // occupied path): conflict at the destination.
+        if let Some(or_) = ours_by_dst.get(name) {
+            if et.is_some() && theirs_by_dst.get(name).map(|r| r.src.as_str()) != Some(or_.src.as_str()) {
+                conflicts.push(path.clone());
+                continue;
+            }
+        }
+        if let Some(tr) = theirs_by_dst.get(name) {
+            if eo.is_some() && ours_by_dst.get(name).map(|r| r.src.as_str()) != Some(tr.src.as_str()) {
+                conflicts.push(path.clone());
+                continue;
+            }
+        }
+
+        merge_entry(engine, eb, eo, et, dir, name, changes, conflicts, depth)?;
+    }
+    Ok(())
+}
+
+/// The 3-way file merge behind a rename: `base_entry` is the pre-rename
+/// source entry, `ours_entry` and `theirs_entry` the two sides' entries
+/// at the surviving path (the renaming side's destination, the other
+/// side's edited source). Mode merges by the trivial rules; content
+/// merges by `merge3` over the three blobs. The change is emitted at
+/// `dst_path` vs OURS (`eo` is ours' entry at that path, `None` when
+/// ours' tree lacks the destination).
+#[allow(clippy::too_many_arguments)]
+fn merge_rename_edit(
+    engine: &Engine,
+    base_entry: &TreeEntry,
+    ours_entry: &TreeEntry,
+    theirs_entry: &TreeEntry,
+    eo: Option<&TreeEntry>,
+    dst_path: &str,
+    changes: &mut Vec<Change>,
+    conflicts: &mut Vec<String>,
+) -> Result<(), StoreError> {
+    let eb = Some(base_entry);
+    let o = ours_entry;
+    let t = theirs_entry;
+    merge_file(engine, eb, eo, o, t, dst_path, changes, conflicts)
 }
 
 /// The per-entry merge rules (spec §4). Emits the change vs OURS for
