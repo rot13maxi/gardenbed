@@ -11,13 +11,31 @@
 //! a corrupt cache can never poison anyone (v0.2.md §5's cache-tier
 //! argument, applied locally).
 //!
+//! The shared store is **partitioned by (upstream origin, repository)**:
+//! one `FsObjectStore` per scope under `<cache_root>/scopes/<hex>/`, the
+//! hex a SHA-256 over the upstream endpoint and the repository name (the
+//! same convention the regional cache tier uses). The scope is a
+//! membership proof: an object is cached under a scope only after that
+//! scope's own origin fetch succeeded, so a repository that lacks an
+//! object is answered with the origin's own `NOT_FOUND`, never another
+//! repository's cached bytes — the cross-repository object leak the
+//! content-address-only layout allowed (`authorize_hit`'s `ListRefs`
+//! probe proves the caller may read the repository, but says nothing
+//! about which objects that repository holds). The endpoint rides in the
+//! scope for the same reason: a reused cache root fronting a different
+//! upstream starts cold rather than serving the old upstream's objects.
+//! Pre-scope cache roots (`<cache_root>/objects/...`, written before the
+//! partition) are never read: their bytes carry no membership proof, so
+//! serving them would need an independent establishment that does not
+//! exist — a miss plus one origin fetch is the safe re-warm.
+//!
 //! Writes (`PutBlob`, `CreateChangeset`, `CasRef`, `Rebase`, `Publish`, `Merge`) are
 //! gated on the peer-uid check ([`peer_uid_ok`]): the unix socket is
 //! mode-0700 in a private directory, and the kernel credential check is
 //! the second lock on that door.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -27,6 +45,7 @@ use gardenbed_protocol::convert::{id_from_bytes, id_to_bytes};
 use gardenbed_protocol::gardenbed_server::Gardenbed;
 use gardenbed_protocol::pb;
 use gardenbed_store::{FsObjectStore, ObjectStore as _};
+use sha2::{Digest, Sha256};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -98,29 +117,39 @@ type BoxStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'stati
 /// The caching gRPC proxy over one upstream server.
 pub struct ProxyService {
     upstream: Arc<Upstream>,
-    cache: FsObjectStore,
+    /// The cache root every scope directory lives under (kept for
+    /// `Clone`, which reopens per-scope stores from it).
+    cache_root: PathBuf,
+    /// One object store per (origin, repo) scope. A scope is opened
+    /// lazily on first use and kept for the daemon's lifetime; stores
+    /// are open-directory value types, so the map holds `Arc`s.
+    scopes: Mutex<HashMap<String, Arc<FsObjectStore>>>,
     /// Per-tree singleflight: concurrent `GetTree` requests for the same
-    /// id collapse into one upstream fetch.
-    tree_locks: Mutex<HashMap<Id, Arc<tokio::sync::Mutex<()>>>>,
+    /// (scope, id) collapse into one upstream fetch.
+    #[allow(clippy::type_complexity)]
+    tree_locks: Mutex<HashMap<(String, Id), Arc<tokio::sync::Mutex<()>>>>,
     /// Counters for tests/diagnostics: how many RPCs the daemon answered
     /// from its cache.
     cache_hits: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ProxyService {
-    /// A proxy over `upstream` caching objects into the store rooted at
-    /// `cache_root` (created if missing; same GBLO1 envelope and sharding
-    /// as `.bed/objects`).
+    /// A proxy over `upstream` caching objects into per-(origin, repo)
+    /// scope stores under `cache_root` (created if missing; same GBLO1
+    /// envelope and sharding as `.bed/objects` inside each scope). The
+    /// root itself is only created here; each scope directory is opened
+    /// lazily on its first use.
     pub fn new(upstream: &str, cache_root: &Path) -> Result<Self, Status> {
-        let cache = FsObjectStore::open(cache_root).map_err(|e| {
+        std::fs::create_dir_all(cache_root).map_err(|e| {
             Status::internal(format!(
-                "cannot open the shared object cache at {}: {e}",
+                "cannot create the shared object cache root at {}: {e}",
                 cache_root.display()
             ))
         })?;
         Ok(ProxyService {
             upstream: Arc::new(Upstream::new(upstream.to_owned())),
-            cache,
+            cache_root: cache_root.to_path_buf(),
+            scopes: Mutex::new(HashMap::new()),
             tree_locks: Mutex::new(HashMap::new()),
             cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
@@ -132,9 +161,42 @@ impl ProxyService {
         self.cache_hits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The shared object store (same store the daemon writes through).
-    pub fn cache(&self) -> &FsObjectStore {
-        &self.cache
+    /// The cache scope key for `repo` under this proxy's upstream: the
+    /// SHA-256 hex over `(upstream endpoint, repo name)`. A digest, not
+    /// the raw repo string: repository names are protocol strings, never
+    /// filesystem path components (a hostile or merely unusual name must
+    /// not escape the cache root or collide with its sibling
+    /// directories). The endpoint rides in the key so a cache root reused
+    /// for a different upstream starts cold (that upstream's membership
+    /// is unproven) instead of serving the old upstream's objects.
+    fn scope_key(&self, repo: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.upstream.endpoint.as_bytes());
+        hasher.update([0]);
+        hasher.update(repo.as_bytes());
+        let digest: [u8; 32] = hasher.finalize().into();
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// The (lazily opened, shared) object store for one cache scope:
+    /// `<cache_root>/scopes/<scope_key(repo)>`. Opening is
+    /// singleflighted through the map lock; a concurrent first use of
+    /// the same scope joins the same `Arc` store.
+    fn scope_store(&self, repo: &str) -> Result<Arc<FsObjectStore>, Status> {
+        let key = self.scope_key(repo);
+        let mut scopes = self.scopes.lock().expect("scope map");
+        if let Some(store) = scopes.get(&key) {
+            return Ok(store.clone());
+        }
+        let dir = self.cache_root.join("scopes").join(&key);
+        let store = Arc::new(FsObjectStore::open(&dir).map_err(|e| {
+            Status::internal(format!(
+                "cannot open the scoped object cache at {}: {e}",
+                dir.display()
+            ))
+        })?);
+        scopes.insert(key, store.clone());
+        Ok(store)
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -153,10 +215,10 @@ impl ProxyService {
     /// no object ids — the probe cannot confuse "denied" with "missing
     /// object".
     ///
-    /// Cache hits MUST pass this gate. The shared cache is keyed by
-    /// content address only — it cannot know which repository or token a
-    /// blob was fetched under — so serving a hit without consulting the
-    /// upstream would hand cached bytes to a caller the server would
+    /// Cache hits MUST pass this gate. The scoped cache proves
+    /// membership (the object was fetched from this repo on this
+    /// upstream) but nothing about the *caller*: without a consult,
+    /// serving a hit would hand cached bytes to a peer the server would
     /// deny (an anonymous peer, or a token scoped to another repo).
     /// Correctness beats the cache here: the daemon is a convenience
     /// tier, not a policy engine. The probe is one round-trip per cache
@@ -187,18 +249,18 @@ impl ProxyService {
         Err(status)
     }
 
-    /// Cache-first tree lookup: shared store (after an upstream
-    /// authorization consult), then one upstream `GetTree`,
-    /// write-through. Concurrent requests for the same id collapse into a
-    /// single fetch.
+    /// Cache-first tree lookup: the (origin, repo) scope's store (after
+    /// an upstream authorization consult), then one upstream `GetTree`,
+    /// write-through. Concurrent requests for the same (scope, id)
+    /// collapse into a single fetch.
     async fn tree_from_cache(
         &self,
         repo: &str,
         id: Id,
         auth: AuthValue,
     ) -> Result<pb::TreeResp, Status> {
-        if let Some(bytes) = self
-            .cache
+        let store = self.scope_store(repo)?;
+        if let Some(bytes) = store
             .get_tree(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
         {
@@ -211,15 +273,15 @@ impl ProxyService {
             return pb::TreeResp::try_from(&tree)
                 .map_err(|_| Status::internal("cached tree cannot be re-encoded"));
         }
-        // Singleflight per id: the winner fetches and writes through, the
-        // latecomer re-checks the cache under the lock.
+        // Singleflight per (scope, id): the winner fetches and writes
+        // through, the latecomer re-checks the scope's cache under the
+        // lock.
         let lock = {
             let mut locks = self.tree_locks.lock().expect("tree lock map");
-            locks.entry(id).or_default().clone()
+            locks.entry((self.scope_key(repo), id)).or_default().clone()
         };
         let _gate = lock.lock().await;
-        if let Some(bytes) = self
-            .cache
+        if let Some(bytes) = store
             .get_tree(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
         {
@@ -244,26 +306,27 @@ impl ProxyService {
         let bytes = tree
             .canonical_bytes()
             .map_err(|_| Status::internal("upstream tree cannot be canonically encoded"))?;
-        self.cache
+        store
             .put_tree(id, &bytes)
             .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
         pb::TreeResp::try_from(&tree)
             .map_err(|_| Status::internal("upstream tree cannot be re-encoded"))
     }
 
-    /// Cache-first blob lookup: shared store (after an upstream
-    /// authorization consult), else one streamed upstream `GetBlob`,
-    /// reassembled, hash-verified, write-through, then streamed back to
-    /// the caller in 64 KiB chunks (tonic's default 4 MiB decode limit
-    /// applies per message — one giant chunk would fail the client).
+    /// Cache-first blob lookup: the (origin, repo) scope's store (after
+    /// an upstream authorization consult), else one streamed upstream
+    /// `GetBlob`, reassembled, hash-verified, write-through, then
+    /// streamed back to the caller in 64 KiB chunks (tonic's default
+    /// 4 MiB decode limit applies per message — one giant chunk would
+    /// fail the client).
     async fn blob_stream(
         self,
         repo: String,
         id: Id,
         auth: AuthValue,
     ) -> Result<BoxStream<pb::BlobChunk>, Status> {
-        if let Some(content) = self
-            .cache
+        let store = self.scope_store(&repo)?;
+        if let Some(content) = store
             .get_blob(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
         {
@@ -303,7 +366,7 @@ impl ProxyService {
                 id.to_hex()
             )));
         }
-        self.cache
+        store
             .put_blob(&content)
             .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
         Ok(chunked(content))
@@ -681,20 +744,16 @@ impl Gardenbed for ProxyService {
 
 impl Clone for ProxyService {
     /// Clones the proxy handle. Cheap: every field is behind an Arc or a
-    /// lock, except the cache store handle (an open-directory value type)
-    /// and the tree singleflight map — a fresh map per clone only bounds
-    /// fetch collapsing, never correctness (the cache re-check under each
-    /// lock is what dedups).
+    /// lock, except the per-scope store map and the tree singleflight map
+    /// — fresh maps per clone only bound fetch collapsing, never
+    /// correctness (the scope's cache re-check under each lock is what
+    /// dedups). The scope map starts empty and reopens lazily, the same
+    /// way the first construction did.
     fn clone(&self) -> Self {
-        let cache_root = self
-            .cache
-            .objects_dir()
-            .parent()
-            .expect("the cache dir always has a parent")
-            .to_path_buf();
         ProxyService {
             upstream: self.upstream.clone(),
-            cache: FsObjectStore::open(&cache_root).expect("the shared cache reopens"),
+            cache_root: self.cache_root.clone(),
+            scopes: Mutex::new(HashMap::new()),
             tree_locks: Mutex::new(HashMap::new()),
             cache_hits: self.cache_hits.clone(),
         }

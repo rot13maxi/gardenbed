@@ -461,6 +461,46 @@ impl Server {
         }
     }
 
+    /// Spawns the server binary over `root` bound to a *fixed* address
+    /// (`serve --addr ADDR`): for tests that need two server processes to
+    /// be reachable under one endpoint string (a daemon restart whose
+    /// scope key — a digest over the upstream endpoint — must stay stable
+    /// across the restart, standing in for the same server coming back).
+    pub async fn spawn_at_addr(root: &Path, addr: &str) -> Self {
+        let mut child = tokio::process::Command::new(server_bin())
+            .arg("serve")
+            .arg("--addr")
+            .arg(addr)
+            .arg("--root")
+            .arg(root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("gardenbed-server binary spawns");
+        let stdout = child.stdout.take().expect("server stdout piped");
+        let line = timeout(Duration::from_secs(30), async {
+            let mut lines = BufReader::new(stdout).lines();
+            lines
+                .next_line()
+                .await
+                .expect("server stdout open")
+                .expect("server prints a line")
+        })
+        .await
+        .expect("server announces itself within 30s");
+        let announced = line
+            .strip_prefix("listening on ")
+            .unwrap_or_else(|| panic!("expected a listening line, got {line:?}"))
+            .to_owned();
+        assert_eq!(announced, addr, "the server binds the requested address");
+        Server {
+            child,
+            addr: addr.to_owned(),
+            root: root.to_path_buf(),
+        }
+    }
+
     /// The endpoint bed expects: `http://ip:port`.
     pub fn http(&self) -> String {
         format!("http://{}", self.addr)
@@ -482,6 +522,16 @@ impl Server {
     /// A snapshot of the server's counted RPCs: `(get_tree, get_blob)`.
     pub async fn counted(&self, client: &GardenbedClient) -> (u64, u64) {
         let stats: BTreeMap<String, u64> = client.get_stats(REPO).await.expect("GetStats works");
+        (
+            *stats.get("get_tree").expect("get_tree counter"),
+            *stats.get("get_blob").expect("get_blob counter"),
+        )
+    }
+
+    /// [`Server::counted`] for a named repository (fixtures with repos
+    /// other than `REPO`).
+    pub async fn counted_for_repo(&self, client: &GardenbedClient, repo: &str) -> (u64, u64) {
+        let stats: BTreeMap<String, u64> = client.get_stats(repo).await.expect("GetStats works");
         (
             *stats.get("get_tree").expect("get_tree counter"),
             *stats.get("get_blob").expect("get_blob counter"),
@@ -651,15 +701,27 @@ impl Daemon {
     /// shared cache under `root`. Waits (≤ 30 s) for the
     /// `listening on <path>` stdout line.
     pub async fn spawn(root: &Path, upstream: &str) -> Self {
-        let socket = root.join("daemon.sock");
         let cache_home = root.join("xdg-cache");
         std::fs::create_dir_all(root).expect("daemon root created");
+        Self::spawn_with_socket(&root.join("daemon.sock"), &cache_home, upstream).await
+    }
+
+    /// Spawns the daemon proxying `upstream` with a *shared* cache root
+    /// and caller-chosen socket path: for tests that restart the daemon
+    /// over the same cache (or front a different upstream with it). The
+    /// `--cache` dir is `<cache_home>/gardenbed`, matching [`Daemon::spawn`].
+    pub async fn spawn_with_socket(socket: &Path, cache_home: &Path, upstream: &str) -> Self {
+        let root = socket
+            .parent()
+            .expect("socket path has a parent")
+            .to_path_buf();
+        std::fs::create_dir_all(&root).expect("daemon root created");
         let mut child = tokio::process::Command::new(daemon_bin())
             .arg("serve")
             .arg("--upstream")
             .arg(upstream)
             .arg("--socket")
-            .arg(&socket)
+            .arg(socket)
             .arg("--cache")
             .arg(cache_home.join("gardenbed"))
             .stdout(Stdio::piped())
@@ -687,8 +749,8 @@ impl Daemon {
         Daemon {
             child,
             socket: PathBuf::from(line),
-            cache_home,
-            root: root.to_path_buf(),
+            cache_home: cache_home.to_path_buf(),
+            root,
         }
     }
 
