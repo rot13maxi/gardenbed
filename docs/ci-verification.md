@@ -21,7 +21,7 @@ Two workflows own the coverage:
 | `clippy` | no lint debt (`-D warnings`) | unchanged |
 | `test` | full workspace suite, chaos included | unchanged |
 | `perf` | release-mode budget tests, `--ignored`, plus the `corpus_ripgrep_*` import gates against a fresh bare clone | unchanged, including the `--skip kernel_` carve-out (see Tier 3) |
-| `fuzz-smoke` | **blocking** bounded fuzz: 5 targets × 30 s / 250k execs, seeded from `fuzz/corpus/` | **was** `continue-on-error`; see below |
+| `fuzz-smoke` | **blocking** bounded fuzz: 5 targets × 30 s / 250k execs (4 seeded from `fuzz/corpus/`, `fuzz_pack_reader` fresh — it has no committed corpus) | **was** `continue-on-error`; see below |
 | `playwright` | **new** — the full `e2e/` Playwright suite against the real `gardenbed-web` binary built from the tree | see below |
 | `demo` | `demo/run-v0.1.sh` | unchanged |
 
@@ -55,14 +55,19 @@ or fake depth:
   target: whichever fires first ends the run, so a target that wanders
   into a pathologically slow input cannot stretch the job, and a fast
   target cannot balloon its execution count into an unbounded run.
-* **Seed honesty** — cargo-fuzz loads the committed corpora under
-  `fuzz/corpus/<target>/` by default (its own per-target corpus dir; no
-  `-dir` override needed — verified locally that seeds are read and new
-  units written there) (the accumulated sweep artifacts
-  [release-0.1.md](release-0.1.md) documents). Every push therefore
-  replays the *entire historically covered input set* plus fresh short
-  exploration. A regression on any input the corpus reaches is a hard
-  red; that is the defensible claim of a blocking smoke.
+* **Seed honesty, per target** — four of the five smoke targets
+  (`decode_changeset`, `decode_tree`, `fuzz_difftree_parse`,
+  `fuzz_mcp_line`) have committed corpora under `fuzz/corpus/<target>/`
+  (cargo-fuzz loads them by default; verified locally that seeds are
+  read and new units written there). Every push replays their
+  *entire historically covered input set* plus fresh short exploration —
+  a regression on any input the corpus reaches is a hard red.
+  `fuzz_pack_reader` has **no committed corpus** (its recorded 1.12M-run
+  clean sweep was performed without one; `fuzz/corpus/fuzz_pack_reader/`
+  does not exist), so its smoke slice is pure fresh exploration —
+  verified locally to boot, explore, and exit clean from an empty
+  corpus. The seeded-replay claim covers the four, not the five; the
+  job name and comments say so.
 
 What this job does **not** claim: novel fuzzing depth. The 24 h / 1
 CPU-hour bars from [v0.1.md](v0.1.md) §M8 and the v0.2 merge/pack bars
@@ -264,10 +269,30 @@ hand.
 * **Runner label is the opt-in:** `runs-on: [self-hosted, linux,
   kernel-corpus]`. No such runner → the job queues, nothing runs.
 * **Preflight fails loudly, not silently.** The declared paths must
-  exist, be a bed store layout (`loam/objects`), the mirror must be a
-  bare repo with `refs/heads/master`, and the object count must exceed a
-  million files (docs record 10,360,644) — a path pointing at a partial
-  or synthetic store fails the contract by name.
+  exist, be a bed store in EITHER layout `resolve_layout` accepts
+  (current: `metadata.sqlite3` + `objects/`; pre-rename:
+  `seedbed.sqlite3` + `loam/` — the database file is the discriminator,
+  exactly the server's own rule, so a future raw-tree-capture re-import
+  in the current layout works identically; both-metadata-files or
+  neither is an error), the mirror must be a bare repo with
+  `refs/heads/master`, and the object count must exceed a million files
+  (docs record 10,360,644) — a path pointing at a partial, synthetic,
+  or wrong-layout store fails the contract by name.
+* **Scratch isolation.** The metadata scratch copy lives in a per-run
+  `mktemp` directory exported through `GITHUB_ENV` — never a fixed
+  path — because two dispatches on the same ref can run concurrently
+  (the concurrency group keys on ref and deliberately does not cancel).
+  A fixed `/dev/shm/kernel-corpus-run` would have one run's
+  `if: always()` cleanup delete the other run's metadata copy
+  mid-flight. tmpfs is preferred when it has room (checked against the
+  DB size plus 20% headroom); otherwise the runner's temp disk is used.
+  Each run cleans exactly its own directory.
+* **Pass-count assertion, not `--exact` faith.** `--ignored --exact`
+  runs the named test, but an absent name under `--exact` runs 0 tests
+  and exits 0 (probe-verified). The gate tees the run output and
+  asserts exactly 1 passed / 0 failed from the parsed `test result:`
+  line; name drift, a filter typo, or a build failure each fail the
+  job.
 * **What runs:** `kernel_export_spot_check`
   (`crates/git/tests/kernel_spot.rs`) in release mode with
   `--ignored --exact` (so a test rename that makes the filter match
@@ -323,9 +348,18 @@ future gate should too:
    the job, never assumed (dogfood #17/#20).
 3. **Bounds are two-sided.** Time-bounded jobs also carry execution
    bounds (`-runs`), and opt-in jobs assert on the *output* of the run
-   (skip-note greps, pass summaries) rather than on `-- --list` counts
-   — skipped tests still list, so a list count can never distinguish a
-   run from a skip.
+   (skip-note greps, parsed pass counts) rather than on `-- --list`
+   counts — skipped tests still list, so a list count can never
+   distinguish a run from a skip.
+4. **A pass count is asserted, not implied.** `--exact` does NOT fail
+   an absent filter: `cargo test missing_test -- --exact` prints
+   "running 0 tests", exits 0 (verified with a probe). Every
+   single-test or opt-in job therefore parses the `test result:` line
+   and asserts the executed/passed count — the kernel gate requires
+   exactly 1 passed; the suite jobs require > 0 passed and 0 failed.
+   All the negative controls (skip note, zero-passed, wrong-count,
+   failures-present) were run against the extracted assertion logic
+   and fail correctly.
 
 ## Verifying the workflows themselves
 

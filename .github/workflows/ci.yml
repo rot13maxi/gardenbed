@@ -179,9 +179,17 @@ jobs:
       # chains per input and are orders of magnitude slower per exec; they
       # run in the nightly campaign where their 120 s bars fit. Same class
       # split as docs/release-0.1.md's per-target results table.
-      - name: fuzz smoke (5 targets, 30 s + 250k execs each, seeded)
+      # Seeding honesty, target by target: four of the five targets have
+      # committed seed corpora under fuzz/corpus/<target>/ (the recorded
+      # sweep artifacts, docs/release-0.1.md). fuzz_pack_reader has NO
+      # committed corpus — its 1.12M-run clean sweep was recorded
+      # without one, and cargo-fuzz starts it from an empty corpus dir
+      # (verified locally: the run boots, explores, and exits clean).
+      # It stays in the smoke as pure fresh exploration; the seeded
+      # replay claim covers the other four only.
+      - name: fuzz smoke (5 targets, 30 s + 250k execs each; 4 seeded, 1 fresh)
         run: |
-          set -eu
+          set -euo pipefail
           for t in decode_changeset decode_tree fuzz_difftree_parse fuzz_mcp_line fuzz_pack_reader; do
             echo "::group::cargo fuzz run $t"
             cargo fuzz run "$t" -- -max_total_time=30 -runs=250000 -rss_limit_mb=4096
@@ -210,9 +218,9 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo install cargo-fuzz --locked
-      - name: fuzz campaign (8 targets, 120 s each, seeded)
+      - name: fuzz campaign (8 targets, 120 s each; 7 seeded, fuzz_pack_reader fresh)
         run: |
-          set -eu
+          set -euo pipefail
           for t in decode_changeset decode_tree fuzz_tree_apply fuzz_diff fuzz_difftree_parse fuzz_mcp_line fuzz_merge3 fuzz_pack_reader; do
             echo "::group::cargo fuzz run $t"
             cargo fuzz run "$t" -- -max_total_time=120 -rss_limit_mb=4096
@@ -475,27 +483,39 @@ jobs:
         run: |
           set -euo pipefail
           cargo test -p gardenbed-server --test scale -- --nocapture 2>&1 | tee /tmp/scale.log
-      - name: Assert the live suites actually ran (no silent skip)
+      # A green cargo exit does NOT prove the live path ran: both suites
+      # print a skip note and exit 0 when the env wiring regresses, and a
+      # zero-test run also exits 0. The assertions below check BOTH the
+      # skip notes AND the parsed pass counts — the parity suite has 7
+      # tests and the scale suite 2 at the time of writing, and the
+      # counts are asserted as "> 0 passed, 0 failed" so a rename or
+      # filter drift that silently shrinks a suite to zero still fails
+      # here rather than passing vacuously. (A `-- --list` count would
+      # be worthless: skipped tests still list.)
+      - name: Assert the live suites actually ran (no silent skip, non-zero pass count)
         if: always()
         run: |
           set -eu
-          # A green cargo exit does NOT prove the live path ran: both
-          # suites print a skip note and exit 0 when the env wiring
-          # regresses. Grep the captured output for those notes — a
-          # single skip line fails the job here instead of passing
-          # vacuously. (A `-- --list` count would be worthless here:
-          # skipped tests still list.)
-          if grep -q "skipping parity tests" /tmp/parity.log 2>/dev/null; then
-            echo "FAIL: parity suite skipped (live-service env not picked up); see /tmp/parity.log"
-            exit 1
-          fi
-          if grep -q "scale tests skipped" /tmp/scale.log 2>/dev/null; then
-            echo "FAIL: scale suite skipped (GARDENBED_SCALE_TEST/env not picked up); see /tmp/scale.log"
-            exit 1
-          fi
-          grep -q "test result: ok" /tmp/parity.log || { echo "FAIL: no parity pass summary"; exit 1; }
-          grep -q "test result: ok" /tmp/scale.log || { echo "FAIL: no scale pass summary"; exit 1; }
-          echo "OK: parity and scale suites executed against the live services"
+          assert_suite() { # <log> <suite-name> <skip-string>
+            log="$1"; suite="$2"; skip="$3"
+            if [ ! -f "$log" ]; then
+              echo "FAIL: no $suite log at $log — the run step never produced output"
+              exit 1
+            fi
+            if grep -q "$skip" "$log"; then
+              echo "FAIL: $suite suite skipped (live-service env not picked up); see $log"
+              exit 1
+            fi
+            passed=$(grep -o 'test result: ok\. [0-9]* passed' "$log" | grep -o '[0-9]*' | head -1 || echo "")
+            failed=$(grep -o '[0-9]* failed' "$log" | grep -o '[0-9]*' | head -1 || echo "")
+            echo "$suite: passed=${passed:-none} failed=${failed:-0}"
+            test -n "$passed" || { echo "FAIL: no 'test result: ok' line in $log"; exit 1; }
+            test "$passed" -gt 0 || { echo "FAIL: $suite ran 0 tests — filter drift or a wiring regression; see $log"; exit 1; }
+            test "${failed:-0}" -eq 0 || { echo "FAIL: $suite had $failed failures; see $log"; exit 1; }
+          }
+          assert_suite /tmp/parity.log parity "skipping parity tests"
+          assert_suite /tmp/scale.log scale "scale tests skipped"
+          echo "OK: parity and scale suites executed (non-zero pass counts) against the live services"
       - name: Teardown compose stack
         if: always()
         run: docker compose -f tools/scale/compose.yaml down -v --remove-orphans
@@ -553,8 +573,10 @@ jobs:
       # of a vacuous pass. (The preflight above already failed hard if
       # /dev/fuse is absent; this catches the narrower case where the
       # binary-level availability probe disagrees — e.g. fusermount3
-      # present but non-functional for this user.)
-      - name: Assert the mount tests actually ran (no all-skip)
+      # present but non-functional for this user.) The pass count is
+      # asserted > 0 as well: a filter typo or test-file rename that
+      # shrinks the run to zero tests would otherwise exit 0 green.
+      - name: Assert the mount tests actually ran (no skip, non-zero pass count)
         if: always()
         run: |
           set -eu
@@ -562,5 +584,10 @@ jobs:
             echo "FAIL: mount suite skipped on a runner labeled 'fuse' — availability probe disagreed with the preflight; see /tmp/mount.log"
             exit 1
           fi
-          grep -q "test result: ok" /tmp/mount.log || { echo "FAIL: no mount pass summary"; exit 1; }
-          echo "OK: mount suite executed on this FUSE-capable runner"
+          passed=$(grep -o 'test result: ok\. [0-9]* passed' /tmp/mount.log | grep -o '[0-9]*' | head -1 || echo "")
+          failed=$(grep -o '[0-9]* failed' /tmp/mount.log | grep -o '[0-9]*' | head -1 || echo "")
+          echo "mount suite: passed=${passed:-none} failed=${failed:-0}"
+          test -n "$passed" || { echo "FAIL: no 'test result: ok' line in /tmp/mount.log"; exit 1; }
+          test "$passed" -gt 0 || { echo "FAIL: mount suite ran 0 tests — filter drift or a wiring regression; see /tmp/mount.log"; exit 1; }
+          test "${failed:-0}" -eq 0 || { echo "FAIL: mount suite had $failed failures; see /tmp/mount.log"; exit 1; }
+          echo "OK: mount suite executed (non-zero pass count) on this FUSE-capable runner"
