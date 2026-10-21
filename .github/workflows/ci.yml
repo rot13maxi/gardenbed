@@ -374,6 +374,16 @@ jobs:
   # + the one-shot bucket creator) and points both live-service suites at
   # its published ports:
   #
+  #   * cold concurrent first-open — `cargo test -p gardenbed-store
+  #     --features scale --test postgres_schema`: the 23505 race suite
+  #     (16 concurrent independent handles + a two-process variant +
+  #     repeated drop/recreate fresh-schema cycles) against the compose
+  #     stack's FRESH Postgres. This is the regression for the bug the
+  #     old TEMPORARY warm-up step masked; the suite landed with the
+  #     advisory-lock fix and this job runs it FIRST, before any store
+  #     open exists to make the schema exist. It is env-gated the same
+  #     way as parity (GARDENBED_TEST_PG_URL), so the assert step below
+  #     proves it executed rather than skipped;
   #   * store parity — `cargo test -p gardenbed-store --features scale
   #     --test parity`: the full backend-independent matrix re-run against
   #     Postgres metadata + S3 objects (GARDENBED_TEST_PG_URL +
@@ -446,26 +456,20 @@ jobs:
              mc stat ci/$bucket"
       - name: Build workspace bins (server suites spawn the server bin)
         run: cargo build --workspace --bins
-      # TEMPORARY mitigation — REMOVE when todo/postgres-schema lands
-      # (narrow init/migration transaction locking + cold concurrent-open
-      # regression). Schema warm-up on the FRESH Postgres the compose
-      # step just created: the parity suite opens several
-      # PostgresMetadataStores in parallel and each open runs CREATE
-      # TABLE IF NOT EXISTS — on an empty database Postgres's catalog
-      # check-then-insert is not atomic under concurrency, so two
-      # first-opens can race into `pg_type_typname_nsp_index`
-      # duplicate-key and the tests fail with `Db("db error")`
-      # (observed locally: 6/7 red on a fresh volume, 7/7 green on the
-      # immediate rerun). One store open here — the same constructor the
-      # suite uses — makes the schema exist before the parallel opens.
-      # This MASKS the race for CI; it does not close the production
-      # issue. The final integrated CI runs the parity suite against a
-      # truly fresh service with no warm-up. `--exact` refuses a silent
-      # filter miss; the chosen test is the suite's cheapest opener.
-      - name: Warm the Postgres schema (fresh-DB create race)
-        run: >-
-          cargo test -p gardenbed-store --features scale --test parity
-          pg_cas_race_from_absent_ref -- --exact --test-threads=1
+      # Cold concurrent first-open: the 23505 race regression, run
+      # BEFORE any other store open against the fresh Postgres the
+      # compose step just created (nothing else in this job has opened
+      # a store yet, so "first open" is real). The old TEMPORARY warm-up
+      # step that masked this race is REMOVED — the advisory-lock fix
+      # (serialized schema init) landed with this suite, and the job now
+      # proves the cold path instead of hiding it. Output is teed for
+      # the no-skip/pass-count assert step (same class as parity/scale:
+      # the suite skips with a printed note when GARDENBED_TEST_PG_URL
+      # is unset, and a green cargo exit alone cannot prove execution).
+      - name: Postgres schema init (cold concurrent first-open)
+        run: |
+          set -euo pipefail
+          cargo test -p gardenbed-store --features scale --test postgres_schema -- --nocapture 2>&1 | tee /tmp/pgschema.log
       # Parity: the full store matrix against Postgres+S3. Output goes
       # to a log the no-skip step greps — the suite skips-with-note and
       # exits 0 when env is unset, so cargo's exit code alone CANNOT
@@ -513,9 +517,10 @@ jobs:
             test "$passed" -gt 0 || { echo "FAIL: $suite ran 0 tests — filter drift or a wiring regression; see $log"; exit 1; }
             test "${failed:-0}" -eq 0 || { echo "FAIL: $suite had $failed failures; see $log"; exit 1; }
           }
+          assert_suite /tmp/pgschema.log postgres-schema "skipping postgres schema tests"
           assert_suite /tmp/parity.log parity "skipping parity tests"
           assert_suite /tmp/scale.log scale "scale tests skipped"
-          echo "OK: parity and scale suites executed (non-zero pass counts) against the live services"
+          echo "OK: postgres-schema, parity, and scale suites executed (non-zero pass counts) against the live services"
       - name: Teardown compose stack
         if: always()
         run: docker compose -f tools/scale/compose.yaml down -v --remove-orphans

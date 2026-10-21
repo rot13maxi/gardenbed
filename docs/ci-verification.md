@@ -123,16 +123,31 @@ already exists`). The immediate rerun was 7/7 green — the schema existed
 by then. Any fresh-database first run (CI every night, a first `docker
 compose up`) hits it.
 
-The **product fix is assigned to a separate lane**
-(`todo/postgres-schema`): narrow init/migration transaction locking in
-`crates/store/src/postgres.rs` plus a cold concurrent-open regression
-test. This job's warm-up step (one store open via the suite's own
-cheapest test before the parallel suite) is a **temporary local
-mitigation that masks the race for CI only — it does not close the
-production issue**, and it must be REMOVED when the fix lands: the final
-integrated CI is expected to run the parity suite against a truly fresh
-service with no warm-up, so the regression test guards the real path.
-Tracked as a removal dependency on `todo/postgres-schema`.
+The **product fix landed on a separate lane**
+(`todo/postgres-schema`, changeset `8dff7b8bba63b15b`, under review at
+integration time): all schema/migration DDL now runs inside one
+transaction holding `pg_advisory_xact_lock`, so racing first-opens
+serialize, and the lane adds a dedicated regression suite
+(`crates/store/tests/postgres_schema.rs`, gated on
+`GARDENBED_TEST_PG_URL`): 16 concurrent independent handles racing
+`open()` on a provably-empty isolated schema, a two-process variant
+(6 child test binaries), and repeated drop/recreate fresh-schema cycles
+proving the lock never leaks.
+
+The warm-up step that previously masked this race for CI **is removed**:
+this lane's live-services job now runs the `postgres_schema` suite
+FIRST — before any other store open exists against the fresh compose
+Postgres, so "first open" is genuinely cold — followed by the parity
+suite with no warm-up at all. The suite is env-gated exactly like
+parity (skips with a printed note when `GARDENBED_TEST_PG_URL` is
+unset), so the job's assert step proves it executed (skip-note grep +
+parsed pass count > 0) rather than trusting cargo's exit code — the
+default workspace `cargo test --workspace` does NOT exercise it (its
+env-gated tests skip), and the parity-only nightly would not exercise
+the cold/process regression at all. This lane keeps its dependency on
+the reviewed `todo/postgres-schema` fix: the workflow text assumes that
+lane's changeset is in the integration base (the regression suite file
+must exist for the job to run).
 
 ## Tier 2 — nightly (schedule + workflow_dispatch)
 
