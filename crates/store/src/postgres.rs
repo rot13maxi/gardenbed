@@ -583,6 +583,96 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         })
     }
 
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, Id)],
+    ) -> Result<crate::traits::ExportMappingReport, StoreError> {
+        use crate::traits::{ExportMappingConflict, ExportMappingReport};
+        // Normalize before connecting: malformed shas are caller bugs and
+        // must not land any pair.
+        let mut normalized = Vec::with_capacity(pairs.len());
+        for (sha, cs) in pairs {
+            normalized.push((normalize_git_sha(sha)?, *cs));
+        }
+        let query: Vec<(String, Vec<u8>, Id)> = normalized
+            .iter()
+            .map(|(sha, cs)| (sha.clone(), cs.as_bytes().to_vec(), *cs))
+            .collect();
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            let mut report = ExportMappingReport::default();
+            let mut insert: Vec<bool> = Vec::with_capacity(query.len());
+            // In-batch view of already-accepted pairs: a later pair
+            // repeating an accepted sha or cs (a twin: same git bytes,
+            // different cs) classifies against it, never re-inserts —
+            // otherwise the UNIQUE constraints would fire mid-batch.
+            let mut seen_sha: std::collections::HashMap<String, Id> =
+                std::collections::HashMap::new();
+            let mut seen_cs: std::collections::HashMap<Id, String> =
+                std::collections::HashMap::new();
+            for (sha, cs_bytes, cs) in &query {
+                let by_sha: Option<Id> = match tx
+                    .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[sha])
+                    .await
+                    .map_err(pg_err)?
+                {
+                    Some(row) => Some(id_from_bytea(row.get(0))?),
+                    None => seen_sha.get(sha).copied(),
+                };
+                let by_cs: Option<String> = match tx
+                    .query_opt("SELECT git_sha FROM git_map WHERE cs = $1", &[cs_bytes])
+                    .await
+                    .map_err(pg_err)?
+                {
+                    Some(row) => Some(row.get(0)),
+                    None => seen_cs.get(cs).cloned(),
+                };
+                match (by_sha, by_cs) {
+                    (Some(existing_cs), Some(existing_sha))
+                        if existing_cs == *cs && existing_sha == *sha =>
+                    {
+                        report.unchanged += 1; // idempotent
+                        insert.push(false);
+                    }
+                    (None, None) => {
+                        // Fresh pair: neither side bound. The insert
+                        // happens in the second pass, after the whole
+                        // batch is classified.
+                        insert.push(true);
+                        seen_sha.insert(sha.clone(), *cs);
+                        seen_cs.insert(*cs, sha.clone());
+                    }
+                    (existing_cs, existing_sha) => {
+                        // Refused, never overwritten (twin semantics;
+                        // the import-written canonical row survives).
+                        report.conflicts.push(ExportMappingConflict {
+                            git_sha: sha.clone(),
+                            cs: *cs,
+                            existing_cs_for_sha: existing_cs,
+                            existing_sha_for_cs: existing_sha,
+                        });
+                        insert.push(false);
+                    }
+                }
+            }
+            for (i, (sha, cs_bytes, _)) in query.iter().enumerate() {
+                if !insert[i] {
+                    continue;
+                }
+                tx.execute(
+                    "INSERT INTO git_map(git_sha, cs) VALUES($1, $2)",
+                    &[sha, cs_bytes],
+                )
+                .await
+                .map_err(pg_err)?;
+                report.recorded += 1;
+            }
+            tx.commit().await.map_err(pg_err)?;
+            Ok(report)
+        })
+    }
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
         let pool = self.pool.clone();

@@ -54,6 +54,7 @@ fn kernel_export_spot_check() {
         metadata.clone(),
         &ExportOptions {
             refs: vec!["refs/heads/master".to_owned()],
+            record_mappings: false,
         },
     );
     let report = match result {

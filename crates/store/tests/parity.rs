@@ -181,6 +181,105 @@ fn git_mapping_checks(store: &dyn MetadataStore, tag: &str) {
     );
 }
 
+/// `record_export_mappings` parity: idempotence, conflict refusal in both
+/// directions, mixed batches, and batch atomicity on malformed input.
+/// Shares `git_mapping_checks`' fixture scheme (salted per-run shas, no
+/// changeset rows needed — git_map carries no FK).
+fn export_mapping_checks(store: &dyn MetadataStore, tag: &str) {
+    let cs1 = id_of(0x710 ^ hash_tag(tag));
+    let cs2 = id_of(0x711 ^ hash_tag(tag));
+    let cs3 = id_of(0x712 ^ hash_tag(tag));
+    let salt = run_salt();
+    let salted = |byte: u8| {
+        let mut v = [0u8; 20];
+        for (i, b) in v.iter_mut().enumerate() {
+            *b = byte
+                .wrapping_add(salt.to_le_bytes()[i % 8])
+                .wrapping_add(i as u8);
+        }
+        hex(&v)
+    };
+    let sha1 = salted(0x71);
+    let sha2 = salted(0x72);
+    let sha3 = salted(0x73);
+
+    // Empty batch: a no-op that must succeed.
+    let r = store.record_export_mappings(&[]).expect("empty batch");
+    assert_eq!((r.recorded, r.unchanged, r.conflicts.len()), (0, 0, 0));
+
+    // A fresh batch records every pair.
+    let r = store
+        .record_export_mappings(&[(sha1.clone(), cs1), (sha2.clone().to_uppercase(), cs2)])
+        .expect("record batch");
+    assert_eq!((r.recorded, r.unchanged, r.conflicts.len()), (2, 0, 0));
+    assert_eq!(store.cs_for_git(&sha1).unwrap(), Some(cs1));
+    assert_eq!(store.cs_for_git(&sha2).unwrap(), Some(cs2));
+    assert_eq!(
+        store.git_for_cs(cs2).unwrap(),
+        Some(sha2.to_lowercase()),
+        "uppercase input was normalized"
+    );
+
+    // The same batch again is idempotent, case-insensitively.
+    let r = store
+        .record_export_mappings(&[(sha1.clone(), cs1), (sha2.clone(), cs2)])
+        .expect("idempotent batch");
+    assert_eq!((r.recorded, r.unchanged, r.conflicts.len()), (0, 2, 0));
+
+    // Conflicts, both directions, mixed with accepted pairs in ONE batch:
+    // (sha1→cs3) conflicts on the sha side, (sha3→cs1) on the cs side,
+    // (sha3→cs3) is fresh and MUST still land.
+    let r = store
+        .record_export_mappings(&[
+            (sha1.clone(), cs3),
+            (sha3.clone(), cs1),
+            (sha3.clone(), cs3),
+        ])
+        .expect("mixed batch succeeds");
+    assert_eq!(r.recorded, 1, "the fresh pair lands");
+    assert_eq!(r.unchanged, 0);
+    assert_eq!(r.conflicts.len(), 2);
+    let by_sha: Vec<&String> = r.conflicts.iter().map(|c| &c.git_sha).collect();
+    assert!(by_sha.contains(&&sha1), "sha-side conflict reported");
+    assert!(by_sha.contains(&&sha3), "cs-side conflict reported");
+    for c in &r.conflicts {
+        if c.git_sha == sha1 {
+            // (sha1, cs3): sha side is taken by cs1; cs3 is unmapped.
+            assert_eq!(c.existing_cs_for_sha, Some(cs1));
+            assert_eq!(c.existing_sha_for_cs, None);
+        } else {
+            // (sha3, cs1): cs side is taken by sha1; sha3 is unmapped.
+            assert_eq!(c.existing_cs_for_sha, None);
+            assert_eq!(c.existing_sha_for_cs.as_deref(), Some(sha1.as_str()));
+        }
+    }
+    // Refused pairs did NOT land; the fresh pair did.
+    assert_eq!(
+        store.cs_for_git(&sha1).unwrap(),
+        Some(cs1),
+        "refused sha untouched"
+    );
+    assert_eq!(store.git_for_cs(cs1).unwrap(), Some(sha1));
+    assert_eq!(store.cs_for_git(&sha3).unwrap(), Some(cs3));
+    assert_eq!(store.git_for_cs(cs3).unwrap(), Some(sha3.to_lowercase()));
+
+    // Malformed sha anywhere in the batch: hard Invalid, and — the batch
+    // atomicity contract — the valid fresh pair in the same batch must
+    // NOT have landed.
+    let sha4 = salted(0x74);
+    let cs4 = id_of(0x713 ^ hash_tag(tag));
+    let malformed = format!("{tag}not-a-sha");
+    assert!(matches!(
+        store.record_export_mappings(&[(malformed, cs4), (sha4.clone(), cs4)]),
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(
+        store.cs_for_git(&sha4).unwrap(),
+        None,
+        "a malformed pair in the batch rolled the batch back"
+    );
+}
+
 fn ref_listing_checks(store: &dyn MetadataStore, tag: &str) {
     let expected: [(&str, u64); 3] = [
         (&format!("{tag}/main"), 1),
@@ -545,6 +644,7 @@ fn pg_metadata_parity() {
     };
     changeset_checks(&store, &tag);
     git_mapping_checks(&store, &tag);
+    export_mapping_checks(&store, &tag);
     ref_listing_checks(&store, &tag);
     derived_checks(&store, &tag);
     cas_sequential_semantics(&store, &tag);
