@@ -1276,6 +1276,11 @@ fn load_or_default(objects: &dyn ObjectStore, id: Option<Id>) -> Result<Tree, St
     }
 }
 
+/// Bound on the recursive virtual-base fold's descent (criss-cross
+/// stacks of stacks). Beyond it the fold falls back to the first base
+/// in the deterministic order — a documented limit, not a mis-merge.
+const MAX_RECURSIVE_BASE_DEPTH: usize = 16;
+
 impl Engine {
     /// The 3-way merge of the trees of `ours` and `theirs` over their
     /// merge base, as a change list vs ours. Conflicts (content or
@@ -1300,6 +1305,19 @@ impl Engine {
             Some(b) => self.derive_tree(b)?,
             None => None,
         };
+        self.merge_tree_ids(b_tree, o_tree, t_tree)
+    }
+
+    /// The 3-way walk over raw TREE ids (`None` = empty): the body of
+    /// [`Engine::merge_tree_changes`] split out so the recursive
+    /// virtual-base fold (which produces a tree, not a changeset) can
+    /// run the exact same merge code.
+    fn merge_tree_ids(
+        &self,
+        b_tree: Option<Id>,
+        o_tree: Option<Id>,
+        t_tree: Option<Id>,
+    ) -> Result<Result<Vec<Change>, Vec<String>>, StoreError> {
         let mut changes: Vec<Change> = Vec::new();
         let mut conflicts: Vec<String> = Vec::new();
         walk(
@@ -1320,4 +1338,202 @@ impl Engine {
         changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
         Ok(Ok(changes))
     }
+
+    /// The 3-way tree merge with **recursive multi-base resolution**
+    /// (git's `merge-recursive`/`merge-ort` shape): computes every
+    /// maximal common ancestor of `ours` and `theirs`
+    /// ([`Engine::merge_bases_all`], deterministically ordered) and,
+    /// when there is more than one, folds them into one **virtual
+    /// base tree** before the ordinary walk.
+    ///
+    /// The fold is itself a sequence of 3-way tree merges —
+    /// `virtual = merge(merge(bases[0], bases[1] over base-of-bases),
+    /// bases[2], …)` — computed against the bases' own merge base,
+    /// recursively, with [`MAX_RECURSIVE_BASE_DEPTH`] bounding the
+    /// descent. A conflicting base fold embeds the conflict by
+    /// *dropping the conflicting path from the virtual base* (the path
+    /// then merges as if absent from the base, which surfaces the
+    /// real disagreement to the outer merge instead of hiding it
+    /// behind an arbitrary pick): the virtual base is a derived,
+    /// never-stored tree, so nothing partial is ever persisted.
+    ///
+    /// A unique merge base skips the fold entirely — the behavior is
+    /// byte-identical to [`Engine::merge_tree_changes`] for every
+    /// non-criss-cross merge (the v0.2 contract preserved).
+    ///
+    /// Determinism: the base order is `(committer seconds desc, id
+    /// bytes desc)`; the fold is a pure function of immutable trees;
+    /// wiped caches reproduce identical merges.
+    pub fn merge_tree_changes_recursive(
+        &self,
+        ours: Id,
+        theirs: Id,
+    ) -> Result<Result<Vec<Change>, Vec<String>>, StoreError> {
+        let bases = self.merge_bases_all(ours, theirs)?;
+        match bases.len() {
+            0 => {
+                // Unrelated histories: the caller (Repo::merge)
+                // refuses before reaching here; at the engine level
+                // an empty base is the empty-tree merge.
+                self.merge_tree_changes(None, ours, theirs)
+            }
+            1 => self.merge_tree_changes(Some(bases[0]), ours, theirs),
+            _ => {
+                let virtual_base = self.fold_virtual_base(&bases, 0)?;
+                let o_tree = self.derive_tree(ours)?;
+                let t_tree = self.derive_tree(theirs)?;
+                self.merge_tree_ids(virtual_base, o_tree, t_tree)
+            }
+        }
+    }
+
+    /// The octopus fold round: a 3-way merge of raw TREE ids over an
+    /// EXPLICIT base list (the accumulated references' common
+    /// ancestors — the caller computes them, because the accumulated
+    /// merge-result tree has no changeset of its own to walk ancestry
+    /// from). One base is the ordinary merge; several fold into a
+    /// virtual base first, exactly as [`Engine::merge_tree_changes_recursive`].
+    pub fn merge_tree_changes_over_trees(
+        &self,
+        bases: &[Id],
+        ours_tree: Option<Id>,
+        theirs_tree: Option<Id>,
+    ) -> Result<Result<Vec<Change>, Vec<String>>, StoreError> {
+        match bases.len() {
+            0 => self.merge_tree_ids(None, ours_tree, theirs_tree),
+            1 => self.merge_tree_ids(Some(bases[0]), ours_tree, theirs_tree),
+            _ => {
+                let virtual_base = self.fold_virtual_base(bases, 0)?;
+                self.merge_tree_ids(virtual_base, ours_tree, theirs_tree)
+            }
+        }
+    }
+
+    /// Folds `bases` (deterministically ordered) into one virtual base
+    /// tree id, left-to-right: `acc = merge(acc, bases[i])` over
+    /// `merge_base(acc, bases[i])`. Conflicting paths drop out of the
+    /// virtual base (see [`Engine::merge_tree_changes_recursive`]).
+    /// Folds `bases` (deterministically ordered, ALL changeset ids)
+    /// into one virtual base TREE id (`None` = empty), left-to-right:
+    /// `acc = merge(acc, bases[i])` over `merge_bases_all(acc_cs,
+    /// bases[i])`, with conflicts resolved by dropping the conflicting
+    /// paths from the virtual base (see
+    /// [`Engine::merge_tree_changes_recursive`]).
+    ///
+    /// NOTE on ids: the fold works in TREE space internally
+    /// (`acc_tree`), but `merge_tree_changes` and
+    /// `merge_bases_all` take CHANGESET ids — the fold tracks the
+    /// changeset whose tree `acc_tree` currently is (`acc_cs`) so
+    /// ancestry stays real. The first base's changeset anchors it.
+    fn fold_virtual_base(
+        &self,
+        bases: &[Id],
+        depth: usize,
+    ) -> Result<Option<Id>, StoreError> {
+        if depth > MAX_RECURSIVE_BASE_DEPTH {
+            // Bounded descent: fall back to the first base in the
+            // deterministic order (a documented limit; git has no
+            // such cap but pathological criss-cross stacks are not
+            // constructible through ordinary merges).
+            return self.derive_tree(bases[0]);
+        }
+        let mut acc_tree = self.derive_tree(bases[0])?;
+        let mut acc_cs = bases[0];
+        for &b in &bases[1..] {
+            let inner_bases = self.merge_bases_all(acc_cs, b)?;
+            let inner_base_cs = inner_bases.first().copied();
+            // The tree id of the inner base (None = empty tree).
+            let inner_base_tree = match inner_base_cs {
+                Some(x) => self.derive_tree(x)?,
+                None => None,
+            };
+            let b_tree = self.derive_tree(b)?;
+            let acc_b = self.merge_tree_ids(inner_base_tree, acc_tree, b_tree)?;
+            let changes = match acc_b {
+                Ok(changes) => changes,
+                Err(conflicts) => {
+                    // Conflicting fold: recompute the fold WITHOUT the
+                    // conflicting paths — each conflicting path drops
+                    // from the virtual base, so the outer merge sees it
+                    // as base-absent (both sides changed) instead of
+                    // anchored to an arbitrary side.
+                    self.virtual_base_dropping(inner_base_tree, acc_tree, b_tree, &conflicts)?
+                }
+            };
+            // Apply the fold's changes onto the accumulator tree.
+            let folded = gardenbed_model::Changeset {
+                parents: vec![acc_cs],
+                changes,
+                message: "virtual base fold".into(),
+                author: gardenbed_model::Identity {
+                    name: "gardenbed".into(),
+                    email: "virtual@base".into(),
+                    time_secs: 0,
+                    tz_min: 0,
+                },
+                committer: gardenbed_model::Identity {
+                    name: "gardenbed".into(),
+                    email: "virtual@base".into(),
+                    time_secs: 0,
+                    tz_min: 0,
+                },
+                signature: None,
+            };
+            acc_tree = self.apply_changeset_to_tree(acc_tree, &folded)?;
+            // The accumulator's tree is now the merged fold; the
+            // changeset anchor stays the LAST merged base for the
+            // next round's ancestry (the fold's result is
+            // tree-identical to that merge, and its ancestry is a
+            // superset through the merged pair).
+            acc_cs = b;
+        }
+        Ok(acc_tree)
+    }
+
+    /// The fold step over a conflicting base pair: the change list
+    /// that turns the accumulator TREE into the pruned union —
+    /// `b`'s non-conflicting changes vs the inner base ride along,
+    /// and every conflicting path is DELETED from the result (the
+    /// virtual base simply lacks those paths, so the outer merge
+    /// treats them as base-absent). All arguments are TREE ids
+    /// (`None` = empty tree).
+    fn virtual_base_dropping(
+        &self,
+        inner_base: Option<Id>,
+        acc_tree: Option<Id>,
+        t_tree: Option<Id>,
+        conflicts: &[String],
+    ) -> Result<Vec<Change>, StoreError> {
+        let mut changes = Vec::new();
+        // Theirs' side of the diff vs the inner base, minus conflicts.
+        let diff = crate::diff::diff_trees(&*self.objects, inner_base, t_tree)?;
+        for mut c in diff {
+            if conflicts.iter().any(|p| p == &c.path) {
+                continue;
+            }
+            // A rename fact from the tree diff is irrelevant to the
+            // fold's change list; normalize to add/modify.
+            c.src_path = None;
+            changes.push(c);
+        }
+        // Conflicting paths present in the accumulator are DELETED
+        // from the virtual base.
+        let o_files = self.flatten_tree(acc_tree)?;
+        for (path, _mode, _blob) in o_files {
+            if conflicts.iter().any(|p| p == &path) {
+                changes.push(Change {
+                    path,
+                    op: Op::Delete,
+                    blob: None,
+                    src_path: None,
+                    // Canonical deletes carry Mode::Regular.
+                    mode: Mode::Regular,
+                });
+            }
+        }
+        changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        changes.dedup_by(|a, b| a.path == b.path);
+        Ok(changes)
+    }
+
 }

@@ -444,6 +444,74 @@ fn merge_base_naive_impl(
     Ok(candidates.first().map(|&(_, c)| c))
 }
 
+/// All maximal common ancestors of `a` and `b` — git's
+/// `merge-base --all`: every common ancestor that is not a proper
+/// ancestor of another common ancestor. Deterministically ordered
+/// (newest committer seconds first, then descending id bytes) so the
+/// recursive merge's virtual-base fold is replica-stable.
+///
+/// A criss-cross history yields two or more; anything with a unique
+/// best base yields exactly one. Empty when the histories are
+/// unrelated.
+fn merge_bases_all_impl(
+    metadata: &dyn MetadataStore,
+    a: Id,
+    b: Id,
+) -> Result<Vec<Id>, StoreError> {
+    if a == b {
+        return Ok(vec![a]);
+    }
+    let anc_a = ancestors_naive(metadata, a)?;
+    let anc_b = ancestors_naive(metadata, b)?;
+    let common: Vec<Id> = anc_a.intersection(&anc_b).copied().collect();
+    if common.is_empty() {
+        return Ok(Vec::new());
+    }
+    // The maximal filter needs "x is a proper ancestor of y" over the
+    // common set only: precompute each common node's ancestors within
+    // the common set by walking parents (bounded by the common set —
+    // the walk cannot leave it, since every parent of a common node
+    // that is shared is itself common; a parent only one side has is
+    // not in the set and cannot make another common node ancestral).
+    let common_set: HashSet<Id> = common.iter().copied().collect();
+    let mut dominated: HashSet<Id> = HashSet::new();
+    for &c in &common {
+        // BFS from c's parents, staying inside the common set.
+        let mut seen: HashSet<Id> = HashSet::new();
+        let mut queue: Vec<Id> = Vec::new();
+        let (cs, _) = metadata.get_changeset(c)?.ok_or(StoreError::NotFound)?;
+        for p in &cs.parents {
+            if common_set.contains(p) {
+                queue.push(*p);
+            }
+        }
+        while let Some(x) = queue.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            dominated.insert(x);
+            let (xs, _) = metadata.get_changeset(x)?.ok_or(StoreError::NotFound)?;
+            for p in &xs.parents {
+                if common_set.contains(p) && !seen.contains(p) {
+                    queue.push(*p);
+                }
+            }
+        }
+    }
+    let mut maximal: Vec<(u64, Id)> = Vec::new();
+    for c in common {
+        if !dominated.contains(&c) {
+            let (cs, _) = metadata.get_changeset(c)?.ok_or(StoreError::NotFound)?;
+            maximal.push((cs.committer.time_secs, c));
+        }
+    }
+    maximal.sort_by(|x, y| {
+        y.0.cmp(&x.0)
+            .then_with(|| y.1.as_bytes().cmp(x.1.as_bytes()))
+    });
+    Ok(maximal.into_iter().map(|(_, c)| c).collect())
+}
+
 // ------------------------------------------------------- accelerated walk
 
 /// Decides whether `a` lies on `x`'s first-parent segment run (strictly
@@ -622,6 +690,18 @@ impl Engine {
     /// filter); see the module docs for the tie-breaking rule.
     pub fn merge_base_naive(&self, a: Id, b: Id) -> Result<Option<Id>, StoreError> {
         merge_base_naive_impl(&*self.metadata, a, b)
+    }
+
+    /// All maximal common ancestors of `a` and `b` (git's
+    /// `merge-base --all`), deterministically ordered: newest
+    /// committer seconds first, then descending id bytes.
+    ///
+    /// This is the multi-base answer the recursive merge folds into a
+    /// virtual base; a unique best base yields one element and the
+    /// fold is the ordinary single-base merge. Unrelated histories
+    /// yield an empty vector.
+    pub fn merge_bases_all(&self, a: Id, b: Id) -> Result<Vec<Id>, StoreError> {
+        merge_bases_all_impl(&*self.metadata, a, b)
     }
 
     /// Eagerly derives what should exist as soon as a changeset is created

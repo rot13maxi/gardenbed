@@ -217,15 +217,17 @@ async fn run(cli: &Cli) -> Result<i32, ClientError> {
         }
 
         Command::Merge {
-            target,
+            targets,
             message,
             author,
         } => {
             let _bed = WorkingCopy::open(&cli.state_dir)?;
-            CsOrRef::parse(target)?;
+            for t in targets.iter() {
+                CsOrRef::parse(t)?;
+            }
             let out = gardenbed::ops::merge(
                 &cli.state_dir,
-                target,
+                &targets,
                 message.as_deref(),
                 author.as_deref(),
             )
