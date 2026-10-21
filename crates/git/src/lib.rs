@@ -115,6 +115,7 @@ mod options;
 // never trust a declared length. Not part of the stabilized surface.
 pub mod pack;
 mod report;
+mod rawtree;
 mod resolve;
 mod transform;
 

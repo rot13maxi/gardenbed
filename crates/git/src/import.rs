@@ -45,6 +45,7 @@ use crate::graph::{Arena, Node, read_commit};
 use crate::gtree::{GEntry, GKind};
 use crate::oid::GitOid;
 use crate::options::ImportOptions;
+use crate::rawtree::RawTreeCapture;
 use crate::report::{ImportReport, RefRewind};
 use crate::resolve::{GitObjects, MAX_TREE_DEPTH, gitlink_blob_id};
 use crate::transform::repair_dir_to_file;
@@ -116,6 +117,9 @@ pub fn import_from_path(
     // The caller's engine is superseded by one over the counting wrapper:
     // derived trees then count toward `objects_written`.
     let engine = Engine::new(counting.clone(), metadata.clone());
+    // Raw-tree capture state (one memo for the whole run: subtrees
+    // shared across commits are decided once).
+    let mut raw_tree_capture = RawTreeCapture::new();
     let mut git_objects = GitObjects::new(&repo, counting.as_ref());
 
     let mut report = ImportReport::default();
@@ -200,9 +204,32 @@ pub fn import_from_path(
             };
             let reconstructed =
                 crate::commit::reconstruct_bytes(&raw, &raw.tree.to_hex(), &model_parent_hexes);
-            let raw_capture = if reconstructed == raw_bytes {
+            // Raw-tree capture (raw-tree fidelity): walk the commit's
+            // tree closure; divergent subtrees (pre-canonical modes,
+            // non-UTF-8 names) get verbatim rows keyed by their original
+            // git SHA, and a divergent ROOT forces raw-commit capture —
+            // the raw commit's `tree` header then carries the original
+            // root SHA the export needs. Rows land additively before the
+            // ingest transaction below (crash-orphan-safe: a row is only
+            // consumed when a captured commit's tree header names it).
+            let (root, written_trees) = engine.validated_tree_for_new_with_writes(&cs)?;
+            let raw_tree_rows = raw_tree_capture.capture_commit_tree(
+                &repo,
+                &engine,
+                raw.tree,
+                root,
+                metadata.as_ref(),
+                &sha_hex,
+            )?;
+            report.raw_trees_captured += raw_tree_rows as u64;
+            let raw_capture = if reconstructed == raw_bytes && raw_tree_rows == 0 {
                 None
             } else {
+                // Unreconstructable headers, or a divergent root tree:
+                // the original commit bytes carry what the model cannot
+                // — extra headers, and the original root SHA in the
+                // `tree` header (which the export resolves through
+                // raw-tree rows).
                 Some(raw_bytes.as_slice())
             };
             // Batched ingest: the changeset row, the git mapping and the
@@ -219,7 +246,6 @@ pub fn import_from_path(
             for parent in &cs.parents {
                 engine.certify_history(*parent)?;
             }
-            let (root, written_trees) = engine.validated_tree_for_new_with_writes(&cs)?;
             let rows = engine.derived_rows_for_validated_tree(cs_id, &cs, root)?;
             // Same last-chance re-check as the server's CreateChangeset:
             // the import holds repo.lock only shared, so a --force gc can

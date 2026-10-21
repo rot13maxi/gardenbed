@@ -114,6 +114,60 @@ pub trait MetadataStore: Send + Sync {
         let _ = cs;
         Ok(None)
     }
+    /// The verbatim bytes of the original git tree object keyed by its
+    /// original git tree SHA (v0.2 raw-tree capture; the M18.5 successor
+    /// to raw-commit capture). `None` when no row was captured (the tree
+    /// reconstructs byte-exactly from the model, or the store predates
+    /// raw-tree capture).
+    ///
+    /// The key is the **original git SHA-1** of the tree — never the
+    /// canonical model tree id: multiple distinct git trees (differing
+    /// pre-canonical modes, non-UTF-8 names) can normalize to one model
+    /// tree, and keying by model id would silently conflate them. The
+    /// model-tree association is carried by
+    /// [`MetadataStore::raw_tree_model_id`].
+    fn raw_tree(&self, _git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(None)
+    }
+
+    /// The canonical model tree id a captured raw tree (keyed by its
+    /// original git tree SHA, see [`MetadataStore::raw_tree`]) normalizes
+    /// to — the association the export uses to seed its render with
+    /// original bytes. `None` when no row was captured, or when the
+    /// normalized model tree is empty (an empty normalized tree has no
+    /// model id; the export renders the canonical empty tree).
+    fn raw_tree_model_id(&self, _git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        Ok(None)
+    }
+
+    /// Records one verbatim git tree object, keyed by its **original git
+    /// tree SHA** (see [`MetadataStore::raw_tree`] for why the git SHA is
+    /// the key), together with the canonical model tree id the tree
+    /// normalizes to (`None` for an empty normalized tree).
+    ///
+    /// Additive and content-addressed, like blob objects: rows may be
+    /// written **before** the ordinary validated-changeset transaction
+    /// that references them. A crash between the put and the ingest
+    /// leaves an orphan row — harmless by construction, since the key is
+    /// the git SHA of content the importer read from git, and a row is
+    /// only ever consumed when a captured commit's `tree` header names
+    /// its key.
+    ///
+    /// Immutability: re-putting the same git SHA with identical bytes and
+    /// the same model association is an idempotent no-op; different bytes
+    /// or a different association is a [`StoreError::ImmutabilityViolation`].
+    /// The bytes must SHA-1 to `git_tree_sha` — anything else is
+    /// [`StoreError::Invalid`] (the row is content-addressed by its key).
+    fn put_raw_tree(
+        &self,
+        _git_tree_sha: [u8; 20],
+        _model_tree: Option<Id>,
+        _bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Db(
+            "raw-tree capture is unsupported by this metadata store".into(),
+        ))
+    }
 
     /// Ids of stored changesets whose 32-byte id sorts in the half-open
     /// byte range `[lo, hi_exclusive)` — the storage primitive behind

@@ -45,6 +45,151 @@ pub(crate) enum GKind {
     File,
 }
 
+/// One entry of a git tree, preserving the original bytes: the exact mode
+/// string git wrote (e.g. `100664`, never canonicalized) and the raw name
+/// bytes (which may not be UTF-8). Raw fidelity (raw-tree capture) works
+/// on this view; the model view stays [`GEntry`].
+#[derive(Clone, Debug)]
+pub(crate) struct RawEntry {
+    /// The mode string exactly as git wrote it (e.g. `100664`).
+    pub mode: String,
+    /// The name bytes exactly as git wrote them (any non-NUL bytes).
+    pub name: Vec<u8>,
+    /// The entry id (blob, tree, or commit for gitlinks).
+    pub oid: GitOid,
+    /// Directory or file leaf (derived from the mode's type bits).
+    pub kind: GKind,
+}
+
+/// Parses a git tree into [`RawEntry`]s — the byte-preserving view.
+///
+/// The mode string is kept verbatim (`100664` stays `100664`) and name
+/// bytes are never decoded, so a tree rendered back from these entries
+/// reproduces the original object bytes exactly — the capture predicate
+/// (`reconstruct_raw`) and the verbatim export path both work on this
+/// view. Malformed input errors identically to [`parse_tree`].
+pub(crate) fn parse_tree_raw(data: &[u8]) -> Result<Vec<RawEntry>, String> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos < data.len() {
+        let sp = data[pos..]
+            .iter()
+            .position(|b| *b == b' ')
+            .ok_or("tree entry missing mode separator")?
+            + pos;
+        let mode = std::str::from_utf8(&data[pos..sp])
+            .map_err(|_| "tree mode is not UTF-8")?
+            .to_owned();
+        let nul = data[sp + 1..]
+            .iter()
+            .position(|b| *b == 0)
+            .ok_or("tree entry name not NUL-terminated")?
+            + sp
+            + 1;
+        if nul + 21 > data.len() {
+            return Err("tree entry id is truncated".into());
+        }
+        let name = data[sp + 1..nul].to_vec();
+        let mut raw = [0u8; 20];
+        raw.copy_from_slice(&data[nul + 1..nul + 1 + 20]);
+        let oid = GitOid::from_bytes(raw);
+        // Same classification as `map_mode` (type bits decide the kind);
+        // unsupported modes are the loud parse errors they always were.
+        let (kind, _) = map_mode(&mode)
+            .ok_or_else(|| format!("unsupported tree entry mode {mode:?}"))?;
+        out.push(RawEntry {
+            mode,
+            name,
+            oid,
+            kind,
+        });
+        pos = nul + 21;
+    }
+    Ok(out)
+}
+
+/// Renders a git tree body from [`RawEntry`]s **verbatim**: original mode
+/// strings, original name bytes, git's entry order (directories compare
+/// as `name + "/"`). This is the inverse of [`parse_tree_raw`] and the
+/// byte source for verbatim raw-tree export.
+///
+/// The export's canonical path ([`crate::export`]'s `TreeRenderer`)
+/// already emits this same entry order; the only intended difference
+/// between a verbatim render and a canonical render is mode strings and
+/// name bytes — which is exactly what raw capture preserves.
+pub(crate) fn render_raw(entries: &[RawEntry]) -> Vec<u8> {
+    // Sort the way git stores tree entries: name bytes, directories as
+    // name + "/".
+    let mut sorted: Vec<&RawEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        let mut ka = a.name.clone();
+        let mut kb = b.name.clone();
+        if a.kind == GKind::Dir {
+            ka.push(b'/');
+        }
+        if b.kind == GKind::Dir {
+            kb.push(b'/');
+        }
+        ka.cmp(&kb)
+    });
+    let mut out = Vec::new();
+    for e in sorted {
+        out.extend_from_slice(e.mode.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(&e.name);
+        out.push(b'\0');
+        out.extend_from_slice(e.oid.as_bytes());
+    }
+    out
+}
+
+/// Renders the tree body the **canonical export** would produce from
+/// these entries: canonical mode strings (per `git_mode`) and lossy-decoded
+/// names — the model's view. Byte-equality with the original tree bytes
+/// proves the model reproduces the tree exactly; any difference (mode
+/// bytes, non-UTF-8 names) is the raw-tree capture predicate firing.
+///
+/// `blob_shas` maps each file entry's git oid to the SHA the exported
+/// pack carries for it (blobs and gitlinks alike — gitlink pointers are
+/// the upstream SHA-1 unchanged). `tree_shas` does the same for
+/// directory entries; both come from the caller's memo. Owned `[u8; 20]`
+/// values keep the render free of borrowed-lifetime plumbing.
+pub(crate) fn render_canonical(
+    entries: &[RawEntry],
+    blob_shas: impl Fn(&RawEntry) -> Option<[u8; 20]>,
+    tree_shas: impl Fn(&RawEntry) -> Option<[u8; 20]>,
+) -> Option<Vec<u8>> {
+    let mut sorted: Vec<&RawEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        let mut ka = a.name.clone();
+        let mut kb = b.name.clone();
+        if a.kind == GKind::Dir {
+            ka.push(b'/');
+        }
+        if b.kind == GKind::Dir {
+            kb.push(b'/');
+        }
+        ka.cmp(&kb)
+    });
+    let mut out = Vec::new();
+    for e in sorted {
+        let mode = crate::export::canonical_git_mode(e.kind, e.mode.as_str())?;
+        // A name the model cannot hold (non-UTF-8) makes the canonical
+        // render impossible: the caller treats `None` as a capture.
+        let name = std::str::from_utf8(&e.name).ok()?;
+        out.extend_from_slice(mode.as_bytes());
+        out.push(b' ');
+        out.extend_from_slice(name.as_bytes());
+        out.push(b'\0');
+        let sha: [u8; 20] = match e.kind {
+            GKind::File => blob_shas(e)?,
+            GKind::Dir => tree_shas(e)?,
+        };
+        out.extend_from_slice(&sha);
+    }
+    Some(out)
+}
+
 /// Parses the raw bytes of a git tree object.
 pub(crate) fn parse_tree(data: &[u8]) -> Result<Vec<GEntry>, String> {
     let mut out = Vec::new();

@@ -873,4 +873,13 @@ fn pre_canonical_100664_mode_fixups_import_via_raw_fallback() {
     assert_eq!(second.commits_skipped, 1, "the walk prunes at the tip");
     assert_eq!(second.objects_written, 0, "a re-import writes zero objects");
     assert!(second.refs_updated.is_empty(), "refs must not move");
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("raw-mode-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported, objects, metadata, &gardenbed_git::ExportOptions::default(),
+    ).expect("raw non-canonical tree modes must export SHA-exact");
+    for sha in [&c1, &c2, &c3, &c4] {
+        assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha));
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported raw-mode history is valid");
 }
