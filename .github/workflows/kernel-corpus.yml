@@ -194,6 +194,7 @@ jobs:
       # is used — both are scratch, and the corpus is untouched either way.
       - name: Scratch metadata copy (per-run mktemp; corpus stays pristine)
         run: |
+          set -eu
           meta_size=$(stat -c%s "$KERNEL_META")
           # 20% headroom over the DB size for the WAL the open will write.
           # Units: stat is bytes, so the free-space check MUST also be
