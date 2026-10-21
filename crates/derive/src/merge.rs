@@ -1399,9 +1399,15 @@ impl Engine {
         ours_tree: Option<Id>,
         theirs_tree: Option<Id>,
     ) -> Result<Result<Vec<Change>, Vec<String>>, StoreError> {
-        match bases.len() {
+        // `bases` are CHANGESET ids (octopus accumulates references);
+        // derive each base's tree before the tree-level walk.
+        let base_trees: Vec<Option<Id>> = bases
+            .iter()
+            .map(|&b| self.derive_tree(b))
+            .collect::<Result<_, _>>()?;
+        match base_trees.len() {
             0 => self.merge_tree_ids(None, ours_tree, theirs_tree),
-            1 => self.merge_tree_ids(Some(bases[0]), ours_tree, theirs_tree),
+            1 => self.merge_tree_ids(base_trees[0], ours_tree, theirs_tree),
             _ => {
                 let virtual_base = self.fold_virtual_base(bases, 0)?;
                 self.merge_tree_ids(virtual_base, ours_tree, theirs_tree)
