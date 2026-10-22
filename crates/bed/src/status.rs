@@ -41,8 +41,9 @@ use gardenbed_model::blob_id;
 use crate::error::ClientError;
 use crate::sparse::dir_may_hold_selected;
 use crate::sparse::in_sparse;
-use crate::treestate::HINT_UNVERIFIED;
+use crate::treestate::MODE_EXEC;
 use crate::treestate::MODE_GITLINK;
+use crate::treestate::MODE_REGULAR;
 use crate::treestate::MODE_SYMLINK;
 use crate::treestate::Treestate;
 
@@ -387,8 +388,17 @@ fn classify_tracked(
     }
 
     let observed = match observe(root, rel)? {
-        Some(observed) => observed,
-        // Vanished between pass 1 and here: pass 1 already called it.
+        Some(mut observed) => {
+            // Windows cannot represent the exec bit, so a regular file's
+            // observed mode inherits the tracked row's exec identity
+            // instead of fabricating a mode divergence on every scan
+            // (the same contract as Git-for-Windows).
+            #[cfg(windows)]
+            if observed.mode == MODE_REGULAR && entry.mode == MODE_EXEC {
+                observed.mode = MODE_EXEC;
+            }
+            observed
+        }
         None => return Ok(ScanDelta::Clean),
     };
 
