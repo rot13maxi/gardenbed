@@ -583,3 +583,341 @@ fn recursive_merge_is_deterministic_across_runs() {
     let second = engine.merge_tree_changes_recursive(ours, theirs).unwrap();
     assert_eq!(first, second, "repeated recursive merges are identical");
 }
+
+// ---------------------------------------------------------------------------
+// THREE maximal common ancestors (the fold's accumulated-ancestry
+// contract): the fold must consume all three bases, anchoring later
+// rounds on the accumulated VIRTUAL changeset (parents
+// [prev_acc, b]) — not on the last sibling base, whose history drops
+// everything folded before it.
+// ---------------------------------------------------------------------------
+
+/// (engine, ours, theirs, ours' post-state, theirs' post-state).
+type ThreeBaseFixture = (Engine, Id, Id, Snap, Snap);
+
+/// (git repo dir, ours' post-state, theirs' post-state).
+type GitThreeBase = (tempfile::TempDir, Snap, Snap);
+
+/// Builds the git-verified three-maximal-base shape in engine stores:
+///
+/// ```text
+/// base -- x -- y -- z        (siblings, disjoint union content each)
+/// p1 = (x, y)  p2 = (y, x)   (cross-merges carrying the union)
+/// ours   = (p1, z) + ours edit
+/// theirs = (p2, z) + theirs edit
+/// ```
+///
+/// `merge_bases_all(ours, theirs)` = {x, y, z} (three maximal). The
+/// union trees make a correct fold reproduce the union; the tips'
+/// disjoint edits must ride on top cleanly. A fold that anchors
+/// round 2 at merge_bases_all(b1, b2) alone (dropping b0's ancestry)
+/// loses the union content and mis-merges.
+fn three_maximal_base_fixture(disjoint: bool) -> ThreeBaseFixture {
+    let objects = Arc::new(MemoryStore::new()) as Arc<dyn ObjectStore>;
+    let metadata = Arc::new(MemoryStore::new()) as Arc<dyn MetadataStore>;
+    let engine = Engine::new(objects.clone(), metadata.clone());
+
+    let mut union = Snap::new();
+    union.insert("f.txt".to_owned(), b"base\n".to_vec());
+    union.insert("fx".to_owned(), b"X\n".to_vec());
+    union.insert("fy".to_owned(), b"Y\n".to_vec());
+    union.insert("fz".to_owned(), b"Z\n".to_vec());
+
+    let commit = |tag: &str, secs: u64, parents: Vec<Id>, snap: &Snap| -> Id {
+        let mut changes = Vec::new();
+        if parents.is_empty() {
+            for (p, c) in snap {
+                changes.push(Change {
+                    path: p.clone(),
+                    op: Op::Add,
+                    blob: Some(blob_id(c)),
+                    src_path: None,
+                    mode: Mode::Regular,
+                });
+            }
+        } else {
+            // Full post-state snapshots: diff vs the first parent's
+            // tree (all parents carry the same tree in this shape).
+            let prev = engine
+                .flatten_tree(engine.derive_tree(parents[0]).unwrap())
+                .unwrap();
+            for (ppath, _pm, _pb) in &prev {
+                if !snap.contains_key(ppath) {
+                    changes.push(Change {
+                        path: ppath.clone(),
+                        op: Op::Delete,
+                        blob: None,
+                        src_path: None,
+                        mode: Mode::Regular,
+                    });
+                }
+            }
+            for (p, c) in snap {
+                let op = if prev.iter().any(|(pp, _, _)| pp == p) {
+                    Op::Modify
+                } else {
+                    Op::Add
+                };
+                changes.push(Change {
+                    path: p.clone(),
+                    op,
+                    blob: Some(blob_id(c)),
+                    src_path: None,
+                    mode: Mode::Regular,
+                });
+            }
+        }
+        changes.sort_by(|x, y| x.path.as_bytes().cmp(y.path.as_bytes()));
+        for c in &changes {
+            if c.blob.is_some() {
+                let content = snap.get(&c.path).expect("changed path in snap").clone();
+                objects.put_blob(&content).unwrap();
+            }
+        }
+        let cs = gardenbed_model::Changeset {
+            parents,
+            changes,
+            message: format!("3base {tag}"),
+            author: ident(tag, secs),
+            committer: ident(tag, secs),
+            signature: None,
+        };
+        let id = metadata.put_changeset(&cs).unwrap();
+        engine.on_changeset_created(id).unwrap();
+        id
+    };
+
+    let mut base_snap = Snap::new();
+    base_snap.insert("f.txt".to_owned(), b"base\n".to_vec());
+    let base = commit("base", 1, vec![], &base_snap);
+    let mut x_snap = union.clone();
+    x_snap.insert("fx".to_owned(), b"X\n".to_vec());
+    let x = commit("x", 2, vec![base], &x_snap);
+    let mut y_snap = union.clone();
+    y_snap.insert("fy".to_owned(), b"Y\n".to_vec());
+    let y = commit("y", 3, vec![base], &y_snap);
+    let mut z_snap = union.clone();
+    z_snap.insert("fz".to_owned(), b"Z\n".to_vec());
+    let z = commit("z", 4, vec![base], &z_snap);
+    let p1 = commit("p1", 5, vec![x, y], &union);
+    let p2 = commit("p2", 6, vec![y, x], &union);
+    let ours_m = commit("oursM", 7, vec![p1, z], &union);
+    let theirs_m = commit("theirsM", 8, vec![p2, z], &union);
+
+    let mut ours_snap = union.clone();
+    let mut theirs_snap = union.clone();
+    if disjoint {
+        ours_snap.insert("fx".to_owned(), b"FX4\n".to_vec());
+        theirs_snap.insert("fy".to_owned(), b"FY4\n".to_vec());
+    } else {
+        // BOTH tips edit the SAME file with the SAME bytes (a shared
+        // edit): still clean, and the content must be the shared one.
+        ours_snap.insert("fx".to_owned(), b"FX4\n".to_vec());
+        theirs_snap.insert("fx".to_owned(), b"FX4\n".to_vec());
+    }
+    let ours = commit("ourstip", 9, vec![ours_m], &ours_snap);
+    let theirs = commit("theirstip", 10, vec![theirs_m], &theirs_snap);
+    let _ = (ours, theirs);
+    (engine, ours, theirs, ours_snap, theirs_snap)
+}
+
+/// The same three-maximal-base shape as a real git repository:
+/// returns (tempdir, shas (ours, theirs)) with refs set.
+fn git_three_maximal_base(disjoint: bool) -> GitThreeBase {
+    let dir = tempfile::tempdir().expect("git tempdir");
+    let g = |args: &[&str]| {
+        let out = git_cmd(dir.path(), args).output().expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {} failed: {}{}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+    };
+    g(&["init", "-q", "-b", "main", "."]);
+    g(&["config", "user.email", "t@gardenbed.example"]);
+    g(&["config", "user.name", "T"]);
+
+    let write_union = |drop: &[&str]| -> String {
+        for (p, c) in [
+            ("f.txt", "base\n"),
+            ("fx", "X\n"),
+            ("fy", "Y\n"),
+            ("fz", "Z\n"),
+        ] {
+            if drop.contains(&p) {
+                continue;
+            }
+            std::fs::write(dir.path().join(p), c).unwrap();
+            g(&["add", "--", p]);
+        }
+        String::from_utf8(
+            git_cmd(dir.path(), &["write-tree"])
+                .output()
+                .expect("write-tree")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    };
+    let t_base = write_union(&["fx", "fy", "fz"]);
+    let t_x = write_union(&["fy", "fz"]);
+    let t_y = write_union(&["fx", "fz"]);
+    let t_z = write_union(&["fx", "fy"]);
+    let t_union = write_union(&[]);
+    let c = |tree: &str, parents: &[&str], msg: &str| -> String {
+        echo_commit_tree(&dir, tree, parents, msg)
+    };
+    let base = c(&t_base, &[], "base");
+    let x = c(&t_x, &[&base], "x");
+    let y = c(&t_y, &[&base], "y");
+    let z = c(&t_z, &[&base], "z");
+    let p1 = c(&t_union, &[&x, &y], "p1");
+    let p2 = c(&t_union, &[&y, &x], "p2");
+    let ours_m = c(&t_union, &[&p1, &z], "oursM");
+    let theirs_m = c(&t_union, &[&p2, &z], "theirsM");
+    // Tip trees: union + the edits.
+    let mut ours_snap: BTreeMap<String, Vec<u8>> = [
+        ("f.txt", b"base\n".to_vec()),
+        ("fx", b"X\n".to_vec()),
+        ("fy", b"Y\n".to_vec()),
+        ("fz", b"Z\n".to_vec()),
+    ]
+    .into_iter()
+    .map(|(p, c)| (p.to_owned(), c))
+    .collect();
+    let mut theirs_snap = ours_snap.clone();
+    if disjoint {
+        ours_snap.insert("fx".to_owned(), b"FX4\n".to_vec());
+        theirs_snap.insert("fy".to_owned(), b"FY4\n".to_vec());
+    } else {
+        ours_snap.insert("fx".to_owned(), b"FX4\n".to_vec());
+        theirs_snap.insert("fx".to_owned(), b"FX4\n".to_vec());
+    }
+    let tree_of = |snap: &BTreeMap<String, Vec<u8>>| -> String {
+        for (p, c) in snap {
+            std::fs::write(dir.path().join(p), c).unwrap();
+            g(&["add", "--", p]);
+        }
+        String::from_utf8(
+            git_cmd(dir.path(), &["write-tree"])
+                .output()
+                .expect("write-tree")
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_owned()
+    };
+    let t_ours = tree_of(&ours_snap);
+    let t_theirs = tree_of(&theirs_snap);
+    let ours = c(&t_ours, &[&ours_m], "ourstip");
+    let theirs = c(&t_theirs, &[&theirs_m], "theirstip");
+    g(&["update-ref", "refs/heads/ours", &ours]);
+    g(&["update-ref", "refs/heads/theirs", &theirs]);
+    // Sanity: exactly THREE maximal bases (git merge-base --all).
+    let all = git_out(dir.path(), &["merge-base", "--all", "ours", "theirs"])
+        .map(|v| String::from_utf8_lossy(&v).into_owned())
+        .unwrap_or_default();
+    let count = all.lines().filter(|l| !l.trim().is_empty()).count();
+    assert_eq!(count, 3, "git sees three maximal bases, got: {all}");
+    (dir, ours_snap, theirs_snap)
+}
+
+#[test]
+fn three_maximal_bases_disjoint_edits_merge_clean_like_git() {
+    let (engine, ours, theirs, ours_snap, theirs_snap) = three_maximal_base_fixture(true);
+    let (gdir, _o, _t) = git_three_maximal_base(true);
+    let git = git_merge_tree(gdir.path(), "ours", "theirs").expect("git merge-tree runs");
+
+    let recursive = engine.merge_tree_changes_recursive(ours, theirs).unwrap();
+    match (git.conflicted, recursive) {
+        (false, Ok(changes)) => {
+            let merged_cs = gardenbed_model::Changeset {
+                parents: vec![ours],
+                changes: changes.clone(),
+                message: "merged".into(),
+                author: ident("m", 11),
+                committer: ident("m", 11),
+                signature: None,
+            };
+            let root = engine
+                .apply_changeset_to_tree(engine.derive_tree(ours).unwrap(), &merged_cs)
+                .unwrap();
+            let merged: BTreeMap<String, Vec<u8>> = engine
+                .flatten_tree(root)
+                .unwrap()
+                .into_iter()
+                .map(|(p, _m, b)| (p, engine.objects().get_blob(b).unwrap().unwrap()))
+                .collect();
+            let mut expect = ours_snap.clone();
+            expect.insert("fy".to_owned(), theirs_snap["fy"].clone());
+            assert_eq!(
+                merged, expect,
+                "merged tree must carry the union plus both tips' disjoint edits"
+            );
+            let git_files = ls_tree(gdir.path(), &git.tree);
+            assert_eq!(
+                merged.keys().collect::<Vec<_>>(),
+                git_files.keys().collect::<Vec<_>>(),
+                "path set differs from git"
+            );
+            for (path, content) in &git_files {
+                assert_eq!(
+                    merged.get(path).map(|v| v.as_slice()),
+                    Some(content.as_slice()),
+                    "content at {path} differs from git"
+                );
+            }
+        }
+        (false, Err(found)) => {
+            panic!("git merged cleanly (3 maximal bases) but gardenbed conflicted: {found:?}")
+        }
+        (true, _) => panic!("git conflicted on the disjoint 3-base shape: unexpected"),
+    }
+}
+
+#[test]
+fn three_maximal_bases_shared_edit_merges_clean_like_git() {
+    let (engine, ours, theirs, _ours_snap, _theirs_snap) = three_maximal_base_fixture(false);
+    let (gdir, _o, _t) = git_three_maximal_base(false);
+    let git = git_merge_tree(gdir.path(), "ours", "theirs").expect("git merge-tree runs");
+    assert!(!git.conflicted, "git must merge the shared-edit shape");
+
+    let recursive = engine
+        .merge_tree_changes_recursive(ours, theirs)
+        .unwrap()
+        .expect("shared edit on 3 maximal bases is clean");
+    let merged_cs = gardenbed_model::Changeset {
+        parents: vec![ours],
+        changes: recursive.clone(),
+        message: "merged".into(),
+        author: ident("m", 12),
+        committer: ident("m", 12),
+        signature: None,
+    };
+    let root = engine
+        .apply_changeset_to_tree(engine.derive_tree(ours).unwrap(), &merged_cs)
+        .unwrap();
+    let merged: BTreeMap<String, Vec<u8>> = engine
+        .flatten_tree(root)
+        .unwrap()
+        .into_iter()
+        .map(|(p, _m, b)| (p, engine.objects().get_blob(b).unwrap().unwrap()))
+        .collect();
+    assert_eq!(
+        merged.get("fx").map(|v| v.as_slice()),
+        Some(b"FX4\n".to_vec().as_slice()),
+        "the shared edit must land"
+    );
+    let git_files = ls_tree(gdir.path(), &git.tree);
+    for (path, content) in &git_files {
+        assert_eq!(
+            merged.get(path).map(|v| v.as_slice()),
+            Some(content.as_slice()),
+            "content at {path} differs from git"
+        );
+    }
+}

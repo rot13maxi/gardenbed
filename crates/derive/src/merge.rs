@@ -166,30 +166,42 @@ fn detect_side_renames(
         .collect();
     if !open_adds.is_empty() && !open_dels.is_empty() {
         let mut pairs: Vec<(u32, usize, usize)> = Vec::new(); // (score, di, ai)
+        // Candidate span data, computed ONCE per blob id: the pairing
+        // loop is quadratic in candidates, so blob fetches and chunk
+        // hashing must not repeat per pair. `None` = blob missing
+        // (scores against it stay 0 — never a false rename).
+        let mut profile_cache: HashMap<Id, Option<SpanProfile>> = HashMap::new();
+        let mut profile = |blob: Id| -> Result<Option<SpanProfile>, StoreError> {
+            if let Some(hit) = profile_cache.get(&blob) {
+                return Ok(hit.clone());
+            }
+            let prof = objects
+                .get_blob(blob)?
+                .map(|content| SpanProfile::build(content.as_slice()));
+            profile_cache.insert(blob, prof.clone());
+            Ok(prof)
+        };
         for (di, (_sp, se)) in open_dels.iter().enumerate() {
             if !files_only(se) {
                 continue;
             }
-            let src_content = objects.get_blob(se.blob.expect("file entry carries a blob"))?;
+            let Some(src_profile) = profile(se.blob.expect("file entry carries a blob"))? else {
+                continue;
+            };
             for (ai, (_dp, de)) in open_adds.iter().enumerate() {
                 if !files_only(de) {
                     continue;
                 }
-                let Some(score) = similarity_score(
-                    src_content.as_deref(),
-                    objects
-                        .get_blob(de.blob.expect("file entry carries a blob"))?
-                        .as_deref(),
-                ) else {
+                let Some(dst_profile) = profile(de.blob.expect("file entry carries a blob"))?
+                else {
                     continue;
                 };
+                let score = src_profile.similarity(&dst_profile);
                 if score >= MIN_RENAME_SCORE {
                     pairs.push((score, di, ai));
                 }
             }
         }
-        // Best score first; ties resolved deterministically by
-        // (dst path, src path) byte order.
         pairs.sort_by(|x, y| {
             y.0.cmp(&x.0).then_with(|| {
                 let xd = open_adds[x.2].0.as_bytes();
@@ -226,31 +238,88 @@ const MIN_RENAME_SCORE: u32 = 50;
 /// `diff.renameLimit` default is 1000; we keep the same order).
 const MAX_RENAME_CANDIDATES: usize = 1000;
 
-/// Line-based similarity between two blobs, in percent (0..=100):
-/// `100 * common_lines / max(lines_a, lines_b)` where common lines are
-/// the unchanged half of the line diff — git's `diffcore_rename`
-/// estimate for text files. `None` when either side is past the xdiff
-/// bounds (no score, never a mis-detected rename).
-fn similarity_score(a: Option<&[u8]>, b: Option<&[u8]>) -> Option<u32> {
-    let a = a.unwrap_or(&[]);
-    let b = b.unwrap_or(&[]);
-    if a.is_empty() || b.is_empty() {
-        return None; // an empty side has no lines to share
+/// The rename-similarity estimator's chunk size: git's `diffcore_rename`
+/// hashes fixed-size spans of at most this many bytes (a chunk never
+/// crosses a newline — the span hash treats the line break as a hard
+/// boundary).
+const SPAN_CHUNK_MAX: usize = 64;
+
+/// Memoized rename-similarity data for one candidate blob: a multiset
+/// of chunk hashes (each weighted by its byte length) plus the blob's
+/// total byte count. Computed ONCE per candidate per detection pass —
+/// the quadratic pairing loop must not re-fetch or re-hash blobs.
+#[derive(Clone, Default)]
+struct SpanProfile {
+    /// (chunk hash, chunk byte length), in content order.
+    chunks: Vec<(u64, usize)>,
+    /// Total bytes of the content (the score's denominator weight).
+    total: usize,
+}
+
+impl SpanProfile {
+    fn build(content: &[u8]) -> SpanProfile {
+        let mut chunks = Vec::new();
+        let mut total = 0usize;
+        let mut start = 0usize;
+        while start < content.len() {
+            // A chunk ends at the first newline at or after `start`,
+            // or after SPAN_CHUNK_MAX bytes, whichever comes first.
+            let limit = (start + SPAN_CHUNK_MAX).min(content.len());
+            let mut end = limit;
+            if let Some(nl) = content[start..limit].iter().position(|&b| b == b'\n') {
+                end = start + nl + 1;
+            }
+            let slice = &content[start..end];
+            chunks.push((fnv1a(slice), slice.len()));
+            total += slice.len();
+            start = end;
+        }
+        SpanProfile { chunks, total }
     }
-    let ra = xdiff::split_records(a);
-    let rb = xdiff::split_records(b);
-    let max = ra.len().max(rb.len());
-    if max == 0 {
-        return None;
+
+    /// Byte-weighted similarity in percent (0..=100): the bytes in
+    /// matched chunks over the larger side's total bytes. Chunks match
+    /// as a MULTISET — duplicate chunk contents count at their
+    /// multiplicity on both sides, so a file of repeated identical
+    /// chunks cannot inflate its score against an unrelated file.
+    fn similarity(&self, other: &SpanProfile) -> u32 {
+        if self.total == 0 || other.total == 0 {
+            return 0; // an empty side has nothing to share
+        }
+        // Count matched bytes per hash value, capped at the smaller
+        // multiplicity (multiset intersection, byte-weighted).
+        let (small, large) = if self.chunks.len() <= other.chunks.len() {
+            (&self.chunks, &other.chunks)
+        } else {
+            (&other.chunks, &self.chunks)
+        };
+        let mut pool: BTreeMap<u64, usize> = BTreeMap::new();
+        for &(h, len) in large {
+            *pool.entry(h).or_insert(0) += len;
+        }
+        let mut matched = 0usize;
+        for &(h, len) in small {
+            if let Some(avail) = pool.get_mut(&h)
+                && *avail >= len
+            {
+                *avail -= len;
+                matched += len;
+            }
+        }
+        let denom = self.total.max(other.total);
+        ((100 * matched as u64) / denom as u64) as u32
     }
-    let diff = xdiff::diff_lines(&ra, &rb)?;
-    let removed = diff.changed_old.iter().filter(|c| **c).count();
-    let added = diff.changed_new.iter().filter(|c| **c).count();
-    let common = ra
-        .len()
-        .saturating_sub(removed)
-        .min(rb.len().saturating_sub(added));
-    Some((100 * common as u64 / max as u64) as u32)
+}
+
+/// FNV-1a over the chunk bytes — the span hash. Not cryptographic; it
+/// only needs to collide negligibly across chunks of one comparison.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// The outcome of one 3-way file merge.
@@ -787,14 +856,15 @@ fn merge_dir_rename_aware(
     // source + both destinations.
     for (src, or_) in &ours_by_src {
         if let Some(tr) = theirs_by_src.get(src)
-            && or_.dst != tr.dst {
-                conflicts.push(or_.src.clone());
-                conflicts.push(or_.dst.clone());
-                conflicts.push(tr.dst.clone());
-                consumed.insert(base_name(src));
-                consumed.insert(base_name(&or_.dst));
-                consumed.insert(base_name(&tr.dst));
-            }
+            && or_.dst != tr.dst
+        {
+            conflicts.push(or_.src.clone());
+            conflicts.push(or_.dst.clone());
+            conflicts.push(tr.dst.clone());
+            consumed.insert(base_name(src));
+            consumed.insert(base_name(&or_.dst));
+            consumed.insert(base_name(&tr.dst));
+        }
     }
 
     for name in &names {
@@ -829,15 +899,15 @@ fn merge_dir_rename_aware(
         }
         if let Some(tr) = theirs_by_src.get(name)
             && eo.is_none()
-                && eb.is_some()
-                && !ours_by_dst.contains_key(base_name(&tr.dst))
-                && !ours_by_src.contains_key(name)
-            {
-                conflicts.push(path.clone());
-                conflicts.push(tr.dst.clone());
-                consumed.insert(base_name(&tr.dst));
-                continue;
-            }
+            && eb.is_some()
+            && !ours_by_dst.contains_key(base_name(&tr.dst))
+            && !ours_by_src.contains_key(name)
+        {
+            conflicts.push(path.clone());
+            conflicts.push(tr.dst.clone());
+            consumed.insert(base_name(&tr.dst));
+            continue;
+        }
 
         // ---- rename vs edit at the source path (ours renamed, theirs
         // edited the same source content): the edit merges INTO the
@@ -847,49 +917,55 @@ fn merge_dir_rename_aware(
         // both endpoints already express ours' rename (deleted source,
         // added destination).
         if let Some(or_) = ours_by_src.get(name)
-            && et.is_some() && et.expect("checked").kind == TreeKind::File && !entries_eq(et, eb)
-                && let Some(dst_entry) = engine.entry_at(o_root, &or_.dst)? {
-                    let dst_path = or_.dst.clone();
-                    // OURS' entry at the DESTINATION (None when the
-                    // destination is not in ours' tree): the change is
-                    // vs ours, so the no-op prune compares there.
-                    merge_rename_edit(
-                        engine,
-                        &or_.src_base,
-                        &dst_entry,
-                        et.expect("checked above"),
-                        engine.entry_at(o_root, &dst_path)?.as_ref(),
-                        &dst_path,
-                        changes,
-                        conflicts,
-                    )?;
-                    consumed.insert(base_name(&or_.dst));
-                    continue;
-                }
+            && et.is_some()
+            && et.expect("checked").kind == TreeKind::File
+            && !entries_eq(et, eb)
+            && let Some(dst_entry) = engine.entry_at(o_root, &or_.dst)?
+        {
+            let dst_path = or_.dst.clone();
+            // OURS' entry at the DESTINATION (None when the
+            // destination is not in ours' tree): the change is
+            // vs ours, so the no-op prune compares there.
+            merge_rename_edit(
+                engine,
+                &or_.src_base,
+                &dst_entry,
+                et.expect("checked above"),
+                engine.entry_at(o_root, &dst_path)?.as_ref(),
+                &dst_path,
+                changes,
+                conflicts,
+            )?;
+            consumed.insert(base_name(&or_.dst));
+            continue;
+        }
         if let Some(tr) = theirs_by_src.get(name)
-            && eo.is_some() && eo.expect("checked").kind == TreeKind::File && !entries_eq(eo, eb)
-                && let Some(dst_entry) = engine.entry_at(t_root, &tr.dst)? {
-                    let dst_path = tr.dst.clone();
-                    // OURS still holds the edited source (`eo`); the
-                    // merged content lands at the destination, and the
-                    // source must GO — ours' tree still has it, so the
-                    // change list (which is vs OURS) needs the delete.
-                    let src_path = path.clone();
-                    let src_eo = eo.expect("checked above");
-                    merge_rename_edit(
-                        engine,
-                        &tr.src_base,
-                        src_eo,
-                        &dst_entry,
-                        engine.entry_at(o_root, &dst_path)?.as_ref(),
-                        &dst_path,
-                        changes,
-                        conflicts,
-                    )?;
-                    delete(Some(src_eo), &src_path, changes);
-                    consumed.insert(base_name(&tr.dst));
-                    continue;
-                }
+            && eo.is_some()
+            && eo.expect("checked").kind == TreeKind::File
+            && !entries_eq(eo, eb)
+            && let Some(dst_entry) = engine.entry_at(t_root, &tr.dst)?
+        {
+            let dst_path = tr.dst.clone();
+            // OURS still holds the edited source (`eo`); the
+            // merged content lands at the destination, and the
+            // source must GO — ours' tree still has it, so the
+            // change list (which is vs OURS) needs the delete.
+            let src_path = path.clone();
+            let src_eo = eo.expect("checked above");
+            merge_rename_edit(
+                engine,
+                &tr.src_base,
+                src_eo,
+                &dst_entry,
+                engine.entry_at(o_root, &dst_path)?.as_ref(),
+                &dst_path,
+                changes,
+                conflicts,
+            )?;
+            delete(Some(src_eo), &src_path, changes);
+            consumed.insert(base_name(&tr.dst));
+            continue;
+        }
 
         // ---- both sides renamed the same source to the SAME
         // destination: a 3-way content merge at the destination with
@@ -897,41 +973,42 @@ fn merge_dir_rename_aware(
         // ancestor — without it the destination looks like add/add).
         if let Some(or_) = ours_by_dst.get(name)
             && let Some(tr) = theirs_by_dst.get(name)
-                && or_.src == tr.src
-                    && let (Some(dst_o), Some(dst_t)) = (
-                        o_tree.entries.iter().find(|e| e.name == *name),
-                        t_tree.entries.iter().find(|e| e.name == *name),
-                    ) {
-                        merge_rename_edit(
-                            engine,
-                            &or_.src_base,
-                            dst_o,
-                            dst_t,
-                            eo,
-                            &or_.dst,
-                            changes,
-                            conflicts,
-                        )?;
-                        continue;
-                    }
+            && or_.src == tr.src
+            && let (Some(dst_o), Some(dst_t)) = (
+                o_tree.entries.iter().find(|e| e.name == *name),
+                t_tree.entries.iter().find(|e| e.name == *name),
+            )
+        {
+            merge_rename_edit(
+                engine,
+                &or_.src_base,
+                dst_o,
+                dst_t,
+                eo,
+                &or_.dst,
+                changes,
+                conflicts,
+            )?;
+            continue;
+        }
 
         // ---- a rename destination colliding with a path the other
         // side has or added (rename/rename 2-to-1, or rename onto an
         // occupied path): conflict at the destination.
         if let Some(or_) = ours_by_dst.get(name)
             && et.is_some()
-                && theirs_by_dst.get(name).map(|r| r.src.as_str()) != Some(or_.src.as_str())
-            {
-                conflicts.push(path.clone());
-                continue;
-            }
+            && theirs_by_dst.get(name).map(|r| r.src.as_str()) != Some(or_.src.as_str())
+        {
+            conflicts.push(path.clone());
+            continue;
+        }
         if let Some(tr) = theirs_by_dst.get(name)
             && eo.is_some()
-                && ours_by_dst.get(name).map(|r| r.src.as_str()) != Some(tr.src.as_str())
-            {
-                conflicts.push(path.clone());
-                continue;
-            }
+            && ours_by_dst.get(name).map(|r| r.src.as_str()) != Some(tr.src.as_str())
+        {
+            conflicts.push(path.clone());
+            continue;
+        }
 
         merge_entry(
             engine,
@@ -1358,7 +1435,7 @@ fn load_or_default(objects: &dyn ObjectStore, id: Option<Id>) -> Result<Tree, St
 }
 
 /// Bound on the recursive virtual-base fold's descent (criss-cross
-/// stacks of stacks). Beyond it the fold falls back to the first base
+/// stacks of stacks). Beyond it the fold REFUSES with a named error
 /// in the deterministic order — a documented limit, not a mis-merge.
 const MAX_RECURSIVE_BASE_DEPTH: usize = 16;
 
@@ -1459,11 +1536,12 @@ impl Engine {
     ) {
         for or_ in ours_renames {
             if let Some(tr) = theirs_renames.iter().find(|x| x.src == or_.src)
-                && or_.dst != tr.dst {
-                    conflicts.push(or_.src.clone());
-                    conflicts.push(or_.dst.clone());
-                    conflicts.push(tr.dst.clone());
-                }
+                && or_.dst != tr.dst
+            {
+                conflicts.push(or_.src.clone());
+                conflicts.push(or_.dst.clone());
+                conflicts.push(tr.dst.clone());
+            }
         }
     }
 
@@ -1648,21 +1726,31 @@ impl Engine {
     /// ancestry stays real. The first base's changeset anchors it.
     fn fold_virtual_base(&self, bases: &[Id], depth: usize) -> Result<Option<Id>, StoreError> {
         if depth > MAX_RECURSIVE_BASE_DEPTH {
-            // Bounded descent: fall back to the first base in the
-            // deterministic order (a documented limit; git has no
-            // such cap but pathological criss-cross stacks are not
-            // constructible through ordinary merges).
-            return self.derive_tree(bases[0]);
+            // Bounded descent, LOUD: a criss-cross stack deeper than
+            // the cap is not silently anchored to an arbitrary base —
+            // the merge refuses with a nameable error. (git has no
+            // such cap; pathological stacks this deep are not
+            // constructible through ordinary merges, and refusing is
+            // safe where a wrong base silently is not.)
+            return Err(StoreError::Invalid(format!(
+                "recursive merge base fold exceeded depth {}",
+                MAX_RECURSIVE_BASE_DEPTH
+            )));
         }
         let mut acc_tree = self.derive_tree(bases[0])?;
         let mut acc_cs = bases[0];
         for &b in &bases[1..] {
             let inner_bases = self.merge_bases_all(acc_cs, b)?;
-            let inner_base_cs = inner_bases.first().copied();
-            // The tree id of the inner base (None = empty tree).
-            let inner_base_tree = match inner_base_cs {
-                Some(x) => self.derive_tree(x)?,
-                None => None,
+            // The inner base: ONE maximal base is the ordinary
+            // anchor; SEVERAL fold RECURSIVELY (each level +1 depth)
+            // — discarding all but the first would mis-anchor the
+            // round exactly like the outer merge it defuses.
+            let inner_base_tree = if inner_bases.is_empty() {
+                None
+            } else if inner_bases.len() == 1 {
+                self.derive_tree(inner_bases[0])?
+            } else {
+                self.fold_virtual_base(&inner_bases, depth + 1)?
             };
             let b_tree = self.derive_tree(b)?;
             let acc_b = self.merge_tree_ids(inner_base_tree, acc_tree, b_tree)?;
@@ -1677,9 +1765,13 @@ impl Engine {
                     self.virtual_base_dropping(inner_base_tree, acc_tree, b_tree, &conflicts)?
                 }
             };
-            // Apply the fold's changes onto the accumulator tree.
+            // The fold round is a REAL (virtual) changeset: parents
+            // [acc_cs, b]. Storing it means the next round's
+            // `merge_bases_all(acc_cs, b')` sees the accumulated
+            // ancestry — the union of everything folded so far plus
+            // `b` — instead of one sibling's history.
             let folded = gardenbed_model::Changeset {
-                parents: vec![acc_cs],
+                parents: vec![acc_cs, b],
                 changes,
                 message: "virtual base fold".into(),
                 author: gardenbed_model::Identity {
@@ -1696,13 +1788,9 @@ impl Engine {
                 },
                 signature: None,
             };
+            let folded_cs = self.metadata.put_changeset(&folded)?;
             acc_tree = self.apply_changeset_to_tree(acc_tree, &folded)?;
-            // The accumulator's tree is now the merged fold; the
-            // changeset anchor stays the LAST merged base for the
-            // next round's ancestry (the fold's result is
-            // tree-identical to that merge, and its ancestry is a
-            // superset through the merged pair).
-            acc_cs = b;
+            acc_cs = folded_cs;
         }
         Ok(acc_tree)
     }

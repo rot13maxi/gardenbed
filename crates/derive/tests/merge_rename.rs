@@ -38,7 +38,40 @@ fn ident(tag: &str) -> Identity {
 }
 
 /// A file's shape in a fixture snapshot: (content, mode).
-type File = (&'static str, Mode);
+type File = (String, Mode);
+
+/// `files` with borrowed `&'static str` literals (the static matrix).
+fn sfiles(list: &[(&'static str, &'static str)]) -> BTreeMap<&'static str, File> {
+    list.iter()
+        .map(|(p, c)| (*p, ((*c).to_owned(), Mode::Regular)))
+        .collect()
+}
+
+/// Binary fixtures as String content: the fixture's bytes are valid
+/// UTF-8 by construction (0x01..=0x7F plus NUL), so the round-trip is
+/// byte-exact while still exercising NUL and control bytes.
+fn binary_bytes_string(v: Vec<u8>) -> String {
+    String::from_utf8(v).expect("fixture bytes are valid UTF-8")
+}
+
+/// `files` with raw byte content (binary fixtures).
+fn bfiles(list: &[(&'static str, Vec<u8>)]) -> BTreeMap<&'static str, File> {
+    list.iter()
+        .map(|(p, c)| (*p, (binary_bytes_string(c.clone()), Mode::Regular)))
+        .collect()
+}
+
+/// Static (path, literal) expectations → owned (path, String) pairs.
+fn owned_expect(list: Vec<(&'static str, &'static str)>) -> Vec<(&'static str, String)> {
+    list.into_iter().map(|(p, c)| (p, c.to_owned())).collect()
+}
+
+/// `files` with owned String content (dynamic fixtures).
+fn ofiles(list: &[(&'static str, String)]) -> BTreeMap<&'static str, File> {
+    list.iter()
+        .map(|(p, c)| (*p, ((*c).clone(), Mode::Regular)))
+        .collect()
+}
 
 /// Builds a linear chain of snapshots into fresh stores. Each element
 /// is one changeset's full post-state; deletions are implicit (a path
@@ -102,12 +135,6 @@ fn fixture(snapshots: &[BTreeMap<&'static str, File>]) -> (Engine, Vec<Id>) {
     (engine, ids)
 }
 
-fn files(list: &[(&'static str, &'static str)]) -> BTreeMap<&'static str, File> {
-    list.iter()
-        .map(|(p, c)| (*p, (*c, Mode::Regular)))
-        .collect()
-}
-
 fn flat_files(engine: &Engine, cs: Id) -> BTreeMap<String, (Mode, Id)> {
     engine
         .flatten_tree(engine.derive_tree(cs).unwrap())
@@ -124,6 +151,110 @@ fn merged_paths(
     theirs: Id,
 ) -> Result<Vec<Change>, Vec<String>> {
     engine.merge_tree_changes(Some(base), ours, theirs).unwrap()
+}
+
+/// Deterministic pseudorandom bytes (xorshift64*) for score fixtures:
+/// the same SHAPE as the coordinator's merge-score-oracle2 (3 short
+/// shared lines + one 1000-char random line), with exact bytes fixed
+/// by this seed so the matrix is reproducible.
+fn xorshift_bytes(seed: u64, len: usize) -> String {
+    let mut x = seed | 1;
+    let mut out = String::with_capacity(len);
+    for _ in 0..len {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        // Printable, git-stable bytes (no NUL, no newline).
+        out.push((b'a' + (x % 26) as u8) as char);
+    }
+    out
+}
+
+fn score_fixture_a() -> String {
+    format!("one\ntwo\nthree\n{}\n", xorshift_bytes(0x5EED_0001, 1000))
+}
+
+fn score_fixture_b() -> String {
+    format!("one\ntwo\nthree\n{}\n", xorshift_bytes(0x5EED_0002, 1000))
+}
+
+fn score_fixture_a_edited() -> String {
+    format!("ONE\ntwo\nthree\n{}\n", xorshift_bytes(0x5EED_0001, 1000))
+}
+
+/// B: a REAL rename of A with the long line edited in the middle —
+/// the head of the long line stays byte-identical, so the
+/// byte-weighted spans still pair (git's estimate: mostly copied
+/// bytes).
+fn score_fixture_b_partial_edit() -> String {
+    let long = xorshift_bytes(0x5EED_0001, 1000);
+    let edited = format!("{}{}", &long[..450], &xorshift_bytes(0x5EED_0003, 100));
+    format!("one\ntwo\nthree\n{edited}\n")
+}
+
+/// Binary fixture with NUL bytes: bytes 0..255 repeating with a NUL
+/// every 7th slot (the base), XORed per the side's edit.
+fn binary_base() -> Vec<u8> {
+    // Byte values chosen to be VALID UTF-8 (0x01..=0x7F; NUL included)
+    // so the String round-trip is byte-exact while still exercising
+    // NUL and control bytes through the span chunker.
+    let mut v: Vec<u8> = Vec::new();
+    for i in 0..200u32 {
+        v.push((i % 127 + 1) as u8);
+        if i % 7 == 3 {
+            v.push(0);
+        }
+    }
+    v
+}
+
+fn binary_fixture_ours() -> Vec<u8> {
+    let mut v = binary_base();
+    // Range-preserving edits (byte stays 0x01..=0x7F): the fixture's
+    // String round-trip must stay byte-exact.
+    v[100] = b'Z';
+    v[150] = b'Y';
+    v
+}
+
+fn binary_fixture_theirs() -> Vec<u8> {
+    let mut v = binary_base();
+    v[5] = b'X';
+    v
+}
+
+/// ~40 KiB of mostly-divergent pseudorandom bytes sharing 100 tiny
+/// lines ("s<N>\n"): byte weighting keeps the common mass (~500
+/// bytes of ~40k, ~1%) far below the rename threshold even though
+/// the LINE count overlap is high.
+fn huge_fixture_base() -> String {
+    let mut s = String::new();
+    for i in 0..100 {
+        s.push_str(&format!("s{i}\n"));
+    }
+    s.push_str(&xorshift_bytes(0xB16B_0001, 40_000));
+    s.push('\n');
+    s
+}
+
+fn huge_fixture_other() -> String {
+    let mut s = String::new();
+    for i in 0..100 {
+        s.push_str(&format!("s{i}\n"));
+    }
+    s.push_str(&xorshift_bytes(0xB16B_0002, 40_000));
+    s.push('\n');
+    s
+}
+
+fn huge_fixture_edited() -> String {
+    let mut s = String::new();
+    for i in 0..100 {
+        s.push_str(&format!("s{i}\n"));
+    }
+    s.push_str(&xorshift_bytes(0xB16B_0001, 40_000));
+    s.push_str("\nEDITED\n");
+    s
 }
 
 // ------------------------------------------------------ git oracle side
@@ -249,7 +380,7 @@ struct Case {
     theirs: usize,
     /// Ok = clean merge with exactly these (path, content) pairs;
     /// Err = conflict naming these paths.
-    expect: Result<Vec<(&'static str, &'static str)>, Vec<&'static str>>,
+    expect: Result<Vec<(&'static str, String)>, Vec<&'static str>>,
 }
 
 fn run_case(case: &Case) {
@@ -348,14 +479,14 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-one-side",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\n")]),
-                files(&[("one.txt", "one\ntwo\nthree\n")]),
-                files(&[("f.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("one.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("one.txt", "one\ntwo\nthree\n")]),
+            expect: Ok(owned_expect(vec![("one.txt", "one\ntwo\nthree\n")])),
         },
         // ---- clean: rename on one side, EDIT at the source on the
         // other — the edit must land at the destination (scored
@@ -363,49 +494,58 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-vs-edit",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
-                files(&[("one.txt", "one\ntwo\nthree\nfour\nfive\n")]),
-                files(&[("f.txt", "one\ntwo\nEDIT\nfour\nfive\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                sfiles(&[("one.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nEDIT\nfour\nfive\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("one.txt", "one\ntwo\nEDIT\nfour\nfive\n")]),
+            expect: Ok(owned_expect(vec![(
+                "one.txt",
+                "one\ntwo\nEDIT\nfour\nfive\n",
+            )])),
         },
         // ---- clean: rename+edit on one side, untouched on the other.
         Case {
             name: "rename-plus-edit-vs-untouched",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
-                files(&[("one.txt", "one\ntwo\nthree\nfour\nEDIT\n")]),
-                files(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                sfiles(&[("one.txt", "one\ntwo\nthree\nfour\nEDIT\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("one.txt", "one\ntwo\nthree\nfour\nEDIT\n")]),
+            expect: Ok(owned_expect(vec![(
+                "one.txt",
+                "one\ntwo\nthree\nfour\nEDIT\n",
+            )])),
         },
         // ---- clean: both sides rename the same source to the SAME
         // destination with different edits — contents merge.
         Case {
             name: "rename-rename-same-dst",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\n")]),
-                files(&[("same.txt", "OURS\none\ntwo\nthree\n")]),
-                files(&[("same.txt", "one\ntwo\nthree\nTHEIRS\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("same.txt", "OURS\none\ntwo\nthree\n")]),
+                sfiles(&[("same.txt", "one\ntwo\nthree\nTHEIRS\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("same.txt", "OURS\none\ntwo\nthree\nTHEIRS\n")]),
+            expect: Ok(owned_expect(vec![(
+                "same.txt",
+                "OURS\none\ntwo\nthree\nTHEIRS\n",
+            )])),
         },
         // ---- conflict: rename/rename 1-to-2 (different dsts).
         Case {
             name: "rename-rename-1to2",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\n")]),
-                files(&[("one.txt", "one\ntwo\nthree\n")]),
-                files(&[("two.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("one.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("two.txt", "one\ntwo\nthree\n")]),
             ],
             base: 0,
             ours: 1,
@@ -416,9 +556,9 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-delete",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\n")]),
-                files(&[("one.txt", "one\ntwo\nthree\n")]),
-                files(&[]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[("one.txt", "one\ntwo\nthree\n")]),
+                sfiles(&[]),
             ],
             base: 0,
             ours: 1,
@@ -430,9 +570,9 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-rename-2to1",
             snapshots: vec![
-                files(&[("a.txt", "alpha\n"), ("b.txt", "beta\n")]),
-                files(&[("same.txt", "alpha\n"), ("b.txt", "beta\n")]),
-                files(&[("a.txt", "alpha\n"), ("same.txt", "beta\n")]),
+                sfiles(&[("a.txt", "alpha\n"), ("b.txt", "beta\n")]),
+                sfiles(&[("same.txt", "alpha\n"), ("b.txt", "beta\n")]),
+                sfiles(&[("a.txt", "alpha\n"), ("same.txt", "beta\n")]),
             ],
             base: 0,
             ours: 1,
@@ -443,14 +583,14 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-with-mode-flip",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\n")]),
-                BTreeMap::from([("one.txt", ("one\ntwo\n", Mode::Exec))]),
-                files(&[("f.txt", "one\ntwo\n")]),
+                sfiles(&[("f.txt", "one\ntwo\n")]),
+                BTreeMap::from([("one.txt", ("one\ntwo\n".to_owned(), Mode::Exec))]),
+                sfiles(&[("f.txt", "one\ntwo\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("one.txt", "one\ntwo\n")]),
+            expect: Ok(owned_expect(vec![("one.txt", "one\ntwo\n")])),
         },
         // ---- clean: CROSS-DIRECTORY rename on one side, edit at the
         // source on the other — the edit must land at the destination
@@ -459,17 +599,17 @@ fn rename_matrix_matches_git() {
         Case {
             name: "cross-dir-rename-vs-edit",
             snapshots: vec![
-                files(&[
+                sfiles(&[
                     ("dirA/f", "line one\nline two\nline three\nline four\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
                 ]),
-                files(&[
+                sfiles(&[
                     ("dirB/g", "line one\nline two\nline three\nline four\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
                 ]),
-                files(&[
+                sfiles(&[
                     ("dirA/f", "line one\nline two\nEDIT BY THEIRS\nline four\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
@@ -478,10 +618,10 @@ fn rename_matrix_matches_git() {
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![(
+            expect: Ok(owned_expect(vec![(
                 "dirB/g",
                 "line one\nline two\nEDIT BY THEIRS\nline four\n",
-            )]),
+            )])),
         },
         // ---- conflict: CROSS-DIRECTORY rename/delete (ours moves
         // dirA/f to dirB/g, theirs deletes dirA/f). Git refuses with
@@ -489,17 +629,17 @@ fn rename_matrix_matches_git() {
         Case {
             name: "cross-dir-rename-delete",
             snapshots: vec![
-                files(&[
+                sfiles(&[
                     ("dirA/f", "line one\nline two\nline three\nline four\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
                 ]),
-                files(&[
+                sfiles(&[
                     ("dirB/g", "line one\nline two\nline three\nline four\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
                 ]),
-                files(&[("dirA/keep", "anchorA\n"), ("dirB/keep", "anchorB\n")]),
+                sfiles(&[("dirA/keep", "anchorA\n"), ("dirB/keep", "anchorB\n")]),
             ],
             base: 0,
             ours: 1,
@@ -512,14 +652,17 @@ fn rename_matrix_matches_git() {
         Case {
             name: "edit-vs-rename-reversed",
             snapshots: vec![
-                files(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
-                files(&[("f.txt", "one\ntwo\nEDIT BY OURS\nfour\nfive\n")]),
-                files(&[("one.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nthree\nfour\nfive\n")]),
+                sfiles(&[("f.txt", "one\ntwo\nEDIT BY OURS\nfour\nfive\n")]),
+                sfiles(&[("one.txt", "one\ntwo\nthree\nfour\nfive\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("one.txt", "one\ntwo\nEDIT BY OURS\nfour\nfive\n")]),
+            expect: Ok(owned_expect(vec![(
+                "one.txt",
+                "one\ntwo\nEDIT BY OURS\nfour\nfive\n",
+            )])),
         },
         // ---- clean: a file renamed INTO a directory with its own
         // name (A → A/sub) while the other side EDITS the file A.
@@ -531,14 +674,17 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-into-own-dir-vs-edit",
             snapshots: vec![
-                files(&[("A", "line one\nline two\nline three\n")]),
-                files(&[("A/sub", "line one\nline two\nline three\n")]),
-                files(&[("A", "line one\nEDITED\nline three\n")]),
+                sfiles(&[("A", "line one\nline two\nline three\n")]),
+                sfiles(&[("A/sub", "line one\nline two\nline three\n")]),
+                sfiles(&[("A", "line one\nEDITED\nline three\n")]),
             ],
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![("A/sub", "line one\nEDITED\nline three\n")]),
+            expect: Ok(owned_expect(vec![(
+                "A/sub",
+                "line one\nEDITED\nline three\n",
+            )])),
         },
         // ---- clean: BOTH sides rename A → A/sub (same destination)
         // and each adds a DISTINCT file under the new A directory.
@@ -549,12 +695,12 @@ fn rename_matrix_matches_git() {
         Case {
             name: "rename-into-own-dir-both-sides-with-extras",
             snapshots: vec![
-                files(&[("A", "line one\nline two\nline three\n")]),
-                files(&[
+                sfiles(&[("A", "line one\nline two\nline three\n")]),
+                sfiles(&[
                     ("A/sub", "line one\nline two\nline three\n"),
                     ("A/oursExtra", "ours\n"),
                 ]),
-                files(&[
+                sfiles(&[
                     ("A/sub", "line one\nline two\nline three\n"),
                     ("A/theirsExtra", "theirs\n"),
                 ]),
@@ -562,11 +708,11 @@ fn rename_matrix_matches_git() {
             base: 0,
             ours: 1,
             theirs: 2,
-            expect: Ok(vec![
+            expect: Ok(owned_expect(vec![
                 ("A/sub", "line one\nline two\nline three\n"),
                 ("A/oursExtra", "ours\n"),
                 ("A/theirsExtra", "theirs\n"),
-            ]),
+            ])),
         },
         // ---- conflict: CROSS-DIRECTORY rename/rename 1-to-2 (both
         // sides move dirA/f to different directories). Git refuses
@@ -574,19 +720,19 @@ fn rename_matrix_matches_git() {
         Case {
             name: "cross-dir-rename-rename-1to2",
             snapshots: vec![
-                files(&[
+                sfiles(&[
                     ("dirA/f", "line one\nline two\nline three\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
                     ("dirC/keep", "anchorC\n"),
                 ]),
-                files(&[
+                sfiles(&[
                     ("dirB/g", "line one\nline two\nline three\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
                     ("dirC/keep", "anchorC\n"),
                 ]),
-                files(&[
+                sfiles(&[
                     ("dirC/h", "line one\nline two\nline three\n"),
                     ("dirA/keep", "anchorA\n"),
                     ("dirB/keep", "anchorB\n"),
@@ -597,6 +743,137 @@ fn rename_matrix_matches_git() {
             ours: 1,
             theirs: 2,
             expect: Err(vec!["dirA/f", "dirB/g", "dirC/h"]),
+        },
+        // ---- conflict: NO rename — shared short lines with a huge
+        // DIVERGENT random line each (the coordinator's
+        // merge-score-oracle2 shape). Git's byte-weighted estimator
+        // sees ~no common BYTES (3 short lines of 1010); the old
+        // line-count estimator scored 75 and silently paired A→B,
+        // relocating theirs' edit of A into B and DROPPING A. Git:
+        // CONFLICT (modify/delete) on A.
+        Case {
+            name: "scored-no-pair-random-long-line",
+            snapshots: vec![
+                ofiles(&[("A", score_fixture_a())]),
+                ofiles(&[("B", score_fixture_b())]),
+                ofiles(&[("A", score_fixture_a_edited())]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Err(vec!["A"]),
+        },
+        // ---- conflict: same shape REVERSED (theirs adds B, ours
+        // edits A) — symmetry: no pair, modify/delete on A.
+        Case {
+            name: "scored-no-pair-random-long-line-reversed",
+            snapshots: vec![
+                ofiles(&[("A", score_fixture_a())]),
+                ofiles(&[("A", score_fixture_a_edited())]),
+                ofiles(&[("B", score_fixture_b())]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Err(vec!["A"]),
+        },
+        // ---- clean: a real rename whose LONG line was edited in the
+        // middle (byte-weighted spans still pair: the first 64-byte
+        // chunk and the short lines dominate the byte mass). Git
+        // merges clean, edit rides the rename.
+        Case {
+            name: "scored-pair-edited-long-line",
+            snapshots: vec![
+                ofiles(&[("A", score_fixture_a())]),
+                ofiles(&[("B", score_fixture_b_partial_edit())]),
+                ofiles(&[("A", score_fixture_a())]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(vec![("B", score_fixture_b_partial_edit())]),
+        },
+        // ---- conflict: BINARY content with NUL bytes — the rename
+        // IS detected (span chunking is byte-based; NULs are ordinary
+        // bytes) but git refuses to CONTENT-merge binary files
+        // ("Cannot merge binary files"), so both git and gardenbed
+        // conflict at the destination. The rename detection itself is
+        // proven by the conflict being at moved.dat (not a
+        // modify/delete on bin.dat).
+        Case {
+            name: "binary-nul-rename-vs-edit",
+            snapshots: vec![
+                bfiles(&[("bin.dat", binary_base())]),
+                bfiles(&[("moved.dat", binary_fixture_ours())]),
+                bfiles(&[("bin.dat", binary_fixture_theirs())]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Err(vec!["moved.dat"]),
+        },
+        // ---- clean: exact-duplicate blobs at two sources, one moved
+        // — pass 1 pairs deterministically (lexicographically first
+        // dst with identical blob), the other stays put.
+        Case {
+            name: "duplicate-blobs-one-moves",
+            snapshots: vec![
+                sfiles(&[("a.txt", "dup\ncontent\n"), ("b.txt", "dup\ncontent\n")]),
+                sfiles(&[("moved.txt", "dup\ncontent\n"), ("b.txt", "dup\ncontent\n")]),
+                sfiles(&[("a.txt", "dup\ncontent\n"), ("b.txt", "dup\ncontent\n")]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(owned_expect(vec![
+                ("moved.txt", "dup\ncontent\n"),
+                ("b.txt", "dup\ncontent\n"),
+            ])),
+        },
+        // ---- clean: two deletes + two adds with EQUAL scores (ties)
+        // — the deterministic (dst, src) byte-order tie-break picks
+        // the same pairing git's rename detection does (both sides
+        // move both files; contents merge identically either way).
+        Case {
+            name: "scored-tie-two-pairs",
+            snapshots: vec![
+                sfiles(&[
+                    ("f1.txt", "shared one\nshared two\nshared three\n"),
+                    ("f2.txt", "shared one\nshared two\nshared three\n"),
+                ]),
+                sfiles(&[
+                    ("g1.txt", "shared one\nshared two\nshared three\n"),
+                    ("g2.txt", "shared one\nshared two\nshared three\n"),
+                ]),
+                sfiles(&[
+                    ("f1.txt", "shared one\nshared two\nshared three\n"),
+                    ("f2.txt", "shared one\nshared two\nshared three\n"),
+                ]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Ok(owned_expect(vec![
+                ("g1.txt", "shared one\nshared two\nshared three\n"),
+                ("g2.txt", "shared one\nshared two\nshared three\n"),
+            ])),
+        },
+        // ---- conflict: NO rename despite MANY tiny common lines —
+        // byte weighting must not let 100 short shared lines outvote
+        // two giant divergent blobs (false-positive guard for the
+        // new estimator, the inverse of the oracle above). Git: no
+        // pairing, modify/delete on big.bin.
+        Case {
+            name: "huge-blobs-short-common-lines-no-pair",
+            snapshots: vec![
+                ofiles(&[("big.bin", huge_fixture_base())]),
+                ofiles(&[("other.bin", huge_fixture_other())]),
+                ofiles(&[("big.bin", huge_fixture_edited())]),
+            ],
+            base: 0,
+            ours: 1,
+            theirs: 2,
+            expect: Err(vec!["big.bin"]),
         },
     ];
     for case in &cases {

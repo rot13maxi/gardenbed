@@ -33,10 +33,17 @@ which tree-walk level each endpoint surfaces at.
 - **Pass 1, exact renames:** destination blob id equals the source's.
   Each source pairs with the lexicographically first exact
   destination; ties pick the first source in path order.
-- **Pass 2, scored renames:** leftovers scored by line similarity
-  (`similarity_score`, git's `estimate_similarity` shape: common
-  lines over max line count); greedy best-first pairing; a pair must
-  clear `MIN_RENAME_SCORE = 50` (git's `-M50%`).
+- **Pass 2, scored renames:** leftovers scored by BYTE-weighted span
+  similarity (`SpanProfile`, git's `diffcore_rename` shape): content
+  is chunked at newline boundaries to spans of at most 64 bytes,
+  hashed (FNV-1a), and matched as a byte-weighted MULTISET — the
+  score is matched-chunk bytes over the larger side's total bytes.
+  Common BYTES, not common line counts: three shared short lines
+  cannot outvote two divergent megabyte lines. Greedy best-first
+  pairing; a pair must clear `MIN_RENAME_SCORE = 50` (git's
+  `-M50%`). Candidate span data is memoized per blob id per detection
+  pass — the quadratic pairing loop never re-fetches or re-hashes a
+  blob.
 - **Bounds:** `MAX_RENAME_CANDIDATES = 1000` per side over the whole
   tree (git's `diff.renameLimit` default). Beyond it, candidates stay
   unpaired and the merge degrades to rename-blind for them — the same
@@ -105,13 +112,19 @@ semantics), and:
   `merge_tree_changes` (the v0.2 contract preserved).
 - **≥2 bases:** `fold_virtual_base` folds them left-to-right —
   `acc = merge(acc, bases[i])` over `merge_bases_all(acc, bases[i])`
-  — into a **virtual base tree** that is derived, never stored. A
+  — into a **virtual base tree**. Each round's fold IS stored as a
+  virtual changeset with parents `[prev_acc, bases[i]]`, so the next
+  round's `merge_bases_all` sees the ACCUMULATED ancestry (the union
+  of everything folded so far), not one sibling's history. When a
+  round's own inner bases are multiple, the inner anchor is itself a
+  RECURSIVE fold (depth +1) — all inner maximal bases participate. A
   conflicting inner fold DROPS the conflicting paths from the virtual
   base (`virtual_base_dropping`): the outer merge then sees those
   paths as base-absent, surfacing the real disagreement instead of
   hiding it behind an arbitrary pick. `MAX_RECURSIVE_BASE_DEPTH = 16`
-  bounds stacked criss-crosses; beyond it the fold falls back to the
-  first base in the deterministic order (documented limit).
+  bounds stacked criss-crosses; beyond it the merge REFUSES with a
+  named error — never a silent anchor to an arbitrary base
+  (documented limit).
 
 `Repo::merge` uses the recursive path; `Engine::merge_tree_changes`
 (single explicit base) remains for callers that want exactly that.
@@ -172,7 +185,7 @@ git repositories (`git merge-tree --write-tree`, `git merge-base`)
 and compares classification (clean/conflict, conflict paths) plus
 every clean path's merged content and the full merged path set.
 
-- `crates/derive/tests/merge_rename.rs` — 14-case matrix: the eight
+- `crates/derive/tests/merge_rename.rs` — 21-case matrix: the eight
   same-directory shapes, cross-directory rename-vs-edit (clean, edit
   lands at `dirB/g`, source gone), cross-directory rename/delete
   (refused, both endpoints), cross-directory rename/rename 1-to-2
@@ -182,12 +195,26 @@ every clean path's merged content and the full merged path set.
   (clean; the edit lands at `A/sub` and nothing else survives), and
   both sides renaming `A` → `A/sub` with distinct extras under `A/`
   (clean; all three files survive). Both oracle cases run the same
-  fixture content through real git inside the test.
-- `crates/derive/tests/merge_recursive.rs` — 5 tests: `merge_bases_all`
+  fixture content through real git inside the test. Seven
+  byte-span-estimator cases: the random-long-line no-pair shape (both
+  directions — git's modify/delete conflict, not a false rename), a
+  REAL rename of a mostly-copied long line, binary-with-NUL rename
+  (detection proven by the conflict landing at the destination — git
+  refuses binary content merges), exact-duplicate blobs with one
+  mover, an equal-score two-pair tie, and a huge-blobs /
+  short-common-lines false-positive guard.
+- `crates/derive/tests/merge_recursive.rs` — 7 tests: `merge_bases_all`
   parity with `git merge-base --all` on criss-crosses; clean-fold
   content equality with git; classification parity (single-base
   tie-break conflicts where git+recursive merges cleanly); unique-base
-  byte-identity with the single-base path; determinism across runs.
+  byte-identity with the single-base path; determinism across runs;
+  and TWO three-maximal-base regressions (disjoint tips' edits and a
+  shared edit) over the git-verified shape
+  `base→{x,y,z} siblings, p1=(x,y), p2=(y,x), ours=(p1,z)+edit,
+  theirs=(p2,z)+edit` — asserting `git merge-base --all` sees exactly
+  three maximal bases and the fold reproduces git's clean merge
+  content (the accumulated-ancestry contract: the fold's virtual
+  changesets carry the union ancestry).
 - `crates/derive/tests/merge_base_maximal.rs` — 5 tests: same-second
   criss-cross (both direct APIs pick a maximal base; `merge_bases_all`
   equals the maximal pair; merging over the dominated pick conflicts
@@ -207,7 +234,8 @@ every clean path's merged content and the full merged path set.
 |---|---|---|---|
 | `MIN_RENAME_SCORE` | 50 | `-M50%` | pair stays delete+add |
 | `MAX_RENAME_CANDIDATES` | 1000/side/tree | `diff.renameLimit` | rename-blind for the surplus |
-| `MAX_RECURSIVE_BASE_DEPTH` | 16 | (none) | fold falls back to first base |
+| `MAX_RECURSIVE_BASE_DEPTH` | 16 | (none) | merge refuses loudly (named error) |
+| `SPAN_CHUNK_MAX` | 64 bytes | span-hash size | chunks beyond 64B split |
 
 Octopus refusal is refusal: there is no "last round is softer"
 behavior (git's exit-2 vs exit-1 distinction is a script protocol
