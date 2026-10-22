@@ -40,7 +40,7 @@ from the pinned real-kernel gate.
 - **Scratch clone required** for every run:
 
   ```bash
-  git clone --no-hardlinks /home/user/.corpora/linux.git \
+  git clone --bare --no-hardlinks /home/user/.corpora/linux.git \
       /tmp/gardenbed-todo/m18-scratch/linux.git   # fresh each campaign
   ```
 
@@ -50,7 +50,7 @@ from the pinned real-kernel gate.
 
 ## Runs (release builds, cargo-gate, no concurrent cargo)
 
-1. **A (control)**: bed-main binary (no raw-tree capture), release,
+1. **A (control)**: the pinned pre-feature binary (no raw-tree capture), release,
    import the 1,000-commit segment into a fresh store.
 2. **B (treatment)**: this lane's binary (raw-tree capture), release,
    same segment, fresh store.
@@ -58,8 +58,9 @@ from the pinned real-kernel gate.
    fairness). Record wall-clock and `raw_trees_captured` per run.
 4. Repeat the pair for the 5,000-commit segment (one pair is enough if
    the 1,000-commit pair is stable).
-5. Resource envelope for the 5,000-commit run (from M18.5): ~5–6 GB RSS,
-   ~40 GB disk — verify the scratch volume has headroom.
+5. The final 2026-10-22 runs peaked at about 2.44 GiB RSS. Reserve scratch
+   space for the bare mirror and all retained fresh stores; the original
+   procedure reserved about 40 GB. Keep an explicit memory bound.
 
 ## Quiet-box criteria (all must hold at run time)
 

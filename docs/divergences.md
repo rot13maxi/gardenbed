@@ -17,7 +17,7 @@ exports back with byte-identical commit SHAs (verified in
 **Retired by raw-commit capture (v0.2 D21).** The importer byte-compares
 each commit's original object bytes with what the model can reconstruct;
 a signature makes them differ, so the original bytes are captured verbatim
-in a sparse side table (`git_raw_commit`, keyed by changeset id) inside
+in a sparse side table (`git_raw_commit`, keyed by original Git SHA) inside
 the ingest transaction, and the export emits them as-is. The SHA is the
 original by definition — no re-signing, no id forking.
 
@@ -30,33 +30,31 @@ returns the original object bytes.
 **Residual:** v0.1 stores carry no raw rows; exporting their signed
 changesets REFUSES loudly (the SHA assertion fires before anything
 ships — `signed_dropped` is 0 on every successful export). Re-importing
-the git history into a fresh store retires the divergence with stable
-changeset ids (canonical bytes are unchanged).
+the Git history into a fresh store supplies the missing raw bytes. Existing
+ids and mappings are never rewritten; the historical owner-exec-bit
+normalization exception is documented in §4.
 
-## 2. Non-UTF-8 commit bytes are transcoded lossily (narrowed to paths in v0.2)
+## 2. Non-UTF-8 bytes — original Git bytes preserved, native paths remain lossy
 
-**What remains:** gardenbed stores `String`s; **path names** that are not
-valid UTF-8 are decoded with `String::from_utf8_lossy` at import (each
-invalid byte becomes U+FFFD). This is tree-level divergence: the derived
-tree differs from git's raw tree, so such commits cannot round-trip, and
-the export now **refuses loudly** (`ExportError::Changeset`: the raw
-commit bytes do not reference the derived tree) rather than emitting a
-transcoded commit with a silently different SHA.
+Raw-commit capture preserves non-UTF-8 identity and message bytes. Sparse
+raw-tree capture also preserves original path-name bytes and their complete
+tree closure, so newly imported history exports with the original Git SHAs.
+See `non_utf8_author_roundtrips_exactly` in `crates/git/tests/export.rs` and
+`nested_non_utf8_dir_with_divergent_grandchild_roundtrips` in `edgecases.rs`.
 
-**What was fixed (v0.2 D21):** non-UTF-8 **identity** bytes (author/
-committer names, emails) and **messages**. The import capture predicate
-byte-compares the reconstruction with the original object; any lossy
-decode makes them differ, so the original bytes are captured and the
-export emits them verbatim — SHA-exact.
+**Remaining model boundary:** native path operations use `String` and decode
+invalid UTF-8 as U+FFFD. Verbatim Git export does not make those original
+byte names separately addressable in native commands, nor disambiguate two
+names with the same lossy spelling. Raw objects preserve imported identity;
+native edits are modeled through the decoded paths. Stores imported before
+raw-tree capture need a fresh re-import to gain the missing original tree
+bytes; an export with insufficient raw data refuses loudly rather than
+silently substituting a different SHA.
 
-**Repro (fixed half):** `non_utf8_author_roundtrips_exactly` in
-`crates/git/tests/export.rs` — a latin-1 author name roundtrips SHA-exact.
-
-**Repro (remaining half):** import a repository containing a non-UTF-8
-path name and export it: the export fails with
-`the raw commit bytes do not reference the derived tree`. The
-**raw-tree capture** that would retire this half is gated on the kernel
-import throughput gate (§4 below).
+Raw-tree capture passed the matched throughput threshold on 2026-10-22;
+the [measurement report](raw-tree-measurement-2026-10-22.md) distinguishes
+that evidence from the historical resumed-import baseline and full-corpus
+roundtrip verification.
 
 ## 3. (Retired in v0.2) Extra commit headers are not modeled
 
@@ -127,8 +125,9 @@ exec bits were group/other — a mode git itself reports as `100644`.
 Affected stores are retired by **re-import**; existing mappings and
 canonical changeset ids are never rewritten in place (re-import
 recomputes them; changeset ids change only on commits whose trees carry
-such modes). The kernel corpus is unaffected (it carries `100664`, no
-exec bits at all).
+such modes). The generated mode fixtures cover this compatibility exception. The
+measured kernel segments contain no divergent raw trees; no exhaustive
+whole-corpus mode claim follows from that sample.
 
 **Why not fixed outright:** re-canonicalizing historical trees would
 rewrite git object identity (the raw tree SHAs are what corpus pins
@@ -143,8 +142,10 @@ in `crates/git/tests/edgecases.rs` — hand-crafted trees via
 fresh tree objects and refuses `100664` without the flag; objects that
 already contain the mode are accepted by plain `git fsck`, warning only).
 
-**Repro (export refusal):** import such a repository, export it — the
-export names the changeset whose raw tree diverges.
+**Repro (export fidelity):** the edge-case tests above import and export
+new histories with raw-tree capture and compare original Git SHAs. Legacy
+stores without sufficient raw bytes can still refuse export; re-import
+into a fresh store supplies those bytes without rewriting old mappings.
 
 ---
 
