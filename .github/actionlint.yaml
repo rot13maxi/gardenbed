@@ -1,0 +1,17 @@
+# actionlint config for this repository.
+#
+# The self-hosted nightly jobs (ci.yml `fuse-mount`, kernel-corpus.yml)
+# run on runners with CUSTOM labels beyond the standard set:
+#
+#   fuse           host with /dev/fuse + fusermount3 available
+#   kernel-corpus  host with the externally provisioned kernel corpus
+#                  (vars.KERNEL_GB_ROOT / vars.KERNEL_GIT_MIRROR)
+#
+# Attaching these labels to a self-hosted runner is the documented
+# opt-in for those gates (docs/ci-verification.md). Listing them here
+# teaches actionlint they are deliberate, so `actionlint` passes on a
+# checkout without a real runner behind the label.
+self-hosted-runner:
+  labels:
+    - fuse
+    - kernel-corpus

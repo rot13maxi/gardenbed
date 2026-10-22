@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS git_raw_commit (
     cs   BLOB PRIMARY KEY REFERENCES changesets(id),
     data BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS git_raw_tree (
+    git_sha BLOB PRIMARY KEY CHECK(length(git_sha) = 20),
+    data    BLOB NOT NULL,
+    model   BLOB CHECK(length(model) IN (0, 32))
+);
 ";
 
 /// zstd level for raw-commit frames — fixed for determinism (D21).
@@ -67,6 +72,40 @@ pub(crate) const ZSTD_LEVEL: i32 = 3;
 /// Sanity bound on a decompressed raw commit (64 MiB): far above any real
 /// commit object, small enough to refuse a corrupt frame's huge claim.
 pub(crate) const MAX_RAW_COMMIT: usize = 64 * 1024 * 1024;
+
+/// zstd level for raw-tree frames — same fixed-for-determinism convention
+/// as raw-commit rows (D21).
+pub(crate) const ZSTD_RAW_TREE_LEVEL: i32 = 3;
+
+/// Sanity bound on a decompressed raw tree (256 MiB): far above any real
+/// tree object (the linux kernel's largest trees are a few hundred KiB),
+/// small enough to refuse a corrupt frame's huge claim.
+pub(crate) const MAX_RAW_TREE: usize = 256 * 1024 * 1024;
+
+/// `SHA-1("tree <len>\0" + data)` — git's object name for a tree. Raw-tree
+/// rows are content-addressed by this value (the ORIGINAL git tree SHA is
+/// the row key), so the store itself recomputes and checks it.
+pub(crate) fn git_tree_sha1(data: &[u8]) -> [u8; 20] {
+    use sha1::Digest as _;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(b"tree ");
+    hasher.update(data.len().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Lowercase hex of a 20-byte SHA-1 — error-message formatting shared by
+/// the raw-tree paths.
+pub(crate) fn hex_sha(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 
 /// The SQLite (metadata) metadata store.
 ///
@@ -780,6 +819,112 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                     .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
             })
             .transpose()
+    }
+
+    fn raw_tree(&self, git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.read_conn()?;
+        let frame: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM git_raw_tree WHERE git_sha = ?1",
+                params![git_tree_sha.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        frame
+            .map(|f| {
+                zstd::bulk::decompress(&f, MAX_RAW_TREE)
+                    .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))
+            })
+            .transpose()
+    }
+
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        let conn = self.read_conn()?;
+        let model: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT model FROM git_raw_tree WHERE git_sha = ?1",
+                params![git_tree_sha.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        model
+            .map(|bytes| {
+                if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    id_from_blob(&bytes).map(Some)
+                }
+            })
+            .transpose()
+    }
+
+    fn put_raw_tree(
+        &self,
+        git_tree_sha: [u8; 20],
+        model_tree: Option<Id>,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        // Content-addressed by the key: the bytes must SHA-1 to it. This
+        // also makes a tampered row (wrong bytes under a captured key)
+        // impossible to write through the API — only a direct DB edit can
+        // produce one, and the export's per-tree SHA assertion catches it.
+        let actual = git_tree_sha1(bytes);
+        if actual != git_tree_sha {
+            return Err(StoreError::Invalid(format!(
+                "raw tree bytes SHA-1 to {}, not {}",
+                hex_sha(&actual),
+                hex_sha(&git_tree_sha)
+            )));
+        }
+        let frame = zstd::bulk::compress(bytes, ZSTD_RAW_TREE_LEVEL)
+            .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+        let model_payload: Vec<u8> = model_tree
+            .map(|id| id.as_bytes().to_vec())
+            .unwrap_or_default();
+        self.in_tx(|tx| {
+            // Compare decoded bytes, never frames: a level change must
+            // not fabricate a violation (same convention as raw commits).
+            let previous: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM git_raw_tree WHERE git_sha = ?1",
+                    params![git_tree_sha.as_slice()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            match previous {
+                Some(frame_prev) => {
+                    let prev_bytes = zstd::bulk::decompress(&frame_prev, MAX_RAW_TREE)
+                        .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+                    if prev_bytes.as_slice() == bytes {
+                        // Same content: idempotent no-op. The stored
+                        // (first-seen) model association stays untouched —
+                        // one git tree can normalize to different model
+                        // trees across import contexts (legacy-Exec
+                        // frontier vs fresh-Regular; see the trait doc),
+                        // and the export resolves the model tree from
+                        // changeset context, never from this column.
+                        Ok(())
+                    } else {
+                        Err(StoreError::Invalid(format!(
+                            "raw tree {} already captured with different bytes — \
+                             content-addressed rows are immutable",
+                            hex_sha(&git_tree_sha)
+                        )))
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO git_raw_tree(git_sha, data, model) VALUES(?1, ?2, ?3)",
+                        params![git_tree_sha.as_slice(), frame, model_payload],
+                    )
+                    .map_err(db_err)?;
+                    Ok(())
+                }
+            }
+        })
     }
 
     fn put_validated_changeset(

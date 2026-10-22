@@ -43,6 +43,14 @@ pub struct ImportReport {
     /// value existed — moving a ref that had no prior value is a fast
     /// forward by definition.
     pub refs_rewound: Vec<RefRewind>,
+    /// Raw tree rows captured this run: git tree objects whose canonical
+    /// render diverges from the original bytes (pre-canonical modes such
+    /// as `100664`, non-UTF-8 names), stored verbatim keyed by the
+    /// original git tree SHA so export can emit them SHA-exact. Shared
+    /// subtrees are decided once per run, so this counts distinct rows,
+    /// and idempotent re-imports report zero (the walk's memo plus the
+    /// store's immutability check).
+    pub raw_trees_captured: u64,
     /// Wall-clock duration of the whole import (graph walk + ingestion).
     pub elapsed: Duration,
 }
@@ -86,6 +94,9 @@ impl std::fmt::Display for ImportReport {
             self.elapsed.as_secs_f64(),
             self.commits_per_second(),
         )?;
+        if self.raw_trees_captured > 0 {
+            write!(f, ", {} raw tree(s) captured", self.raw_trees_captured)?;
+        }
         if !self.refs_rewound.is_empty() {
             write!(f, ", {} ref(s) rewound", self.refs_rewound.len())?;
         }

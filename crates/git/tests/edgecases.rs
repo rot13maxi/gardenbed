@@ -873,4 +873,1171 @@ fn pre_canonical_100664_mode_fixups_import_via_raw_fallback() {
     assert_eq!(second.commits_skipped, 1, "the walk prunes at the tip");
     assert_eq!(second.objects_written, 0, "a re-import writes zero objects");
     assert!(second.refs_updated.is_empty(), "refs must not move");
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("raw-mode-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("raw non-canonical tree modes must export SHA-exact");
+    for sha in [&c1, &c2, &c3, &c4] {
+        assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha));
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported raw-mode history is valid");
+}
+
+/// Non-UTF-8 path bytes (latin-1 `café` with `\xe9`): the model keeps a
+/// lossy name (`caf\u{FFFD}`) for querying, the raw tree preserves the
+/// original bytes, and the export must reproduce the original SHA —
+/// byte-exact history without silent name mangling.
+#[test]
+fn non_utf8_path_bytes_capture_and_roundtrip() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"latin-1 named\n");
+    // A tree entry name with the raw byte \xe9 (not valid UTF-8).
+    let name: &[u8] = b"caf\xe9.txt";
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"100644 ");
+    bytes.extend_from_slice(name);
+    bytes.push(0);
+    bytes.extend_from_slice(&hex_bytes(&blob));
+    let tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &bytes,
+    );
+    let c1 = b.commit_tree(&tree, &[], "latin-1 filename\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the raw-name tree");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("non-UTF-8 names import via raw-tree capture")
+    };
+    assert_eq!(report.commits_new, 1);
+    assert!(
+        report.raw_trees_captured >= 1,
+        "the non-UTF-8 tree is captured: {}",
+        report.raw_trees_captured
+    );
+
+    // The model path is the lossy decode (queryable), never the raw bytes.
+    let (objects, metadata, engine) = open_stores(&garden);
+    let root = engine
+        .derive_tree(metadata.cs_for_git(&c1).unwrap().unwrap())
+        .expect("derive")
+        .expect("root");
+    let flat = engine.flatten_tree(Some(root)).expect("flatten");
+    assert_eq!(flat.len(), 1);
+    assert_eq!(
+        flat[0].0, "caf\u{FFFD}.txt",
+        "the model holds the lossy name for queries"
+    );
+
+    // Export: SHA-exact, because the raw tree row carries the bytes.
+    let exported = b._dir.path().join("non-utf8-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("non-UTF-8 history exports SHA-exact");
+    assert!(
+        roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1),
+        "the commit SHA roundtrips"
+    );
+    assert!(
+        roundtrip.raw_trees_emitted >= 1,
+        "the raw tree is emitted verbatim: {}",
+        roundtrip.raw_trees_emitted
+    );
+    gardenbed_harness::git_fsck(&exported).expect("exported raw-name history is valid");
+}
+
+/// Two sibling names whose lossy UTF-8 decodings collide (`a\xff` and
+/// `a\xfe` both become `a\u{FFFD}`) cannot live in one model tree: the
+/// import must refuse loudly, never silently conflate two files. The
+/// refusal comes from whichever guard fires first — the model-building
+/// duplicate-path check (diff classification) or the raw-tree capture
+/// walk's collision guard (divergent trees) — both loud, both before
+/// anything is ingested.
+#[test]
+fn lossy_sibling_name_collision_refuses_loudly() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"content\n");
+    let mut bytes = Vec::new();
+    for name in [&b"a\xff"[..], &b"a\xfe"[..]] {
+        bytes.extend_from_slice(b"100644 ");
+        bytes.extend_from_slice(name);
+        bytes.push(0);
+        bytes.extend_from_slice(&hex_bytes(&blob));
+    }
+    let tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &bytes,
+    );
+    let _c1 = b.commit_tree(&tree, &[], "colliding siblings\n");
+
+    let garden = b._dir.path().join("garden");
+    let (objects, metadata, engine) = open_stores(&garden);
+    let err = import_from_path(
+        &b.repo,
+        objects.clone(),
+        metadata.clone(),
+        engine,
+        &Default::default(),
+    )
+    .expect_err("the colliding-siblings tree must be refused");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate path") || msg.contains("collide after lossy UTF-8 decoding"),
+        "the refusal names the collision: {msg}"
+    );
+
+    // Nothing was ingested: the store stays empty of changesets.
+    let rows = common::sql_scalar(&garden, "SELECT count(*) FROM changesets");
+    assert_eq!(rows, 0, "a refused import stores no changesets");
+}
+
+/// A tampered raw-tree row (direct DB edit — the only path that can
+/// produce one, since `put_raw_tree` checks the hash): the export's
+/// per-tree SHA assertion must refuse loudly, never emit wrong bytes.
+#[test]
+fn tampered_raw_tree_row_refuses_at_export() {
+    let b = Builder::new();
+
+    let old = b.blob(b"old content\n");
+    let t1 = b.raw_tree(&[("100664", &old, "file.txt")]);
+    let c1 = b.commit_tree(&t1, &[], "old world\n");
+    let _ = c1;
+
+    let garden = b._dir.path().join("garden");
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import with raw-tree capture succeeds");
+    }
+
+    // Tamper: replace the captured row's bytes with a decompressible
+    // frame whose bytes hash elsewhere (same shape as the row's frame).
+    {
+        let conn =
+            rusqlite::Connection::open(garden.join("metadata.sqlite3")).expect("open metadata");
+        let frame: Vec<u8> = conn
+            .query_row("SELECT data FROM git_raw_tree", [], |r| r.get(0))
+            .expect("the captured row exists");
+        let mut decoded = zstd::bulk::decompress(&frame, 256 * 1024 * 1024).expect("decode");
+        decoded.extend_from_slice(b"tampered");
+        let tampered = zstd::bulk::compress(&decoded, 3).expect("re-encode");
+        conn.execute(
+            "UPDATE git_raw_tree SET data = ?1",
+            rusqlite::params![tampered],
+        )
+        .expect("tamper");
+    }
+
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("tampered-export.git");
+    let err = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect_err("a tampered raw-tree row must refuse the export");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("a tampered or corrupt row") || msg.contains("tampered"),
+        "the refusal names the tampered row: {msg}"
+    );
+}
+
+/// A native changeset committed on top of imported pre-canonical history
+/// (the bed flow over raw-captured commits): the export must still
+/// reproduce the imported SHAs for the old commits and emit the native
+/// child — raw capture must not break the incremental path.
+#[test]
+fn native_changeset_on_raw_captured_history_exports() {
+    let b = Builder::new();
+
+    let old = b.blob(b"old content\n");
+    let t1 = b.raw_tree(&[("100664", &old, "file.txt")]);
+    let c1 = b.commit_tree(&t1, &[], "old world\n");
+
+    let garden = b._dir.path().join("garden");
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds");
+    }
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        let cs1 = metadata.cs_for_git(&c1).unwrap().expect("mapped");
+
+        // A native child: the bed flow — plain Modify through the model
+        // API, validated and stored like the server does.
+        let child = Changeset {
+            parents: vec![cs1],
+            changes: vec![gardenbed_model::Change {
+                path: "file.txt".into(),
+                op: Op::Modify,
+                blob: Some(blob_id(b"native edit\n")),
+                src_path: None,
+                mode: Mode::Regular,
+            }],
+            message: "native child\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        engine.certify_history(cs1).expect("certify parent");
+        objects.put_blob(b"native edit\n").expect("blob");
+        let cs_child = child.id().expect("canonical");
+        let root = engine.validated_tree_for_new(&child).expect("derive tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_child, &child, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&child, root, &rows, None, None, None)
+            .expect("put changeset");
+        // Export walks refs: move main onto the native child (the bed
+        // publish flow) so both commits are reachable.
+        let won = metadata
+            .cas_ref("refs/heads/main", Some(cs1), cs_child)
+            .expect("cas");
+        assert!(
+            matches!(won, gardenbed_store::RefCas::Won { .. }),
+            "the ref must move onto the native child"
+        );
+    }
+
+    // Export: the imported commit keeps its SHA (raw tree), the child
+    // exports after it (parents before children).
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("native-child-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("native-on-raw history exports");
+    assert!(
+        roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1),
+        "the imported pre-canonical commit keeps its SHA"
+    );
+    assert_eq!(roundtrip.commits.len(), 2, "import + native child");
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Regression (found in review): two ordinary, header-reconstructable
+/// commits sharing the SAME non-canonical root tree in one import. The
+/// second commit inserts no new raw-tree row (the walk's memo decides
+/// the shared root once), but the root still DIVERGES — raw-commit
+/// capture must be forced from the divergence flag, never from the row
+/// count, or the second commit exports with a canonical tree SHA and
+/// breaks SHA-exactness.
+#[test]
+fn two_commits_sharing_noncanonical_root_export_exact() {
+    let b = Builder::new();
+
+    // One 100664 root tree; two commits point at it (git allows
+    // metadata-only commits with the same tree).
+    let old = b.blob(b"shared content\n");
+    let t1 = b.raw_tree(&[("100664", &old, "file.txt")]);
+    let c1 = b.commit_tree(&t1, &[], "first commit on the shared tree\n");
+    let c2 = b.commit_tree(&t1, &[&c1], "second commit, same tree, headers fine\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 2);
+    // ONE row (the shared root decided once), but BOTH commits diverged.
+    assert_eq!(
+        report.raw_trees_captured, 1,
+        "the shared root is captured exactly once"
+    );
+
+    // Both commits export SHA-exact — the memo hit must not demote the
+    // second commit to canonical reconstruction.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("shared-root-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("both commits export");
+    for sha in [&c1, &c2] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} must export SHA-exact"
+        );
+    }
+    assert_eq!(roundtrip.commits.len(), 2);
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Nested non-UTF-8 directory names: a non-UTF-8 dir entry whose subtree
+/// contains a divergent grandchild (100664 file inside it). The capture
+/// walk and the export both pair raw dir entries with model subtrees by
+/// the LOSSY name (the model holds `d\u{FFFD}/…`), and the association
+/// must resolve after the collision guard — otherwise the divergent
+/// grandchild loses its model association and export cannot render the
+/// canonical siblings.
+#[test]
+fn nested_non_utf8_dir_with_divergent_grandchild_roundtrips() {
+    let b = Builder::new();
+
+    let deep = b.blob(b"deep content\n");
+    let plain = b.blob(b"plain sibling\n");
+
+    // Inner tree: 100664 file `inner.txt` (divergent grandchild).
+    let mut inner = Vec::new();
+    inner.extend_from_slice(b"100664 inner.txt\0");
+    inner.extend_from_slice(&hex_bytes(&deep));
+    let inner_tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &inner,
+    );
+
+    // Outer tree: non-UTF-8 dir name `d\xe9` containing the inner tree,
+    // plus a canonical sibling file.
+    let dir_name: &[u8] = b"d\xe9";
+    let mut outer = Vec::new();
+    // git tree order: `d\xe9/` sorts before `plain.txt`.
+    outer.extend_from_slice(b"40000 ");
+    outer.extend_from_slice(dir_name);
+    outer.push(0);
+    outer.extend_from_slice(&hex_bytes(&inner_tree));
+    outer.extend_from_slice(b"100644 plain.txt\0");
+    outer.extend_from_slice(&hex_bytes(&plain));
+    let outer_tree = b.git_stdin(
+        &["hash-object", "-t", "tree", "-w", "--stdin", "--literally"],
+        &outer,
+    );
+    let c1 = b.commit_tree(&outer_tree, &[], "nested non-utf8 dir\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the nested trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("nested non-UTF-8 dirs import via raw capture")
+    };
+    assert_eq!(report.commits_new, 1);
+    assert!(
+        report.raw_trees_captured >= 2,
+        "the non-UTF-8 outer tree AND the 100664 inner tree are captured: {}",
+        report.raw_trees_captured
+    );
+
+    // Export: SHA-exact through the nested raw rows.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("nested-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("nested non-UTF-8 history exports SHA-exact");
+    assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1));
+    gardenbed_harness::git_fsck(&exported).expect("exported nested history is valid");
+}
+
+/// Owner-bit mode rule (review finding 2): git normalizes pre-canonical
+/// blob modes by the OWNER exec bit only — 100654 and 100645 become
+/// 100644, only 100744 becomes 100755 (oracle:
+/// /tmp/gardenbed-todo/mode-oracle/results.json). The model must agree:
+/// group/other exec bits alone do NOT make a file Exec. A native child
+/// of such a commit must export 100644, not 100755 — the model mode is
+/// what leaks into natively-created history.
+#[test]
+fn group_exec_bit_modes_map_to_regular_and_native_children_export_644() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"mode probe\n");
+    let t1 = b.raw_tree(&[("100654", &blob, "f")]);
+    let c1 = b.commit_tree(&t1, &[], "group-exec pre-canonical mode\n");
+    // 100745: other-exec — also Regular by the owner-bit rule, and by
+    // git's own normalization.
+    let t2 = b.raw_tree(&[("100645", &blob, "g")]);
+    let c2 = b.commit_tree(&t2, &[&c1], "other-exec pre-canonical mode\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 2);
+
+    // The MODEL trees must classify both as Regular (flat paths f, g).
+    // The model drops no entries here, so the derived tree contains
+    // both files; the model mode is observable through the derived
+    // rows' blob modes.
+    let (_objects, metadata, _engine) = open_stores(&garden);
+    let cs2 = metadata.cs_for_git(&c2).unwrap().expect("c2 mapped");
+    let cs = metadata.get_changeset(cs2).unwrap().expect("present").0;
+    let f_mode = cs
+        .changes
+        .iter()
+        .find(|c| c.path == "g")
+        .expect("path g in the model")
+        .mode;
+    assert_eq!(f_mode, Mode::Regular, "100645 (other-exec) maps to Regular");
+    let cs1 = metadata.cs_for_git(&c1).unwrap().expect("c1 mapped");
+    let cs1d = metadata.get_changeset(cs1).unwrap().expect("present").0;
+    let f1_mode = cs1d
+        .changes
+        .iter()
+        .find(|c| c.path == "f")
+        .expect("path f in the model")
+        .mode;
+    assert_eq!(
+        f1_mode,
+        Mode::Regular,
+        "100654 (group-exec) maps to Regular"
+    );
+
+    // A native descendant of c2 re-modifies f: its exported mode must
+    // be 100644 (the model says Regular), never 100755.
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        let child = Changeset {
+            parents: vec![cs2],
+            changes: vec![gardenbed_model::Change {
+                path: "f".into(),
+                op: Op::Modify,
+                blob: Some(blob_id(b"native edit\n")),
+                src_path: None,
+                mode: Mode::Regular,
+            }],
+            message: "native child of other-exec history\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        engine.certify_history(cs2).expect("certify parent");
+        objects.put_blob(b"native edit\n").expect("blob");
+        let cs_child = child.id().expect("canonical");
+        let root = engine.validated_tree_for_new(&child).expect("derive tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_child, &child, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&child, root, &rows, None, None, None)
+            .expect("put changeset");
+        let won = metadata
+            .cas_ref("refs/heads/main", Some(cs2), cs_child)
+            .expect("cas");
+        assert!(matches!(won, gardenbed_store::RefCas::Won { .. }));
+    }
+
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("mode-native-child-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("native-on-group-exec history exports");
+    assert_eq!(roundtrip.commits.len(), 3, "two imports + native child");
+    for sha in [&c1, &c2] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} keeps its SHA through raw capture"
+        );
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+
+    // The exported native child carries f as 100644 — the observable
+    // mode in any downstream clone (run against the EXPORT, not the
+    // source repo).
+    let mut cmd = Command::new("git");
+    cmd.current_dir(&exported)
+        .arg("ls-tree")
+        .arg("refs/heads/main")
+        .arg("--")
+        .arg("f");
+    hermetic(&mut cmd);
+    let out = cmd.output().expect("ls-tree runs");
+    assert!(out.status.success(), "ls-tree failed");
+    let modes = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        modes.starts_with("100644"),
+        "the native child exports f as 100644, not 100755: {modes}"
+    );
+}
+
+/// Empty directories (review finding 3): the model drops them, the raw
+/// tree keeps them. A commit whose tree carries an empty dir DIVERGES
+/// from the canonical render of what the model derives, so the capture
+/// predicate must fire (root diverged ⇒ raw commit captured ⇒ SHA-exact
+/// roundtrip). The old predicate compared against render_canonical of
+/// the RAW entries — which preserves the empty-dir entry — so it said
+/// "no divergence," nothing was captured, and export refused loudly.
+#[test]
+fn empty_dir_commit_roundtrips_sha_exact() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"file next to the empty dir\n");
+    let empty = b.raw_tree(&[]); // the empty dir's own tree object
+    let root = b.raw_tree(&[("40000", &empty, "d"), ("100644", &blob, "f.txt")]);
+    let c1 = b.commit_tree(&root, &[], "commit with an empty directory\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 1);
+    assert!(
+        report.raw_trees_captured >= 2,
+        "the root AND the empty dir's tree are captured: {}",
+        report.raw_trees_captured
+    );
+
+    // Export: SHA-exact through the raw rows (the empty dir survives).
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("empty-dir-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("empty-dir history exports SHA-exact");
+    assert!(roundtrip.commits.iter().any(|(_, git_sha)| git_sha == &c1));
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Memo-upgrade regression (review finding 3, follow-up): in ONE import
+/// batch, c0 has the EMPTY root tree, c1 adds only an empty directory
+/// `d` (whose child is that same empty-tree SHA), and c2 returns to the
+/// empty root. The empty-tree SHA is first memoized as a canonical ROOT
+/// (c0: byte-exact, no row); c1's walk then needs it as a ROW — the
+/// captured parent names `d` and the export walk resolves dir entries
+/// through raw-tree rows. A forced-child capture must UPGRADE the stale
+/// no-row memo decision, not be suppressed by it; c2's memo hit (now
+/// "captured") must force c2's own raw-commit capture so it too exports
+/// SHA-exact.
+#[test]
+fn empty_tree_sha_memo_upgrade_from_canonical_root_to_dropped_child() {
+    let b = Builder::new();
+
+    let empty = b.raw_tree(&[]);
+    let root_with_d = b.raw_tree(&[("40000", &empty, "d")]);
+    let c0 = b.commit_tree(&empty, &[], "c0: empty root\n");
+    let c1 = b.commit_tree(&root_with_d, &[&c0], "c1: add empty dir d\n");
+    let c2 = b.commit_tree(&empty, &[&c1], "c2: back to empty root\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("import succeeds")
+    };
+    assert_eq!(report.commits_new, 3);
+    // The empty-tree SHA: one row (upgraded when c1's `d` needs it),
+    // plus c1's root carrying `d` — the exact count is the row upgrade
+    // (empty tree) + the parent (root with d); c0 and c2 add nothing.
+    assert_eq!(
+        report.raw_trees_captured, 2,
+        "empty-tree row upgraded from the no-row root decision + the root with d"
+    );
+
+    // ALL THREE commits export SHA-exact.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("empty-tree-upgrade-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("the empty-tree memo-upgrade history exports SHA-exact");
+    assert_eq!(roundtrip.commits.len(), 3);
+    for sha in [&c0, &c1, &c2] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} must export SHA-exact"
+        );
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Empty-dir-only ROOT commit (review finding 3): a root whose tree
+/// contains only empty directories — git's diff sees no blobs, so the
+/// classifier produces an empty diff. The model legitimately derives
+/// the empty tree (it drops empty dirs); the raw-tree capture walk
+/// preserves the directories so the commit exports SHA-exact. The old
+/// guard refused this shape ("produced no diff although its tree is not
+/// empty") because it counted RAW tree entries; it now refuses only
+/// when the root's FILE closure is non-empty — a genuinely unexpected
+/// empty diff (real files git somehow did not report) still refuses.
+#[test]
+fn empty_dir_only_root_commit_roundtrips_sha_exact() {
+    let b = Builder::new();
+
+    // Nested empty dirs: d/ contains only an empty dir e/.
+    let empty = b.raw_tree(&[]);
+    let d_tree = b.raw_tree(&[("40000", &empty, "e")]);
+    let root = b.raw_tree(&[("40000", &d_tree, "d")]);
+    let c0 = b.commit_tree(&root, &[], "root with only nested empty dirs\n");
+    // Metadata reuse on the same root: a second commit pointing at the
+    // same tree must also export SHA-exact (memo decisions are reused,
+    // no double rows).
+    let c1 = b.commit_tree(&root, &[&c0], "same tree again\n");
+
+    gardenbed_harness::git_fsck(&b.repo).expect("fsck accepts the hand-crafted trees");
+
+    let garden = b._dir.path().join("garden");
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(&b.repo, objects, metadata, engine, &Default::default())
+            .expect("an empty-dir-only root imports — its file closure is empty")
+    };
+    assert_eq!(report.commits_new, 2);
+    // Rows: the empty tree `e`, the dir tree `d` (contains e), and the
+    // root (contains d) — all captured; the second commit adds none.
+    assert_eq!(
+        report.raw_trees_captured, 3,
+        "e + d + root captured once: {}",
+        report.raw_trees_captured
+    );
+
+    // Both commits export SHA-exact through the raw rows.
+    let (objects, metadata, _) = open_stores(&garden);
+    let exported = b._dir.path().join("empty-root-export.git");
+    let roundtrip = gardenbed_git::export_to_path(
+        &exported,
+        objects,
+        metadata,
+        &gardenbed_git::ExportOptions::default(),
+    )
+    .expect("the empty-dir-only-root history exports SHA-exact");
+    assert_eq!(roundtrip.commits.len(), 2);
+    for sha in [&c0, &c1] {
+        assert!(
+            roundtrip.commits.iter().any(|(_, git_sha)| git_sha == sha),
+            "commit {sha} must export SHA-exact"
+        );
+    }
+    gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+}
+
+/// Legacy-upgrade association regression (root compatibility blocker,
+/// R2 hard blocker): a store imported by an OLD build (pre-owner-bit
+/// rule) holds a legacy `Exec` model for a `100654` git entry — the
+/// legacy seed is EXACTLY what the old binary wrote: canonical Exec
+/// changeset + git mapping + ref, and NOTHING else (verified against
+/// the real control-binary probe: no raw commit row, no raw-tree row
+/// for the legacy root c0). The upgraded build then imports NEW git
+/// history: c1 (metadata-only descendant on `main`, inheriting the
+/// legacy Exec frontier — its capture walk writes the raw-tree row
+/// with the legacy-Exec association) and c2 (independent fresh root on
+/// `refs/heads/other` reusing the SAME git tree SHA, deriving Regular
+/// under the owner-bit rule). The import must NOT fail on the
+/// association clash: the raw-tree association is first-seen ADVISORY
+/// (one git tree legitimately normalizes to different model trees
+/// across a legacy frontier and a fresh import), while the BYTES stay
+/// content-addressed and immutable.
+///
+/// Honest export boundary (matches the root probe's actual export log,
+/// export-correct-root.log): the OLD `main` history still contains the
+/// legacy c0 whose canonical reconstruction diverges (Exec model vs
+/// 100654 bytes) and holds NO raw rows — exporting `main` keeps
+/// refusing loudly (the known pre-canonical divergence, retired only
+/// by fresh full re-import; see docs/divergences.md). The freshly
+/// imported `other` branch — every commit of which the CURRENT build
+/// captured verbatim — exports SHA-exact for its own ref.
+#[test]
+fn legacy_exec_frontier_and_fresh_regular_import_coexist() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"content\n");
+    // One 100654 entry: owner bit clear => Regular under the owner-bit
+    // rule; the legacy rule mapped it Exec.
+    let shared_tree = b.raw_tree(&[("100654", &blob, "f")]);
+    let c0 = b.commit_tree(&shared_tree, &[], "legacy root\n");
+    let c1 = b.commit_tree(&shared_tree, &[&c0], "incremental metadata only\n");
+    // Independent fresh root, same git tree, on its OWN branch.
+    let c2 = b.commit_tree(&shared_tree, &[], "fresh independent root\n");
+    // commit_tree left main on c2; restore the probe's ref topology:
+    // main at c1 (legacy + descendant), other at c2 (fresh).
+    b.git(&["update-ref", "refs/heads/main", &c1]);
+    b.git(&["update-ref", "refs/heads/other", &c2]);
+
+    let garden = b._dir.path().join("garden");
+    {
+        // --- The LEGACY seed: exactly what the old binary wrote ---
+        let (objects, metadata, engine) = open_stores(&garden);
+        let legacy_cs = Changeset {
+            parents: vec![],
+            changes: vec![gardenbed_model::Change {
+                path: "f".into(),
+                op: Op::Add,
+                blob: Some(blob_id(b"content\n")),
+                src_path: None,
+                mode: Mode::Exec,
+            }],
+            message: "legacy root\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Legacy".into(),
+                email: "legacy@example.test".into(),
+                time_secs: 1,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Legacy".into(),
+                email: "legacy@example.test".into(),
+                time_secs: 1,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        objects.put_blob(b"content\n").expect("blob");
+        let cs_id = legacy_cs.id().expect("canonical");
+        let root = engine
+            .validated_tree_for_new(&legacy_cs)
+            .expect("derive legacy tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_id, &legacy_cs, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&legacy_cs, root, &rows, Some(&c0), None, None)
+            .expect("legacy put: canonical Exec CS + git mapping only");
+        metadata
+            .cas_ref("refs/heads/main", None, cs_id)
+            .expect("legacy ref");
+        // NO raw commit row, NO raw-tree row: the old binary captured
+        // none for c0 (verified against the real control probe store).
+    }
+
+    // --- Upgraded build imports BOTH branches (single real import,
+    // main first: c0 skipped via mapping, c1 inherits the legacy Exec
+    // frontier and captures the raw-tree row with the Exec
+    // association; then other: c2 derives Regular for the SAME git
+    // tree bytes — the old clash point, must now succeed). ---
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(
+            &b.repo,
+            objects,
+            metadata,
+            engine,
+            &ImportOptions::default(),
+        )
+        .expect("the upgraded import must not fail on the legacy frontier")
+    };
+    assert_eq!(report.commits_new, 2, "c1 and c2; c0 is mapped-skipped");
+    assert_eq!(report.raw_trees_captured, 1, "the shared divergent tree");
+
+    // The association column keeps the FIRST-seen (legacy Exec) value
+    // while the fresh Regular branch imported fine: advisory, observable.
+    {
+        let (_objects, metadata, _engine) = open_stores(&garden);
+        let key: [u8; 20] = hex_bytes(&shared_tree)
+            .as_slice()
+            .try_into()
+            .expect("20-byte sha");
+        let assoc = metadata.raw_tree_model_id(key).unwrap().expect("row");
+        // The first-seen association is a real model tree id (c1's
+        // capture on main landed before c2's on other): advisory but
+        // observable.
+        assert!(assoc.is_some(), "association stays a real model tree");
+    }
+
+    // c1 carries the ONLY raw commit row (probe-verified); the fresh
+    // branch c2 was captured verbatim by the current build.
+    {
+        let (_objects, metadata, _engine) = open_stores(&garden);
+        let cs_c1 = metadata.cs_for_git(&c1).unwrap().expect("c1 mapped");
+        assert!(
+            metadata.raw_commit(cs_c1).unwrap().is_some(),
+            "c1 has a raw commit row"
+        );
+        let cs_c2 = metadata.cs_for_git(&c2).unwrap().expect("c2 mapped");
+        assert!(
+            metadata.raw_commit(cs_c2).unwrap().is_some(),
+            "c2 has a raw commit row"
+        );
+    }
+
+    // --- Export boundary, honestly ---
+    // The freshly imported `other` branch exports SHA-exact for its
+    // own ref (its commits were captured verbatim by this build).
+    {
+        let (objects, metadata, _) = open_stores(&garden);
+        let exported = b._dir.path().join("legacy-upgrade-fresh-export.git");
+        let opts = gardenbed_git::ExportOptions {
+            refs: vec!["refs/heads/other".into()],
+        };
+        let roundtrip = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
+            .expect("the fresh branch exports SHA-exact");
+        assert_eq!(roundtrip.commits.len(), 1);
+        assert_eq!(
+            roundtrip.refs,
+            vec![("refs/heads/other".into(), c2.clone())]
+        );
+        gardenbed_harness::git_fsck(&exported).expect("exported fresh branch is valid");
+    }
+    // The OLD `main` history still refuses loudly: c0's canonical
+    // reconstruction diverges (legacy Exec model vs its 100654 bytes)
+    // and it holds no raw rows — the known pre-canonical divergence,
+    // retired only by a fresh full re-import (root probe's actual
+    // export-correct-root.log: exit 1, SHA divergence on c0).
+    {
+        let (objects, metadata, _) = open_stores(&garden);
+        let exported = b._dir.path().join("legacy-upgrade-main-export.git");
+        let opts = gardenbed_git::ExportOptions {
+            refs: vec!["refs/heads/main".into()],
+        };
+        let err = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
+            .expect_err("the legacy main history must refuse loudly, not silently diverge");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("reconstruction diverges") || msg.contains("computed git SHA"),
+            "loud SHA-divergence refusal, got: {msg}"
+        );
+    }
+}
+
+/// Fresh-first order: the upgraded build imports the fresh Regular
+/// branch BEFORE the legacy state exists, then the legacy Exec
+/// frontier arrives (an old binary's incremental write into the
+/// now-upgraded store) for the SAME git tree bytes. Both orders must
+/// coexist — the association is advisory in either direction.
+#[test]
+fn fresh_regular_import_then_legacy_exec_frontier_coexist() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"content\n");
+    let shared_tree = b.raw_tree(&[("100654", &blob, "f")]);
+    let c0 = b.commit_tree(&shared_tree, &[], "legacy root\n");
+    let c1 = b.commit_tree(&shared_tree, &[&c0], "incremental metadata only\n");
+    let c2 = b.commit_tree(&shared_tree, &[], "fresh independent root\n");
+    b.git(&["update-ref", "refs/heads/main", &c1]);
+    b.git(&["update-ref", "refs/heads/other", &c2]);
+
+    let garden = b._dir.path().join("garden");
+    {
+        // Fresh import FIRST (only `other`: Regular model for the 100654
+        // entry — c2's raw rows land now).
+        let (objects, metadata, engine) = open_stores(&garden);
+        let opts = ImportOptions {
+            refs: vec!["refs/heads/other".into()],
+            ..Default::default()
+        };
+        let report =
+            import_from_path(&b.repo, objects, metadata, engine, &opts).expect("fresh import");
+        assert_eq!(report.commits_new, 1);
+        assert_eq!(report.raw_trees_captured, 1, "the 100654 tree diverges");
+    }
+    {
+        // Then the legacy frontier: an old binary's incremental import
+        // of `main` — canonical Exec CS + mapping + raw capture for the
+        // same git bytes with the OLD Exec model — through public APIs
+        // (exactly the state the old control binary leaves behind).
+        let (objects, metadata, engine) = open_stores(&garden);
+        let legacy_cs = Changeset {
+            parents: vec![],
+            changes: vec![gardenbed_model::Change {
+                path: "f".into(),
+                op: Op::Add,
+                blob: Some(blob_id(b"content\n")),
+                src_path: None,
+                mode: Mode::Exec,
+            }],
+            message: "legacy root\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Legacy".into(),
+                email: "legacy@example.test".into(),
+                time_secs: 1,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Legacy".into(),
+                email: "legacy@example.test".into(),
+                time_secs: 1,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        objects.put_blob(b"content\n").expect("blob");
+        let cs_id = legacy_cs.id().expect("canonical");
+        let root = engine
+            .validated_tree_for_new(&legacy_cs)
+            .expect("derive legacy tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_id, &legacy_cs, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&legacy_cs, root, &rows, Some(&c0), None, None)
+            .expect("legacy mapping into the upgraded store");
+        metadata
+            .cas_ref("refs/heads/main", None, cs_id)
+            .expect("legacy ref");
+        // The legacy capture walk's raw-tree put for the shared tree
+        // with the Exec association: same bytes, different association
+        // — idempotent Ok under the advisory rule (this is the exact
+        // clash that used to fail the import in the other order).
+        let tree_bytes = {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"100654 f\0");
+            bytes.extend_from_slice(&hex_bytes(&blob));
+            bytes
+        };
+        metadata
+            .put_raw_tree(
+                hex_bytes(&shared_tree)
+                    .as_slice()
+                    .try_into()
+                    .expect("20-byte sha"),
+                root,
+                &tree_bytes,
+            )
+            .expect("legacy same-bytes put is an idempotent no-op");
+    }
+    {
+        // Now the upgraded build imports the REST of main (c1, the
+        // metadata-only descendant): the memo hits the shared tree
+        // (already captured with the fresh Regular association) with
+        // the LEGACY Exec context — must succeed.
+        let (objects, metadata, engine) = open_stores(&garden);
+        let report = import_from_path(
+            &b.repo,
+            objects,
+            metadata,
+            engine,
+            &ImportOptions::default(),
+        )
+        .expect("import after the legacy frontier must not fail");
+        assert_eq!(report.commits_new, 1, "only c1 remains");
+    }
+
+    // The fresh branch still exports SHA-exact after the legacy
+    // frontier landed in the same store.
+    {
+        let (objects, metadata, _) = open_stores(&garden);
+        let exported = b._dir.path().join("fresh-then-legacy-export.git");
+        let opts = gardenbed_git::ExportOptions {
+            refs: vec!["refs/heads/other".into()],
+        };
+        let roundtrip = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
+            .expect("the fresh branch still exports SHA-exact");
+        assert_eq!(roundtrip.commits.len(), 1);
+        assert_eq!(
+            roundtrip.refs,
+            vec![("refs/heads/other".into(), c2.clone())]
+        );
+        gardenbed_harness::git_fsck(&exported).expect("exported fresh branch is valid");
+    }
+}
+
+/// Single-batch variant: the fresh branch and the legacy descendant
+/// arrive in ONE import batch after the legacy seed — the capture
+/// walk's memo sees the same git tree SHA under two model contexts
+/// inside one walk instance. Plus: a native child on the fresh branch
+/// and a reopen/re-export.
+#[test]
+fn single_batch_import_of_legacy_and_fresh_frontiers() {
+    let b = Builder::new();
+
+    let blob = b.blob(b"content\n");
+    let shared_tree = b.raw_tree(&[("100654", &blob, "f")]);
+    let c0 = b.commit_tree(&shared_tree, &[], "legacy root\n");
+    let c1 = b.commit_tree(&shared_tree, &[&c0], "incremental metadata only\n");
+    let c2 = b.commit_tree(&shared_tree, &[], "fresh independent root\n");
+    b.git(&["update-ref", "refs/heads/main", &c1]);
+    b.git(&["update-ref", "refs/heads/other", &c2]);
+
+    let garden = b._dir.path().join("garden");
+    // Legacy seed (CS + mapping + ref, NO raw rows).
+    let _cs_legacy = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        let legacy_cs = Changeset {
+            parents: vec![],
+            changes: vec![gardenbed_model::Change {
+                path: "f".into(),
+                op: Op::Add,
+                blob: Some(blob_id(b"content\n")),
+                src_path: None,
+                mode: Mode::Exec,
+            }],
+            message: "legacy root\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Legacy".into(),
+                email: "legacy@example.test".into(),
+                time_secs: 1,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Legacy".into(),
+                email: "legacy@example.test".into(),
+                time_secs: 1,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        objects.put_blob(b"content\n").expect("blob");
+        let cs_id = legacy_cs.id().expect("canonical");
+        let root = engine
+            .validated_tree_for_new(&legacy_cs)
+            .expect("derive legacy tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_id, &legacy_cs, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&legacy_cs, root, &rows, Some(&c0), None, None)
+            .expect("legacy put");
+        metadata
+            .cas_ref("refs/heads/main", None, cs_id)
+            .expect("legacy ref");
+        cs_id
+    };
+
+    // Single batch: c1 (legacy Exec context) and c2 (fresh Regular
+    // context) in ONE import — the memo handles the same tree SHA
+    // under both contexts.
+    let report = {
+        let (objects, metadata, engine) = open_stores(&garden);
+        import_from_path(
+            &b.repo,
+            objects,
+            metadata,
+            engine,
+            &ImportOptions::default(),
+        )
+        .expect("single batch import")
+    };
+    assert_eq!(report.commits_new, 2);
+    assert_eq!(
+        report.raw_trees_captured, 1,
+        "the shared tree captured once"
+    );
+
+    // Fresh branch export stays SHA-exact.
+    {
+        let (objects, metadata, _) = open_stores(&garden);
+        let exported = b._dir.path().join("single-batch-export.git");
+        let opts = gardenbed_git::ExportOptions {
+            refs: vec!["refs/heads/other".into()],
+        };
+        let roundtrip = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
+            .expect("the fresh branch exports SHA-exact");
+        assert_eq!(roundtrip.commits.len(), 1);
+        assert_eq!(
+            roundtrip.refs,
+            vec![("refs/heads/other".into(), c2.clone())]
+        );
+        gardenbed_harness::git_fsck(&exported).expect("exported history is valid");
+    }
+
+    // Native child on the fresh branch (the model now says Regular).
+    let cs_c2 = {
+        let (_objects, metadata, _engine) = open_stores(&garden);
+        metadata.cs_for_git(&c2).unwrap().expect("c2 mapped")
+    };
+    {
+        let (objects, metadata, engine) = open_stores(&garden);
+        let child = Changeset {
+            parents: vec![cs_c2],
+            changes: vec![gardenbed_model::Change {
+                path: "f".into(),
+                op: Op::Modify,
+                blob: Some(blob_id(b"native edit\n")),
+                src_path: None,
+                mode: Mode::Regular,
+            }],
+            message: "native child\n".into(),
+            author: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "Bed".into(),
+                email: "bed@example.com".into(),
+                time_secs: 1_800_000_000,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        engine.certify_history(cs_c2).expect("certify parent");
+        objects.put_blob(b"native edit\n").expect("blob");
+        let cs_child = child.id().expect("canonical");
+        let root = engine.validated_tree_for_new(&child).expect("derive tree");
+        let rows = engine
+            .derived_rows_for_validated_tree(cs_child, &child, root)
+            .expect("derived rows");
+        metadata
+            .put_validated_changeset(&child, root, &rows, None, None, None)
+            .expect("put changeset");
+        let won = metadata
+            .cas_ref("refs/heads/other", Some(cs_c2), cs_child)
+            .expect("cas");
+        assert!(matches!(won, gardenbed_store::RefCas::Won { .. }));
+    }
+
+    // Reopen and re-export the fresh branch WITH the native child:
+    // c2 keeps its SHA (captured verbatim) and the native child
+    // exports after it.
+    {
+        let (objects, metadata, _) = open_stores(&garden);
+        let exported2 = b._dir.path().join("single-batch-native-export.git");
+        let opts = gardenbed_git::ExportOptions {
+            refs: vec!["refs/heads/other".into()],
+        };
+        let roundtrip2 = gardenbed_git::export_to_path(&exported2, objects, metadata, &opts)
+            .expect("native child on the fresh branch exports");
+        assert_eq!(roundtrip2.commits.len(), 2, "c2 + native child");
+        assert_eq!(roundtrip2.refs.len(), 1);
+        assert_eq!(roundtrip2.refs[0].0, "refs/heads/other");
+        gardenbed_harness::git_fsck(&exported2).expect("exported history is valid");
+    }
 }

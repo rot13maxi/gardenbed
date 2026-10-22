@@ -12,7 +12,10 @@
 //! CAS (decision D6) is a single guarded `UPDATE ... WHERE` on the
 //! existing-ref path (rowcount 1 ⇔ won) and
 //! `INSERT ... ON CONFLICT DO NOTHING` on the create path, re-reading
-//! the current value for the Conflict report. No advisory locks.
+//! the current value for the Conflict report. No advisory locks on the
+//! data path — the ONE advisory lock the store takes is
+//! transaction-scoped, held only around schema DDL at `open()` (see
+//! [`SCHEMA_LOCK_KEY`]); no trait call ever waits on it.
 //!
 //! Async bridging: `tokio-postgres` is async while the traits are sync,
 //! so the store owns a dedicated driver thread running a private
@@ -40,8 +43,10 @@ use tokio_postgres::NoTls;
 /// Schema (D5): same five tables as SQLite, BLOB→`bytea`. `refs.cs`
 /// carries no FK to changesets — SQLite has none either (a CAS may point
 /// a ref at an id before its changeset row lands). `CREATE TABLE IF NOT
-/// EXISTS` on every open, exactly like SQLite; first schema cut, no
-/// migrations yet.
+/// EXISTS` on every open, exactly like SQLite — but under the open-time
+/// advisory lock (see [`PostgresMetadataStore::open`]), because unlike
+/// SQLite's single-writer database the same fresh schema can be opened
+/// concurrently by many replicas.
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS changesets (
     id        bytea PRIMARY KEY,
@@ -69,6 +74,11 @@ CREATE TABLE IF NOT EXISTS git_raw_commit (
     cs   bytea PRIMARY KEY REFERENCES changesets(id),
     data bytea NOT NULL
 );
+CREATE TABLE IF NOT EXISTS git_raw_tree (
+    git_sha bytea PRIMARY KEY CHECK(length(git_sha) = 20),
+    data    bytea NOT NULL,
+    model   bytea CHECK(length(model) IN (0, 32))
+);
 ";
 
 /// Schema amendments applied after SCHEMA on every open
@@ -79,6 +89,13 @@ CREATE TABLE IF NOT EXISTS git_raw_commit (
 const MIGRATIONS: &str = "
 ALTER TABLE changesets ADD COLUMN IF NOT EXISTS arrived BIGSERIAL;
 ";
+
+/// Advisory-lock key for schema initialization (see
+/// [`PostgresMetadataStore::open`]). A fixed 64-bit constant, database-
+/// scoped by Postgres itself; only another application choosing the same
+/// arbitrary number on the same database could collide — the value is
+/// random to keep that accidental.
+const SCHEMA_LOCK_KEY: i64 = 0x2A61_D8E3_4B7C_59F1;
 
 /// The PostgreSQL (metadata) metadata store.
 ///
@@ -117,9 +134,37 @@ impl PostgresMetadataStore {
                 .map_err(|e| StoreError::Db(format!("postgres pool: {e}")))?;
             // One connection up front: fail fast on unreachable servers
             // (instead of at the first trait call) and create the schema.
-            let conn = pool.get().await.map_err(pg_err)?;
-            conn.batch_execute(SCHEMA).await.map_err(pg_err)?;
-            conn.batch_execute(MIGRATIONS).await.map_err(pg_err)?;
+            // Schema DDL runs inside ONE transaction holding a
+            // transaction-scoped advisory lock on a fixed key, so N
+            // replicas racing `open()` on a fresh database serialize:
+            // the first runs the DDL, every later opener finds the
+            // tables already in place (the DDL is `IF NOT EXISTS`
+            // -guarded) and its own batch is a no-op. Without the
+            // lock, concurrent `CREATE TABLE IF NOT EXISTS` both pass
+            // the catalog check and both insert into `pg_type`, so one
+            // loses the race with a duplicate-key error on
+            // `pg_type_typname_nsp_index` (SQLSTATE 23505 — observed
+            // 6/7-fail on a fresh parallel parity run). The lock is
+            // transaction-scoped (`pg_advisory_xact_lock`), so it is
+            // released at COMMIT/ROLLBACK even if the process dies
+            // mid-DDL — no leak, and the transaction rolls a
+            // half-written schema cut back. It is cluster-scoped, so
+            // it also serializes across replicas (a process-local
+            // mutex cannot), and ordinary pooled trait calls take no
+            // advisory locks, so CAS traffic is unaffected. Any new
+            // schema amendment joins `MIGRATIONS` (or a later
+            // migration block) inside this same transaction, keeping
+            // ALL DDL on one connection under one lock.
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            let lock = tx
+                .query_one("SELECT pg_advisory_xact_lock($1)", &[&SCHEMA_LOCK_KEY])
+                .await
+                .map_err(pg_err)?;
+            drop(lock);
+            tx.batch_execute(SCHEMA).await.map_err(pg_err)?;
+            tx.batch_execute(MIGRATIONS).await.map_err(pg_err)?;
+            tx.commit().await.map_err(pg_err)?;
             Ok::<Pool, StoreError>(pool)
         })?;
         Ok(PostgresMetadataStore { pool, driver })
@@ -853,6 +898,125 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                         .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
                 })
                 .transpose()
+        })
+    }
+
+    fn raw_tree(&self, git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let conn = pool.get().await.map_err(pg_err)?;
+            let frame: Option<Vec<u8>> = conn
+                .query_opt(
+                    "SELECT data FROM git_raw_tree WHERE git_sha = $1",
+                    &[&git_tree_sha.to_vec()],
+                )
+                .await
+                .map_err(pg_err)?
+                .map(|row| row.get(0));
+            frame
+                .map(|f| {
+                    zstd::bulk::decompress(&f, crate::sqlite::MAX_RAW_TREE)
+                        .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))
+                })
+                .transpose()
+        })
+    }
+
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let conn = pool.get().await.map_err(pg_err)?;
+            let model: Option<Vec<u8>> = conn
+                .query_opt(
+                    "SELECT model FROM git_raw_tree WHERE git_sha = $1",
+                    &[&git_tree_sha.to_vec()],
+                )
+                .await
+                .map_err(pg_err)?
+                .map(|row| row.get(0));
+            model
+                .map(|bytes| {
+                    if bytes.is_empty() {
+                        Ok(None)
+                    } else {
+                        id_from_bytea(&bytes).map(Some)
+                    }
+                })
+                .transpose()
+        })
+    }
+
+    fn put_raw_tree(
+        &self,
+        git_tree_sha: [u8; 20],
+        model_tree: Option<Id>,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        // Content-addressed by the key (SQLite twin): the bytes must
+        // SHA-1 to it, so a tampered row cannot be written through the
+        // API — the export's per-tree SHA assertion catches direct edits.
+        let actual = crate::sqlite::git_tree_sha1(bytes);
+        if actual != git_tree_sha {
+            return Err(StoreError::Invalid(format!(
+                "raw tree bytes SHA-1 to {}, not {}",
+                crate::sqlite::hex_sha(&actual),
+                crate::sqlite::hex_sha(&git_tree_sha)
+            )));
+        }
+        // Own the bytes: the async block must be 'static (same shape as
+        // the other async trait methods in this file).
+        let bytes = bytes.to_vec();
+        let frame = zstd::bulk::compress(&bytes, crate::sqlite::ZSTD_RAW_TREE_LEVEL)
+            .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+        let model_payload: Vec<u8> = model_tree
+            .map(|id| id.as_bytes().to_vec())
+            .unwrap_or_default();
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            // Insert-first (the codebase's concurrent-idempotence shape,
+            // same as put_changeset): ON CONFLICT DO NOTHING claims the
+            // key, then the row is re-read and verified inside this
+            // transaction. Under READ COMMITTED the loser's insert is a
+            // no-op and the returned row is the winner's.
+            let inserted = tx
+                .execute(
+                    "INSERT INTO git_raw_tree(git_sha, data, model) VALUES($1, $2, $3) \
+                     ON CONFLICT (git_sha) DO NOTHING",
+                    &[&git_tree_sha.to_vec(), &frame, &model_payload],
+                )
+                .await
+                .map_err(pg_err)?;
+            if inserted == 0 {
+                let row = tx
+                    .query_one(
+                        "SELECT data FROM git_raw_tree WHERE git_sha = $1",
+                        &[&git_tree_sha.to_vec()],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                // Compare decoded bytes, never frames (SQLite twin). The
+                // stored (first-seen) model association stays untouched —
+                // one git tree can normalize to different model trees
+                // across import contexts (legacy-Exec frontier vs
+                // fresh-Regular; see the trait doc), and the export
+                // resolves the model tree from changeset context, never
+                // from the model column.
+                let prev_frame: Vec<u8> = row.get(0);
+                let prev_bytes =
+                    zstd::bulk::decompress(&prev_frame, crate::sqlite::MAX_RAW_TREE)
+                        .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+                if prev_bytes.as_slice() != bytes {
+                    return Err(StoreError::Invalid(format!(
+                        "raw tree {} already captured with different bytes — \
+                         content-addressed rows are immutable",
+                        crate::sqlite::hex_sha(&git_tree_sha)
+                    )));
+                }
+            }
+            tx.commit().await.map_err(pg_err)?;
+            Ok(())
         })
     }
 }
