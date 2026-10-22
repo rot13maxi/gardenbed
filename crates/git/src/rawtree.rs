@@ -150,11 +150,14 @@ impl RawTreeCapture {
             });
         }
         if let Some(decided) = self.memo.get(&tree) {
-            // Already decided for this git tree SHA. A previously captured
-            // association is reusable only when the model tree matches;
-            // distinct model trees sharing one git tree SHA cannot happen
-            // (same bytes → same normalized model tree), so the memo is
-            // sound.
+            // Already decided for this git tree SHA — the DIVERGENCE
+            // decision is content-determined (same bytes ⇒ same
+            // divergence), so it is reused regardless of the model
+            // association of the current context: one git tree can
+            // normalize to different model trees across import contexts
+            // (a store's legacy frontier versus a fresh import; the
+            // association is first-seen advisory, and the export
+            // resolves the model tree from changeset context).
             //
             // One upgrade exception (empty-dir fidelity): a tree earlier
             // decided "no row" — e.g. the EMPTY tree as a canonical ROOT

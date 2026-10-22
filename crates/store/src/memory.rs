@@ -360,14 +360,16 @@ impl MetadataStore for MemoryStore {
             )));
         }
         self.write(|s| match s.raw_trees.get(&git_tree_sha) {
-            Some((existing, existing_model))
-                if existing.as_slice() == bytes && *existing_model == model_tree =>
-            {
-                Ok(())
-            }
+            // Identical bytes: idempotent no-op. The stored (first-seen)
+            // model association stays untouched — one git tree can
+            // normalize to different model trees across import contexts
+            // (legacy-Exec frontier vs fresh-Regular; see the trait doc),
+            // and the export resolves the model tree from changeset
+            // context, never from this column.
+            Some((existing, _)) if existing.as_slice() == bytes => Ok(()),
             Some(_) => Err(StoreError::Invalid(format!(
-                "raw tree {} already captured with different bytes or model \
-                 association — content-addressed rows are immutable",
+                "raw tree {} already captured with different bytes — \
+                 content-addressed rows are immutable",
                 crate::sqlite::hex_sha(&git_tree_sha)
             ))),
             None => {

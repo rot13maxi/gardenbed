@@ -800,22 +800,13 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                     let prev_bytes = zstd::bulk::decompress(&frame_prev, MAX_RAW_TREE)
                         .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
                     if prev_bytes.as_slice() == bytes {
-                        // Same content: the model association must match
-                        // too, or the row would silently change meaning.
-                        let prev_model: Vec<u8> = tx
-                            .query_row(
-                                "SELECT model FROM git_raw_tree WHERE git_sha = ?1",
-                                params![git_tree_sha.as_slice()],
-                                |r| r.get(0),
-                            )
-                            .map_err(db_err)?;
-                        if prev_model != model_payload {
-                            return Err(StoreError::Invalid(format!(
-                                "raw tree {} already captured with a different model \
-                                 association — content-addressed rows are immutable",
-                                hex_sha(&git_tree_sha)
-                            )));
-                        }
+                        // Same content: idempotent no-op. The stored
+                        // (first-seen) model association stays untouched —
+                        // one git tree can normalize to different model
+                        // trees across import contexts (legacy-Exec
+                        // frontier vs fresh-Regular; see the trait doc),
+                        // and the export resolves the model tree from
+                        // changeset context, never from this column.
                         Ok(())
                     } else {
                         Err(StoreError::Invalid(format!(

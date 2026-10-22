@@ -762,12 +762,13 @@ fn pg_raw_tree_concurrent_idempotence() {
         assert_eq!(stores[0].raw_tree_model_id(key).unwrap(), Some(Some(model)));
     }
 
-    // Mixed conflicting-association barrier round: same key, same bytes,
-    // half the callers put a DIFFERENT model association. Whichever
-    // insert lands first wins; every other caller must either be Ok
-    // (its association matches the stored row) or refused loudly with
-    // Invalid — never a duplicate-key Db error, and never a silent
-    // overwrite of the winner's association.
+    // Mixed-association barrier round: same key, same bytes, half the
+    // callers put a DIFFERENT model association. Same-bytes puts are all
+    // idempotent Ok (the association is first-seen advisory — one git
+    // tree can normalize differently across import contexts); the row's
+    // final association is whichever insert landed first, and the bytes
+    // are never overwritten. A Db error here would be the old
+    // duplicate-key bug.
     {
         let mut key = [0u8; 20];
         let body = raw_tree_body(&mut key, &tag, salt, 0xB7);
@@ -790,18 +791,15 @@ fn pg_raw_tree_concurrent_idempotence() {
             .collect();
         let mut ok = 0;
         for h in handles {
-            match h.join().expect("caller thread") {
-                Ok(()) => ok += 1,
-                Err(StoreError::Invalid(_)) => {}
-                Err(e) => panic!(
-                    "conflicting-association race must refuse with Invalid, \
-                     not {e:?} (a Db error here is the old duplicate-key bug)"
-                ),
-            }
+            h.join().expect("caller thread").expect(
+                "every same-bytes put is idempotent Ok regardless of association — \
+                     a Db error here is the old duplicate-key bug",
+            );
+            ok += 1;
         }
-        // The winner(s) all carry ONE association; the losers are loud
-        // Invalids; the row's final association is one of the racers'.
-        assert!(ok >= 1, "at least the winner returns Ok (ok={ok})");
+        // All callers succeeded; the row's association is whichever
+        // insert landed first, and the bytes are unchanged.
+        assert_eq!(ok, callers, "every same-bytes mixed-association put is Ok");
         let stored_assoc = stores[0]
             .raw_tree_model_id(key)
             .unwrap()
@@ -835,12 +833,12 @@ fn pg_raw_tree_concurrent_idempotence() {
     ));
     assert_eq!(store.raw_tree(key).unwrap(), Some(body.clone()));
 
-    // Conflicting association for an existing key refuses loudly too.
+    // Same bytes with a different association: idempotent Ok, first-seen
+    // association stays (advisory).
     let other = id_of(0x6E8 ^ hash_tag(&tag));
-    assert!(matches!(
-        store.put_raw_tree(key, Some(other), &body),
-        Err(StoreError::Invalid(_))
-    ));
+    store
+        .put_raw_tree(key, Some(other), &body)
+        .expect("same-bytes different-association put is an idempotent no-op");
     assert_eq!(store.raw_tree_model_id(key).unwrap(), Some(Some(model)));
 
     // An absent key reads as None (wrongkey direction).

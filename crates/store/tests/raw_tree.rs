@@ -7,10 +7,12 @@
 //!
 //! * **Hash discipline** — the row key is `SHA-1("tree <len>\0" + bytes)`;
 //!   bytes that hash elsewhere are refused with `Invalid`, never stored.
-//! * **Immutability** — re-putting the same key with identical bytes and
-//!   the same model association is an idempotent no-op; different bytes
-//!   or a different association is a loud `Invalid` (content-addressed
-//!   rows never change meaning).
+//! * **Immutability** — re-putting the same key with identical bytes is
+//!   an idempotent no-op (regardless of the model association: one git
+//!   tree can normalize to different model trees across import contexts
+//!   — a legacy frontier versus a fresh import — and the association is
+//!   first-seen advisory); different BYTES is a loud `Invalid`
+//!   (content-addressed rows never change content).
 //! * **Model association** — `raw_tree_model_id` returns the recorded
 //!   association, including the `Some(None)` (empty normalized tree)
 //!   and `None` (no row) cases; a key with no row reads as absent for
@@ -86,12 +88,23 @@ fn raw_tree_checks(store: &dyn MetadataStore) {
         .put_raw_tree(key, Some(id_of(1)), &body)
         .expect("re-put");
 
-    // Same bytes, different model association: the row would silently
-    // change meaning — loud refusal.
-    assert!(matches!(
-        store.put_raw_tree(key, Some(id_of(2)), &body),
-        Err(StoreError::Invalid(_))
-    ));
+    // Same bytes, different model association: idempotent Ok, and the
+    // FIRST-seen association stays (advisory; the export resolves the
+    // model tree from changeset context — one git tree legitimately
+    // normalizes differently across a legacy and a fresh import).
+    store
+        .put_raw_tree(key, Some(id_of(2)), &body)
+        .expect("same-bytes different-association put is an idempotent no-op");
+    assert_eq!(
+        store.raw_tree_model_id(key).unwrap(),
+        Some(Some(id_of(1))),
+        "the first-seen association stays untouched"
+    );
+    assert_eq!(
+        store.raw_tree(key).unwrap().expect("row"),
+        body,
+        "the bytes never change"
+    );
     // Same association, different bytes (hash discipline catches this
     // first: the bytes no longer SHA-1 to the key).
     assert!(matches!(

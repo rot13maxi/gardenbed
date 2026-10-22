@@ -132,10 +132,13 @@ pub trait MetadataStore: Send + Sync {
 
     /// The canonical model tree id a captured raw tree (keyed by its
     /// original git tree SHA, see [`MetadataStore::raw_tree`]) normalizes
-    /// to — the association the export uses to seed its render with
-    /// original bytes. `None` when no row was captured, or when the
+    /// to — the association recorded by the FIRST same-bytes put (see
+    /// [`MetadataStore::put_raw_tree`]: it is advisory; the same git
+    /// bytes can normalize differently across import contexts, and the
+    /// export resolves the model tree from the changeset context).
+    /// `None` when no row was captured, or when the first-seen
     /// normalized model tree is empty (an empty normalized tree has no
-    /// model id; the export renders the canonical empty tree).
+    /// model id).
     fn raw_tree_model_id(&self, _git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
         Ok(None)
     }
@@ -153,14 +156,20 @@ pub trait MetadataStore: Send + Sync {
     /// only ever consumed when a captured commit's `tree` header names
     /// its key.
     ///
-    /// Immutability: re-putting the same git SHA with identical bytes and
-    /// the same model association is an idempotent no-op; different bytes
-    /// or a different association is a [`StoreError::Invalid`] naming the
-    /// git SHA (the row is keyed by a 20-byte git tree SHA, not a model
-    /// [`Id`](gardenbed_model::Id), so the violation is reported as
-    /// `Invalid` rather than `ImmutabilityViolation`). The bytes must
-    /// SHA-1 to `git_tree_sha` — anything else is also
-    /// [`StoreError::Invalid`] (the row is content-addressed by its key).
+    /// Immutability: the BYTES are immutable — re-putting the same git
+    /// SHA with different bytes is a [`StoreError::Invalid`] naming the
+    /// git SHA, and the bytes must SHA-1 to `git_tree_sha` (the row is
+    /// content-addressed by its key). The model association is
+    /// first-seen **advisory**: a re-put with identical bytes and a
+    /// different association is an idempotent no-op that leaves the
+    /// stored association untouched. One git tree can legitimately
+    /// normalize to different model trees in different import contexts
+    /// (a store upgraded across the owner-bit mode rule holds a legacy
+    /// `Exec` frontier; a fresh import of the same git bytes derives
+    /// `Regular`), and the export resolves the model tree from the
+    /// CHANGESER context, never from this column — so refusing a
+    /// differing association would reject valid histories, not protect
+    /// integrity.
     fn put_raw_tree(
         &self,
         _git_tree_sha: [u8; 20],

@@ -901,21 +901,26 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
             if inserted == 0 {
                 let row = tx
                     .query_one(
-                        "SELECT data, model FROM git_raw_tree WHERE git_sha = $1",
+                        "SELECT data FROM git_raw_tree WHERE git_sha = $1",
                         &[&git_tree_sha.to_vec()],
                     )
                     .await
                     .map_err(pg_err)?;
-                // Compare decoded bytes, never frames (SQLite twin).
+                // Compare decoded bytes, never frames (SQLite twin). The
+                // stored (first-seen) model association stays untouched —
+                // one git tree can normalize to different model trees
+                // across import contexts (legacy-Exec frontier vs
+                // fresh-Regular; see the trait doc), and the export
+                // resolves the model tree from changeset context, never
+                // from the model column.
                 let prev_frame: Vec<u8> = row.get(0);
-                let prev_model: Vec<u8> = row.get(1);
                 let prev_bytes =
                     zstd::bulk::decompress(&prev_frame, crate::sqlite::MAX_RAW_TREE)
                         .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
-                if prev_bytes.as_slice() != bytes || prev_model != model_payload {
+                if prev_bytes.as_slice() != bytes {
                     return Err(StoreError::Invalid(format!(
-                        "raw tree {} already captured with different bytes or model \
-                         association — content-addressed rows are immutable",
+                        "raw tree {} already captured with different bytes — \
+                         content-addressed rows are immutable",
                         crate::sqlite::hex_sha(&git_tree_sha)
                     )));
                 }

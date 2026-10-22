@@ -19,9 +19,20 @@ M18.5, recorded on the quiet box). Raw-tree capture adds, per commit:
 - one tree walk of the commit's root closure (memoized across commits by
   git tree SHA — shared subtrees are decided once per import),
 - a `render_canonical` byte-compare per distinct tree,
-- one zstd-3 frame + one SQLite row per DISTINCT divergent subtree (the
-  kernel's pre-canonical segments fix up modes in bulk, so the divergent
-  set is large in exactly those segments — the gate exists to bound this).
+- one zstd-3 frame + one row per DISTINCT divergent subtree.
+
+**What a real quiet pair actually measures (observed 2026-10-22, pair
+r2):** the 1,000-commit master segment captured **0 raw-tree rows**
+(245 raw commits; `git_raw_tree: 0`) — the segment's trees are all
+canonical, so a quiet pair measures the capture-decision WALK
+(read + byte-compare per distinct tree), not divergent-row write cost.
+The early-history mode-fixup claim (kernel pre-canonical segments
+fixing modes in bulk) is NOT supported by current evidence: the
+v2.6.12 raw-closure scan (1076 trees) found **0 non-canonical modes**
+(`legacy-kernel-mode-scan.json`). Do not assume kernel raw-tree growth
+without a captured-segment proof; a SEPARATE generated non-canonical
+stress fixture may be added to bound the write path, but it is distinct
+from the pinned real-kernel gate.
 
 ## Corpus (READ-ONLY pinned mirror; never import into it)
 
@@ -78,9 +89,11 @@ M18.5, recorded on the quiet box). Raw-tree capture adds, per commit:
   measure both ratios, and INVESTIGATE the actual difference (profile
   the capture walk, count captured rows, check io) — do not rerun
   indefinitely and do not wave the discrepancy off as noise.
-- The gate is closed only on actual measured data from a
-  coordinator-scheduled exclusive window; a procedure alone never
-  closes it.
+- Final campaign: 3 quiet pairs on the FINAL code (A/B alternating) plus
+  the 5,000-commit segment; the historical 278 baseline is a
+  full-resume (619,487 commits / 2,230 s) versus this gate's fresh
+  limited-snapshot workload — the matching semantics of both sides must
+  be stated in the report, honestly, before any comparison is drawn.
 
 ## If the gate cannot run (current state)
 
