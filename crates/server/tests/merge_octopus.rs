@@ -66,14 +66,15 @@ impl ServerProc {
 
         Repo::open(&root.join("garden")).expect("fixture repository opens");
 
-        let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        let child = tokio::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
             .arg("--addr")
             .arg("127.0.0.1:0")
             .arg("--root")
             .arg(root)
+            .kill_on_drop(true)
             .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("server binary spawns");
+            .spawn();
+        let mut child = child.expect("server binary spawns");
         let stdout = child.stdout.take().expect("stdout piped");
         let mut lines = BufReader::new(stdout).lines();
         let line = timeout(Duration::from_secs(30), lines.next_line())
@@ -94,9 +95,21 @@ impl ServerProc {
             .expect("client connects")
     }
 
+    /// Graceful shutdown at the end of a passing test.
     async fn shutdown(mut self) {
-        let _ = self.child.kill().await;
+        self.child.kill().await.expect("server killed");
         let _ = self.child.wait().await;
+    }
+}
+
+/// A panicking test must NOT leak the spawned server binary (the
+/// process outlives the test harness, holding its systemd scope and
+/// the shared cargo gate). `Drop` fires on unwind exactly when the
+/// `shutdown` call was skipped. Kill-on-drop is belt and braces: the
+/// child is configured to die with the harness too.
+impl Drop for ServerProc {
+    fn drop(&mut self) {
+        let _ = self.child.start_kill();
     }
 }
 
@@ -581,5 +594,106 @@ async fn octopus_matches_git_tree_on_clean_fold() {
         git.insert(path.to_owned(), blob);
     }
     assert_eq!(garden, git, "gardenbed octopus tree equals git's");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn octopus_merges_when_pairwise_maximal_sets_do_not_intersect() {
+    // The R2 finding-2 DAG: a target diverged BELOW another side's
+    // fork point makes the pairwise maximal base sets disjoint —
+    // intersecting them (the old octopus_bases) refused a merge git
+    // completes. Git's octopus runs multi-arg
+    // `git merge-base --all $SHA1 $MRC` (git-merge-octopus.sh:72):
+    // the maximal elements of anc(t) ∩ (anc(ref) for some ref) —
+    // computed as the UNION of the pairwise common ancestors with a
+    // dominance filter, never an intersection.
+    //
+    // DAG (the reviewer's oracle at /tmp/octo-bases-oracle):
+    //   root → x;  y = child(x);  m1 = child(y);  m2 = child(x);
+    //   t = child(y).  Octopus ours = m1, targets = [m2, t].
+    // Round 2 has mrc = [m1, m2]:
+    //   maximal(m1, t) = {y},  maximal(m2, t) = {x}  →  ∩ = {}
+    //   git: `merge-base --all t m1 m2` = y; octopus succeeds with
+    //   parents [m1, m2, t].
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = ServerProc::spawn(dir.path()).await;
+    let repo = "garden";
+    let client = server.client().await;
+
+    // Build the exact DAG through the server boundary.
+    async fn commit(
+        client: &GardenbedClient,
+        repo: &str,
+        parents: Vec<Id>,
+        path: &str,
+        who: &str,
+        secs: u64,
+    ) -> Id {
+        let content = format!("{path}\n").into_bytes();
+        client
+            .create_changeset(
+                repo,
+                &Changeset {
+                    parents,
+                    changes: vec![add(path, &content)],
+                    message: path.into(),
+                    author: identity(who, secs),
+                    committer: identity(who, secs),
+                    signature: None,
+                },
+                blobs(&[&content]),
+            )
+            .await
+            .expect("DAG commit created")
+    }
+    let root = commit(&client, repo, vec![], "root", "amy", 0).await;
+    let x = commit(&client, repo, vec![root], "x", "bob", 1).await;
+    let y = commit(&client, repo, vec![x], "y", "cat", 2).await;
+    let m1 = commit(&client, repo, vec![y], "m1", "dan", 3).await;
+    let m2 = commit(&client, repo, vec![x], "m2", "eve", 4).await;
+    let t = commit(&client, repo, vec![y], "t", "fay", 5).await;
+
+    // ours = m1, targets = [m2, t] (the oracle's argument order).
+    let (mrc, targets) = (vec![m1], vec![m2, t]);
+
+    // Round 1: mrc=[m1] vs m2 — single maximal base x, folds.
+    // Round 2: mrc=[m1,m2] vs t — pairwise maximals {y} and {x} are
+    // DISJOINT; the union+dominance base is {y} and the merge must
+    // proceed, not refuse.
+    let (merged, up_to_date) = client
+        .merge_octopus(
+            repo,
+            mrc[0],
+            &targets,
+            "octopus",
+            &identity("amy", 9),
+            &identity("amy", 9),
+        )
+        .await
+        .expect("octopus merges despite disjoint pairwise maximal sets");
+    assert!(!up_to_date);
+
+    // Parents are exactly (ours, target1, target2) = [m1, m2, t] —
+    // the git-oracle octopus commit b3906c0's parent shape.
+    let cs = client
+        .get_changeset(repo, merged)
+        .await
+        .expect("merged changeset readable");
+    assert_eq!(cs.parents, vec![m1, m2, t], "octopus parents");
+
+    // The merged tree carries every side's file (clean fold).
+    let root_tree = client
+        .root_tree(repo, merged)
+        .await
+        .expect("root tree")
+        .expect("non-empty tree");
+    let tree = client.get_tree(repo, root_tree).await.expect("tree");
+    let mut names: Vec<&str> = tree.entries.iter().map(|e| e.name.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        vec!["m1", "m2", "root", "t", "x", "y"],
+        "every DAG node's file is in the merged tree"
+    );
     server.shutdown().await;
 }

@@ -1068,9 +1068,10 @@ impl Repo {
             if up_to_date {
                 continue;
             }
-            // The common ancestors of the target and EVERY accumulated
-            // reference (git: `git merge-base --all $SHA1 $MRC` with
-            // MRC's space-separated list).
+            // The merge bases of the target against the accumulated
+            // head (git: `git merge-base --all $SHA1 $MRC` with
+            // MRC's space-separated list — union of the pairwise
+            // common ancestors, filtered to maximal).
             let bases = self.octopus_bases(&mrc, t)?;
             if bases.is_empty() {
                 return Err(ServerError::Invalid(format!(
@@ -1174,22 +1175,50 @@ impl Repo {
             .map_err(ServerError::Store)
     }
 
-    /// The common ancestors of `t` and EVERY of `refs` (git's
-    /// `merge-base --all t mrc…` over the accumulated reference list):
-    /// the intersection of each pair's maximal common ancestors.
+    /// The merge bases of the target `t` against the accumulated
+    /// octopus head `refs` — git's multi-argument
+    /// `git merge-base --all $SHA1 $MRC` over the space-separated
+    /// reference list (git-merge-octopus.sh:72).
+    ///
+    /// This is NOT the intersection of each `(ref, t)` pairwise
+    /// maximal set: on `root→x; y=child(x); m1=child(y);
+    /// m2=child(x); t=child(y)` (octopus ours=m1, targets=[m2,t])
+    /// the pairwise maximals are `maximal(m1,t)={y}` and
+    /// `maximal(m2,t)={x}` — their intersection is empty, which
+    /// would refuse a merge git completes (git answers `y` and
+    /// produces parents `[m1,m2,t]`). Instead the result is the
+    /// maximal elements of `ancestors(t) ∩ (ancestors(ref) for some
+    /// ref in refs)`: candidates are gathered as the UNION of each
+    /// pair's full common-ancestor set, then any candidate that is a
+    /// proper ancestor of another candidate is dropped (the same
+    /// union+dominance shape as the engine's `fold_virtual_base`
+    /// accumulated-refs overlay). Empty only when some target
+    /// shares NO ancestor with the accumulated head — the refusal
+    /// git's octopus script reports.
     fn octopus_bases(&self, refs: &[Id], t: Id) -> Result<Vec<Id>, ServerError> {
-        let mut acc: Option<Vec<Id>> = None;
+        // Candidates: every common ancestor of (t, ref) for ANY ref.
+        let mut candidates: Vec<Id> = Vec::new();
         for &m in refs {
             let bases = self.engine.merge_bases_all(m, t)?;
-            acc = Some(match acc {
-                None => bases,
-                Some(mut prev) => {
-                    prev.retain(|b| bases.contains(b));
-                    prev
+            for b in bases {
+                if !candidates.contains(&b) {
+                    candidates.push(b);
                 }
-            });
+            }
         }
-        Ok(acc.unwrap_or_default())
+        // Dominance filter: drop any candidate that is a proper
+        // ancestor of another candidate. What remains is maximal.
+        let mut dominated: Vec<Id> = Vec::new();
+        for (i, &c) in candidates.iter().enumerate() {
+            for (j, &d) in candidates.iter().enumerate() {
+                if i != j && self.engine.is_ancestor(c, d)? {
+                    dominated.push(c);
+                    break;
+                }
+            }
+        }
+        candidates.retain(|c| !dominated.contains(c));
+        Ok(candidates)
     }
 
     /// A snapshot of the request counters, sorted by name.

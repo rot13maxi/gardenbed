@@ -145,9 +145,12 @@ folds `targets` into `ours` sequentially, following
 `git-merge-octopus` (verified against git 2.43 source and behavior):
 
 - **Round i:** merge the accumulated reference with `targets[i]` over
-  `octopus_bases` — the intersection of pairwise `merge_bases_all`
-  over the accumulated references (git: `git merge-base --all SHA
-  $MRC` over the accumulated list).
+  `octopus_bases` — the maximal elements of the UNION of the pairwise
+  common-ancestor sets of the accumulated references vs the target
+  (git: `git merge-base --all $SHA1 $MRC` over the accumulated list;
+  NOT their intersection — a target forked below another side's fork
+  point makes the pairwise maximal sets disjoint, and git still
+  merges).
 - **Up-to-date target** (an ancestor of the accumulated reference):
   skipped, NOT recorded as a parent.
 - **First-round fast-forward** (the first target's tree equals the
