@@ -87,8 +87,7 @@ pub struct ExportOptions {
     /// different counterpart (a native-vs-re-imported twin) are refused
     /// and reported — never overwritten — so import-written mappings and
     /// the incremental import frontier stay canonical.
-    pub record_mappings: bool,
-}
+    pub record_mappings: bool,}
 
 /// What an export produced.
 ///
@@ -120,6 +119,11 @@ pub struct ExportReport {
     /// and refs are already on disk, and the conflicting (canonical,
     /// import-written) mapping was deliberately left untouched.
     pub mappings: Option<gardenbed_store::ExportMappingReport>,
+    /// Raw tree objects emitted verbatim from captured rows (git trees
+    /// whose canonical render diverges: pre-canonical modes, non-UTF-8
+    /// names). The bytes are the original git tree object bodies, so the
+    /// exported pack reproduces the imported SHAs exactly.
+    pub raw_trees_emitted: u64,
     /// Path of the written pack file (the `.idx` sits beside it).
     pub pack_path: std::path::PathBuf,
     /// Wall-clock duration of the whole export.
@@ -371,6 +375,7 @@ pub fn export_to_path(
     let mut t_render_total = std::time::Duration::ZERO;
     let mut commits: Vec<(Id, String)> = Vec::with_capacity(order.len());
     let mut signed_dropped: u64 = 0;
+    let mut raw_trees_emitted: u64 = 0;
     for window in order.chunks(COMMIT_WINDOW) {
         // Derive the window's roots, then decode its not-yet-rendered
         // trees in parallel before rendering anything.
@@ -400,12 +405,50 @@ pub fn export_to_path(
                 trees: &window_trees,
                 pack: &mut pack,
                 written: &mut written,
+                metadata: Some(metadata.as_ref()),
+                raw_emitted: &mut raw_trees_emitted,
             }
             .render(*root)?;
             t_render_total += t1.elapsed();
 
-            // The commit bytes: raw row (verbatim, asserted) or reconstruction.
+            // Raw-tree fidelity: a captured commit's `tree` header names
+            // the ORIGINAL root SHA. When a raw-tree row exists for it,
+            // the original bytes replace the model render as the emitted
+            // tree (subtrees likewise, recursively — each raw row's
+            // entries name child SHAs, and a child with no row renders
+            // canonically from the model through the same memo). The
+            // per-tree SHA assertion below stays load-bearing: the bytes
+            // are hashed and compared against the mapping row.
             let raw = metadata.raw_commit(*id).map_err(ExportError::from)?;
+            let tree_sha = match raw.as_deref() {
+                Some(raw_bytes) => {
+                    let root_sha =
+                        raw_tree_header(raw_bytes).ok_or_else(|| ExportError::Changeset {
+                            id: id.to_hex(),
+                            detail: "the raw commit bytes carry no parseable tree header".into(),
+                        })?;
+                    match metadata.raw_tree(root_sha).map_err(ExportError::from)? {
+                        Some(bytes) => {
+                            TreeRenderer {
+                                engine: &engine,
+                                blob_shas: &blob_shas,
+                                tree_shas: &mut tree_shas,
+                                trees: &window_trees,
+                                pack: &mut pack,
+                                written: &mut written,
+                                metadata: Some(metadata.as_ref()),
+                                raw_emitted: &mut raw_trees_emitted,
+                            }
+                            .emit_raw_tree(root_sha, bytes, *root, 0)?;
+                            root_sha
+                        }
+                        None => tree_sha,
+                    }
+                }
+                None => tree_sha,
+            };
+
+            // The commit bytes: raw row (verbatim, asserted) or reconstruction.
             let (commit_bytes, from_raw) = match raw {
                 Some(bytes) => {
                     // Raw bytes are identity truth, not pack closure truth:
@@ -515,6 +558,7 @@ pub fn export_to_path(
         None
     };
 
+
     let refs: Vec<(String, String)> = tips
         .iter()
         .map(|(name, tip)| {
@@ -533,6 +577,7 @@ pub fn export_to_path(
         commits_exported: order.len() as u64,
         blobs_exported: blob_ids.len() as u64,
         signed_dropped,
+        raw_trees_emitted,
         refs,
         commits,
         mappings,
@@ -584,6 +629,11 @@ struct TreeRenderer<'a> {
     trees: &'a HashMap<Id, Arc<gardenbed_model::Tree>>,
     pack: &'a mut PackWriter,
     written: &'a mut HashSet<[u8; 20]>,
+    /// The metadata store, for resolving captured raw-tree rows by git
+    /// SHA during the raw emit path (`None` disables raw emission).
+    metadata: Option<&'a dyn MetadataStore>,
+    /// Raw tree objects emitted verbatim so far (report counter).
+    raw_emitted: &'a mut u64,
 }
 
 impl TreeRenderer<'_> {
@@ -607,6 +657,126 @@ impl TreeRenderer<'_> {
             }
             Some(id) => self.render_node(id, 0),
         }
+    }
+
+    /// Emits a captured raw tree verbatim: the ORIGINAL git tree object
+    /// bytes replace the canonical render, so the exported pack carries
+    /// the imported SHA. Subtree entries named by the raw bytes recurse:
+    /// a child with a raw row emits its row (divergent child), a child
+    /// without one renders canonically from the model (non-divergent
+    /// child — its canonical render reproduces its original SHA, or
+    /// import would not have skipped it).
+    ///
+    /// `model_tree` is the model subtree at this position (the
+    /// association), used to resolve canonical children. The per-tree SHA
+    /// assertion stays load-bearing: the bytes are re-hashed and must
+    /// equal the row key, so a tampered row fails loudly here.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_raw_tree(
+        &mut self,
+        sha: [u8; 20],
+        bytes: Vec<u8>,
+        model_tree: Option<Id>,
+        depth: usize,
+    ) -> Result<(), ExportError> {
+        if depth > MAX_TREE_DEPTH {
+            return Err(ExportError::Changeset {
+                id: model_tree
+                    .map(|t| t.to_hex())
+                    .unwrap_or_else(|| "empty".into()),
+                detail: "tree nesting exceeds the maximum supported depth".into(),
+            });
+        }
+        // The load-bearing per-tree assertion: row bytes must hash to the
+        // row key. A tampered row (direct DB edit) dies here, loudly.
+        let computed = git_sha1(2, &bytes);
+        if computed != sha {
+            return Err(ExportError::Changeset {
+                id: model_tree
+                    .map(|t| t.to_hex())
+                    .unwrap_or_else(|| "empty".into()),
+                detail: format!(
+                    "raw tree row {} holds bytes that hash to {} — a tampered or \
+                     corrupt row; export refuses rather than emit a wrong SHA",
+                    to_hex(&sha),
+                    to_hex(&computed)
+                ),
+            });
+        }
+        if self.written.insert(sha) {
+            self.pack.push(PackObject {
+                kind: 2,
+                data: bytes.clone(),
+                sha1: sha,
+            })?;
+            *self.raw_emitted += 1;
+        }
+        // Recurse: pair raw entries with the model subtree's entries by
+        // name to resolve non-raw children.
+        let entries =
+            crate::gtree::parse_tree_raw(&bytes).map_err(|detail| ExportError::Changeset {
+                id: model_tree
+                    .map(|t| t.to_hex())
+                    .unwrap_or_else(|| "empty".into()),
+                detail: format!("captured raw tree does not parse: {detail}"),
+            })?;
+        let model_entries: Vec<gardenbed_model::TreeEntry> = match model_tree {
+            Some(id) => self
+                .engine
+                .cached_tree_arc(id)
+                .map_err(ExportError::from)?
+                .map(|t: Arc<gardenbed_model::Tree>| t.entries.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let metadata = self.metadata.ok_or_else(|| {
+            ExportError::Other("raw-tree emission requires the metadata store".into())
+        })?;
+        for e in &entries {
+            if e.kind != crate::gtree::GKind::Dir {
+                continue; // blobs are pushed by the blob phase (identity)
+            }
+            let child_sha = *e.oid.as_bytes();
+            match metadata.raw_tree(child_sha).map_err(ExportError::from)? {
+                Some(child_bytes) => {
+                    // Pair by the lossy name (the model holds lossy
+                    // names; the importer's collision guard proved the
+                    // lossy names unique per directory).
+                    let lossy_name = String::from_utf8_lossy(&e.name).into_owned();
+                    let child_model = model_entries
+                        .iter()
+                        .find(|me| {
+                            me.kind == gardenbed_model::TreeKind::Dir && me.name == lossy_name
+                        })
+                        .and_then(|me| me.tree);
+                    self.emit_raw_tree(child_sha, child_bytes, child_model, depth + 1)?;
+                }
+                None => {
+                    // Non-divergent child: the canonical render (through
+                    // the model) reproduces its original SHA — emit it
+                    // via the normal path so the pack stays complete.
+                    let lossy_name = String::from_utf8_lossy(&e.name).into_owned();
+                    let child_model = model_entries
+                        .iter()
+                        .find(|me| {
+                            me.kind == gardenbed_model::TreeKind::Dir && me.name == lossy_name
+                        })
+                        .and_then(|me| me.tree)
+                        .ok_or_else(|| ExportError::Changeset {
+                            id: model_tree
+                                .map(|t| t.to_hex())
+                                .unwrap_or_else(|| "empty".into()),
+                            detail: format!(
+                                "raw tree names directory {:?} with no model subtree — \
+                                 the model cannot render it; export refuses",
+                                String::from_utf8_lossy(&e.name)
+                            ),
+                        })?;
+                    self.render_node(child_model, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     fn render_node(&mut self, id: Id, depth: usize) -> Result<[u8; 20], ExportError> {
@@ -692,6 +862,24 @@ impl TreeRenderer<'_> {
         self.tree_shas.insert(id, sha);
         Ok(sha)
     }
+}
+
+/// The `tree <40-hex>` header of a raw commit object, as bytes. `None`
+/// when the header is absent or malformed (the caller refuses loudly).
+fn raw_tree_header(raw: &[u8]) -> Option<[u8; 20]> {
+    let line_end = raw.iter().position(|b| *b == b'\n')?;
+    let line = &raw[..line_end];
+    let hex = line.strip_prefix(b"tree ")?;
+    if hex.len() != 40 || hex.iter().any(|b| !b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 20];
+    for i in 0..20 {
+        let hi = (hex[2 * i] as char).to_digit(16)? as u8;
+        let lo = (hex[2 * i + 1] as char).to_digit(16)? as u8;
+        out[i] = (hi << 4) | lo;
+    }
+    Some(out)
 }
 
 /// A raw commit's bytes must only reference what this export writes:
@@ -853,6 +1041,29 @@ fn git_mode(mode: Mode) -> &'static str {
         Mode::Exec => "100755",
         Mode::Symlink => "120000",
         Mode::Gitlink => "160000",
+    }
+}
+
+/// The canonical git mode string the export renders for a tree entry of
+/// `kind` whose original mode string was `mode` — the raw-tree capture
+/// predicate's oracle for "what the canonical export would write".
+///
+/// This is the inverse of the importer's mode canonicalization (`map_mode`):
+/// `100664` → `100644` (the exec-bit rule), `040000` → `40000` (git's
+/// abbreviated directory form). `None` marks a mode the canonical export
+/// cannot reproduce (unsupported mode strings are already parse errors).
+pub(crate) fn canonical_git_mode(kind: crate::gtree::GKind, mode: &str) -> Option<&'static str> {
+    match kind {
+        crate::gtree::GKind::Dir => {
+            if matches!(mode, "400" | "40000" | "040000") {
+                Some("40000")
+            } else {
+                None
+            }
+        }
+        crate::gtree::GKind::File => crate::gtree::map_mode(mode)
+            .and_then(|(_, m)| m)
+            .map(git_mode),
     }
 }
 
