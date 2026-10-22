@@ -921,3 +921,82 @@ fn three_maximal_bases_shared_edit_merges_clean_like_git() {
         );
     }
 }
+
+#[test]
+fn conflicting_multi_base_merge_persists_no_changesets() {
+    // The virtual-base fold must be a PURE overlay: no synthetic or
+    // authored changeset may enter the metadata store, whether the
+    // outer merge is clean or conflicting. Build a three-maximal-base
+    // shape whose tips CONFLICT (same file, overlapping edits), run
+    // the recursive merge, and assert the store's changeset set is
+    // byte-identical before and after (recent_changesets AND the
+    // total put_changeset population via a full re-listing).
+    let (engine, ours, theirs, _o, _t) = three_maximal_base_fixture(true);
+    let metadata = engine.metadata().clone();
+
+    let before: Vec<Id> = metadata.recent_changesets(u32::MAX).unwrap();
+    assert!(before.len() >= 8, "fixture population sanity: {before:?}");
+
+    // Force a conflicting outer merge: the tips' overlapping edits on
+    // the SAME file. Reuse the fixture but edit the same region
+    // differently on each side: re-parent fresh tips over the merge
+    // nodes with colliding content.
+    let objects = engine.objects();
+    let colliding = |tag: &str, secs: u64, parent: Id, content: &[u8]| -> Id {
+        let blob = blob_id(content);
+        objects.put_blob(content).unwrap();
+        let cs = gardenbed_model::Changeset {
+            parents: vec![parent],
+            changes: vec![Change {
+                path: "f.txt".to_owned(),
+                op: Op::Modify,
+                blob: Some(blob),
+                src_path: None,
+                mode: Mode::Regular,
+            }],
+            message: format!("collide {tag}"),
+            author: ident(tag, secs),
+            committer: ident(tag, secs),
+            signature: None,
+        };
+        let id = metadata.put_changeset(&cs).unwrap();
+        engine.on_changeset_created(id).unwrap();
+        id
+    };
+    let ours_c = colliding("oursC", 21, ours, b"OURS-ONLY-LINE\n");
+    let theirs_c = colliding("theirsC", 22, theirs, b"THEIRS-ONLY-LINE\n");
+
+    let mid: Vec<Id> = metadata.recent_changesets(u32::MAX).unwrap();
+    assert_eq!(mid.len(), before.len() + 2, "the two colliding tips");
+
+    // The recursive merge over three maximal bases, conflicting at
+    // the tips: must CONFLICT, and must not store anything.
+    let outcome = engine
+        .merge_tree_changes_recursive(ours_c, theirs_c)
+        .unwrap();
+    let conflicts = outcome.expect_err("overlapping tip edits must conflict");
+    assert!(
+        conflicts.iter().any(|p| p == "f.txt"),
+        "conflict names f.txt: {conflicts:?}"
+    );
+
+    let after: Vec<Id> = metadata.recent_changesets(u32::MAX).unwrap();
+    assert_eq!(
+        after, mid,
+        "the multi-base fold stored no synthetic or authored changesets"
+    );
+
+    // The CLEAN path too: the disjoint three-base merge folds all
+    // bases and still must not persist anything.
+    let (engine2, ours2, theirs2, _o2, _t2) = three_maximal_base_fixture(true);
+    let before2 = engine2.metadata().recent_changesets(u32::MAX).unwrap();
+    engine2
+        .merge_tree_changes_recursive(ours2, theirs2)
+        .unwrap()
+        .expect("disjoint 3-base merge is clean");
+    let after2 = engine2.metadata().recent_changesets(u32::MAX).unwrap();
+    assert_eq!(
+        after2, before2,
+        "the clean multi-base fold also stored nothing"
+    );
+}

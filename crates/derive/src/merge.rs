@@ -1435,8 +1435,8 @@ fn load_or_default(objects: &dyn ObjectStore, id: Option<Id>) -> Result<Tree, St
 }
 
 /// Bound on the recursive virtual-base fold's descent (criss-cross
-/// stacks of stacks). Beyond it the fold REFUSES with a named error
-/// in the deterministic order — a documented limit, not a mis-merge.
+/// stacks of stacks). Beyond it the fold REFUSES with a named error —
+/// a documented limit, never a silent anchor to an arbitrary base.
 const MAX_RECURSIVE_BASE_DEPTH: usize = 16;
 
 impl Engine {
@@ -1648,7 +1648,10 @@ impl Engine {
     /// then merges as if absent from the base, which surfaces the
     /// real disagreement to the outer merge instead of hiding it
     /// behind an arbitrary pick): the virtual base is a derived,
-    /// never-stored tree, so nothing partial is ever persisted.
+    /// never-stored tree, so nothing partial is ever persisted — no
+    /// synthetic or authored changeset enters the metadata store
+    /// either (the ancestry is a pure in-memory overlay; see
+    /// [`Engine::fold_virtual_base`]).
     ///
     /// A unique merge base skips the fold entirely — the behavior is
     /// byte-identical to [`Engine::merge_tree_changes`] for every
@@ -1708,49 +1711,73 @@ impl Engine {
         }
     }
 
-    /// Folds `bases` (deterministically ordered) into one virtual base
-    /// tree id, left-to-right: `acc = merge(acc, bases[i])` over
-    /// `merge_base(acc, bases[i])`. Conflicting paths drop out of the
-    /// virtual base (see [`Engine::merge_tree_changes_recursive`]).
     /// Folds `bases` (deterministically ordered, ALL changeset ids)
     /// into one virtual base TREE id (`None` = empty), left-to-right:
-    /// `acc = merge(acc, bases[i])` over `merge_bases_all(acc_cs,
-    /// bases[i])`, with conflicts resolved by dropping the conflicting
-    /// paths from the virtual base (see
-    /// [`Engine::merge_tree_changes_recursive`]).
+    /// `acc = merge(acc, bases[i])` anchored on the maximal common
+    /// ancestors of the ACCUMULATED references and `bases[i]`, with
+    /// conflicts resolved by dropping the conflicting paths from the
+    /// virtual base (see [`Engine::merge_tree_changes_recursive`]).
     ///
-    /// NOTE on ids: the fold works in TREE space internally
-    /// (`acc_tree`), but `merge_tree_changes` and
-    /// `merge_bases_all` take CHANGESET ids — the fold tracks the
-    /// changeset whose tree `acc_tree` currently is (`acc_cs`) so
-    /// ancestry stays real. The first base's changeset anchors it.
+    /// Ancestry is a VIRTUAL overlay, never stored: the accumulator
+    /// tracks the real changesets folded so far (`acc_refs`). The
+    /// common ancestors of the union ancestry `∪ acc_refs` and `b`
+    /// are the union of `merge_bases_all(ref, b)` over every folded
+    /// reference, filtered to the MAXIMAL set by `is_ancestor` — the
+    /// same shape as the server's `octopus_bases` over its
+    /// accumulated merge references. No synthetic changeset is ever
+    /// written to the metadata store: a merge that conflicts leaves
+    /// `recent_changesets` and every authored-history view untouched
+    /// (derived tree objects are content-addressed and orphan-safe).
     fn fold_virtual_base(&self, bases: &[Id], depth: usize) -> Result<Option<Id>, StoreError> {
         if depth > MAX_RECURSIVE_BASE_DEPTH {
             // Bounded descent, LOUD: a criss-cross stack deeper than
             // the cap is not silently anchored to an arbitrary base —
-            // the merge refuses with a nameable error. (git has no
-            // such cap; pathological stacks this deep are not
-            // constructible through ordinary merges, and refusing is
-            // safe where a wrong base silently is not.)
+            // the merge refuses with a nameable error. Refusing is
+            // safe where a wrong base silently is not.
             return Err(StoreError::Invalid(format!(
                 "recursive merge base fold exceeded depth {}",
                 MAX_RECURSIVE_BASE_DEPTH
             )));
         }
         let mut acc_tree = self.derive_tree(bases[0])?;
-        let mut acc_cs = bases[0];
+        let mut acc_refs: Vec<Id> = vec![bases[0]];
         for &b in &bases[1..] {
-            let inner_bases = self.merge_bases_all(acc_cs, b)?;
+            // Common ancestors of (∪ ancestry of acc_refs, b): the
+            // union of each accumulated reference's maximal bases
+            // with b...
+            let mut candidates: Vec<Id> = Vec::new();
+            for &r in &acc_refs {
+                for base in self.merge_bases_all(r, b)? {
+                    if !candidates.contains(&base) {
+                        candidates.push(base);
+                    }
+                }
+            }
+            // ...then discard the non-maximal (any candidate that is
+            // a strict ancestor of another candidate).
+            let mut maximal: Vec<Id> = Vec::new();
+            for (i, &c) in candidates.iter().enumerate() {
+                let mut dominated = false;
+                for (j, &d) in candidates.iter().enumerate() {
+                    if j != i && c != d && self.is_ancestor(c, d)? {
+                        dominated = true;
+                        break;
+                    }
+                }
+                if !dominated {
+                    maximal.push(c);
+                }
+            }
             // The inner base: ONE maximal base is the ordinary
             // anchor; SEVERAL fold RECURSIVELY (each level +1 depth)
             // — discarding all but the first would mis-anchor the
             // round exactly like the outer merge it defuses.
-            let inner_base_tree = if inner_bases.is_empty() {
+            let inner_base_tree = if maximal.is_empty() {
                 None
-            } else if inner_bases.len() == 1 {
-                self.derive_tree(inner_bases[0])?
+            } else if maximal.len() == 1 {
+                self.derive_tree(maximal[0])?
             } else {
-                self.fold_virtual_base(&inner_bases, depth + 1)?
+                self.fold_virtual_base(&maximal, depth + 1)?
             };
             let b_tree = self.derive_tree(b)?;
             let acc_b = self.merge_tree_ids(inner_base_tree, acc_tree, b_tree)?;
@@ -1765,13 +1792,11 @@ impl Engine {
                     self.virtual_base_dropping(inner_base_tree, acc_tree, b_tree, &conflicts)?
                 }
             };
-            // The fold round is a REAL (virtual) changeset: parents
-            // [acc_cs, b]. Storing it means the next round's
-            // `merge_bases_all(acc_cs, b')` sees the accumulated
-            // ancestry — the union of everything folded so far plus
-            // `b` — instead of one sibling's history.
+            // Advance the accumulator in TREE space only; the folded
+            // references (real changesets) accumulate for the next
+            // round's ancestry overlay.
             let folded = gardenbed_model::Changeset {
-                parents: vec![acc_cs, b],
+                parents: vec![acc_refs.last().copied().expect("non-empty")],
                 changes,
                 message: "virtual base fold".into(),
                 author: gardenbed_model::Identity {
@@ -1788,9 +1813,8 @@ impl Engine {
                 },
                 signature: None,
             };
-            let folded_cs = self.metadata.put_changeset(&folded)?;
             acc_tree = self.apply_changeset_to_tree(acc_tree, &folded)?;
-            acc_cs = folded_cs;
+            acc_refs.push(b);
         }
         Ok(acc_tree)
     }

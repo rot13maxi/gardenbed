@@ -111,13 +111,19 @@ semantics), and:
 - **1 base:** the ordinary single-base merge, byte-identical to
   `merge_tree_changes` (the v0.2 contract preserved).
 - **≥2 bases:** `fold_virtual_base` folds them left-to-right —
-  `acc = merge(acc, bases[i])` over `merge_bases_all(acc, bases[i])`
-  — into a **virtual base tree**. Each round's fold IS stored as a
-  virtual changeset with parents `[prev_acc, bases[i]]`, so the next
-  round's `merge_bases_all` sees the ACCUMULATED ancestry (the union
-  of everything folded so far), not one sibling's history. When a
-  round's own inner bases are multiple, the inner anchor is itself a
-  RECURSIVE fold (depth +1) — all inner maximal bases participate. A
+  `acc = merge(acc, bases[i])` anchored on the MAXIMAL common
+  ancestors of the accumulated references and `bases[i]` — into a
+  **virtual base tree**. The accumulator tracks the real folded
+  changesets (`acc_refs`) as a VIRTUAL ancestry overlay: the common
+  ancestors of `(∪ acc_refs, b)` are the union of
+  `merge_bases_all(ref, b)` over every folded reference, filtered to
+  the maximal set by `is_ancestor` — the same shape as the server's
+  `octopus_bases`. NOTHING is stored: no synthetic or authored
+  changeset ever enters the metadata store (a merge that conflicts
+  leaves `recent_changesets` untouched; the fold's intermediate trees
+  are derived, content-addressed, and orphan-safe). When a round's
+  inner bases are multiple, the inner anchor is itself a RECURSIVE
+  fold (depth +1) — all inner maximal bases participate. A
   conflicting inner fold DROPS the conflicting paths from the virtual
   base (`virtual_base_dropping`): the outer merge then sees those
   paths as base-absent, surfacing the real disagreement instead of
@@ -203,7 +209,7 @@ every clean path's merged content and the full merged path set.
   refuses binary content merges), exact-duplicate blobs with one
   mover, an equal-score two-pair tie, and a huge-blobs /
   short-common-lines false-positive guard.
-- `crates/derive/tests/merge_recursive.rs` — 7 tests: `merge_bases_all`
+- `crates/derive/tests/merge_recursive.rs` — 8 tests: `merge_bases_all`
   parity with `git merge-base --all` on criss-crosses; clean-fold
   content equality with git; classification parity (single-base
   tie-break conflicts where git+recursive merges cleanly); unique-base
@@ -213,8 +219,10 @@ every clean path's merged content and the full merged path set.
   `base→{x,y,z} siblings, p1=(x,y), p2=(y,x), ours=(p1,z)+edit,
   theirs=(p2,z)+edit` — asserting `git merge-base --all` sees exactly
   three maximal bases and the fold reproduces git's clean merge
-  content (the accumulated-ancestry contract: the fold's virtual
-  changesets carry the union ancestry).
+  content — and a no-persistence regression: through BOTH the
+  conflicting and the clean multi-base fold, `recent_changesets` is
+  byte-identical before and after (the virtual ancestry overlay
+  stores nothing).
 - `crates/derive/tests/merge_base_maximal.rs` — 5 tests: same-second
   criss-cross (both direct APIs pick a maximal base; `merge_bases_all`
   equals the maximal pair; merging over the dominated pick conflicts
