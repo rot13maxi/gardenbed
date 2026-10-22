@@ -880,3 +880,241 @@ fn rename_matrix_matches_git() {
         run_case(case);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Locality (the pruned-diff rename candidates): rename detection
+// must read only CHANGED subtrees. A branch that edits files in place
+// across a wide unchanged tree contributes no rename candidates and
+// must not scan the unchanged bulk — tree reads stay O(changed
+// paths), not O(whole tree). The counting store counts every
+// `get_tree`; the control proves the counting works (a rename-heavy
+// branch reads many more trees).
+// ---------------------------------------------------------------------------
+
+/// An [`ObjectStore`] wrapper counting `get_tree` calls (tree gets).
+struct CountingTrees {
+    inner: Arc<MemoryStore>,
+    tree_gets: std::sync::atomic::AtomicUsize,
+}
+
+impl gardenbed_store::ObjectStore for CountingTrees {
+    fn get_blob(&self, id: Id) -> Result<Option<Vec<u8>>, gardenbed_store::StoreError> {
+        self.inner.get_blob(id)
+    }
+    fn put_blob(&self, content: &[u8]) -> Result<Id, gardenbed_store::StoreError> {
+        self.inner.put_blob(content)
+    }
+    fn get_tree(&self, id: Id) -> Result<Option<Vec<u8>>, gardenbed_store::StoreError> {
+        self.tree_gets
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.get_tree(id)
+    }
+    fn put_tree(&self, id: Id, bytes: &[u8]) -> Result<(), gardenbed_store::StoreError> {
+        self.inner.put_tree(id, bytes)
+    }
+    fn has(&self, id: Id) -> Result<bool, gardenbed_store::StoreError> {
+        self.inner.has(id)
+    }
+}
+
+/// Builds `dirs` directories with one file each. Ours edits ONE
+/// file (dir 0), theirs edits a DIFFERENT file (dir 1) — same-path
+/// edits confined to a couple of changed dirs over a wide UNCHANGED
+/// bulk. Commits the three-snapshot chain and merges, returning the
+/// merge's tree-get count (fixture reads excluded).
+fn locality_merge_tree_gets(dirs: usize) -> usize {
+    let objects = Arc::new(CountingTrees {
+        inner: Arc::new(MemoryStore::new()),
+        tree_gets: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metadata = Arc::new(MemoryStore::new()) as Arc<dyn MetadataStore>;
+    let engine = Engine::new(objects.clone() as Arc<dyn ObjectStore>, metadata.clone());
+
+    // Snapshot k: dirs 0..dirs, all files "c"; ours edits d000, theirs
+    // edits d001 (disjoint single-line edits of the same file).
+    let snapshot = |k: usize| -> BTreeMap<String, String> {
+        (0..dirs)
+            .map(|d| {
+                let content = match (k, d) {
+                    (0, _) | (_, 2..) => "line\n".to_owned(),
+                    (1, 0) => "OURS line\n".to_owned(),
+                    (2, 1) => "line THEIRS\n".to_owned(),
+                    (1, _) | (2, _) => "line\n".to_owned(),
+                    _ => unreachable!(),
+                };
+                (format!("d{d:03}/f.txt"), content)
+            })
+            .collect()
+    };
+    let mut ids = Vec::new();
+    for k in 0..3 {
+        let snap = snapshot(k);
+        let mut changes = Vec::new();
+        let prev: BTreeMap<String, (Mode, Id)> = if k == 0 {
+            BTreeMap::new()
+        } else {
+            engine
+                .flatten_tree(engine.derive_tree(ids[k - 1]).unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|(p, m, b)| (p, (m, b)))
+                .collect()
+        };
+        for (path, content) in &snap {
+            let id = blob_id(content.as_bytes());
+            engine.objects().put_blob(content.as_bytes()).unwrap();
+            changes.push(Change {
+                path: path.clone(),
+                op: if prev.contains_key(path) {
+                    Op::Modify
+                } else {
+                    Op::Add
+                },
+                blob: Some(id),
+                src_path: None,
+                mode: Mode::Regular,
+            });
+        }
+        changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let cs = gardenbed_model::Changeset {
+            parents: if k == 0 { vec![] } else { vec![ids[k - 1]] },
+            changes,
+            message: format!("locality {k}"),
+            author: ident("L"),
+            committer: ident("L"),
+            signature: None,
+        };
+        let id = metadata.put_changeset(&cs).unwrap();
+        engine.on_changeset_created(id).unwrap();
+        ids.push(id);
+    }
+    let before = objects.tree_gets.load(std::sync::atomic::Ordering::SeqCst);
+    let outcome = engine
+        .merge_tree_changes(Some(ids[0]), ids[1], ids[2])
+        .expect("merge computes");
+    let _ = outcome.expect("same-path disjoint edits merge clean");
+    objects.tree_gets.load(std::sync::atomic::Ordering::SeqCst) - before
+}
+
+#[test]
+fn mod_only_wide_merge_reads_changed_paths_not_the_whole_tree() {
+    // Same-path edits confined to two dirs over a wide UNCHANGED
+    // bulk: the merge's tree reads must be INDEPENDENT of the
+    // unchanged dir count (O(changed paths), never O(tree)). The
+    // old whole-flatten detection read ~4×(dirs+1) trees per merge;
+    // the pruned diff reads only the changed levels.
+    let small = locality_merge_tree_gets(20);
+    let large = locality_merge_tree_gets(60);
+    assert!(
+        (large as i64 - small as i64).abs() <= 4,
+        "tree reads grew with the UNCHANGED bulk: 20 dirs -> {small}, 60 dirs -> {large}"
+    );
+    // And the absolute count stays tiny: the two changed dirs and
+    // the root, a handful of loads per level — nothing like the
+    // whole-tree flattens (4 × (N+1) trees for N dirs).
+    assert!(
+        small < 20,
+        "mod-only merge over 2 changed dirs read {small} tree gets — expected a small constant"
+    );
+
+    // CONTROL (negative proof the counter registers bulk reads): a
+    // branch that renames EVERY dir's file forces reads through the
+    // whole changed tree.
+    let control = locality_merge_tree_gets_control(20);
+    assert!(
+        control > small * 3,
+        "rename-heavy control read {control} — counter must exceed the mod-only {small}"
+    );
+}
+
+/// The control: every directory's file is RENAMED (delete+add per
+/// dir), so rename detection has candidates everywhere and reads
+/// through the whole changed tree — proving the counter registers
+/// bulk reads when they happen.
+fn locality_merge_tree_gets_control(dirs: usize) -> usize {
+    let objects = Arc::new(CountingTrees {
+        inner: Arc::new(MemoryStore::new()),
+        tree_gets: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let metadata = Arc::new(MemoryStore::new()) as Arc<dyn MetadataStore>;
+    let engine = Engine::new(objects.clone() as Arc<dyn ObjectStore>, metadata.clone());
+
+    // Base: dNNN/f.txt. Ours: dNNN/g.txt (every file renamed).
+    // Theirs: base + one file edited.
+    let mut ids = Vec::new();
+    let build = |k: usize| -> BTreeMap<String, String> {
+        let mut snap = BTreeMap::new();
+        for d in 0..dirs {
+            let path = if k == 1 {
+                format!("d{d:03}/g.txt")
+            } else {
+                format!("d{d:03}/f.txt")
+            };
+            let content = if k == 2 && d == 0 {
+                "edited\n".to_owned()
+            } else {
+                "c\n".to_owned()
+            };
+            snap.insert(path, content);
+        }
+        snap
+    };
+    for k in 0..3 {
+        let snap = build(k);
+        let mut changes = Vec::new();
+        let prev: BTreeMap<String, (Mode, Id)> = if k == 0 {
+            BTreeMap::new()
+        } else {
+            engine
+                .flatten_tree(engine.derive_tree(ids[k - 1]).unwrap())
+                .unwrap()
+                .into_iter()
+                .map(|(p, m, b)| (p, (m, b)))
+                .collect()
+        };
+        for (path, content) in &snap {
+            let id = blob_id(content.as_bytes());
+            engine.objects().put_blob(content.as_bytes()).unwrap();
+            changes.push(Change {
+                path: path.clone(),
+                op: if prev.contains_key(path) {
+                    Op::Modify
+                } else {
+                    Op::Add
+                },
+                blob: Some(id),
+                src_path: None,
+                mode: Mode::Regular,
+            });
+        }
+        for path in prev.keys() {
+            if !snap.contains_key(path) {
+                changes.push(Change {
+                    path: path.clone(),
+                    op: Op::Delete,
+                    blob: None,
+                    src_path: None,
+                    mode: Mode::Regular,
+                });
+            }
+        }
+        changes.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        let cs = gardenbed_model::Changeset {
+            parents: if k == 0 { vec![] } else { vec![ids[k - 1]] },
+            changes,
+            message: format!("control {k}"),
+            author: ident("C"),
+            committer: ident("C"),
+            signature: None,
+        };
+        let id = metadata.put_changeset(&cs).unwrap();
+        engine.on_changeset_created(id).unwrap();
+        ids.push(id);
+    }
+    let before = objects.tree_gets.load(std::sync::atomic::Ordering::SeqCst);
+    let outcome = engine
+        .merge_tree_changes(Some(ids[0]), ids[1], ids[2])
+        .expect("control merge computes");
+    let _ = outcome.expect("rename-heavy control merge is clean");
+    objects.tree_gets.load(std::sync::atomic::Ordering::SeqCst) - before
+}

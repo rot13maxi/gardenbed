@@ -24,11 +24,14 @@ Three engine capabilities, one server capability, one bug fix:
 
 ## Rename detection (whole tree)
 
-`detect_side_renames` pairs each side's (deleted, added) file paths
-over **flattened whole-tree listings** — git's `diffcore_rename`
-scope. Whole-tree pairing is what makes cross-directory moves
-detectable: `dirA/f` deleted and `dirB/g` added pair regardless of
-which tree-walk level each endpoint surfaces at.
+`detect_side_renames` pairs each side's (deleted, added) file paths —
+the two halves of the **pruned tree diff** (`diff_trees`), git's
+`diffcore_rename` scope. Candidates come from changed subtrees ONLY:
+a branch that edits files in place contributes no candidates and
+reads O(changed paths) trees, never the unchanged bulk. Whole-tree
+PAIRING (over the diff's global candidate lists) is what makes
+cross-directory moves detectable: `dirA/f` deleted and `dirB/g` added
+pair regardless of which tree-walk level each endpoint surfaces at.
 
 - **Pass 1, exact renames:** destination blob id equals the source's.
   Each source pairs with the lexicographically first exact
@@ -191,7 +194,7 @@ git repositories (`git merge-tree --write-tree`, `git merge-base`)
 and compares classification (clean/conflict, conflict paths) plus
 every clean path's merged content and the full merged path set.
 
-- `crates/derive/tests/merge_rename.rs` — 21-case matrix: the eight
+- `crates/derive/tests/merge_rename.rs` — 21-case matrix + locality regression: the eight
   same-directory shapes, cross-directory rename-vs-edit (clean, edit
   lands at `dirB/g`, source gone), cross-directory rename/delete
   (refused, both endpoints), cross-directory rename/rename 1-to-2
@@ -208,7 +211,13 @@ every clean path's merged content and the full merged path set.
   (detection proven by the conflict landing at the destination — git
   refuses binary content merges), exact-duplicate blobs with one
   mover, an equal-score two-pair tie, and a huge-blobs /
-  short-common-lines false-positive guard.
+  short-common-lines false-positive guard. The locality regression
+  (`mod_only_wide_merge_reads_changed_paths_not_the_whole_tree`)
+  counts `get_tree` calls through a counting store: same-path edits
+  confined to two directories over 20 vs 60 UNCHANGED directories
+  read the same constant number of trees (O(changed paths)), with a
+  rename-everything control proving the counter registers bulk reads
+  when they happen.
 - `crates/derive/tests/merge_recursive.rs` — 8 tests: `merge_bases_all`
   parity with `git merge-base --all` on criss-crosses; clean-fold
   content equality with git; classification parity (single-base

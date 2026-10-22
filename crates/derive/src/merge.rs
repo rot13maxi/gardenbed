@@ -79,47 +79,43 @@ pub(crate) struct SideRename {
 /// `dirA/f` pairs with the addition of `dirB/g` even though they
 /// surface at different levels of the tree walk.
 ///
-/// Inputs are flattened, path-sorted file listings (path → entry) of
-/// the base and the side. Resolution order matches git's
-/// `diffcore_rename` shape:
+/// Inputs are the side's added paths and the base's deleted paths —
+/// the two halves of the PRUNED tree diff (`diff_trees`), so only
+/// changed subtrees are ever read (locality: a branch editing files
+/// in place contributes no candidates and scans nothing beyond its
+/// changed paths). Resolution order matches git's `diffcore_rename`
+/// shape:
 /// 1. **Exact renames** — destination blob id equals the source's.
 ///    Each source pairs with the lexicographically first exact
 ///    destination (git prefers lower stage/path order too); ties on
 ///    the destination side pick the first source in path order.
 /// 2. **Scored renames** — remaining candidates are scored by
-///    line-based similarity (`similarity_score`) and paired greedily
-///    best-first; a pair must clear [`MIN_RENAME_SCORE`] (git's
-///    default 50%).
+///    byte-weighted span similarity ([`SpanProfile`]) and paired
+///    greedily best-first; a pair must clear [`MIN_RENAME_SCORE`]
+///    (git's default 50%).
 ///
 /// Both passes are bounded by [`MAX_RENAME_CANDIDATES`] per side over
 /// the whole tree; beyond that bound the candidates stay unpaired
 /// (the walk then treats them as plain delete/add, the rename-blind
 /// behavior) — the same shape as git's `diff.renameLimit` falling
 /// back.
+/// Pairs the side's (deleted, added) FILE entries into renames.
+/// `side_adds`/`base_dels` are (path, entry) lists from the pruned
+/// tree diff, in canonical path order (deterministic pairing).
+/// Returns the side's detected renames.
 fn detect_side_renames(
     objects: &dyn ObjectStore,
-    base_entries: &BTreeMap<String, TreeEntry>,
-    side_entries: &BTreeMap<String, TreeEntry>,
+    side_adds: &[(String, TreeEntry)],
+    base_dels: &[(String, TreeEntry)],
 ) -> Result<Vec<SideRename>, StoreError> {
-    let mut adds: Vec<(&String, &TreeEntry)> = Vec::new();
-    let mut dels: Vec<(&String, &TreeEntry)> = Vec::new();
-    for (path, entry) in side_entries {
-        if !base_entries.contains_key(path) {
-            adds.push((path, entry));
-        }
-    }
-    for (path, entry) in base_entries {
-        if !side_entries.contains_key(path) {
-            dels.push((path, entry));
-        }
-    }
+    let adds: Vec<(&String, &TreeEntry)> = side_adds.iter().map(|(p, e)| (p, e)).collect();
+    let dels: Vec<(&String, &TreeEntry)> = base_dels.iter().map(|(p, e)| (p, e)).collect();
     if adds.is_empty() || dels.is_empty() {
         return Ok(Vec::new());
     }
     if adds.len() > MAX_RENAME_CANDIDATES || dels.len() > MAX_RENAME_CANDIDATES {
         return Ok(Vec::new()); // bounded: too many candidates to score
     }
-
     let files_only = |e: &TreeEntry| {
         e.kind == TreeKind::File && e.mode != Mode::Symlink && e.mode != Mode::Gitlink
     };
@@ -667,7 +663,7 @@ fn changed_paths_opts(
 ///
 /// Rename-aware (the v0.3 merge lane): the walk is seeded with each
 /// side's WHOLE-TREE renames (detected once per merge by
-/// [`detect_side_renames`] over flattened trees — cross-directory
+/// [`detect_side_renames`] over the pruned tree diff — cross-directory
 /// moves pair `dirA/f` → `dirB/g`). This level keeps the renames
 /// whose source or destination resolves INSIDE this directory:
 /// a rename on one side against an edit at the source path on the
@@ -1545,9 +1541,16 @@ impl Engine {
         }
     }
 
-    /// One side's whole-tree renames over (base, side) trees: flattened
-    /// file listings keyed by path, screened by [`detect_side_renames`].
-    /// Returns empty for equal trees (the common no-rename case).
+    /// One side's whole-tree renames over (base, side) trees. Rename
+    /// candidates come from the PRUNED tree diff (`diff_trees`): only
+    /// changed subtrees are read — a mod-only branch touches O(changed
+    /// paths) trees and finds no candidates without scanning the
+    /// unchanged bulk (git's diffcore_rename scope, diff-sourced like
+    /// git's own rename detection). Deleted paths resolve their base
+    /// entries via [`Engine::entry_at`]; added paths carry blob+mode
+    /// in the diff's Add changes. Cross-directory moves, file↔dir
+    /// swaps (the diff emits Delete+Add for both sides of the swap),
+    /// and the whole-tree pairing semantics are unchanged.
     fn side_renames(
         &self,
         base: Option<Id>,
@@ -1556,25 +1559,75 @@ impl Engine {
         if base == side {
             return Ok(Vec::new());
         }
-        let flatten = |root: Option<Id>| -> Result<BTreeMap<String, TreeEntry>, StoreError> {
-            let mut out = BTreeMap::new();
-            for (path, mode, blob) in self.flatten_tree(root)? {
-                out.insert(
-                    path,
-                    TreeEntry {
-                        name: String::new(),
-                        kind: TreeKind::File,
-                        mode,
-                        blob: Some(blob),
-                        tree: None,
-                    },
-                );
+        // Pruned diff: reads only trees whose subtrees actually
+        // differ (diff_dir recurses exclusively into changed dirs).
+        let diff = crate::diff::diff_trees(&*self.objects, base, side)?;
+        let mut adds: Vec<(String, TreeEntry)> = Vec::new();
+        let mut dels: Vec<(String, TreeEntry)> = Vec::new();
+        for change in &diff {
+            match change.op {
+                Op::Add => {
+                    // A file added at a fresh path: a rename-candidate
+                    // destination. (Symlinks/gitlinks are filtered as
+                    // candidates inside detect_side_renames.)
+                    if let Some(blob) = change.blob {
+                        adds.push((
+                            change.path.clone(),
+                            TreeEntry {
+                                name: String::new(),
+                                kind: TreeKind::File,
+                                mode: change.mode,
+                                blob: Some(blob),
+                                tree: None,
+                            },
+                        ));
+                    }
+                }
+                Op::Delete => {
+                    // A file deleted from the base: a rename-candidate
+                    // source. The BASE entry (kind/mode/blob) anchors
+                    // the rename rules' 3-way merge.
+                    if let Some(entry) = self.entry_at(base, &change.path)? {
+                        dels.push((change.path.clone(), entry));
+                    }
+                }
+                Op::Modify => {
+                    // Same-path content change: neither an add nor a
+                    // delete — not a rename candidate (git's
+                    // diffcore_rename pairs delete×add only).
+                }
+                Op::Rename => {
+                    // The diff layer can classify a paired
+                    // delete+add as an explicit Rename; treat both
+                    // endpoints as candidates exactly like the raw
+                    // delete+add (src from the base, dst from the
+                    // change) — same mode-class and blob checks apply
+                    // downstream.
+                    if let (Some(blob), Some(src)) = (change.blob, &change.src_path) {
+                        if let Some(entry) = self.entry_at(base, src)? {
+                            dels.push((src.clone(), entry));
+                        }
+                        adds.push((
+                            change.path.clone(),
+                            TreeEntry {
+                                name: String::new(),
+                                kind: TreeKind::File,
+                                mode: change.mode,
+                                blob: Some(blob),
+                                tree: None,
+                            },
+                        ));
+                    }
+                }
             }
-            Ok(out)
-        };
-        let b = flatten(base)?;
-        let o = flatten(side)?;
-        detect_side_renames(&*self.objects, &b, &o)
+        }
+        if adds.is_empty() || dels.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The candidate lists are path-sorted (diff_trees emits the
+        // canonical path order); detect_side_renames' deterministic
+        // pairing contract is preserved.
+        detect_side_renames(&*self.objects, &adds, &dels)
     }
 
     fn merge_tree_ids(
