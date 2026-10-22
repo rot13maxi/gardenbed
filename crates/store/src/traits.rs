@@ -248,6 +248,27 @@ pub trait MetadataStore: Send + Sync {
         }
         Ok(id)
     }
+
+    /// This repository's persistent **incarnation identity**: 16 opaque
+    /// bytes, generated once, atomically, on the first call, and stable
+    /// for the lifetime of the metadata database. A new database (a
+    /// re-initialized or replaced repository) gets a fresh incarnation;
+    /// the same database moved to a new directory keeps its identity —
+    /// so the pair `(repo name, incarnation)` distinguishes a replaced
+    /// repository from a moved one, which neither names nor content
+    /// hashes can do (content can repeat across replacements).
+    ///
+    /// The value is random, not derived from data: it must change on a
+    /// fresh database even when both old and new histories are empty or
+    /// identical, and it must not change when the same bytes are
+    /// re-ingested. Callers treat it as an opaque namespace id (the
+    /// daemon scopes its object cache by it); they never interpret it.
+    ///
+    /// Atomic under concurrency: two simultaneous first calls on
+    /// independent handles (processes, replicas) converge on one stored
+    /// value — the insert is a single SQL statement that at most one
+    /// racer wins, and the loser reads the winner's row.
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError>;
 }
 
 /// One derived-data cache row handed to [`MetadataStore::ingest_changeset`].

@@ -11,23 +11,28 @@
 //! a corrupt cache can never poison anyone (v0.2.md §5's cache-tier
 //! argument, applied locally).
 //!
-//! The shared store is **partitioned by (upstream origin, repository)**:
-//! one `FsObjectStore` per scope under `<cache_root>/scopes/<hex>/`, the
-//! hex a SHA-256 over the upstream endpoint and the repository name (the
-//! same convention the regional cache tier uses). The scope is a
-//! membership proof: an object is cached under a scope only after that
-//! scope's own origin fetch succeeded, so a repository that lacks an
-//! object is answered with the origin's own `NOT_FOUND`, never another
-//! repository's cached bytes — the cross-repository object leak the
-//! content-address-only layout allowed (`authorize_hit`'s `ListRefs`
-//! probe proves the caller may read the repository, but says nothing
-//! about which objects that repository holds). The endpoint rides in the
-//! scope for the same reason: a reused cache root fronting a different
-//! upstream starts cold rather than serving the old upstream's objects.
-//! Pre-scope cache roots (`<cache_root>/objects/...`, written before the
-//! partition) are never read: their bytes carry no membership proof, so
-//! serving them would need an independent establishment that does not
-//! exist — a miss plus one origin fetch is the safe re-warm.
+//! The shared store is **partitioned by (upstream origin, repository,
+//! incarnation)**: one `FsObjectStore` per scope under
+//! `<cache_root>/scopes/<hex>/`, the hex a SHA-256 over the upstream
+//! endpoint, the repository name, and the repository's persistent
+//! incarnation identity (the server-published `RepoInfo` bytes — minted
+//! once per metadata database, so a re-initialized or replaced
+//! repository gets a fresh one while a moved database keeps it). The
+//! scope is a membership proof: an object is cached under a scope only
+//! after that scope's own origin fetch succeeded, so a repository that
+//! lacks an object is answered with the origin's own `NOT_FOUND`, never
+//! another repository's — or another *incarnation's* — cached bytes.
+//! Without the incarnation a repository replaced under the same name
+//! (delete + re-init, a new metadata database) would inherit its
+//! predecessor's warm objects: bytes fetched by other principals that
+//! the replacement repository has never possessed, invisible to the
+//! origin's own NotFound. The endpoint rides in the key for the same
+//! reason: a reused cache root fronting a different upstream starts
+//! cold. Pre-scope cache roots (`<cache_root>/objects/...`) are never
+//! read: no membership proof exists for them. An upstream that predates
+//! the `RepoInfo` RPC answers UNIMPLEMENTED: no identity means no
+//! membership proof either, so the daemon bypasses the cache entirely
+//! for that upstream (origin reads only, nothing written through).
 //!
 //! Writes (`PutBlob`, `CreateChangeset`, `CasRef`, `Rebase`, `Publish`, `Merge`) are
 //! gated on the peer-uid check ([`peer_uid_ok`]): the unix socket is
@@ -120,18 +125,49 @@ pub struct ProxyService {
     /// The cache root every scope directory lives under (kept for
     /// `Clone`, which reopens per-scope stores from it).
     cache_root: PathBuf,
-    /// One object store per (origin, repo) scope. A scope is opened
-    /// lazily on first use and kept for the daemon's lifetime; stores
-    /// are open-directory value types, so the map holds `Arc`s.
+    /// One object store per (origin, repo, incarnation) scope. A scope
+    /// is opened lazily on first use and kept until evicted by the cap;
+    /// stores are open-directory value types, so the map holds `Arc`s.
+    /// Bounded: a replaced repository resolves a new incarnation (and
+    /// therefore a new scope) on its next request, and a cap keeps a
+    /// churn-heavy upstream from growing the map without limit. Eviction
+    /// only bounds fetch collapsing, never correctness.
     scopes: Mutex<HashMap<String, Arc<FsObjectStore>>>,
     /// Per-tree singleflight: concurrent `GetTree` requests for the same
-    /// (scope, id) collapse into one upstream fetch.
+    /// (scope, id) collapse into one upstream fetch. Bounded the same
+    /// way as `scopes`.
     #[allow(clippy::type_complexity)]
     tree_locks: Mutex<HashMap<(String, Id), Arc<tokio::sync::Mutex<()>>>>,
+    /// Set once the upstream answers `RepoInfo` with UNIMPLEMENTED: the
+    /// server predates repository identities, so no cache membership
+    /// proof can exist and every fetch bypasses the cache (origin reads
+    /// only, nothing written through). Shared across clones so the whole
+    /// daemon converges after one probe.
+    no_identity: Arc<std::sync::atomic::AtomicBool>,
     /// Counters for tests/diagnostics: how many RPCs the daemon answered
     /// from its cache.
     cache_hits: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// How one repository's objects may be served from the cache.
+enum Scope {
+    /// Membership is proven for this (origin, repo, incarnation): serve
+    /// from the scope's store, write fetched objects through.
+    Cached(Arc<FsObjectStore>),
+    /// The upstream predates `RepoInfo` (UNIMPLEMENTED): no membership
+    /// proof can exist, so the cache is bypassed entirely — every fetch
+    /// reads the origin, and no bytes are written through under an
+    /// unproven scope.
+    Passthrough,
+}
+
+/// The scopes map cap: far above any real repository count (a daemon
+/// fronts one upstream), small enough that even a pathological
+/// replacement churn stays bounded.
+const SCOPES_CAP: usize = 64;
+
+/// The tree singleflight cap (same reasoning; keys are (scope, id)).
+const TREE_LOCKS_CAP: usize = 1024;
 
 impl ProxyService {
     /// A proxy over `upstream` caching objects into per-(origin, repo)
@@ -151,6 +187,7 @@ impl ProxyService {
             cache_root: cache_root.to_path_buf(),
             scopes: Mutex::new(HashMap::new()),
             tree_locks: Mutex::new(HashMap::new()),
+            no_identity: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cache_hits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
@@ -162,31 +199,84 @@ impl ProxyService {
     }
 
     /// The cache scope key for `repo` under this proxy's upstream: the
-    /// SHA-256 hex over `(upstream endpoint, repo name)`. A digest, not
-    /// the raw repo string: repository names are protocol strings, never
-    /// filesystem path components (a hostile or merely unusual name must
-    /// not escape the cache root or collide with its sibling
-    /// directories). The endpoint rides in the key so a cache root reused
-    /// for a different upstream starts cold (that upstream's membership
-    /// is unproven) instead of serving the old upstream's objects.
-    fn scope_key(&self, repo: &str) -> String {
+    /// SHA-256 hex over `(upstream endpoint, repo name, incarnation)`.
+    /// A digest, not the raw repo string: repository names are protocol
+    /// strings, never filesystem path components (a hostile or merely
+    /// unusual name must not escape the cache root or collide with its
+    /// sibling directories). The endpoint rides in the key so a cache
+    /// root reused for a different upstream starts cold (that
+    /// upstream's membership is unproven). The **incarnation** rides in
+    /// the key so a replaced repository (new metadata database, new
+    /// identity) starts cold too: its predecessor's cached objects were
+    /// fetched by other principals under another repository's
+    /// membership, and content addressing alone cannot tell a repeated
+    /// blob from an inherited one — only the server-published identity
+    /// can.
+    fn scope_key(&self, repo: &str, incarnation: [u8; 16]) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.upstream.endpoint.as_bytes());
         hasher.update([0]);
         hasher.update(repo.as_bytes());
+        hasher.update([0]);
+        hasher.update(incarnation);
         let digest: [u8; 32] = hasher.finalize().into();
         digest.iter().map(|b| format!("{b:02x}")).collect()
     }
 
-    /// The (lazily opened, shared) object store for one cache scope:
-    /// `<cache_root>/scopes/<scope_key(repo)>`. Opening is
-    /// singleflighted through the map lock; a concurrent first use of
-    /// the same scope joins the same `Arc` store.
-    fn scope_store(&self, repo: &str) -> Result<Arc<FsObjectStore>, Status> {
-        let key = self.scope_key(repo);
+    /// Resolves how `repo`'s objects may be served from the cache
+    /// **now**: the upstream's authoritative answer for the repository's
+    /// identity, consulted on every cache-worthy call, mapped to
+    /// [`Scope`]. One `RepoInfo` round-trip (read-role authorized, so it
+    /// doubles as the per-hit authorization consult for this repo — a
+    /// denial propagates) plus, when identity is available, the lazily
+    /// opened scope store. An upstream older than the RPC answers
+    /// UNIMPLEMENTED: no identity means no membership proof, so the
+    /// daemon serves from the origin only (nothing cached, nothing
+    /// written through — a miss re-fetch is always safe).
+    ///
+    /// The resolved identity is NOT memoized: a replaced repository must
+    /// resolve its new incarnation on the very next request, and the
+    /// probe is one cheap unary call — the same per-hit consult rule
+    /// `authorize_hit` applies to authorization.
+    async fn scope(&self, repo: &str, auth: &AuthValue) -> Result<Scope, Status> {
+        if self
+            .no_identity
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(Scope::Passthrough);
+        }
+        let client = self.upstream.get().await?.with_auth_value(auth.clone());
+        let incarnation = match client.repo_info(repo).await {
+            Ok(incarnation) => incarnation,
+            Err(status) => {
+                if status.code() == tonic::Code::Unimplemented {
+                    // Old server: never trust the cache for this upstream
+                    // again (sticky — the server will not grow the RPC
+                    // mid-session), and do not fail the request: the
+                    // origin still serves everything.
+                    self.no_identity
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Ok(Scope::Passthrough);
+                }
+                if transport_dead(&status) {
+                    self.upstream.reset().await;
+                }
+                return Err(status);
+            }
+        };
+        let key = self.scope_key(repo, incarnation);
         let mut scopes = self.scopes.lock().expect("scope map");
         if let Some(store) = scopes.get(&key) {
-            return Ok(store.clone());
+            return Ok(Scope::Cached(store.clone()));
+        }
+        // Bound the map: drop a arbitrary entry once over the cap.
+        // Eviction is safe — a later request re-opens the same directory
+        // (the store is persistent), losing only in-process dedup.
+        if scopes.len() >= SCOPES_CAP {
+            let victim = scopes.keys().next().cloned();
+            if let Some(victim) = victim {
+                scopes.remove(&victim);
+            }
         }
         let dir = self.cache_root.join("scopes").join(&key);
         let store = Arc::new(FsObjectStore::open(&dir).map_err(|e| {
@@ -196,7 +286,7 @@ impl ProxyService {
             ))
         })?);
         scopes.insert(key, store.clone());
-        Ok(store)
+        Ok(Scope::Cached(store))
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -249,17 +339,38 @@ impl ProxyService {
         Err(status)
     }
 
-    /// Cache-first tree lookup: the (origin, repo) scope's store (after
-    /// an upstream authorization consult), then one upstream `GetTree`,
+    /// Cache-first tree lookup: resolve the (origin, repo, incarnation)
+    /// scope (an authorized identity consult — a denial propagates),
+    /// then the scope's store, else one upstream `GetTree`,
     /// write-through. Concurrent requests for the same (scope, id)
-    /// collapse into a single fetch.
+    /// collapse into a single fetch. An old upstream (no identity RPC)
+    /// bypasses the cache: origin fetch, no write-through.
     async fn tree_from_cache(
         &self,
         repo: &str,
         id: Id,
         auth: AuthValue,
     ) -> Result<pb::TreeResp, Status> {
-        let store = self.scope_store(repo)?;
+        let scope = self.scope(repo, &auth).await?;
+        let Scope::Cached(store) = scope else {
+            // Passthrough (old upstream): the origin alone answers.
+            let client = self.upstream.get().await?.with_auth_value(auth);
+            let tree = match client.get_tree(repo, id).await {
+                Ok(tree) => tree,
+                Err(status) => {
+                    if transport_dead(&status) {
+                        self.upstream.reset().await;
+                    }
+                    return Err(status);
+                }
+            };
+            return pb::TreeResp::try_from(&tree)
+                .map_err(|_| Status::internal("upstream tree cannot be re-encoded"));
+        };
+        // The scope resolution already consulted upstream authorization
+        // (RepoInfo is read-role gated with this caller's credentials);
+        // authorize_hit stays as the belt-and-braces per-hit gate the
+        // contract documents.
         if let Some(bytes) = store
             .get_tree(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
@@ -273,12 +384,24 @@ impl ProxyService {
             return pb::TreeResp::try_from(&tree)
                 .map_err(|_| Status::internal("cached tree cannot be re-encoded"));
         }
-        // Singleflight per (scope, id): the winner fetches and writes
-        // through, the latecomer re-checks the scope's cache under the
-        // lock.
+        // Singleflight per (scope dir name, id): the winner fetches and
+        // writes through, the latecomer re-checks the scope's cache
+        // under the lock. (The lock key reuses the store's directory
+        // name: unique per scope, already computed.)
         let lock = {
             let mut locks = self.tree_locks.lock().expect("tree lock map");
-            locks.entry((self.scope_key(repo), id)).or_default().clone()
+            if locks.len() >= TREE_LOCKS_CAP {
+                // Bound the map: evict an arbitrary idle entry. The
+                // gate is advisory (dedup only); losing one only costs
+                // a second fetch, never correctness.
+                if let Some(victim) = locks.keys().next().cloned() {
+                    locks.remove(&victim);
+                }
+            }
+            locks
+                .entry((store.objects_dir().to_string_lossy().into_owned(), id))
+                .or_default()
+                .clone()
         };
         let _gate = lock.lock().await;
         if let Some(bytes) = store
@@ -313,19 +436,29 @@ impl ProxyService {
             .map_err(|_| Status::internal("upstream tree cannot be re-encoded"))
     }
 
-    /// Cache-first blob lookup: the (origin, repo) scope's store (after
-    /// an upstream authorization consult), else one streamed upstream
-    /// `GetBlob`, reassembled, hash-verified, write-through, then
-    /// streamed back to the caller in 64 KiB chunks (tonic's default
-    /// 4 MiB decode limit applies per message — one giant chunk would
-    /// fail the client).
+    /// Cache-first blob lookup: resolve the (origin, repo, incarnation)
+    /// scope (an authorized identity consult — a denial propagates),
+    /// then the scope's store, else one streamed upstream `GetBlob`,
+    /// reassembled, hash-verified, write-through, then streamed back to
+    /// the caller in 64 KiB chunks (tonic's default 4 MiB decode limit
+    /// applies per message — one giant chunk would fail the client). An
+    /// old upstream (no identity RPC) bypasses the cache: origin fetch,
+    /// no write-through.
     async fn blob_stream(
         self,
         repo: String,
         id: Id,
         auth: AuthValue,
     ) -> Result<BoxStream<pb::BlobChunk>, Status> {
-        let store = self.scope_store(&repo)?;
+        let scope = self.scope(&repo, &auth).await?;
+        let Scope::Cached(store) = scope else {
+            // Passthrough (old upstream): the origin alone answers, and
+            // nothing is written through.
+            let content = self
+                .fetch_blob_from_origin(&repo, id, auth)
+                .await?;
+            return Ok(chunked(content));
+        };
         if let Some(content) = store
             .get_blob(id)
             .map_err(|e| Status::internal(format!("shared cache read failed: {e}")))?
@@ -336,8 +469,23 @@ impl ProxyService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(chunked(content));
         }
+        let content = self.fetch_blob_from_origin(&repo, id, auth).await?;
+        store
+            .put_blob(&content)
+            .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
+        Ok(chunked(content))
+    }
+
+    /// One streamed upstream `GetBlob`, reassembled, hash-verified: the
+    /// shared fetch body of the cached and passthrough paths.
+    async fn fetch_blob_from_origin(
+        &self,
+        repo: &str,
+        id: Id,
+        auth: AuthValue,
+    ) -> Result<Vec<u8>, Status> {
         let client = self.upstream.get().await?.with_auth_value(auth);
-        let mut stream = match client.get_blob(&repo, id).await {
+        let mut stream = match client.get_blob(repo, id).await {
             Ok(stream) => stream,
             Err(status) => {
                 if transport_dead(&status) {
@@ -366,10 +514,7 @@ impl ProxyService {
                 id.to_hex()
             )));
         }
-        store
-            .put_blob(&content)
-            .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
-        Ok(chunked(content))
+        Ok(content)
     }
 }
 
@@ -721,6 +866,19 @@ impl Gardenbed for ProxyService {
         Ok(Response::new(resp.into_inner()))
     }
 
+    async fn repo_info(
+        &self,
+        request: Request<pb::RepoInfoReq>,
+    ) -> Result<Response<pb::RepoInfoResp>, Status> {
+        // Transparent forward: the daemon adds no interpretation to the
+        // identity RPC — a client may resolve a repository's incarnation
+        // through the daemon exactly as it would against the server.
+        let client = self.upstream.get().await?;
+        let mut resp = client.raw().clone();
+        let resp = resp.repo_info(forward(request)).await?.into_inner();
+        Ok(Response::new(resp))
+    }
+
     async fn get_stats(
         &self,
         request: Request<pb::GetStatsReq>,
@@ -755,6 +913,7 @@ impl Clone for ProxyService {
             cache_root: self.cache_root.clone(),
             scopes: Mutex::new(HashMap::new()),
             tree_locks: Mutex::new(HashMap::new()),
+            no_identity: self.no_identity.clone(),
             cache_hits: self.cache_hits.clone(),
         }
     }

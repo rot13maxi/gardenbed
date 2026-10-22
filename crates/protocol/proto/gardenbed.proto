@@ -368,6 +368,21 @@ message StatsResp {
   map<string, uint64> counters = 1;
 }
 
+// Repository identity: the repository's persistent incarnation — 16
+// opaque bytes, minted once per metadata database (a re-initialized or
+// replaced repository gets a fresh one; a moved database keeps it).
+// Consumed by cache tiers to scope cached objects by the (repo,
+// incarnation) namespace, so a replaced repository never inherits its
+// predecessor's cached bytes. Opaque by contract: clients never
+// interpret it, only compare and namespace.
+message RepoInfoReq {
+  string repo = 1;
+}
+
+message RepoInfoResp {
+  bytes incarnation = 1;
+}
+
 // --------------------------------------------------------------- responses
 
 // The root tree id of the changeset; absent for an empty root (no files
@@ -447,4 +462,11 @@ service Gardenbed {
 
   // Per-repo request counters (debug/test infrastructure).
   rpc GetStats(GetStatsReq) returns (StatsResp);
+
+  // One repository's persistent identity (see RepoInfoResp): the
+  // incarnation bytes cache tiers scope object namespaces by. Read-role
+  // authorized like every repo-scoped read, so a cache may treat a
+  // successful answer as proof the caller may read the repo — the same
+  // consult the per-hit authorization probe makes.
+  rpc RepoInfo(RepoInfoReq) returns (RepoInfoResp);
 }

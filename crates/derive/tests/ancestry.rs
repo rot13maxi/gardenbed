@@ -284,6 +284,9 @@ struct FailingMetadata {
 }
 
 impl MetadataStore for FailingMetadata {
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        self.inner.repo_incarnation()
+    }
     fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
         self.inner.put_changeset(cs)
     }

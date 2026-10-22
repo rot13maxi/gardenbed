@@ -8,7 +8,7 @@
 //!
 //! Concurrency contract: WAL journaling lets any number of connections
 //! read the last committed snapshot without blocking a writer or each
-//! other, but SQLite still allows only one writer at a time. This store
+//! other, but SQLite still allows one writer at a time. This store
 //! therefore opens one dedicated write connection, guarded by a mutex and
 //! used for every mutation, plus a pool of reader connections (4 by
 //! default, [`SqliteMetadataStore::open_with_readers`]) checked out one
@@ -16,6 +16,34 @@
 //! last commit when the read began — the same data the single-connection
 //! design served, just without serializing readers behind a writer (or
 //! each other) in-process.
+
+/// Generates a fresh 16-byte repository incarnation (see
+/// [`crate::traits::MetadataStore::repo_incarnation`]): 16 bytes from
+/// `/dev/urandom` (never-blocking on Linux; the store crate deliberately
+/// avoids a rand dependency for one 16-byte draw).
+pub(crate) fn random_incarnation() -> Result<[u8; 16], StoreError> {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .map_err(|e| {
+            StoreError::Db(format!("cannot read /dev/urandom for repo incarnation: {e}"))
+        })?;
+    Ok(buf)
+}
+
+/// Parses a stored incarnation blob, refusing lengths other than 16 (a
+/// hand-edited row must not silently re-key the daemon's cache
+/// namespaces onto a colliding value).
+pub(crate) fn parse_incarnation(bytes: &[u8]) -> Result<[u8; 16], StoreError> {
+    bytes.try_into().map_err(|_| {
+        StoreError::Corrupt(format!(
+            "repo_incarnation row holds {} bytes (expected 16)",
+            bytes.len()
+        ))
+    })
+}
+
 
 use crate::StoreError;
 use gardenbed_model::Changeset;
@@ -58,6 +86,10 @@ CREATE TABLE IF NOT EXISTS derived (
 CREATE TABLE IF NOT EXISTS git_raw_commit (
     cs   BLOB PRIMARY KEY REFERENCES changesets(id),
     data BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS repo_incarnation (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    incarnation BLOB NOT NULL CHECK (length(incarnation) = 16)
 );
 ";
 
@@ -369,6 +401,34 @@ impl SqliteMetadataStore {
 }
 
 impl crate::traits::MetadataStore for SqliteMetadataStore {
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        // Read-then-insert in ONE immediate transaction: the write lock
+        // serializes concurrent first callers (including other processes
+        // on the same database), so exactly one racer inserts and both
+        // return the same stored bytes. The singleton CHECK (id = 1)
+        // makes a second insert a constraint error even if the
+        // transaction lock were somehow bypassed.
+        self.in_tx(|tx| {
+            if let Some(bytes) = tx
+                .prepare_cached("SELECT incarnation FROM repo_incarnation WHERE id = 1")
+                .map_err(db_err)?
+                .query_row(params![], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(db_err)?
+            {
+                return parse_incarnation(&bytes);
+            }
+            let fresh = random_incarnation()?;
+            tx.prepare_cached(
+                "INSERT INTO repo_incarnation(id, incarnation) VALUES(1, ?1)",
+            )
+            .map_err(db_err)?
+            .execute(params![fresh.as_slice()])
+            .map_err(db_err)?;
+            Ok(fresh)
+        })
+    }
+
     fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
         let canonical = cs.canonical_bytes().map_err(|e| {
             StoreError::Invalid(format!("changeset is not canonically encodable: {e}"))

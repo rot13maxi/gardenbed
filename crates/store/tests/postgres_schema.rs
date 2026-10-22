@@ -231,6 +231,7 @@ fn assert_schema_complete(base: &str, schema: &str) {
         "git_map",
         "git_raw_commit",
         "refs",
+        "repo_incarnation",
         "validated_changesets_v1",
     ];
     assert_eq!(tables, expected, "schema {schema} table set");
@@ -421,5 +422,73 @@ fn schema_two_process_child_open() {
     println!(
         "CHILD_OPEN_OK {}",
         std::env::var("GARDENBED_CHILD_INDEX").unwrap_or_default()
+    );
+}
+
+/// The repository incarnation: minted atomically on first use, stable
+/// across independent handles (pools, threads, processes), and fresh
+/// for a new schema/database. These are the identity properties the
+/// daemon's cache scoping relies on (see
+/// `MetadataStore::repo_incarnation`).
+#[test]
+fn repo_incarnation_is_atomic_and_stable_across_handles() {
+    let Some(base) = pg_url() else {
+        eprintln!("skipping postgres identity tests: GARDENBED_TEST_PG_URL is not set");
+        return;
+    };
+    let guard = fresh_schema(&base, &format!("{}ident", run_tag()));
+    let url = url_for_schema(&base, &guard.schema);
+
+    // INDEPENDENT handles race the mint: every opener answers the SAME
+    // 16 bytes (one insert wins; the losers read the winner's row).
+    let barrier = Arc::new(Barrier::new(OPENERS));
+    let handles: Vec<_> = (0..OPENERS)
+        .map(|_| {
+            let url = url.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let store = PostgresMetadataStore::open(&url)
+                    .map_err(|e| format!("open: {e:?}"))?;
+                use gardenbed_store::MetadataStore;
+                store
+                    .repo_incarnation()
+                    .map_err(|e| format!("identity: {e:?}"))
+            })
+        })
+        .collect();
+    let mut first = None;
+    for (i, h) in handles.into_iter().enumerate() {
+        let inc = h
+            .join()
+            .expect("identity thread")
+            .unwrap_or_else(|e| panic!("handle {i} failed to mint/read the incarnation: {e}"));
+        first.get_or_insert(inc);
+        assert_eq!(
+            first,
+            Some(inc),
+            "handle {i} observed a different incarnation — the mint is not atomic"
+        );
+    }
+
+    // A LATER opener over the same schema (fresh pool, no in-process
+    // memory to inherit from) reads the SAME stored bytes: identity
+    // survives reopen, exactly like a server restart.
+    let later = PostgresMetadataStore::open(&url).expect("later reopen");
+    use gardenbed_store::MetadataStore;
+    assert_eq!(
+        later.repo_incarnation().expect("later identity read"),
+        first.expect("at least one racer"),
+        "identity must persist across independent handles"
+    );
+
+    // A NEW schema (a re-initialized repository) gets a fresh identity:
+    // the pair (schema, identity) distinguishes replacement from move.
+    let guard2 = fresh_schema(&base, &format!("{}ident2", run_tag()));
+    let url2 = url_for_schema(&base, &guard2.schema);
+    let other = PostgresMetadataStore::open(&url2).expect("second schema opens");
+    let inc2 = other.repo_incarnation().expect("second schema identity");
+    assert_ne!(
+        first, Some(inc2),
+        "a new database must not inherit another's incarnation"
     );
 }

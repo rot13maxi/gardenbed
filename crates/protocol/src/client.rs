@@ -514,6 +514,23 @@ impl GardenbedClient {
         let resp = inner.get_stats(self.request(req)).await?.into_inner();
         Ok(resp.counters.into_iter().collect())
     }
+
+    /// One repository's persistent incarnation identity (16 opaque
+    /// bytes): the namespace id cache tiers scope cached objects by.
+    /// Fails `UNIMPLEMENTED` against a server older than the RPC.
+    pub async fn repo_info(&self, repo: &str) -> Result<[u8; 16], Status> {
+        let req = pb::RepoInfoReq {
+            repo: repo.to_owned(),
+        };
+        let mut inner = self.inner.clone();
+        let resp = inner.repo_info(self.request(req)).await?.into_inner();
+        resp.incarnation.try_into().map_err(|bytes: Vec<u8>| {
+            Status::data_loss(format!(
+                "repo_info for \"{repo}\" returned {} incarnation bytes (expected 16)",
+                bytes.len()
+            ))
+        })
+    }
 }
 
 /// Converts a raw id off the wire, mapping a bad length to a data-loss

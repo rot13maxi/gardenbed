@@ -261,6 +261,9 @@ impl CountingMetadata {
     }
 }
 impl MetadataStore for CountingMetadata {
+    fn repo_incarnation(&self) -> Result<[u8; 16], gardenbed_store::StoreError> {
+        self.inner.repo_incarnation()
+    }
     fn put_changeset(
         &self,
         cs: &Changeset,

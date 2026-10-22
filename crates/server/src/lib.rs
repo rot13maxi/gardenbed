@@ -205,6 +205,9 @@ pub struct Repo {
     metadata: Arc<dyn MetadataStore>,
     engine: Engine,
     stats: Arc<Stats>,
+    /// The repository's incarnation identity, cached after the first
+    /// [`Repo::incarnation`] call (the value is immutable).
+    incarnation: std::sync::OnceLock<[u8; 16]>,
 }
 
 impl std::fmt::Debug for Repo {
@@ -335,6 +338,7 @@ impl Repo {
             metadata,
             engine,
             stats: Arc::new(Stats::default()),
+            incarnation: std::sync::OnceLock::new(),
         }
     }
 
@@ -991,6 +995,21 @@ impl Repo {
     pub fn stats(&self) -> BTreeMap<String, u64> {
         self.stats.snapshot()
     }
+
+    /// The repository's persistent incarnation identity (16 opaque
+    /// bytes; see [`gardenbed_store::MetadataStore::repo_incarnation`]).
+    /// Stable for the lifetime of the metadata database; fresh for a new
+    /// database. Cached on first read: the value is immutable, and the
+    /// lazy metadata insert happens exactly once per repository.
+    pub fn incarnation(&self) -> Result<[u8; 16], gardenbed_store::StoreError> {
+        if let Some(&inc) = self.incarnation.get() {
+            return Ok(inc);
+        }
+        let inc = self.metadata.repo_incarnation()?;
+        self.incarnation.set(inc);
+        Ok(inc)
+    }
+
     /// The shared counters behind [`Repo::stats`] — shared with the
     /// owning [`crate::repos::RepoHandle`] so eviction cannot reset them.
     pub(crate) fn counters(&self) -> &Arc<Stats> {
@@ -1749,6 +1768,21 @@ impl Gardenbed for GardenbedService {
         }))
     }
 
+    async fn repo_info(
+        &self,
+        request: Request<pb::RepoInfoReq>,
+    ) -> Result<Response<pb::RepoInfoResp>, Status> {
+        let (meta, _, req) = request.into_parts();
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Read)?;
+        let repo = self.repo_guard(&req.repo, "RepoInfo")?;
+        let incarnation = repo
+            .incarnation()
+            .map_err(|e| Status::internal(format!("cannot read repo incarnation: {e}")))?;
+        Ok(Response::new(pb::RepoInfoResp {
+            incarnation: incarnation.to_vec(),
+        }))
+    }
+
     async fn get_stats(
         &self,
         request: Request<pb::GetStatsReq>,
@@ -1803,6 +1837,9 @@ mod revspec_tests {
     }
 
     impl MetadataStore for CannedScan {
+        fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+            self.inner.repo_incarnation()
+        }
         fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
             self.inner.put_changeset(cs)
         }

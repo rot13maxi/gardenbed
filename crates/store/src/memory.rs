@@ -17,7 +17,9 @@ use std::sync::RwLock;
 /// for tests.
 #[derive(Debug, Default)]
 struct MemoryInner {
-    /// Blob id → raw (decompressed) content.
+    /// The repository's incarnation identity, lazily generated on first
+    /// use (see [`crate::traits::MetadataStore::repo_incarnation`]).
+    incarnation: Option<[u8; 16]>,
     blobs: HashMap<Id, Vec<u8>>,
     /// Tree id → canonical tree bytes.
     trees: HashMap<Id, Vec<u8>>,
@@ -142,6 +144,20 @@ impl ObjectStore for MemoryStore {
 }
 
 impl MetadataStore for MemoryStore {
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        // Generated under the write lock: concurrent callers see the
+        // first winner's value. (A memory store lives in one process;
+        // "fresh database" is a fresh `MemoryStore::new()`.)
+        self.write(|s| {
+            if let Some(inc) = s.incarnation {
+                return Ok(inc);
+            }
+            let fresh = crate::sqlite::random_incarnation()?;
+            s.incarnation = Some(fresh);
+            Ok(fresh)
+        })
+    }
+
     fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
         let canonical = cs.canonical_bytes().map_err(|e| {
             StoreError::Invalid(format!("changeset is not canonically encodable: {e}"))
