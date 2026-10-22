@@ -160,7 +160,7 @@ pub struct FILE_STANDARD_INFORMATION {
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct FILE_INTERNAL_INFORMATION {
-    pub index_number: i64,
+    pub index_number: u64,
 }
 
 #[repr(C)]

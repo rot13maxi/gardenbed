@@ -276,7 +276,7 @@ mod unix {
 
     /// fsyncs a directory so entries created/renamed inside it are durable.
     pub fn fsync_dir(dir: &DirHandle) -> io::Result<()> {
-        rustix::fs::fsync(&dir.file.as_fd()).map_err(io::Error::from)
+        rustix::fs::fsync(dir.file.as_fd()).map_err(io::Error::from)
     }
 
     /// Reads a directory's entries (names only).

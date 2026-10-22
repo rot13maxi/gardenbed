@@ -35,15 +35,19 @@ pub struct Stat {
     pub file_id: FileId,
 }
 
-/// A file's kernel object identity: (device, inode) on Unix,
+/// A file's kernel object identity: (st_dev, st_ino) on Unix,
 /// (volume serial, file index) on Windows. Equality means "the same
 /// kernel object", which is what staging-journal cleanup ownership needs.
+///
+/// `inode` is `u128` because Windows file indices can be 128-bit (ReFS
+/// `FileIdInformation`); Unix `st_ino` simply occupies the low 64 bits
+/// and no platform truncates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
     /// st_dev / dwVolumeSerialNumber.
     pub device: u64,
-    /// st_ino / file index.
-    pub inode: u64,
+    /// st_ino / file index (128-bit capable for ReFS).
+    pub inode: u128,
 }
 
 #[cfg(unix)]
@@ -91,7 +95,7 @@ mod unix {
             exec: stat.st_mode & 0o111 != 0,
             file_id: FileId {
                 device: stat.st_dev,
-                inode: stat.st_ino,
+                inode: stat.st_ino as u128,
             },
         }
     }
@@ -214,7 +218,7 @@ mod windows {
             exec: false,
             file_id: FileId {
                 device: volume_serial(handle)?,
-                inode: internal.index_number as u64,
+                inode: internal.index_number as u128,
             },
         })
     }
@@ -262,7 +266,7 @@ mod windows {
                     )
                 } != 0
                 {
-                    Some(serial as u64)
+                    Some(serial as u64) // u32 serial widened, no bits lost
                 } else {
                     None
                 }

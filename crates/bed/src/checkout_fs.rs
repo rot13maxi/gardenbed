@@ -602,10 +602,10 @@ fn remove_at(parent: &DirHandle, name: &str) -> Result<(), ClientError> {
         for entry in &mut entries {
             let entry = entry.map_err(io)?;
             let name = entry.file_name();
-            if name != "." && name != ".." {
-                if let Some(name) = name.to_str() {
-                    remove_at(&child, name)?;
-                }
+            if name != "." && name != ".."
+                && let Some(name) = name.to_str()
+            {
+                remove_at(&child, name)?;
             }
         }
         prim::remove_dir(parent, name).map_err(io)?;
