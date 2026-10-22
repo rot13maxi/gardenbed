@@ -223,7 +223,15 @@ impl CheckoutFs {
                 mode: MODE_SYMLINK,
             }
         } else if stat.is_file {
-            let mode = if stat.exec { MODE_EXEC } else { MODE_REGULAR };
+            // Windows has no exec bit (stat.exec is always false there);
+            // the tracked row's exec identity is preserved instead of
+            // diverging — same contract as status's classify_tracked.
+            let mode =
+                if stat.exec || (cfg!(windows) && known.map(|k| k.mode) == Some(MODE_EXEC)) {
+                    MODE_EXEC
+                } else {
+                    MODE_REGULAR
+                };
             // The hint path: a verified row whose size, mtime, and mode
             // still match proves the content without reading it.
             if let Some(known) = known
