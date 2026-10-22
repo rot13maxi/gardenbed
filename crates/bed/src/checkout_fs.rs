@@ -87,6 +87,68 @@ pub(crate) fn io_err(error: impl Into<std::io::Error>) -> ClientError {
     io(error.into())
 }
 
+/// Windows path-aliasing guard: repo paths are Unix-shaped (forward
+/// slashes, case-sensitive), but the NT namespace resolves names
+/// case-insensitively and treats several characters and shapes as
+/// aliases. A repo path that would alias — or silently collide with the
+/// case-insensitive `.bed` state directory — must fail before any local
+/// file is touched, never overwrite or corrupt.
+///
+/// On Unix this is a no-op (paths are taken literally).
+#[cfg(windows)]
+fn check_windows_safe(path: &str) -> Result<(), ClientError> {
+    for comp in path.split('/') {
+        // Backslash and colon are namespace separators / ADS markers in
+        // Win32; a repo path carrying them would address a different
+        // object than the one history names.
+        if comp.contains('\\') || comp.contains(':') {
+            return Err(ClientError::CheckoutBlocked {
+                path: path.to_owned(),
+                reason: "Windows resolves this name differently than history does \
+                         (separator, ADS, or aliasing character)"
+                    .into(),
+            });
+        }
+        // Trailing dots and spaces are stripped by Win32, so "f." and
+        // "f " alias "f".
+        if comp.ends_with('.') || comp.ends_with(' ') {
+            return Err(ClientError::CheckoutBlocked {
+                path: path.to_owned(),
+                reason: "Windows strips a trailing dot or space, so this name aliases \
+                         another file"
+                    .into(),
+            });
+        }
+        // Reserved device names resolve to devices, not files.
+        let stem = comp.split('.').next().unwrap_or("");
+        if matches!(
+            stem.to_ascii_uppercase().as_str(),
+            "CON" | "PRN" | "AUX" | "NUL"
+                | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
+                | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+        ) {
+            return Err(ClientError::CheckoutBlocked {
+                path: path.to_owned(),
+                reason: "Windows reserves this device name; it can never be a file"
+                    .into(),
+            });
+        }
+        // Any case spelling of `.bed` collides with the state directory.
+        if comp.len() == 4 && comp.starts_with('.') && comp[1..].eq_ignore_ascii_case("bed") {
+            return Err(ClientError::CheckoutBlocked {
+                path: path.to_owned(),
+                reason: "this name aliases the case-insensitive .bed state directory"
+                    .into(),
+            });
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn check_windows_safe(_path: &str) -> Result<(), ClientError> {
+    Ok(())
+}
 
 struct StageJournal {
     name: String,
@@ -200,6 +262,7 @@ impl CheckoutFs {
     }
 
     pub(crate) fn remove(&self, path: &str) -> Result<(), ClientError> {
+        check_windows_safe(path)?;
         let Some((parent, name)) = self.parent(path, false)? else {
             return Ok(());
         };
@@ -256,6 +319,7 @@ impl CheckoutFs {
     }
 
     pub(crate) fn write(&self, path: &str, content: &[u8], mode: Mode) -> Result<(), ClientError> {
+        check_windows_safe(path)?;
         let (parent, name) = self.parent(path, true)?.expect("parents created");
         if !same_rename_domain(&parent, &self.staging) {
             return self.write_cross_device(path, &parent, &name, content, mode);
