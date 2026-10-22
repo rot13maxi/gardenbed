@@ -1,20 +1,19 @@
 # M18.5 successor: raw-tree capture throughput gate — measurement procedure
 
-Status: **deferred, not waived.** This is the reproducible procedure for
-the ±20% kernel-segment import gate that `todo/fidelity` (raw-tree
-capture) must run on a quiet host before the gate can be called closed.
-Load history: docs/v0.2.md §M18.5 records 28–230 during the original
-baseline crisis (4–8 commits/s for identical inputs, ±100% run-to-run
-variance); current shared-box load is far lower (observed ~0.6–2.6 on
-the 16-core box, 2026-10-21), so the quiet-window criteria below may
-now be satisfiable — verify with the sampling procedure instead of
-assuming either the old contention or present quiet.
+Status: **measured on 2026-10-22.** The final release candidate passed the
+matched ±20% regression threshold (97.25% of control). See the
+[measurement report](raw-tree-measurement-2026-10-22.md) and its JSON evidence.
+The older absolute 278 commits/s figure describes a resumed workload;
+the fresh total is lower. Separate phase diagnostics identify graph scanning
+and root snapshots as the difference. The procedure below remains for
+reproduction; it does not assert that old contention still exists.
 
 ## What is gated
 
-Import throughput of a kernel-segment with raw-tree capture ON must stay
-within ±20% of the recorded baseline **278 commits/s** (docs/v0.2.md
-M18.5, recorded on the quiet box). Raw-tree capture adds, per commit:
+The original M18.5 plan recorded **278 commits/s** for a resumed import.
+The matched fresh-workload regression threshold is mean(B) ≥ 0.8 × mean(A);
+the historical absolute comparison must also be disclosed and investigated
+(see Pass criteria and the measurement report). Raw-tree capture adds:
 
 - one tree walk of the commit's root closure (memoized across commits by
   git tree SHA — shared subtrees are decided once per import),
@@ -95,7 +94,7 @@ from the pinned real-kernel gate.
   limited-snapshot workload — the matching semantics of both sides must
   be stated in the report, honestly, before any comparison is drawn.
 
-## If the gate cannot run (current state)
+## If a future campaign cannot run
 
 Record precisely: "quiet-host window unavailable (load criteria above
 not met at sampling time); raw-tree capture is exercised and verified

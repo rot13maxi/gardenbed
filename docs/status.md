@@ -16,7 +16,7 @@ Implementation status and completion of verification targets are separate.
 | Blob chunking (M14) | GBLO2 above 1 MiB, FastCDC boundaries, verified whole-blob identity; `crates/store/tests/gblo2.rs`. Chunks are stored inside each blob envelope, without cross-version chunk deduplication. |
 | Offline commits (M15) | Local queue, crash recovery, explicit `bed sync`; `crates/bed/tests/offline.rs`. |
 | Local daemon (M16) | Optional shared object cache, watchers, daemon-first connection and fallback; [daemon guide](daemon.md), `crates/bed/tests/daemon.rs`. |
-| Native export and import fidelity (M17/M18) | Native pack writer, sparse raw-commit capture, verbatim export of signed/extra-header/non-UTF-8 commit metadata; `crates/git/tests/export.rs` and `fidelity.rs`. Raw-tree limitations and throughput verification remain open below. |
+| Native export and import fidelity (M17/M18) | Native pack writer, sparse raw-commit capture, verbatim export of signed/extra-header/non-UTF-8 commit metadata; `crates/git/tests/export.rs` and `fidelity.rs`. Sparse raw-tree capture covers noncanonical modes, non-UTF-8 names and empty directories; matched throughput was measured on 2026-10-22 (limits below). |
 | Diff rendering (M19) | Recorded renames, exact-blob pairing, gitlink pointer hunks; `crates/bed/tests/render_patch.rs`. Similarity-based moved-and-edited pairing and combined merge diffs remain outside scope. |
 | Additional client features | Read-only snapshot FUSE mount; lane refs; stack rebase and already-applied twin recognition. See [CLI reference](cli.md). |
 | Authentication | Optional bearer tokens with per-repository read/write/admin roles; server/bed auth suites. Originally deferred in the plan, now implemented. |
@@ -31,12 +31,12 @@ not a fresh verification of the current checkout.
 
 ## Open implementation and verification work
 
-- **M18 throughput gate:** the ±20% kernel-segment import gate remains deferred
-  pending a meaningful quiet-host measurement. Raw-tree capture remains gated;
-  non-UTF-8 paths and pre-canonical tree modes still limit export. See
-  M18.5 in the [v0.2 plan](v0.2.md)
-  and [Git divergences](divergences.md). Do not infer full kernel SHA roundtrip
-  from sampled content fidelity or signed-commit support.
+- **M18 measured:** raw-tree fidelity passed code review and the matched
+  kernel-segment throughput threshold on 2026-10-22 (97.25% of control).
+  See the [measurement and limits](raw-tree-measurement-2026-10-22.md).
+  Fresh limited imports differ from the historical resumed-import workload;
+  neither the measurement nor hermetic fidelity tests establish a full-kernel
+  SHA roundtrip. Full-scale GC remains separate below.
 - **GC at full kernel scale:** the backlog sweep measured mark batching on a
   1.16M-live-id synthetic store; it did not re-measure the 10.36M-object kernel
   corpus. The original M13 kernel time/RSS target needs separate evidence; see
