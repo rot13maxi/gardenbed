@@ -1,118 +1,148 @@
 # Daemon cache isolation (`todo/daemon-isolation`)
 
 The daemon's shared object cache is partitioned by **(upstream origin,
-repository)**. This note records the leak that motivated the change, the
-layout, the lifecycle contract the partition has (and its one deliberate
-edge), and the tests that pin it all.
+repository, incarnation)**. This note records the leaks that motivated
+the change, the layout, the identity contract, and the tests that pin
+it all.
 
-## The leak
+## The leaks
 
-Before the partition, the daemon's `ProxyService` kept one
-`FsObjectStore` for its whole cache root, keyed by content id only.
-`authorize_hit` — the per-hit upstream probe — consults `ListRefs(repo)`,
-which proves the *caller* may read `repo`, but says nothing about which
-objects `repo` holds. So:
+**Cross-repository.** Before the partition, the daemon's `ProxyService`
+kept one `FsObjectStore` for its whole cache root, keyed by content id
+only. `authorize_hit` — the per-hit upstream probe — consults
+`ListRefs(repo)`, which proves the *caller* may read `repo`, but says
+nothing about which objects `repo` holds. So a warm object fetched
+under repo `alpha`'s authorization was served for `GetBlob(beta, X)` /
+`GetTree(beta, X)` while the origin answered NotFound: **beta's client
+received alpha's bytes**, fetched under another principal's credential.
 
-1. repo `alpha` holds object X; repo `beta` (same server) does not.
-2. a wildcard token warms the daemon's cache with alpha's objects
-   (a tokened clone through the daemon).
-3. a beta-scoped token asks `GetBlob(beta, X)` / `GetTree(beta, X)`:
-   `ListRefs(beta)` authorizes (the token is valid for beta), the origin
-   read is NotFound — but the daemon answered from the cache: **beta's
-   client received alpha's bytes**. A cross-repository object leak: the
-   bytes were fetched under an alpha-authorized credential and served
-   under a beta-only one.
+**Same-name replacement (cross-incarnation).** The (origin, repo)
+partition alone cannot distinguish a repository *replaced* under the
+same name (delete + re-init: a new metadata database) from its
+predecessor. A caller authorized only for the replacement repository
+could read the predecessor's warm objects through the daemon — bytes
+the replacement repository has never possessed and the origin says are
+gone. Unlike a working copy's own local cache (where the possessor
+fetched the bytes itself), the daemon's caller never possessed them:
+serving them is a cross-principal leak. Both leaks are fixed by keying
+cache membership on the **server-published repository identity**.
 
-Regression test: `daemon_cache_does_not_leak_objects_across_repos`
-(`crates/bed/tests/auth.rs`). It was written first and proven failing on
-the unpartitioned daemon (content-addressed caches dedup *bytes*, not
-*membership*).
+Regression tests: `daemon_cache_does_not_leak_objects_across_repos`
+(cross-repository) and
+`daemon_scoped_cache_denies_replacement_repo_the_prior_incarnation_objects`
+(cross-incarnation), both in `crates/bed/tests/auth.rs`. Each was
+proven failing against the unfixed daemon before its fix landed.
+
+## Repository incarnation identity
+
+`MetadataStore::repo_incarnation()` — implemented by the SQLite,
+Postgres, and Memory metadata backends — answers 16 random opaque
+bytes, minted **atomically on first use** and persisted with the
+repository's metadata:
+
+* **SQLite**: a `repo_incarnation` singleton table; read-then-insert
+  in one `BEGIN IMMEDIATE` transaction (the write lock serializes
+  racing first callers, including other processes on the same
+  database).
+* **Postgres**: the same table, `INSERT ... ON CONFLICT DO NOTHING`
+  followed by `SELECT` in one transaction — racing replicas converge on
+  the single stored row. The startup advisory-lock DDL transaction and
+  the strict schema table set are preserved (`repo_incarnation` joined
+  the expected table union).
+* **Memory**: a lazy field under the store's write lock.
+
+The contract:
+
+* **Same identity on restart**: the value persists with the metadata
+  database; a server restart (or any independent handle: another
+  process, another replica) reads the same bytes.
+* **New identity on new database**: a re-initialized or replaced
+  repository (new metadata) mints a fresh identity — never a
+  predecessor's, even when both histories are empty or identical
+  (randomness, not derivation, is what makes this true).
+* **Existing repositories gain identity without rewriting**: the
+  mint is a lazy one-row insert; no existing ids change.
+* **Identity is not derivable from content or ref topology** — those
+  cannot distinguish replacement from coincidence; only the persisted
+  random row can.
+
+The identity is exposed through the additive `RepoInfo` RPC
+(read-role authorized, so a successful answer doubles as proof the
+caller may read the repository). Old servers predate the RPC and
+answer `UNIMPLEMENTED`.
 
 ## The layout
 
 One `FsObjectStore` per scope:
 
 ```text
-<cache_root>/scopes/<sha256(upstream endpoint ⊕ NUL ⊕ repo name)>/objects/<xx>/<62>
+<cache_root>/scopes/<sha256(upstream endpoint ⊕ NUL ⊕ repo name ⊕ NUL ⊕ incarnation)>/objects/<xx>/<62>
 ```
 
 * **A digest, not the raw repo string**: repository names are protocol
-  strings, never filesystem path components — a hostile or merely
-  unusual name cannot escape the cache root or collide with sibling
-  directories.
-* **The endpoint rides in the key**: a `--cache` root reused for a
-  different `--upstream` starts cold. That upstream's membership is
-  unproven; serving the old upstream's objects would be the same leak
-  with a different axis. The regional cache tier (`crates/cache`) uses
-  the identical convention, so the two tiers stay comparable and a
-  shared root's semantics do not depend on which tier fronts it.
-* **Membership, per scope**: an object lands in a scope only after that
-  scope's own origin fetch succeeded. A repo that lacks an object is
-  answered with the origin's own NotFound, never another scope's bytes.
-* **Authorization is unchanged**: every cache hit still pays one
-  `ListRefs` consult (the origin decides who may read). The scope fixes
-  membership, not authorization; both are needed.
-* **Singleflight is scoped too**: concurrent `GetTree` requests collapse
-  per `(scope, id)` — the same tree id in two repos must not collapse
-  into the wrong scope's fetch.
-* **Persistence is scoped**: killing the daemon and restarting over the
-  same cache root (same endpoint) re-opens the same scopes and serves
-  warm objects with zero new origin fetches.
+  strings, never filesystem path components.
+* **The endpoint in the key**: a `--cache` root reused for a different
+  `--upstream` starts cold (that upstream's membership is unproven).
+* **The incarnation in the key**: a replaced repository resolves a
+  fresh identity on its next request, so its scope directory is cold —
+  the predecessor's warm objects are unreachable by name. No deletion
+  of the old scope directory is performed (concurrent requests may
+  still legitimately read the old incarnation's scope; a new namespace
+  simply coexists).
+* **Membership, per scope**: an object lands in a scope only after
+  that scope's own origin fetch succeeded.
+* **Authorization is unchanged**: every cache hit still pays the
+  `ListRefs` consult (`authorize_hit`), and the per-request scope
+  resolution (`RepoInfo`) is itself read-role authorized with the
+  caller's credentials.
+* **Singleflight is scoped** per (scope directory, id).
+* **Bounded maps**: the scopes and tree-lock maps evict arbitrary
+  entries past fixed caps; eviction only costs dedup, never
+  correctness (the stores are persistent and reopen lazily).
 
-## Legacy cache roots
+## Old servers (no identity RPC)
 
-Pre-partition cache roots hold bytes directly under
-`<cache_root>/objects/` with no membership proof. They are **never
-read**: serving them would require independently establishing that the
-(unknown) fetching repo held each object, which no record exists for. A
-miss plus one origin fetch re-warms the object into its proper scope.
-The old bytes simply age out as unreferenced; nothing migrates.
+An upstream that answers `RepoInfo` with `UNIMPLEMENTED` cannot prove
+any membership. The daemon sticks a per-process flag and **bypasses
+the cache entirely** for that upstream: every `GetTree`/`GetBlob`
+reads the origin, and nothing is written through. Legacy pre-scope
+cache bytes (`<cache_root>/objects/`) are likewise never read. A miss
+plus one origin fetch is always the safe re-warm; unproven bytes are
+never served.
 
-## The lifecycle contract (including its one edge)
+## The lifecycle contract
 
-Supported operations (`gardenbed-server move`, delete + re-ingest under
-a reused name) can put a *different history* under the same
-`(endpoint, repo)` identity. The partition cannot distinguish an
-incarnation from its predecessor — by design, because the cache is a
-performance tier, not a consistency oracle:
-
-* Warm scope entries from the prior incarnation stay warm and serve
-  objects the *replacement* repository lacks. The bytes are authentic
-  (content-addressed, hash-verified) and only ever visible to callers
-  the origin authorizes for that repo name. This matches what a working
-  copy's own local cache does after the same replacement: `bed clone`'d
-  history remains readable from `.bed/objects` regardless of what the
-  server later holds.
-* Pinned by `daemon_scoped_cache_serves_replacement_repo_under_same_name`
-  (`crates/bed/tests/auth.rs`): direct origin answer NotFound, warm
-  daemon answer Ok, for the same `(repo, id)`.
-
-An incarnation protocol (repo-epoch ids, scope invalidation on
-replacement) was **not** added: no concrete consumer-visible failure
-mode exists beyond the above — which is identical to the working-copy
-cache's long-standing behavior — and the daemon must not invent a second
-truth about repository identity that the server does not publish. If
-the server ever grows an incarnation/epoch signal, the daemon should key
-scopes on it; that is the coordination point with the regional cache
-tier, which has the same edge.
+* **Restart**: same database ⇒ same identity ⇒ same scope ⇒ warm
+  objects serve with zero new origin fetches.
+* **Move** (`gardenbed-server move`): same database (moved directory)
+  ⇒ same identity ⇒ warm scope survives the rename.
+* **Replacement** (delete + re-init, new database): fresh identity ⇒
+  cold scope ⇒ the replacement's callers get the replacement origin's
+  own answers, never the predecessor's cached bytes.
 
 ## Tests
 
 `crates/bed/tests/auth.rs`:
 
-* `daemon_cache_does_not_leak_objects_across_repos` — the leak: warm
-  alpha objects, beta-scoped token, blob + tree must answer NotFound;
-  alpha control still serves. (RED-first: proven failing pre-fix.)
-* `daemon_cache_hit_still_requires_token` / `daemon_cache_hit_respects_repo_scope`
-  — per-hit authorization consult still gates warm hits (pre-existing,
-  kept green).
+* `daemon_cache_does_not_leak_objects_across_repos` — cross-repo
+  leak: warm alpha objects, beta-scoped token, blob + tree NotFound;
+  alpha control still serves. (RED-first pre-fix.)
+* `daemon_cache_hit_still_requires_token` /
+  `daemon_cache_hit_respects_repo_scope` — per-hit authorization
+  consult still gates warm hits (pre-existing, kept green).
 * `daemon_scoped_cache_persists_across_restart` — daemon restart over
   the same cache root and endpoint: zero new origin fetches.
 * `daemon_scoped_cache_isolates_a_reused_cache_root_from_other_upstreams`
   — same repo name, different upstream, reused cache root: NotFound,
-  not the other origin's bytes; that origin's own content still serves.
-* `daemon_scoped_cache_serves_replacement_repo_under_same_name` — the
-  replacement lifecycle contract above.
+  not the other origin's bytes; that origin's own content still
+  serves.
+* `daemon_scoped_cache_denies_replacement_repo_the_prior_incarnation_objects`
+  — the replacement leak: warm first-incarnation objects fetched by
+  `first-token`; after delete + re-init under the same name, a
+  `replacement-token` caller gets NotFound for the predecessor's blob
+  AND tree through the daemon restarted over the same cache root; the
+  replacement's own content serves. (RED-first pre-fix: the
+  (origin, repo)-only partition served the warm bytes.)
 
 `crates/bed/tests/daemon.rs` (pre-existing, kept green):
 
@@ -120,3 +150,10 @@ tier, which has the same edge.
   dedup still produces zero new server fetches.
 * `two_repositories_through_one_daemon` — two repos through one daemon
   both clone and materialize correctly.
+
+`crates/store/tests/postgres_schema.rs` (live-PG fixture, gated on
+`GARDENBED_TEST_PG_URL`):
+
+* `repo_incarnation_is_atomic_and_stable_across_handles` — 16 racing
+  independent handles mint one identity; a later reopen reads the same
+  bytes; a fresh schema gets a different identity.

@@ -335,3 +335,62 @@ fn read_pool_readers_open_with_the_same_pragmas() {
         assert_eq!(mode, "wal", "reader {i} shares WAL journaling");
     }
 }
+
+/// The repository incarnation identity: stable across independent
+/// handles over one database (a restart reads the same bytes), fresh
+/// for a new database, and identical across concurrent first callers
+/// (one mint wins; the losers read the winner's row). These are the
+/// identity properties the daemon's cache scoping relies on.
+#[test]
+fn repo_incarnation_identity_contract_on_sqlite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("ident.sqlite3");
+
+    // First use mints; a second, independent handle (fresh connection
+    // pool, no shared memory) reads the SAME bytes.
+    let a = SqliteMetadataStore::open(&db).expect("open a");
+    let inc_a = a.repo_incarnation().expect("identity a");
+    let b = SqliteMetadataStore::open(&db).expect("open b");
+    assert_eq!(
+        b.repo_incarnation().expect("identity b"),
+        inc_a,
+        "identity must persist across independent handles"
+    );
+
+    // Concurrent first callers over one database converge on one value:
+    // every handle opens fresh, then all race the mint.
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let db = db.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let store = SqliteMetadataStore::open(&db).expect("open racer");
+                barrier.wait();
+                store.repo_incarnation().expect("identity racer")
+            })
+        })
+        .collect();
+    for (i, h) in handles.into_iter().enumerate() {
+        assert_eq!(
+            h.join().expect("racer thread"),
+            inc_a,
+            "racer {i} observed a different incarnation — the mint is not atomic"
+        );
+    }
+
+    // A NEW database (a re-initialized repository) gets a fresh
+    // identity, even when both databases are otherwise identical.
+    let db2 = dir.path().join("ident2.sqlite3");
+    let c = SqliteMetadataStore::open(&db2).expect("open c");
+    let inc_c = c.repo_incarnation().expect("identity c");
+    assert_ne!(
+        inc_a, inc_c,
+        "a new database must not inherit another's incarnation"
+    );
+
+    // The Memory backend honors the same contract within one store.
+    let m = MemoryStore::new();
+    let inc_m = m.repo_incarnation().expect("identity memory");
+    assert_eq!(m.repo_incarnation().expect("identity memory again"), inc_m);
+}

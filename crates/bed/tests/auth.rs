@@ -614,40 +614,67 @@ async fn daemon_scoped_cache_isolates_a_reused_cache_root_from_other_upstreams()
     server_a.shutdown().await;
 }
 
-/// Same-origin, same-name repository **replacement**: the one identity
-/// the scope cannot distinguish. The supported operations can put a
-/// different history under the same `(endpoint, repo)` name — delete the
-/// repo directory and ingest a new history under the same name (a
-/// re-init/re-import under a reused name). This fixture pins the actual
-/// lifecycle contract: the daemon's warm scope entries stay warm and
-/// serve objects the *replacement* repository lacks, exactly like a
-/// working copy's local cache would. The origin alone cannot make the
-/// replacement's absence visible through a warm cache; only repo
-/// deletion followed by a fresh ingest of an unrelated history can
-/// create this state.
+/// Same-origin, same-name repository **replacement** must not inherit
+/// the predecessor's cached objects. Supported operations can put a
+/// different history under the same `(endpoint, repo)` name — delete
+/// the repo directory and ingest a new history under the same name. The
+/// replacement repository has a **new metadata database**, so the
+/// server mints it a fresh incarnation identity, and the daemon's scope
+/// key (endpoint, repo, incarnation) lands in a cold scope: a caller
+/// authorized only for the replacement repository gets the replacement
+/// origin's own NotFound for the predecessor's objects — never the
+/// predecessor's warm bytes (unlike a working copy's own local cache,
+/// the daemon's caller never possessed those bytes; serving them would
+/// be a cross-principal leak).
 #[tokio::test]
-async fn daemon_scoped_cache_serves_replacement_repo_under_same_name() {
+async fn daemon_scoped_cache_denies_replacement_repo_the_prior_incarnation_objects() {
     use gardenbed_protocol::client::GardenbedClient;
+    use tokio_stream::StreamExt as _;
 
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("server");
     let daemon_root = dir.path().join("daemon");
+
+    // Tokened fixture: `first-token` is authorized for the FIRST
+    // incarnation's content; `replacement-token` for the replacement's
+    // (same repo name — different principals is the leak scenario).
+    // A raw string keeps the TOML literal: no escape-decoding surprises.
+    let auth_path = dir.path().join("auth.toml");
+    fs::write(
+        &auth_path,
+        r#"
+            [tokens."first-token"]
+            repos = ["*"]
+            role = "write"
+
+            [tokens."replacement-token"]
+            repos = ["*"]
+            role = "read"
+        "#,
+    )
+    .expect("auth.toml written");
+
     let history_first = generate(5, &GenOptions::default());
     ingest(&history_first, &root.join("alpha"));
-    let mut server = Server::spawn_at_addr(&root, "127.0.0.1:39715").await;
+    // First server: ephemeral port; the ACTUAL bound address is reused
+    // for the replacement so the daemon sees one stable endpoint.
+    let mut server = Server::spawn_with_auth(&root, &auth_path).await;
+    let addr = server.addr.clone();
     let mut daemon = Daemon::spawn(&daemon_root, &server.http()).await;
 
-    // Warm the daemon's scope for (endpoint, "alpha") with the first
-    // history's objects.
+    // Warm the daemon's cache with the FIRST incarnation's objects,
+    // fetched by the first principal.
     let wc = dir.path().join("wc");
     fs::create_dir_all(&wc).expect("wc dir");
-    let (code, out, err) = bed_via_daemon(
+    let (code, out, err) = bed_via_daemon_with_token(
         &daemon,
         &wc,
         &["clone", &format!("{}/alpha", server.http())],
+        "first-token",
     );
     assert_eq!(code, 0, "clone of the first history: {err}\n{out}");
-    let (code, out, err) = bed_via_daemon(&daemon, &wc, &["sparse", "add", "."]);
+    let (code, out, err) =
+        bed_via_daemon_with_token(&daemon, &wc, &["sparse", "add", "."], "first-token");
     assert_eq!(code, 0, "sparse of the first history: {err}\n{out}");
 
     let head = history_first.changesets.len() - 1;
@@ -656,22 +683,34 @@ async fn daemon_scoped_cache_serves_replacement_repo_under_same_name() {
         .values()
         .find(|(_, mode)| *mode == gardenbed_model::Mode::Regular)
         .expect("the first history's head has a regular file");
+    let first_repo = gardenbed_server::Repo::open(&root.join("alpha")).expect("alpha repo opens");
+    let root_tree = first_repo
+        .root_tree(history_first.head)
+        .expect("alpha head tree")
+        .expect("alpha head has files");
 
-    // Replace the repository: delete it, ingest a different history
-    // under the same name. (Supported operations only; the server is
-    // stopped for the swap so the registry re-scans.)
-    daemon.kill().await;
+    // Replace the repository BEHIND THE LIVE DAEMON: stop only the
+    // server, delete the repo dir, ingest a different history under the
+    // same name, and bring the replacement origin back on the SAME
+    // endpoint (the saved address). The daemon — with its warm in-memory
+    // scope map and cached upstream channel — must resolve a FRESH
+    // identity on the next request (per-request RepoInfo), reconnect,
+    // and answer from the cold replacement scope. (The restarted-daemon
+    // variant of this scenario is the restart-persistence family;
+    // keeping the daemon alive is the harder case: stale in-memory
+    // state must not serve the prior incarnation.)
     server.shutdown().await;
     fs::remove_dir_all(root.join("alpha")).expect("the old repo dir is removed");
     let history_second = generate(11, &GenOptions::default());
     ingest(&history_second, &root.join("alpha"));
-    let mut server2 = Server::spawn_at_addr(&root, "127.0.0.1:39715").await;
+    let mut server2 = Server::spawn_with_auth_at_addr(&root, &auth_path, &addr).await;
 
-    // Directly against the replacement origin: the first history's
-    // blob is gone (NotFound) — the ground truth for this fixture.
+    // Ground truth, directly against the replacement origin: the first
+    // history's blob is gone (NotFound).
     let direct = GardenbedClient::connect(&server2.http())
         .await
-        .expect("client connects to the replacement origin");
+        .expect("client connects to the replacement origin")
+        .with_token("replacement-token");
     let err = direct
         .get_blob("alpha", blob_id)
         .await
@@ -682,23 +721,150 @@ async fn daemon_scoped_cache_serves_replacement_repo_under_same_name() {
         "the origin answers NotFound for the replaced-away blob: {err}"
     );
 
-    // Restart the daemon over the same cache root (same endpoint, same
-    // repo name — the warm scope) and ask for the first history's blob:
-    // the daemon serves the warm entry. This is the pinned contract:
-    // same-(endpoint, repo) replacement keeps prior warm objects
-    // available, exactly like a working copy's own local cache of a
-    // history it has seen. The bytes are authentic (content-addressed
-    // and hash-verified) and only ever visible to callers the origin
-    // authorizes for that repo name.
-    let mut daemon2 = Daemon::spawn(&daemon_root, &server2.http()).await;
-    // (The fixture's servers are open, so no token is needed here.)
-    let client = GardenbedClient::connect(&format!("unix://{}", daemon2.socket.display()))
+    // The LIVE daemon (same process, warm in-memory scope map, cached
+    // upstream channel that just went dead): a caller with a token
+    // authorized for the replacement repository asks for the FIRST
+    // incarnation's blob and tree. The warm cache holds them — fetched
+    // by the first principal — but the replacement's fresh incarnation
+    // scopes to a cold namespace: the daemon must answer the
+    // replacement origin's NotFound, never the warm bytes. (The
+    // upstream channel reset mid-test is the transport-dead retry
+    // path: the request is retried after a fresh dial, not answered
+    // from cache.)
+    let client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
         .await
-        .expect("client connects to the restarted daemon");
-    client
+        .expect("client connects to the live daemon")
+        .with_token("replacement-token");
+
+    // Blob: denied (NotFound via the replacement origin).
+    let err = client
         .get_blob("alpha", blob_id)
         .await
-        .expect("the warm scope serves the prior repo's object under the same name");
+        .expect_err("the prior incarnation's blob must not reach the replacement's callers");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "the daemon answers the replacement's NotFound, not the prior incarnation's bytes: {err}"
+    );
+
+    // Tree: same denial.
+    let err = client
+        .get_tree("alpha", root_tree)
+        .await
+        .expect_err("the prior incarnation's tree must not reach the replacement's callers");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "the daemon answers the replacement's NotFound, not the prior incarnation's bytes: {err}"
+    );
+
+    // Control: the replacement's OWN content serves through the same
+    // daemon (the fresh scope warms normally).
+    let head2 = history_second.changesets.len() - 1;
+    let files2 = gardenbed_harness::generator::files_at(&history_second, head2);
+    let (blob2, _) = *files2
+        .values()
+        .find(|(_, mode)| *mode == gardenbed_model::Mode::Regular)
+        .expect("the second history's head has a regular file");
+    let mut stream = client
+        .get_blob("alpha", blob2)
+        .await
+        .expect("the replacement's own blob serves through the daemon");
+    let mut served = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        served.extend_from_slice(&chunk.expect("replacement blob chunk").data);
+    }
+    assert_eq!(
+        served,
+        history_second
+            .blob(&blob2)
+            .expect("replacement blob content"),
+        "the replacement's blob round-trips"
+    );
+
+    daemon.kill().await;
+    server2.shutdown().await;
+}
+
+/// The restarted-daemon variant of the replacement denial: the daemon
+/// is killed and a fresh process starts over the same cache root. The
+/// persistent scope directory of the prior incarnation still holds the
+/// warm bytes, but the replacement's fresh identity keys a different
+/// scope: the denial holds across restarts too, not only across the
+/// in-memory scope map.
+#[tokio::test]
+async fn daemon_restarted_over_replaced_repo_still_denies_prior_incarnation() {
+    use gardenbed_protocol::client::GardenbedClient;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("server");
+    let daemon_root = dir.path().join("daemon");
+
+    let auth_path = dir.path().join("auth.toml");
+    fs::write(
+        &auth_path,
+        r#"
+            [tokens."first-token"]
+            repos = ["*"]
+            role = "write"
+
+            [tokens."replacement-token"]
+            repos = ["*"]
+            role = "read"
+        "#,
+    )
+    .expect("auth.toml written");
+
+    let history_first = generate(5, &GenOptions::default());
+    ingest(&history_first, &root.join("alpha"));
+    let mut server = Server::spawn_with_auth(&root, &auth_path).await;
+    let addr = server.addr.clone();
+    let mut daemon = Daemon::spawn(&daemon_root, &server.http()).await;
+
+    let wc = dir.path().join("wc");
+    fs::create_dir_all(&wc).expect("wc dir");
+    let (code, out, err) = bed_via_daemon_with_token(
+        &daemon,
+        &wc,
+        &["clone", &format!("{}/alpha", server.http())],
+        "first-token",
+    );
+    assert_eq!(code, 0, "clone of the first history: {err}\n{out}");
+    let (code, out, err) =
+        bed_via_daemon_with_token(&daemon, &wc, &["sparse", "add", "."], "first-token");
+    assert_eq!(code, 0, "sparse of the first history: {err}\n{out}");
+
+    let head = history_first.changesets.len() - 1;
+    let files = gardenbed_harness::generator::files_at(&history_first, head);
+    let (blob_id, _) = *files
+        .values()
+        .find(|(_, mode)| *mode == gardenbed_model::Mode::Regular)
+        .expect("the first history's head has a regular file");
+
+    // Replace the repository (new metadata database, fresh identity)
+    // and kill the daemon: the next daemon is a fresh process over the
+    // same cache root.
+    daemon.kill().await;
+    server.shutdown().await;
+    fs::remove_dir_all(root.join("alpha")).expect("the old repo dir is removed");
+    let history_second = generate(11, &GenOptions::default());
+    ingest(&history_second, &root.join("alpha"));
+    let mut server2 = Server::spawn_with_auth_at_addr(&root, &auth_path, &addr).await;
+    let mut daemon2 = Daemon::spawn(&daemon_root, &server2.http()).await;
+
+    let client = GardenbedClient::connect(&format!("unix://{}", daemon2.socket.display()))
+        .await
+        .expect("client connects to the restarted daemon")
+        .with_token("replacement-token");
+    let err = client
+        .get_blob("alpha", blob_id)
+        .await
+        .expect_err("the prior incarnation's blob must not survive a daemon restart");
+    assert_eq!(
+        err.code(),
+        tonic::Code::NotFound,
+        "the restarted daemon answers the replacement's NotFound: {err}"
+    );
 
     daemon2.kill().await;
     server2.shutdown().await;

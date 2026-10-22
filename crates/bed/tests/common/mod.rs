@@ -512,6 +512,46 @@ impl Server {
         format!("http://{}/{}", self.addr, REPO)
     }
 
+    /// [`Server::spawn_with_auth`] bound to a fixed address (see
+    /// [`Server::spawn_at_addr`]): tokened fixtures that also need a
+    /// stable endpoint across server restarts.
+    pub async fn spawn_with_auth_at_addr(root: &Path, auth_path: &Path, addr: &str) -> Self {
+        let mut child = tokio::process::Command::new(server_bin())
+            .arg("serve")
+            .arg("--auth")
+            .arg(auth_path)
+            .arg("--addr")
+            .arg(addr)
+            .arg("--root")
+            .arg(root)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("gardenbed-server binary spawns");
+        let stdout = child.stdout.take().expect("server stdout piped");
+        let line = timeout(Duration::from_secs(30), async {
+            let mut lines = BufReader::new(stdout).lines();
+            lines
+                .next_line()
+                .await
+                .expect("server stdout open")
+                .expect("server prints a line")
+        })
+        .await
+        .expect("server announces itself within 30s");
+        let announced = line
+            .strip_prefix("listening on ")
+            .unwrap_or_else(|| panic!("expected a listening line, got {line:?}"))
+            .to_owned();
+        assert_eq!(announced, addr, "the server binds the requested address");
+        Server {
+            child,
+            addr: addr.to_owned(),
+            root: root.to_path_buf(),
+        }
+    }
+
     /// A connected typed client.
     pub async fn client(&self) -> GardenbedClient {
         GardenbedClient::connect(&self.http())

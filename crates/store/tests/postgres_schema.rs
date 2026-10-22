@@ -441,14 +441,12 @@ fn repo_incarnation_is_atomic_and_stable_across_handles() {
 
     // INDEPENDENT handles race the mint: every opener answers the SAME
     // 16 bytes (one insert wins; the losers read the winner's row).
-    let barrier = Arc::new(Barrier::new(OPENERS));
     let handles: Vec<_> = (0..OPENERS)
         .map(|_| {
             let url = url.clone();
-            let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
-                let store = PostgresMetadataStore::open(&url)
-                    .map_err(|e| format!("open: {e:?}"))?;
+                let store =
+                    PostgresMetadataStore::open(&url).map_err(|e| format!("open: {e:?}"))?;
                 use gardenbed_store::MetadataStore;
                 store
                     .repo_incarnation()
@@ -488,7 +486,8 @@ fn repo_incarnation_is_atomic_and_stable_across_handles() {
     let other = PostgresMetadataStore::open(&url2).expect("second schema opens");
     let inc2 = other.repo_incarnation().expect("second schema identity");
     assert_ne!(
-        first, Some(inc2),
+        first,
+        Some(inc2),
         "a new database must not inherit another's incarnation"
     );
 }

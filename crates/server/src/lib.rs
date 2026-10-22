@@ -1006,8 +1006,10 @@ impl Repo {
             return Ok(inc);
         }
         let inc = self.metadata.repo_incarnation()?;
-        self.incarnation.set(inc);
-        Ok(inc)
+        // A concurrent first call may have won the set; either value is
+        // the same immutable identity, so the loss is ignored.
+        let _ = self.incarnation.set(inc);
+        Ok(self.incarnation.get().copied().expect("just set"))
     }
 
     /// The shared counters behind [`Repo::stats`] — shared with the

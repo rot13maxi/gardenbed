@@ -1303,3 +1303,55 @@ async fn mcp_serves_the_named_repository_only() {
         "{stderr}"
     );
 }
+
+/// A moved repository keeps its incarnation identity: the identity is
+/// persisted with the metadata database (which move relocates whole),
+/// so `RepoInfo` answers the same 16 bytes under the new name. This is
+/// what lets a daemon's warm cache survive a rename. The contrast case
+/// — a re-initialized repository (new database) minting a fresh
+/// identity — is pinned in `crates/store/tests/metadata.rs` and the
+/// daemon suite.
+#[tokio::test]
+async fn move_preserves_the_repository_incarnation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = multi_root(dir.path(), &["garden"]);
+
+    let server = ServerProc::spawn(&root, None).await;
+    let client = server.client().await;
+    let before = client
+        .repo_info("garden")
+        .await
+        .expect("repo_info before the move");
+    server.shutdown().await;
+
+    // Offline move (the supported rename path): the whole repository
+    // directory — objects, metadata database, and the identity row it
+    // holds — relocates under the new name.
+    let moved = std::process::Command::new(env!("CARGO_BIN_EXE_gardenbed-server"))
+        .arg("move")
+        .arg("--root")
+        .arg(&root)
+        .arg("--from")
+        .arg("garden")
+        .arg("--into")
+        .arg("orchard")
+        .output()
+        .expect("move runs");
+    assert!(
+        moved.status.success(),
+        "move: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+
+    let server = ServerProc::spawn(&root, None).await;
+    let client = server.client().await;
+    let after = client
+        .repo_info("orchard")
+        .await
+        .expect("repo_info after the move");
+    assert_eq!(
+        before, after,
+        "a moved repository keeps its identity (same metadata database)"
+    );
+    server.shutdown().await;
+}

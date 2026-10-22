@@ -239,10 +239,7 @@ impl ProxyService {
     /// probe is one cheap unary call — the same per-hit consult rule
     /// `authorize_hit` applies to authorization.
     async fn scope(&self, repo: &str, auth: &AuthValue) -> Result<Scope, Status> {
-        if self
-            .no_identity
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if self.no_identity.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(Scope::Passthrough);
         }
         let client = self.upstream.get().await?.with_auth_value(auth.clone());
@@ -454,9 +451,7 @@ impl ProxyService {
         let Scope::Cached(store) = scope else {
             // Passthrough (old upstream): the origin alone answers, and
             // nothing is written through.
-            let content = self
-                .fetch_blob_from_origin(&repo, id, auth)
-                .await?;
+            let content = self.fetch_blob_from_origin(&repo, id, auth).await?;
             return Ok(chunked(content));
         };
         if let Some(content) = store

@@ -27,7 +27,9 @@ pub(crate) fn random_incarnation() -> Result<[u8; 16], StoreError> {
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .map_err(|e| {
-            StoreError::Db(format!("cannot read /dev/urandom for repo incarnation: {e}"))
+            StoreError::Db(format!(
+                "cannot read /dev/urandom for repo incarnation: {e}"
+            ))
         })?;
     Ok(buf)
 }
@@ -43,7 +45,6 @@ pub(crate) fn parse_incarnation(bytes: &[u8]) -> Result<[u8; 16], StoreError> {
         ))
     })
 }
-
 
 use crate::StoreError;
 use gardenbed_model::Changeset;
@@ -419,12 +420,10 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                 return parse_incarnation(&bytes);
             }
             let fresh = random_incarnation()?;
-            tx.prepare_cached(
-                "INSERT INTO repo_incarnation(id, incarnation) VALUES(1, ?1)",
-            )
-            .map_err(db_err)?
-            .execute(params![fresh.as_slice()])
-            .map_err(db_err)?;
+            tx.prepare_cached("INSERT INTO repo_incarnation(id, incarnation) VALUES(1, ?1)")
+                .map_err(db_err)?
+                .execute(params![fresh.as_slice()])
+                .map_err(db_err)?;
             Ok(fresh)
         })
     }
