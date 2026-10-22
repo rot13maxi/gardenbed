@@ -308,13 +308,13 @@ impl OwnedAttributes {
 /// with the hex status in the message.
 pub fn io_error_from_nt(status: NTSTATUS, context: &str) -> io::Error {
     let kind = match status as u32 {
-        0xC000_0034 => io::ErrorKind::NotFound,     // STATUS_OBJECT_NAME_NOT_FOUND
-        0xC000_0035 => io::ErrorKind::NotFound,     // STATUS_OBJECT_PATH_NOT_FOUND
+        0xC000_0034 => io::ErrorKind::NotFound, // STATUS_OBJECT_NAME_NOT_FOUND
+        0xC000_0035 => io::ErrorKind::NotFound, // STATUS_OBJECT_PATH_NOT_FOUND
         0xC000_0033 => io::ErrorKind::InvalidInput, // STATUS_OBJECT_NAME_INVALID
-        0xC000_003A => io::ErrorKind::NotFound,     // STATUS_OBJECT_PATH_NOT_FOUND (alt)
-        0xC000_0032 => io::ErrorKind::AlreadyExists,// STATUS_OBJECT_NAME_COLLISION
+        0xC000_003A => io::ErrorKind::NotFound, // STATUS_OBJECT_PATH_NOT_FOUND (alt)
+        0xC000_0032 => io::ErrorKind::AlreadyExists, // STATUS_OBJECT_NAME_COLLISION
         0xC000_00BA => io::ErrorKind::IsADirectory, // STATUS_FILE_IS_A_DIRECTORY
-        0xC000_0103 => io::ErrorKind::NotADirectory,// STATUS_NOT_A_DIRECTORY
+        0xC000_0103 => io::ErrorKind::NotADirectory, // STATUS_NOT_A_DIRECTORY
         _ => io::ErrorKind::Other,
     };
     io::Error::new(kind, format!("{context}: NTSTATUS {status:#010x}"))

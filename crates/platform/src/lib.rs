@@ -33,7 +33,9 @@ pub mod nt;
 pub mod lock;
 pub mod stat;
 
-pub use lock::{LockError, lock_file_exclusive, lock_file_shared, try_lock_file_exclusive, try_lock_file_shared};
+pub use lock::{
+    LockError, lock_file_exclusive, lock_file_shared, try_lock_file_exclusive, try_lock_file_shared,
+};
 pub use stat::{FileId, Stat, fstat, readlinkat, statat, symlinkat, touch_mtime};
 
 /// The current process's numeric identity for per-user scratch paths.
@@ -78,14 +80,9 @@ mod windows_shim {
         attributes: u32,
     }
 
-
     unsafe extern "system" {
         fn GetCurrentProcess() -> HANDLE;
-        fn OpenProcessToken(
-            process: HANDLE,
-            desired_access: u32,
-            token: *mut HANDLE,
-        ) -> i32;
+        fn OpenProcessToken(process: HANDLE, desired_access: u32, token: *mut HANDLE) -> i32;
         fn GetTokenInformation(
             token: HANDLE,
             info_class: u32,
@@ -124,13 +121,7 @@ mod windows_shim {
         }
         let mut buffer = vec![0u8; needed as usize];
         let ok = unsafe {
-            GetTokenInformation(
-                token,
-                1,
-                buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed,
-            )
+            GetTokenInformation(token, 1, buffer.as_mut_ptr().cast(), needed, &mut needed)
         } != 0;
         unsafe { CloseHandle(token) };
         if !ok {

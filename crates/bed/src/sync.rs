@@ -642,6 +642,7 @@ mod tests {
             .is_err()
         );
         fs::write(outside.path().join("f"), b"outside").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), dir.path().join("d")).unwrap();
         assert!(
             preflight(
@@ -679,13 +680,17 @@ mod tests {
 
         fs::write(dir.path().join("f"), b"base").unwrap();
         let meta = std::fs::metadata(dir.path().join("f")).unwrap();
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
         ts.upsert(&TreestateEntry {
             path: "f".into(),
             blob_id: blob_id(b"base"),
             mode: 0,
             size: 4,
+            #[cfg(unix)]
             mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            #[cfg(not(unix))]
+            mtime_ns: crate::status::mtime_ns(&meta),
             hint: HINT_VERIFIED,
         })
         .unwrap();
@@ -755,13 +760,17 @@ mod tests {
         let disk = CheckoutFs::open(dir.path(), bed.dir()).unwrap();
         fs::write(dir.path().join("f"), b"base").unwrap();
         let meta = std::fs::metadata(dir.path().join("f")).unwrap();
+        #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;
         ts.upsert(&TreestateEntry {
             path: "f".into(),
             blob_id: blob_id(b"base"),
             mode: 0,
             size: 4,
+            #[cfg(unix)]
             mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+            #[cfg(not(unix))]
+            mtime_ns: crate::status::mtime_ns(&meta),
             hint: HINT_UNVERIFIED,
         })
         .unwrap();

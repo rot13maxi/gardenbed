@@ -277,15 +277,18 @@ fn git_apply_accepts_every_rendered_shape() {
     assert!(dir.join("new.txt").is_file(), "rename applied: dst exists");
     assert!(!dir.join("old.txt").exists(), "rename applied: src gone");
     assert!(dir.join("run.sh").is_file());
-    let mode = fs::symlink_metadata(dir.join("run.sh"))
-        .unwrap()
-        .permissions();
-    use std::os::unix::fs::PermissionsExt as _;
-    assert!(
-        mode.mode() & 0o111 != 0,
-        "rename+mode applied: {:o}",
-        mode.mode() & 0o777
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::symlink_metadata(dir.join("run.sh"))
+            .unwrap()
+            .permissions();
+        assert!(
+            mode.mode() & 0o111 != 0,
+            "rename+mode applied: {:o}",
+            mode.mode() & 0o777
+        );
+    }
 
     // The gitlink add: a Subproject hunk applies onto the index as a
     // 160000 entry (git apply refuses submodule adds on the worktree

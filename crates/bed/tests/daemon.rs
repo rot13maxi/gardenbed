@@ -28,7 +28,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -203,7 +202,9 @@ fn read_all_files(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
                     fs::read_link(entry.path())
                         .expect("link read")
                         .as_os_str()
-                        .as_bytes()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into_bytes()
                         .to_vec(),
                 );
             } else {
@@ -598,13 +599,23 @@ fn restore_mtime(path: &Path, mtime_ns: i128, size: u64) {
         size,
         "lie keeps the size"
     );
-    let secs = mtime_ns.div_euclid(1_000_000_000);
-    let nanos = mtime_ns.rem_euclid(1_000_000_000) as u32;
-    let time = UNIX_EPOCH + Duration::new(secs as u64, nanos);
-    let f = fs::File::open(path).expect("open for utime");
-    utime::set_file_handle_times(&f, Some(time), Some(time)).expect("mtime restored");
+    #[cfg(unix)]
+    {
+        let secs = mtime_ns.div_euclid(1_000_000_000);
+        let nanos = mtime_ns.rem_euclid(1_000_000_000) as u32;
+        let time = UNIX_EPOCH + Duration::new(secs as u64, nanos);
+        let f = fs::File::open(path).expect("open for utime");
+        utime::set_file_handle_times(&f, Some(time), Some(time)).expect("mtime restored");
+    }
+    #[cfg(not(unix))]
+    {
+        // No fd-anchored utimensat on Windows: the mtime lie is not
+        // restored, but the size check above still ran.
+        let _ = (mtime_ns,);
+    }
 }
 
+#[cfg(unix)]
 mod utime {
     use std::fs::File;
     use std::time::SystemTime;

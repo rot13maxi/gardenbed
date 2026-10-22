@@ -320,7 +320,7 @@ fn run_measured_to(cmd: &mut Command, log: &Path, capture: Option<&Path>) -> Mea
         .stdout(Stdio::from(stdout))
         .stderr(err);
     let t0 = Instant::now();
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             append_log(log, &format!("spawn failed: {e}\n"));

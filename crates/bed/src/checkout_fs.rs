@@ -30,8 +30,8 @@ use crate::treestate::{MODE_EXEC, MODE_REGULAR, MODE_SYMLINK};
 #[path = "checkout_fs_primitives.rs"]
 mod primitives;
 
-use primitives::{DirHandle, Stat};
 use primitives as prim;
+use primitives::{DirHandle, Stat};
 
 pub(crate) struct CheckoutFs {
     root: DirHandle,
@@ -123,22 +123,39 @@ fn check_windows_safe(path: &str) -> Result<(), ClientError> {
         let stem = comp.split('.').next().unwrap_or("");
         if matches!(
             stem.to_ascii_uppercase().as_str(),
-            "CON" | "PRN" | "AUX" | "NUL"
-                | "COM1" | "COM2" | "COM3" | "COM4" | "COM5" | "COM6" | "COM7" | "COM8" | "COM9"
-                | "LPT1" | "LPT2" | "LPT3" | "LPT4" | "LPT5" | "LPT6" | "LPT7" | "LPT8" | "LPT9"
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
         ) {
             return Err(ClientError::CheckoutBlocked {
                 path: path.to_owned(),
-                reason: "Windows reserves this device name; it can never be a file"
-                    .into(),
+                reason: "Windows reserves this device name; it can never be a file".into(),
             });
         }
         // Any case spelling of `.bed` collides with the state directory.
         if comp.len() == 4 && comp.starts_with('.') && comp[1..].eq_ignore_ascii_case("bed") {
             return Err(ClientError::CheckoutBlocked {
                 path: path.to_owned(),
-                reason: "this name aliases the case-insensitive .bed state directory"
-                    .into(),
+                reason: "this name aliases the case-insensitive .bed state directory".into(),
             });
         }
     }
@@ -226,12 +243,11 @@ impl CheckoutFs {
             // Windows has no exec bit (stat.exec is always false there);
             // the tracked row's exec identity is preserved instead of
             // diverging — same contract as status's classify_tracked.
-            let mode =
-                if stat.exec || (cfg!(windows) && known.map(|k| k.mode) == Some(MODE_EXEC)) {
-                    MODE_EXEC
-                } else {
-                    MODE_REGULAR
-                };
+            let mode = if stat.exec || (cfg!(windows) && known.map(|k| k.mode) == Some(MODE_EXEC)) {
+                MODE_EXEC
+            } else {
+                MODE_REGULAR
+            };
             // The hint path: a verified row whose size, mtime, and mode
             // still match proves the content without reading it.
             if let Some(known) = known
@@ -315,7 +331,7 @@ impl CheckoutFs {
                             | std::io::ErrorKind::NotFound
                     ) =>
                 {
-                    return Ok(())
+                    return Ok(());
                 }
                 Err(error) => return Err(io(error)),
             }
@@ -410,11 +426,7 @@ impl CheckoutFs {
     }
 
     fn staging_lock(&self, exclusive: bool) -> Result<File, ClientError> {
-        let fd = prim::open_lock_file(
-            &self.staging,
-            "checkout-staging.lock",
-        )
-        .map_err(io)?;
+        let fd = prim::open_lock_file(&self.staging, "checkout-staging.lock").map_err(io)?;
         let file = fd;
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidData).into());
@@ -565,11 +577,8 @@ impl CheckoutFs {
                 if let Some(fd) = fd {
                     let mut file = fd;
                     file.write_all(content)?;
-                    prim::set_mode(
-                        &file,
-                        if mode == Mode::Exec { 0o755 } else { 0o644 },
-                    )
-                    .map_err(io)?;
+                    prim::set_mode(&file, if mode == Mode::Exec { 0o755 } else { 0o644 })
+                        .map_err(io)?;
                     if !named {
                         link_destination_stage(&file, parent, &temp).map_err(io)?;
                     }
@@ -634,7 +643,11 @@ fn unlink_owned(parent: &DirHandle, name: &str, record: &StageRecord) -> Result<
     }
 }
 
-fn collect_leaves(dir: &DirHandle, path: &str, leaves: &mut Vec<String>) -> Result<(), ClientError> {
+fn collect_leaves(
+    dir: &DirHandle,
+    path: &str,
+    leaves: &mut Vec<String>,
+) -> Result<(), ClientError> {
     let mut entries = prim::read_dir(dir).map_err(io)?;
     let before = leaves.len();
     for entry in &mut entries {
@@ -674,7 +687,8 @@ fn remove_at(parent: &DirHandle, name: &str) -> Result<(), ClientError> {
         for entry in &mut entries {
             let entry = entry.map_err(io)?;
             let name = entry.file_name();
-            if name != "." && name != ".."
+            if name != "."
+                && name != ".."
                 && let Some(name) = name.to_str()
             {
                 remove_at(&child, name)?;
@@ -916,18 +930,32 @@ mod tests {
         let (parent, _) = disk.parent("d/f", true).unwrap().unwrap();
         let flags = rustix::io::FdFlags::CLOEXEC;
         use std::os::fd::AsFd as _;
-        assert!(rustix::io::fcntl_getfd(disk.root.as_fd()).unwrap().contains(flags));
+        assert!(
+            rustix::io::fcntl_getfd(disk.root.as_fd())
+                .unwrap()
+                .contains(flags)
+        );
         assert!(
             rustix::io::fcntl_getfd(disk.staging.as_fd())
                 .unwrap()
                 .contains(flags)
         );
-        assert!(rustix::io::fcntl_getfd(parent.as_fd()).unwrap().contains(flags));
+        assert!(
+            rustix::io::fcntl_getfd(parent.as_fd())
+                .unwrap()
+                .contains(flags)
+        );
         let lock = disk.staging_lock(false).unwrap();
-        assert!(rustix::io::fcntl_getfd(lock.as_fd()).unwrap().contains(flags));
+        assert!(
+            rustix::io::fcntl_getfd(lock.as_fd())
+                .unwrap()
+                .contains(flags)
+        );
         let stage = prim::create_exclusive(&parent, ".bed-checkout-flags").unwrap();
-        let record =
-            StageRecord::new("d/.bed-checkout-flags".to_owned(), &prim::fstat(&stage).unwrap());
+        let record = StageRecord::new(
+            "d/.bed-checkout-flags".to_owned(),
+            &prim::fstat(&stage).unwrap(),
+        );
         let journal = disk.register_stage(record, "checkout-stage-flags").unwrap();
         assert!(
             rustix::io::fcntl_getfd(journal.file.as_fd())

@@ -30,6 +30,7 @@ mod common;
 
 use std::fs;
 use std::io::Write as _;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -174,6 +175,7 @@ fn warm_status_10k_under_500ms() {
         writeln!(content, "row {i} of the warm status perf fixture").unwrap();
         let path = format!("file-{i:05}.txt");
         fs::write(garden.join(&path), &content).expect("file written");
+        #[cfg(unix)]
         let md = fs::metadata(garden.join(&path)).expect("metadata");
         treestate
             .upsert(&TreestateEntry {
@@ -181,7 +183,10 @@ fn warm_status_10k_under_500ms() {
                 blob_id: blob_id(&content),
                 mode: MODE_REGULAR,
                 size: content.len() as i64,
+                #[cfg(unix)]
                 mtime_ns: md.mtime_nsec(),
+                #[cfg(not(unix))]
+                mtime_ns: 0,
                 hint: HINT_VERIFIED,
             })
             .expect("row upserted");

@@ -11,6 +11,7 @@
 //! below — where FUSE *is* available the tests run and must pass. The
 //! module-level API-shape tests in `src/mount.rs` always run, so the
 //! module stays compiled everywhere.
+#![cfg(unix)]
 
 mod common;
 

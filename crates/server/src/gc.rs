@@ -166,12 +166,14 @@ pub fn lock_shared_blocking(root: &Path) -> Result<File, LockError> {
         .truncate(false)
         .open(&path)
         .map_err(LockError::Io)?;
-    gardenbed_platform::lock_file_shared(&file).map_err(|e| LockError::Io(match e {
-        gardenbed_platform::LockError::Held => {
-            io::Error::other("shared lock refused by an exclusive holder")
-        }
-        gardenbed_platform::LockError::Io(e) => e,
-    }))?;
+    gardenbed_platform::lock_file_shared(&file).map_err(|e| {
+        LockError::Io(match e {
+            gardenbed_platform::LockError::Held => {
+                io::Error::other("shared lock refused by an exclusive holder")
+            }
+            gardenbed_platform::LockError::Io(e) => e,
+        })
+    })?;
     Ok(file)
 }
 

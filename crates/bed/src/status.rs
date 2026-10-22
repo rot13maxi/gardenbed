@@ -41,8 +41,11 @@ use gardenbed_model::blob_id;
 use crate::error::ClientError;
 use crate::sparse::dir_may_hold_selected;
 use crate::sparse::in_sparse;
+use crate::treestate::HINT_UNVERIFIED;
+#[cfg(windows)]
 use crate::treestate::MODE_EXEC;
 use crate::treestate::MODE_GITLINK;
+#[cfg(windows)]
 use crate::treestate::MODE_REGULAR;
 use crate::treestate::MODE_SYMLINK;
 use crate::treestate::Treestate;
@@ -388,7 +391,7 @@ fn classify_tracked(
     }
 
     let observed = match observe(root, rel)? {
-        Some(mut observed) => {
+        Some(observed) => {
             // Windows cannot represent the exec bit, so a regular file's
             // observed mode inherits the tracked row's exec identity
             // instead of fabricating a mode divergence on every scan
@@ -637,7 +640,6 @@ impl StatusCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::treestate::HINT_UNVERIFIED;
     use crate::treestate::HINT_VERIFIED;
     use crate::treestate::TreestateEntry;
 
@@ -896,6 +898,7 @@ mod tests {
     /// that reuses the old blob.
     #[test]
     fn mode_only_change_keeps_the_blob_id() {
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let g = Garden::planted(&[("src/run.sh", b"#!/bin/sh\n")]);
         #[cfg(unix)]
         {
@@ -932,6 +935,7 @@ mod tests {
             let outside = tempfile::tempdir().unwrap();
             if link {
                 fs::write(outside.path().join("f"), b"external").unwrap();
+                #[cfg(unix)]
                 std::os::unix::fs::symlink(outside.path(), g.dir.path().join("src")).unwrap();
             } else {
                 fs::write(g.dir.path().join("src"), b"replacement").unwrap();

@@ -266,6 +266,7 @@ async fn commit_covers_every_change_shape_and_leaves_status_clean() {
     fs::write(w.garden.join("docs/readme.md"), &readme).expect("write");
     fs::remove_file(w.garden.join("notes/todo.txt")).expect("rm");
     fs::rename(w.garden.join("src/lib.rs"), w.garden.join("src/moved.rs")).expect("mv");
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mut perms = fs::metadata(w.garden.join("src/moved.rs"))
@@ -275,6 +276,7 @@ async fn commit_covers_every_change_shape_and_leaves_status_clean() {
         fs::set_permissions(w.garden.join("src/moved.rs"), perms).unwrap();
     }
     fs::write(w.garden.join("src/new.rs"), b"pub fn new() {}\n").expect("write");
+    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::write(w.garden.join("run.sh"), b"#!/bin/sh\necho hi\n").expect("write");
@@ -282,6 +284,7 @@ async fn commit_covers_every_change_shape_and_leaves_status_clean() {
         perms.set_mode(perms.mode() | 0o111);
         fs::set_permissions(w.garden.join("run.sh"), perms).unwrap();
     }
+    #[cfg(unix)]
     std::os::unix::fs::symlink("docs/readme.md", w.garden.join("link")).expect("symlink");
 
     let (code, out, stderr) = bed(
@@ -297,7 +300,11 @@ async fn commit_covers_every_change_shape_and_leaves_status_clean() {
     assert_eq!(code, 0, "commit: {stderr}\n{out}");
     assert!(out.contains("created changeset "), "out: {out}");
     assert!(
-        out.contains("3 added, 1 modified, 1 deleted, 1 renamed"),
+        out.contains(if cfg!(unix) {
+            "3 added, 1 modified, 1 deleted, 1 renamed"
+        } else {
+            "1 added, 1 modified, 1 deleted, 1 renamed"
+        }),
         "out: {out}"
     );
     assert!(out.contains("working copy at "), "out: {out}");

@@ -157,8 +157,8 @@ pub fn try_lock_root_shared(root: &Path) -> Result<File, RootLockError> {
 /// refuses, because moving files under live sqlite connections strands
 /// the WAL and the SHM.
 pub fn try_lock_root_exclusive(root: &Path) -> Result<File, RootLockError> {
-    open_lock_file(root).and_then(|file| {
-        match gardenbed_platform::try_lock_file_exclusive(&file) {
+    open_lock_file(root).and_then(
+        |file| match gardenbed_platform::try_lock_file_exclusive(&file) {
             Ok(()) => Ok(file),
             Err(gardenbed_platform::LockError::Held) => Err(RootLockError::Held {
                 mode: "shared (a server is likely serving this root)",
@@ -167,8 +167,8 @@ pub fn try_lock_root_exclusive(root: &Path) -> Result<File, RootLockError> {
                 path: root.join(ROOT_LOCK),
                 source,
             }),
-        }
-    })
+        },
+    )
 }
 
 /// Opens (creating when absent, mode 0600 on Unix) the root's lockfile.
@@ -183,7 +183,11 @@ fn open_lock_file(root: &Path) -> Result<File, RootLockError> {
     let open = {
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut o = std::fs::OpenOptions::new();
-        o.create(true).truncate(false).read(true).write(true).mode(0o600);
+        o.create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .mode(0o600);
         o
     };
     #[cfg(not(unix))]

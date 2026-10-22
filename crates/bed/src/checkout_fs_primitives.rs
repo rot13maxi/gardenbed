@@ -15,10 +15,11 @@
 //!   device or FIFO operation.
 //! * [`renameat`] publishes atomically within one rename domain.
 
+pub use gardenbed_platform::stat::Stat;
 use std::fs::File;
 use std::io;
+#[cfg(unix)]
 use std::io::Read as _;
-pub use gardenbed_platform::stat::Stat;
 
 /// Re-export for the checkout module's journal-lock use.
 pub use gardenbed_platform::try_lock_file_exclusive;
@@ -64,7 +65,9 @@ mod unix {
     pub fn open_dir(path: &Path) -> io::Result<DirHandle> {
         let fd = rustix::fs::open(
             path,
-            rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
         )?;
         Ok(DirHandle {
@@ -113,29 +116,33 @@ mod unix {
                 | rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::DIRECTORY
                 | rustix::fs::OFlags::NOFOLLOW;
-            let next =
-                match rustix::fs::openat(dir.file.as_fd(), part, flags, rustix::fs::Mode::empty()) {
-                    Ok(next) => next,
-                    Err(rustix::io::Errno::NOENT) if create => {
-                        match rustix::fs::mkdirat(
-                            dir.file.as_fd(),
-                            part,
-                            rustix::fs::Mode::from_raw_mode(0o755),
-                        ) {
-                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                            Err(e) => return Err(io(e.into())),
-                        }
-                        rustix::fs::openat(dir.file.as_fd(), part, flags, rustix::fs::Mode::empty())
-                            .map_err(|e| io(e.into()))?
+            let next = match rustix::fs::openat(
+                dir.file.as_fd(),
+                part,
+                flags,
+                rustix::fs::Mode::empty(),
+            ) {
+                Ok(next) => next,
+                Err(rustix::io::Errno::NOENT) if create => {
+                    match rustix::fs::mkdirat(
+                        dir.file.as_fd(),
+                        part,
+                        rustix::fs::Mode::from_raw_mode(0o755),
+                    ) {
+                        Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                        Err(e) => return Err(io(e.into())),
                     }
-                    Err(rustix::io::Errno::NOENT) => return Ok(None),
-                    Err(e) => {
-                        return Err(crate::error::ClientError::CheckoutBlocked {
-                            path: path.to_owned(),
-                            reason: format!("ancestor {part:?} is not a real directory ({e})"),
-                        });
-                    }
-                };
+                    rustix::fs::openat(dir.file.as_fd(), part, flags, rustix::fs::Mode::empty())
+                        .map_err(|e| io(e.into()))?
+                }
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(e) => {
+                    return Err(crate::error::ClientError::CheckoutBlocked {
+                        path: path.to_owned(),
+                        reason: format!("ancestor {part:?} is not a real directory ({e})"),
+                    });
+                }
+            };
             dir = DirHandle::from_fd(next, dir.path.join(part));
         }
         unreachable!("validated repository paths are nonempty")
@@ -244,22 +251,19 @@ mod unix {
 
     /// Sets a file's permission bits.
     pub fn set_mode(file: &File, bits: u32) -> io::Result<()> {
-        rustix::fs::fchmod(
-            file.as_fd(),
-            rustix::fs::Mode::from_raw_mode(bits),
-        )
-        .map_err(io::Error::from)
+        rustix::fs::fchmod(file.as_fd(), rustix::fs::Mode::from_raw_mode(bits))
+            .map_err(io::Error::from)
     }
 
     /// Renames `from` → `to` across two anchored directories.
-    pub fn renameat(from_dir: &DirHandle, from: &str, to_dir: &DirHandle, to: &str) -> io::Result<()> {
-        rustix::fs::renameat(
-            from_dir.file.as_fd(),
-            from,
-            to_dir.file.as_fd(),
-            to,
-        )
-        .map_err(io::Error::from)
+    pub fn renameat(
+        from_dir: &DirHandle,
+        from: &str,
+        to_dir: &DirHandle,
+        to: &str,
+    ) -> io::Result<()> {
+        rustix::fs::renameat(from_dir.file.as_fd(), from, to_dir.file.as_fd(), to)
+            .map_err(io::Error::from)
     }
 
     /// Unlinks `name` inside `dir`.
@@ -368,8 +372,9 @@ mod unix {
 mod windows {
     use super::*;
     use gardenbed_platform::nt::*;
+    use gardenbed_platform::stat::nt_open_relative;
     use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// An anchored directory: a live NT handle (opened with
     /// `FILE_FLAG_BACKUP_SEMANTICS`) plus its resolved final path for the
@@ -414,7 +419,10 @@ mod windows {
     pub fn open_dir(path: &Path) -> io::Result<DirHandle> {
         let file = open_dir_handle(path)?;
         let final_path = final_path(&file)?;
-        Ok(DirHandle { file, path: final_path })
+        Ok(DirHandle {
+            file,
+            path: final_path,
+        })
     }
 
     /// Opens `name` inside `dir` as a directory, refusing to follow a
@@ -437,8 +445,8 @@ mod windows {
         root: &DirHandle,
         path: &str,
         create: bool,
-    ) -> Result<Option<(DirHandle, String)>, super::super::error::ClientError> {
-        let io = |e: io::Error| super::super::checkout_fs::io_err(e);
+    ) -> Result<Option<(DirHandle, String)>, crate::error::ClientError> {
+        let io = |e: io::Error| crate::checkout_fs::io_err(e);
         let mut dir = root.duplicate().map_err(io)?;
         let mut parts = path.split('/').peekable();
         while let Some(part) = parts.next() {
@@ -460,8 +468,12 @@ mod windows {
                             }
                         })
                         .map_err(io)?;
-                    let handle = nt_open_dir_relative(dir.file.as_raw_handle(), part, "walk_parent(created)")
-                        .map_err(io)?;
+                    let handle = nt_open_dir_relative(
+                        dir.file.as_raw_handle(),
+                        part,
+                        "walk_parent(created)",
+                    )
+                    .map_err(io)?;
                     let path = final_path_of(handle.as_raw()).map_err(io)?;
                     dir = DirHandle::from_nt(handle, path);
                 }
@@ -517,7 +529,7 @@ mod windows {
         if !stat.is_file {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
-        let file = handle.into_file();
+        let mut file = handle.into_file();
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut file, &mut bytes)?;
         Ok(bytes)
@@ -544,7 +556,9 @@ mod windows {
         let handle = nt_open_relative(
             dir.file.as_raw_handle(),
             name,
-            DesiredAccess::FILE_GENERIC_READ | DesiredAccess::FILE_GENERIC_WRITE | DesiredAccess::SYNCHRONIZE,
+            DesiredAccess::FILE_GENERIC_READ
+                | DesiredAccess::FILE_GENERIC_WRITE
+                | DesiredAccess::SYNCHRONIZE,
             FILE_OPEN,
             CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT
                 | CreateOptions::FILE_OPEN_REPARSE_POINT
@@ -559,7 +573,9 @@ mod windows {
         let handle = nt_open_relative(
             dir.file.as_raw_handle(),
             name,
-            DesiredAccess::FILE_GENERIC_READ | DesiredAccess::FILE_GENERIC_WRITE | DesiredAccess::SYNCHRONIZE,
+            DesiredAccess::FILE_GENERIC_READ
+                | DesiredAccess::FILE_GENERIC_WRITE
+                | DesiredAccess::SYNCHRONIZE,
             FILE_OPEN_IF,
             CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT
                 | CreateOptions::FILE_OPEN_REPARSE_POINT
@@ -598,8 +614,7 @@ mod windows {
             from,
             DesiredAccess::DELETE | DesiredAccess::SYNCHRONIZE,
             FILE_OPEN,
-            CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT
-                | CreateOptions::FILE_OPEN_REPARSE_POINT,
+            CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_OPEN_REPARSE_POINT,
             "renameat(source)",
         )?;
         let mut wide: Vec<u16> = to.encode_utf16().collect();
@@ -878,6 +893,8 @@ mod windows {
     /// fstat through a borrowed handle (no ownership taken).
     fn stat_by_handle(handle: &OwnedNtHandle) -> io::Result<Stat> {
         let _ = handle;
-        Err(io::Error::other("stat_by_handle: use gardenbed_platform::fstat"))
+        Err(io::Error::other(
+            "stat_by_handle: use gardenbed_platform::fstat",
+        ))
     }
 }

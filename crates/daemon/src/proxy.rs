@@ -747,6 +747,7 @@ mod tests {
         assert!(message.contains("was refused"), "{message}");
         assert!(message.contains(&format!("uid {other}")), "{message}");
     }
+    #[cfg(unix)]
     #[tokio::test]
     async fn peer_uid_check_over_a_real_socket() {
         // SO_PEERCRED over a real unix socket: a connected peer's

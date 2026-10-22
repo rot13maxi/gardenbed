@@ -62,6 +62,7 @@ async fn world_with_external_state(
     let garden = root.path().join("garden");
     fs::create_dir(&garden).unwrap();
     if let Some(external) = external {
+        #[cfg(unix)]
         std::os::unix::fs::symlink(external, garden.join(state_name)).unwrap();
     }
     let store_root = root.path().join("server").join(REPO);
@@ -131,6 +132,7 @@ async fn ancestor_symlink_and_untracked_collisions_refuse_before_sparse_config_m
     let mut w = world(Some("d/f"), ".bed").await;
     let outside = tempfile::tempdir().unwrap();
     fs::write(outside.path().join("f"), b"valuable").unwrap();
+    #[cfg(unix)]
     std::os::unix::fs::symlink(outside.path(), w.garden.join("d")).unwrap();
     let config = fs::read(w.garden.join(".bed/config.toml")).unwrap();
     let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
@@ -182,7 +184,9 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
         }
     };
     let mut w = world_with_external_state(None, ".bed", Some(state.path())).await;
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt as _;
+    #[cfg(unix)]
     if fs::metadata(&w.garden).unwrap().dev() == fs::metadata(state.path()).unwrap().dev() {
         w.server.shutdown().await;
         eprintln!("cross-device CLI test unavailable: devices are identical");
@@ -191,6 +195,7 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
     let (code, _, err) = bed(&w.garden, &["sparse", "add", "."]);
     assert_eq!(code, 0, "{err}");
     assert_eq!(fs::read(w.garden.join("a")).unwrap(), b"base");
+    #[cfg(unix)]
     std::os::unix::fs::symlink("a", w.garden.join("link")).unwrap();
     let (code, _, err) = bed(&w.garden, &["commit", "-m", "symlink"]);
     assert_eq!(code, 0, "{err}");
@@ -222,12 +227,23 @@ async fn cross_device_state_symlink_supports_regular_files_symlinks_dirty_refusa
     // registered device/inode pair is excluded from status and commit.
     let stage = ".bed-checkout-recovery";
     fs::write(w.garden.join(stage), b"partial stage bytes").unwrap();
+    #[cfg(unix)]
     let meta = fs::symlink_metadata(w.garden.join(stage)).unwrap();
+    #[cfg(unix)]
     let record = format!(
         "version = 1\npath = \"{stage}\"\ndevice = \"{:x}\"\ninode = \"{:x}\"\nsymlink = false\n",
         meta.dev(),
         meta.ino()
     );
+    #[cfg(not(unix))]
+    let record = {
+        let f = fs::File::open(w.garden.join(stage)).unwrap();
+        let id = gardenbed_platform::fstat(&f).unwrap().file_id;
+        format!(
+            "version = 1\npath = \"{stage}\"\ndevice = \"{:x}\"\ninode = \"{:x}\"\nsymlink = false\n",
+            id.device, id.inode
+        )
+    };
     fs::write(state.path().join("checkout-stage-recovery"), record).unwrap();
     fs::write(w.garden.join("normal"), b"real work").unwrap();
     let (code, out, err) = bed(&w.garden, &["status", "--full-scan"]);

@@ -2020,9 +2020,9 @@ fn blame_cs_id(r: &gardenbed_protocol::pb::BlameRange) -> Result<Id, ClientError
 /// through the same cache-first path every other command uses, so
 /// `.bed/objects` stays bounded by what the mount actually read.
 pub async fn mount(state_dir: &Path, mountpoint: &Path) -> Result<(), ClientError> {
-    let bed = WorkingCopy::open(state_dir)?;
     #[cfg(unix)]
     {
+        let bed = WorkingCopy::open(state_dir)?;
         if !crate::mount::fuse_available() {
             return Err(ClientError::MountUnavailable);
         }

@@ -12,7 +12,9 @@ mod common;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::ffi::OsStrExt as _;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -282,8 +284,15 @@ fn assert_fidelity(g: &Garden, index: usize) {
             Mode::Symlink => {
                 let target =
                     fs::read_link(&abs).unwrap_or_else(|e| panic!("symlink {path} readable: {e}"));
+                #[cfg(unix)]
                 assert_eq!(
                     target.as_os_str().as_bytes(),
+                    content.as_slice(),
+                    "symlink {path} target bytes"
+                );
+                #[cfg(not(unix))]
+                assert_eq!(
+                    target.to_string_lossy().as_bytes(),
                     content.as_slice(),
                     "symlink {path} target bytes"
                 );
@@ -291,11 +300,14 @@ fn assert_fidelity(g: &Garden, index: usize) {
             _ => {
                 let bytes = fs::read(&abs).unwrap_or_else(|e| panic!("file {path} readable: {e}"));
                 assert_eq!(&bytes, content, "file {path} bytes");
-                let mode_bits = fs::metadata(&abs).unwrap().permissions().mode();
-                if *mode == Mode::Exec {
-                    assert_ne!(mode_bits & 0o111, 0, "exec bit on {path}");
-                } else {
-                    assert_eq!(mode_bits & 0o111, 0, "no exec bit on {path}");
+                #[cfg(unix)]
+                {
+                    let mode_bits = fs::metadata(&abs).unwrap().permissions().mode();
+                    if *mode == Mode::Exec {
+                        assert_ne!(mode_bits & 0o111, 0, "exec bit on {path}");
+                    } else {
+                        assert_eq!(mode_bits & 0o111, 0, "no exec bit on {path}");
+                    }
                 }
             }
         }

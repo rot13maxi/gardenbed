@@ -87,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             #[cfg(not(unix))]
             {
-                let _ = (socket, cache);
+                let _ = (socket, cache, upstream);
                 eprintln!(
                     "error: the daemon requires Unix domain sockets, which this \
                      platform (Windows) does not provide; run it on Unix, or talk \

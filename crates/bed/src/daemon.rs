@@ -48,6 +48,7 @@ pub fn socket_path() -> Option<PathBuf> {
 }
 
 /// The default socket path, ignoring `GARDENBED_DAEMON`.
+#[cfg(unix)]
 fn default_socket_path() -> PathBuf {
     if let Ok(runtime) = std::env::var("XDG_RUNTIME_DIR") {
         let runtime = PathBuf::from(runtime);
@@ -59,6 +60,7 @@ fn default_socket_path() -> PathBuf {
 }
 
 /// `$TMPDIR/gardenbed-<uid>` (or `/tmp/...`).
+#[cfg(unix)]
 fn tmp_fallback() -> PathBuf {
     let base = match std::env::var("TMPDIR") {
         Ok(tmp) if PathBuf::from(&tmp).is_absolute() => PathBuf::from(tmp),
@@ -68,6 +70,7 @@ fn tmp_fallback() -> PathBuf {
 }
 
 /// This process's uid (the platform crate's: unix getuid, Windows RID).
+#[cfg(unix)]
 fn current_uid() -> u32 {
     gardenbed_platform::current_uid()
 }

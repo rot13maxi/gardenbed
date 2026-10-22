@@ -102,8 +102,8 @@ mod unix {
 
     /// Reads the link-target bytes of `name` inside `dir`.
     pub fn readlinkat(dir: &File, name: &str) -> std::io::Result<Vec<u8>> {
-        let target = rustix::fs::readlinkat(dir.as_fd(), name, Vec::new())
-            .map_err(std::io::Error::from)?;
+        let target =
+            rustix::fs::readlinkat(dir.as_fd(), name, Vec::new()).map_err(std::io::Error::from)?;
         Ok(target.as_bytes().to_vec())
     }
 
@@ -386,14 +386,14 @@ mod windows {
                 ".",
                 DesiredAccess::FILE_READ_ATTRIBUTES | DesiredAccess::SYNCHRONIZE,
                 FILE_OPEN,
-                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT | CreateOptions::FILE_OPEN_REPARSE_POINT,
+                CreateOptions::FILE_SYNCHRONOUS_IO_NONALERT
+                    | CreateOptions::FILE_OPEN_REPARSE_POINT,
                 "symlinkat(dir)",
             )?;
             final_path_of(handle.as_raw())?
         };
         let link = path.join(name);
-        let os_target =
-            std::ffi::OsString::from(String::from_utf8_lossy(target).into_owned());
+        let os_target = std::ffi::OsString::from(String::from_utf8_lossy(target).into_owned());
         std::os::windows::fs::symlink_file(&os_target, &link).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
