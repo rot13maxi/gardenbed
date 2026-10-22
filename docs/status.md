@@ -10,7 +10,7 @@ Implementation status and completion of verification targets are separate.
 | Area | Current implementation and evidence |
 |---|---|
 | v0.1 core (M0–M8) | Canonical model, filesystem/SQLite storage, derived trees and ancestry, sparse working copies, commit/rebase/publish, Git import/export, blame, MCP. [Release record](release-0.1.md) records results and original-target deviations. |
-| Merge (M9/M10) | Server-side two-parent merge, `Merge` RPC, `bed merge`; differential tests in `crates/derive/tests/merge.rs` and integration suites in bed/server. Rename-aware merge and recursive multi-base resolution remain outside scope. |
+| Merge (M9/M10) | Rename-aware two-parent merge, recursive maximal-base resolution, and native octopus merges through `Merge`/`MergeOctopus` and `bed merge <TARGET>...`. Same-second/skewed-clock ancestry regressions, Git oracle rename/base fixtures, and server/client integration suites are covered in [merge behavior](merge-rename-octopus.md). |
 | Multi-repository serving (M11/M12) | Lazy repository lookup, bounded handles, URL repository selection, import/export/move tooling; `crates/server/tests/multi_repo.rs`. |
 | Garbage collection (M13) | Local offline-first mark/sweep, dry-run, min-age, force-mode write coordination; `crates/server/src/gc.rs` and `gc*` integration suites. Changeset and Git-mapping rows are retained. |
 | Blob chunking (M14) | GBLO2 above 1 MiB, FastCDC boundaries, verified whole-blob identity; `crates/store/tests/gblo2.rs`. Chunks are stored inside each blob envelope, without cross-version chunk deduplication. |
@@ -50,8 +50,8 @@ not a fresh verification of the current checkout.
   a structural follow-up (dogfood #26).
 - **Deferred scope:** regional cache tier, Windows, LFS, recursive submodules,
   history pruning, cross-version chunk deduplication, per-chunk blob streaming,
-  combined merge diffs, rename-aware merge, native octopus merge, and retiring
-  the `git diff-tree` similarity subprocess. The v0.3/later labels in
+  combined merge diffs, similarity-based moved-and-edited diff rendering, and
+  retiring the `git diff-tree` similarity subprocess. The v0.3/later labels in
   [v0.2 scope](v0.2.md#1-scope) are planning targets.
 - **Benchmark coverage:** selection/concurrency/queue-depth sweeps, multi-repo
   fan-out, interrupted provisioning comparisons, aggregate CI footprint, and
