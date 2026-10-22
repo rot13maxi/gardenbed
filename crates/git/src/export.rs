@@ -87,7 +87,8 @@ pub struct ExportOptions {
     /// different counterpart (a native-vs-re-imported twin) are refused
     /// and reported — never overwritten — so import-written mappings and
     /// the incremental import frontier stay canonical.
-    pub record_mappings: bool,}
+    pub record_mappings: bool,
+}
 
 /// What an export produced.
 ///
@@ -557,7 +558,6 @@ pub fn export_to_path(
     } else {
         None
     };
-
 
     let refs: Vec<(String, String)> = tips
         .iter()
