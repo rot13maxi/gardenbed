@@ -64,9 +64,13 @@ The socket's directory is mode 0700 — only the owner's uid may connect.
 
 The shared cache uses the same store format and sharding as `.bed/objects`
 (GBLO1/GBLO2 envelope selection by size, 2-level shard, hash-verified on
-read and write), so a warm second working copy's fetch is answered from the
-cache and never reaches the server — cross-working-copy dedup falls out of
-content addressing, not out of a cache-invalidation protocol.
+read and write). A warm second working copy in the same repository scope
+fetches object contents from this cache; metadata authorization and identity
+probes still reach the server. Scopes include the upstream endpoint,
+repository name, and the server-published repository incarnation. A new
+metadata database under a reused name gets a fresh identity and cannot
+inherit the predecessor's cached objects. See [cache isolation](daemon-cache-isolation.md).
+Older upstreams without `RepoInfo` are served directly, with caching disabled.
 
 ## What the daemon serves
 
@@ -77,10 +81,10 @@ metadata (an authed upstream sees the same bearer token `bed` sent) — with
 two divergences:
 
 - **`GetTree`/`GetBlob` are cache-first, but auth-checked on hits**: answered
-  from the shared object store when present — after one upstream
-  authorization probe (a repo-scoped, `authorize()`-gated read forwarded
-  with the caller's credentials, so the server, not the cache, decides who
-  may read) — else fetched upstream once and written through. Concurrent
+  from the scoped object store when present. A live, read-authorized
+  `RepoInfo` request selects the incarnation; cache hits also retain the
+  `ListRefs` authorization check with the caller's credentials. A miss is
+  fetched upstream and written through only within that proven scope. Concurrent
   requests for the same id collapse into one fetch; a denied probe denies
   the hit. Cached blobs stream back to the caller in 64 KiB chunks
   (matching the server's stream shape; tonic's 4 MiB per-message decode

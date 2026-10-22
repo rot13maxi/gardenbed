@@ -243,6 +243,13 @@ tags, and the verification record for a release lives in
 
 ### Fixed
 
+- Shared daemon caches now separate upstreams, repositories, and repository
+  incarnations, preventing cross-repository and same-name replacement leaks.
+  `RepoInfo` authorizes each scope; older servers use uncached passthrough.
+  Identity persists atomically in SQLite/Postgres and is stable per in-memory
+  store instance. [Cache isolation](docs/daemon-cache-isolation.md) records the
+  lifecycle and verification.
+
 - PostgreSQL schema initialization now serializes concurrent first opens
   across replicas in one transaction, preventing duplicate catalog-key
   failures on an empty database.

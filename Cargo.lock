@@ -1236,6 +1236,7 @@ version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
  "gardenbed-model",
+ "getrandom 0.3.4",
  "object_store",
  "rusqlite",
  "rustix",

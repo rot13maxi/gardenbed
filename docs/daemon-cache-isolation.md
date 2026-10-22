@@ -37,8 +37,8 @@ proven failing against the unfixed daemon before its fix landed.
 
 `MetadataStore::repo_incarnation()` — implemented by the SQLite,
 Postgres, and Memory metadata backends — answers 16 random opaque
-bytes, minted **atomically on first use** and persisted with the
-repository's metadata:
+bytes from the operating system random generator, minted **atomically
+on first use** and stored with the repository metadata:
 
 * **SQLite**: a `repo_incarnation` singleton table; read-then-insert
   in one `BEGIN IMMEDIATE` transaction (the write lock serializes
@@ -49,13 +49,15 @@ repository's metadata:
   the single stored row. The startup advisory-lock DDL transaction and
   the strict schema table set are preserved (`repo_incarnation` joined
   the expected table union).
-* **Memory**: a lazy field under the store's write lock.
+* **Memory**: a lazy field under the store's write lock, stable for that
+  store instance. A fresh in-memory store gets a new identity; it has no
+  durable state to reopen.
 
 The contract:
 
-* **Same identity on restart**: the value persists with the metadata
-  database; a server restart (or any independent handle: another
-  process, another replica) reads the same bytes.
+* **Same identity on durable-store restart**: SQLite and Postgres keep
+  the value in the metadata database; another handle, process, or replica
+  reads the same bytes.
 * **New identity on new database**: a re-initialized or replaced
   repository (new metadata) mints a fresh identity — never a
   predecessor's, even when both histories are empty or identical
@@ -115,7 +117,9 @@ never served.
 * **Restart**: same database ⇒ same identity ⇒ same scope ⇒ warm
   objects serve with zero new origin fetches.
 * **Move** (`gardenbed-server move`): same database (moved directory)
-  ⇒ same identity ⇒ warm scope survives the rename.
+  ⇒ same identity. The namespace also includes the repository name, so
+  the new name starts cold; identity continuity does not reuse the old
+  name's cache scope.
 * **Replacement** (delete + re-init, new database): fresh identity ⇒
   cold scope ⇒ the replacement's callers get the replacement origin's
   own answers, never the predecessor's cached bytes.
@@ -140,9 +144,12 @@ never served.
   — the replacement leak: warm first-incarnation objects fetched by
   `first-token`; after delete + re-init under the same name, a
   `replacement-token` caller gets NotFound for the predecessor's blob
-  AND tree through the daemon restarted over the same cache root; the
+  AND tree while the daemon stays alive across replacement; the
   replacement's own content serves. (RED-first pre-fix: the
   (origin, repo)-only partition served the warm bytes.)
+
+* `daemon_restarted_over_replaced_repo_still_denies_prior_incarnation`
+  checks the persistent-cache variant after restarting the daemon.
 
 `crates/bed/tests/daemon.rs` (pre-existing, kept green):
 

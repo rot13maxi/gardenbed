@@ -18,19 +18,13 @@
 //! each other) in-process.
 
 /// Generates a fresh 16-byte repository incarnation (see
-/// [`crate::traits::MetadataStore::repo_incarnation`]): 16 bytes from
-/// `/dev/urandom` (never-blocking on Linux; the store crate deliberately
-/// avoids a rand dependency for one 16-byte draw).
+/// [`crate::traits::MetadataStore::repo_incarnation`]), using the operating
+/// system random generator through `getrandom` on supported platforms.
+/// Failure is propagated; there is no predictable fallback identity.
 pub(crate) fn random_incarnation() -> Result<[u8; 16], StoreError> {
-    use std::io::Read;
     let mut buf = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut buf))
-        .map_err(|e| {
-            StoreError::Db(format!(
-                "cannot read /dev/urandom for repo incarnation: {e}"
-            ))
-        })?;
+    getrandom::fill(&mut buf)
+        .map_err(|e| StoreError::Db(format!("cannot generate repo incarnation: {e}")))?;
     Ok(buf)
 }
 
