@@ -615,7 +615,7 @@ fn remove_at(parent: &DirHandle, name: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -625,29 +625,270 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("f"), b"valuable").unwrap();
         std::fs::create_dir(root.path().join("d")).unwrap();
-        symlink(outside.path(), &root.path().join("d/link"));
+        std::os::unix::fs::symlink(outside.path(), root.path().join("d/link")).unwrap();
         let disk = CheckoutFs::open(root.path(), outside.path()).unwrap();
         disk.remove("d").unwrap();
-        assert_eq!(
-            fs2::read(&outside.path().join("f")).unwrap(),
-            b"valuable".to_vec()
-        );
         assert!(!root.path().join("d").exists());
+        assert_eq!(
+            std::fs::read(outside.path().join("f")).unwrap(),
+            b"valuable"
+        );
     }
 
-    #[cfg(unix)]
-    fn symlink(from: &Path, to: &Path) {
-        std::os::unix::fs::symlink(from, to).unwrap();
+    #[test]
+    fn failed_staging_preserves_the_old_leaf_and_completed_writes_replace_it() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join(".bed");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::write(root.path().join("f"), b"old").unwrap();
+        let disk = CheckoutFs::open(root.path(), &state).unwrap();
+        assert!(disk.write("f", b"invalid\0target", Mode::Symlink).is_err());
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
+        disk.write("f", b"new", Mode::Exec).unwrap();
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"new");
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(root.path().join("f"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
     }
 
-    #[cfg(windows)]
-    fn symlink(from: &Path, to: &Path) {
-        std::os::windows::fs::symlink_dir(from, to).unwrap();
-    }
-
-    mod fs2 {
-        pub fn read(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
-            std::fs::read(path)
+    fn cross_device_dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
+        let root = tempfile::tempdir().unwrap();
+        let state = match tempfile::tempdir_in("/dev/shm") {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("cross-device test unavailable: {error}");
+                return None;
+            }
+        };
+        use std::os::unix::fs::MetadataExt as _;
+        if std::fs::metadata(root.path()).unwrap().dev()
+            == std::fs::metadata(state.path()).unwrap().dev()
+        {
+            eprintln!("cross-device test unavailable: /tmp and /dev/shm share a device");
+            return None;
         }
+        Some((root, state))
+    }
+
+    #[test]
+    fn cross_device_regular_and_symlink_publication_is_atomic_and_preserves_old_leaf_on_failure() {
+        let Some((root, state)) = cross_device_dirs() else {
+            return;
+        };
+        std::fs::write(root.path().join("f"), b"old").unwrap();
+        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
+        assert!(disk.write("f", b"bad\0target", Mode::Symlink).is_err());
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
+        disk.write("f", b"new", Mode::Exec).unwrap();
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"new");
+        disk.write("f", b"relative-target", Mode::Symlink).unwrap();
+        assert_eq!(
+            std::fs::read_link(root.path().join("f")).unwrap(),
+            Path::new("relative-target")
+        );
+        disk.write("f", b"regular again", Mode::Regular).unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("f")).unwrap(),
+            b"regular again"
+        );
+        assert!(disk.journals().unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn registered_staging_is_hidden_but_substituted_and_unregistered_entries_are_preserved() {
+        let Some((root, state)) = cross_device_dirs() else {
+            return;
+        };
+        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
+        let temp = ".bed-checkout-owned";
+        let mut fd = prim::create_exclusive(&disk.root, temp).unwrap();
+        let record = StageRecord::new(temp.to_owned(), &prim::fstat(&fd).unwrap());
+        let journal = disk.register_stage(record, "checkout-stage-owned").unwrap();
+        fd.write_all(b"partial stage").unwrap();
+        {
+            let (_lock, hidden) = disk.staging_scan().unwrap();
+            assert!(hidden.contains(temp));
+        }
+        // A live writer keeps ownership; cleanup may not steal its stage.
+        disk.cleanup_staging().unwrap();
+        assert!(root.path().join(temp).exists());
+        drop(journal);
+        std::fs::rename(root.path().join(temp), root.path().join("held-inode")).unwrap();
+        std::fs::write(root.path().join(temp), b"user replacement").unwrap();
+        std::fs::write(root.path().join(".bed-checkout-unregistered"), b"user file").unwrap();
+        {
+            let (_lock, hidden) = disk.staging_scan().unwrap();
+            assert!(!hidden.contains(temp));
+            assert!(!hidden.contains(".bed-checkout-unregistered"));
+        }
+        disk.cleanup_staging().unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join(temp)).unwrap(),
+            b"user replacement"
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(".bed-checkout-unregistered")).unwrap(),
+            b"user file"
+        );
+        assert!(disk.journals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cross_device_stage_crash_child() {
+        let Some(root) = std::env::var_os("GARDENBED_STAGE_CRASH_ROOT") else {
+            return;
+        };
+        let state = std::env::var_os("GARDENBED_STAGE_CRASH_STATE").unwrap();
+        let disk = CheckoutFs::open(Path::new(&root), Path::new(&state)).unwrap();
+        let name = ".bed-checkout-killed";
+        let mut fd = prim::create_exclusive(&disk.root, name).unwrap();
+        let record = StageRecord::new(name.to_owned(), &prim::fstat(&fd).unwrap());
+        let _journal = disk
+            .register_stage(record, "checkout-stage-killed")
+            .unwrap();
+        fd.write_all(b"incomplete stage").unwrap();
+        std::fs::write(Path::new(&state).join("child-ready"), b"ready").unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn killed_cross_device_writer_is_recovered_without_publishing_partial_bytes() {
+        let Some((root, state)) = cross_device_dirs() else {
+            return;
+        };
+        std::fs::write(root.path().join("f"), b"old").unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "checkout_fs::tests::cross_device_stage_crash_child",
+                "--nocapture",
+            ])
+            .env("GARDENBED_STAGE_CRASH_ROOT", root.path())
+            .env("GARDENBED_STAGE_CRASH_STATE", state.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state.path().join("child-ready").exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let ready = state.path().join("child-ready").exists();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(ready, "child registered its partial stage before kill");
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
+        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
+        {
+            let (_lock, hidden) = disk.staging_scan().unwrap();
+            assert!(hidden.contains(".bed-checkout-killed"));
+        }
+        disk.cleanup_staging().unwrap();
+        assert!(!root.path().join(".bed-checkout-killed").exists());
+        disk.write("f", b"complete", Mode::Regular).unwrap();
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"complete");
+        assert!(disk.journals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cross_device_writer_waits_for_a_scan_before_creating_staging_entries() {
+        let Some((root, state)) = cross_device_dirs() else {
+            return;
+        };
+        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
+        let (scan_lock, _) = disk.staging_scan().unwrap();
+        let root_path = root.path().to_path_buf();
+        let state_path = state.path().to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let writer = CheckoutFs::open(&root_path, &state_path).unwrap();
+            sender.send(false).unwrap();
+            writer.write("f", b"complete", Mode::Regular).unwrap();
+            sender.send(true).unwrap();
+        });
+        assert!(
+            !receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        drop(scan_lock);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        );
+        thread.join().unwrap();
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"complete");
+    }
+
+    #[test]
+    fn checkout_descriptors_and_locks_are_not_inherited_by_exec_children() {
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
+        let (parent, _) = disk.parent("d/f", true).unwrap().unwrap();
+        let flags = rustix::io::FdFlags::CLOEXEC;
+        use std::os::fd::AsFd as _;
+        assert!(rustix::io::fcntl_getfd(disk.root.as_fd()).unwrap().contains(flags));
+        assert!(
+            rustix::io::fcntl_getfd(disk.staging.as_fd())
+                .unwrap()
+                .contains(flags)
+        );
+        assert!(rustix::io::fcntl_getfd(parent.as_fd()).unwrap().contains(flags));
+        let lock = disk.staging_lock(false).unwrap();
+        assert!(rustix::io::fcntl_getfd(lock.as_fd()).unwrap().contains(flags));
+        let stage = prim::create_exclusive(&parent, ".bed-checkout-flags").unwrap();
+        let record =
+            StageRecord::new("d/.bed-checkout-flags".to_owned(), &prim::fstat(&stage).unwrap());
+        let journal = disk.register_stage(record, "checkout-stage-flags").unwrap();
+        assert!(
+            rustix::io::fcntl_getfd(journal.file.as_fd())
+                .unwrap()
+                .contains(flags)
+        );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod prune_tests {
+    use super::*;
+    #[test]
+    fn prune_removes_empty_chain_but_respects_sparse_and_content() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("crates/web/src")).unwrap();
+        std::fs::write(root.path().join("crates/web/src/main.rs"), b"x").unwrap();
+        let disk = CheckoutFs::open(root.path(), outside.path()).unwrap();
+        disk.remove("crates/web/src/main.rs").unwrap();
+        // `crates` is sparse-selected and stays; the emptied chain below
+        // it is pruned.
+        disk.prune_empty("crates/web/src", &["crates".to_owned()])
+            .unwrap();
+        assert!(!root.path().join("crates/web/src").exists());
+        assert!(!root.path().join("crates/web").exists());
+        assert!(root.path().join("crates").exists());
+
+        // Untracked content blocks pruning of its directory.
+        std::fs::create_dir_all(root.path().join("crates/keep")).unwrap();
+        std::fs::write(root.path().join("crates/keep/precious"), b"u").unwrap();
+        disk.prune_empty("crates/keep", &[]).unwrap();
+        assert!(root.path().join("crates/keep").exists());
+        assert!(root.path().join("crates/keep/precious").exists());
     }
 }

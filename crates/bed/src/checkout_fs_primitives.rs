@@ -51,6 +51,12 @@ mod unix {
                 path,
             }
         }
+
+        /// The anchored fd — test-visible for CLOEXEC discipline checks.
+        #[cfg(test)]
+        pub(crate) fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+            self.file.as_fd()
+        }
     }
 
     /// Opens a directory without following a symlink at the final
