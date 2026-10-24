@@ -63,6 +63,30 @@ pub fn touch_mtime(path: &std::path::Path) -> std::io::Result<()> {
     filetime::set_file_mtime(path, filetime::FileTime::now())
 }
 
+/// fsyncs a directory so entries created/renamed inside it are durable.
+///
+/// Unix: `fsync` on a directory fd. Windows: plain `File::open(dir)`
+/// is refused with `ERROR_ACCESS_DENIED` — a directory handle must be
+/// opened with `FILE_FLAG_BACKUP_SEMANTICS` first, after which
+/// `FlushFileBuffers` (via `sync_all`) is the durability equivalent
+/// (the same contract as checkout_fs_primitives::fsync_dir).
+pub fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(dir)?.sync_all()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(dir)?
+            .sync_all()
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use super::*;
@@ -411,6 +435,27 @@ mod windows {
 mod tests {
     use super::*;
 
+    /// Opens a directory for `statat`/`symlinkat` on both platforms:
+    /// Windows requires `FILE_FLAG_BACKUP_SEMANTICS` (plain
+    /// `File::open(dir)` is `ERROR_ACCESS_DENIED`).
+    #[allow(unused)]
+    fn open_dir(path: &std::path::Path) -> File {
+        #[cfg(unix)]
+        {
+            File::open(path).unwrap()
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+                .unwrap()
+        }
+    }
+
     #[test]
     fn statat_reads_kind_size_and_mtime_without_following_links() {
         let dir = tempfile::tempdir().unwrap();
@@ -418,7 +463,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("d")).unwrap();
         symlink("f", &dir.path().join("link"));
 
-        let root = File::open(dir.path()).unwrap();
+        let root = open_dir(dir.path());
         let file = statat(&root, "f").unwrap();
         assert!(file.is_file && !file.is_symlink && !file.is_dir);
         assert_eq!(file.size, 5);
@@ -437,11 +482,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a"), b"one").unwrap();
         std::fs::write(dir.path().join("b"), b"two").unwrap();
-        let root = File::open(dir.path()).unwrap();
+        let root = open_dir(dir.path());
         let a = statat(&root, "a").unwrap();
         let b = statat(&root, "b").unwrap();
         assert_ne!(a.file_id, b.file_id);
-        let root2 = File::open(dir.path()).unwrap();
+        let root2 = open_dir(dir.path());
         let a2 = statat(&root2, "a").unwrap();
         assert_eq!(a.file_id, a2.file_id);
     }
@@ -449,7 +494,7 @@ mod tests {
     #[test]
     fn symlinkat_roundtrips_target_bytes() {
         let dir = tempfile::tempdir().unwrap();
-        let root = File::open(dir.path()).unwrap();
+        let root = open_dir(dir.path());
         symlinkat(&root, "made", b"elsewhere/target").unwrap();
         let stat = statat(&root, "made").unwrap();
         assert!(stat.is_symlink);
@@ -463,8 +508,20 @@ mod tests {
 
     #[cfg(windows)]
     fn symlink(target: &str, to: &std::path::Path) {
-        let root = File::open(to.parent().unwrap()).unwrap();
+        let root = open_dir(to.parent().unwrap());
         let name = to.file_name().unwrap().to_string_lossy().into_owned();
         symlinkat(&root, &name, target.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn fsync_dir_accepts_a_directory_with_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), b"entry").unwrap();
+        // The exact failure the native Windows CI hit: opening a
+        // directory without FILE_FLAG_BACKUP_SEMANTICS is
+        // ERROR_ACCESS_DENIED (os error 5) — here it must succeed and
+        // flush.
+        super::fsync_dir(dir.path()).unwrap();
+        super::fsync_dir(dir.path().join("f").parent().unwrap()).unwrap();
     }
 }
