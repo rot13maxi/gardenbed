@@ -1,11 +1,9 @@
-# Rename-aware, recursive, octopus merges (v0.3 merge lane)
+# Rename-aware, recursive, octopus merges
 
-This is the task doc for the `todo/merges` lane. It documents the
-merge semantics the lane introduces, their bounds, the git parity
-evidence, and the DOGFOOD #30 fix. Shared docs (divergences.md,
-cli.md, status.md) carry only what this lane proposes for them in its
-final report; retirement text for divergences §8/§9 is proposed there,
-not applied here.
+The engine, server and CLI implement the merge behavior below. Shared
+[divergences](divergences.md), [CLI reference](cli.md) and [status](status.md)
+record the supported behavior and remaining bounds. The Git-oracle fixtures
+and DOGFOOD #30 regressions provide the verification described here.
 
 ## What changed
 

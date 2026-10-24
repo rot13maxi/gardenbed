@@ -14,6 +14,10 @@ tags, and the verification record for a release lives in
   without publishing a partial merge. [Behavior and limits](docs/merge-rename-octopus.md)
   document scoring, parent order, and older-server refusal.
 
+- Sparse raw-tree capture preserves imported noncanonical modes, non-UTF-8
+  names and empty directories during SHA-exact Git export; matched kernel
+  throughput measurements and migration boundaries are documented.
+
 - CI now includes blocking bounded fuzz smoke and Playwright, plus
   nightly/manual PostgreSQL/S3 schema, parity, and replica checks.
   FUSE verification is explicitly enabled on a provisioned self-hosted
