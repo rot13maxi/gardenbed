@@ -667,10 +667,14 @@ mod windows {
         mark_for_deletion(handle.as_raw(), "remove_dir")
     }
 
-    /// fsyncs a directory. Windows FlushFileBuffers on a directory
-    /// handle is the durability equivalent.
+    /// fsyncs a directory. Windows FlushFileBuffers requires a handle
+    /// with GENERIC_WRITE, which the read-anchored `DirHandle` does not
+    /// carry (and must not: every checkout operation composes through
+    /// it); a transient write-capable handle is opened on the anchor's
+    /// resolved final path instead, preserving the durability contract
+    /// without widening the anchor's access.
     pub fn fsync_dir(dir: &DirHandle) -> io::Result<()> {
-        dir.file.sync_all()
+        gardenbed_platform::fsync_dir(&dir.path)
     }
 
     /// Reads a directory's entries (names only).

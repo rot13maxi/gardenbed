@@ -179,7 +179,14 @@ fn locate_guarded_bin(spec: &BinSpec) -> PathBuf {
         &["release", "debug"]
     };
     for profile in profiles {
-        let candidate = workspace_target.join(profile).join(name);
+        // Windows artifacts carry the .exe suffix cargo builds (the
+        // same file an override or a `cargo build` produces there);
+        // `Path::is_file` does not consult PATHEXT, so the default
+        // lookup must append it explicitly. `EXE_SUFFIX` is empty on
+        // Unix, leaving those paths byte-identical.
+        let candidate = workspace_target
+            .join(profile)
+            .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
         if !candidate.is_file() {
             continue;
         }

@@ -8,6 +8,7 @@ license.workspace = true
 gardenbed-model.workspace = true
 gardenbed-store = { path = "../store" }
 gardenbed-derive = { path = "../derive" }
+gardenbed-platform = { path = "../platform" }
 crc32fast = "1.5"
 flate2 = "1.1"
 gix = "0.89.0"

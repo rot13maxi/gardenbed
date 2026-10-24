@@ -1143,7 +1143,7 @@ fn prepare_target(git_dir: &Path) -> Result<(), ExportError> {
 fn fsync_rename(from: &Path, to: &Path) -> Result<(), ExportError> {
     let result = std::fs::rename(from, to).and_then(|_| {
         if let Some(parent) = to.parent() {
-            std::fs::File::open(parent)?.sync_all()?;
+            gardenbed_platform::fsync_dir(parent).map_err(std::io::Error::other)?;
         }
         Ok(())
     });
