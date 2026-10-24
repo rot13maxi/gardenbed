@@ -1059,6 +1059,7 @@ dependencies = [
  "gardenbed-daemon",
  "gardenbed-harness",
  "gardenbed-model",
+ "gardenbed-platform",
  "gardenbed-protocol",
  "gardenbed-server",
  "gardenbed-store",
@@ -1105,6 +1106,7 @@ dependencies = [
  "clap",
  "gardenbed-harness",
  "gardenbed-model",
+ "gardenbed-platform",
  "gardenbed-protocol",
  "gardenbed-store",
  "libc",
@@ -1187,6 +1189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gardenbed-platform"
+version = "0.1.0"
+dependencies = [
+ "bitflags 2.13.2",
+ "filetime",
+ "gardenbed-model",
+ "rustix",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "gardenbed-protocol"
 version = "0.1.0"
 dependencies = [
@@ -1212,12 +1226,12 @@ dependencies = [
  "gardenbed-git",
  "gardenbed-harness",
  "gardenbed-model",
+ "gardenbed-platform",
  "gardenbed-protocol",
  "gardenbed-store",
  "log",
  "prost",
  "rusqlite",
- "rustix",
  "serde",
  "sha2 0.10.9",
  "tempfile",
@@ -1236,9 +1250,9 @@ version = "0.1.0"
 dependencies = [
  "deadpool-postgres",
  "gardenbed-model",
+ "gardenbed-platform",
  "object_store",
  "rusqlite",
- "rustix",
  "sha1",
  "sha2 0.10.9",
  "tempfile",
