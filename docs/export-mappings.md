@@ -3,10 +3,11 @@
 `gardenbed-server export --record-mappings` persists the computed
 changeset↔git-SHA mapping into the metadata store's `git_map` table after
 a successful export (v0.2, dogfood #26). This closes the loop that
-previously required manually recording the landing tip: after any
-`--record-mappings` export, the OPERATIONS §1.1b `MAIN_TWIN` query
-answers for **native** main tips too, and a re-import of the exported
-repository into the same stores is a pure no-op.
+previously required manually recording the landing tip: for an accepted
+native-tip pair, OPERATIONS §1.1b can resolve `MAIN_TWIN` from the stored
+row. A native representation twin refused in favor of another canonical
+changeset can still need the recorded landing SHA; inspect conflicts.
+Re-import recognizes the exported SHAs through their surviving mappings.
 
 ## Semantics
 
@@ -24,8 +25,9 @@ Per exported `(git sha, changeset)` pair:
   the existing mapping survives.
 * **All-or-nothing.** Accepted pairs land in one store transaction per
   batch. A crash between the git side (pack/idx/refs, already complete)
-  and the metadata side leaves the batch entirely absent — re-running
-  the same export repairs it (every pair is idempotent). A malformed sha
+  and the metadata side can leave the batch absent; a crash during commit
+  can leave the whole transaction present or absent. Re-running the same
+  export is idempotent for identical pairs. A malformed sha
   in the batch fails the whole call before any row lands.
 * **Conflicts are data, not errors.** The export itself succeeded; each
   conflict is printed on stderr as
@@ -33,7 +35,9 @@ Per exported `(git sha, changeset)` pair:
   and the surviving canonical row.
 * **Only successful bytes are recorded.** Recording happens after
   `write_refs`; a refused (e.g. non-bare target) or failed export
-  records nothing.
+  cannot record mappings before its Git refs complete. A later metadata
+  error is returned even though the Git side is already complete; accepted
+  mappings remain transactional, and the export can be rerun.
 
 ## Report line
 
@@ -58,12 +62,12 @@ parsing the line — demo/run-v0.2.sh, the runbook — are unaffected).
 
 ## Limitations
 
-* The mapping table stays a bijection: no alias support for multiple
-  changesets sharing one git SHA (the one genuine collision shape — a
-  native-vs-re-imported twin — is refused and reported, not aliased).
-  Canonical history has no duplicate SHAs, so this is deliberately not
-  over-engineered.
-* `--record-mappings` writes to the metadata store: it is not safe to
-  run concurrently with an import racing the same sha. The bijection
-  refusal makes the outcome safe (no overwrite, no corruption) either
-  way; the loser is simply reported.
+* The mapping table stays a bijection: multiple canonical changesets can
+  export identical Git bytes, but `git_map` records one association per SHA.
+  Representation twins are reported, never silently aliased or overwritten.
+  Canonical changeset history is not rewritten to enforce the mapping.
+* Concurrent identical batches are idempotent. Competing associations preserve
+  the first committed binding and report conflicts. PostgreSQL retries only
+  SQLSTATE 40P01 (a known-aborted deadlocked transaction), at most eight
+  attempts; other errors propagate. Coordinate imports/exports when choosing
+  between representation twins, and inspect the actual surviving mapping.
