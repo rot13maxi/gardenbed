@@ -233,6 +233,13 @@ impl Gardenbed for SplittingProxy {
         Err(Status::unimplemented("not routed by this proxy"))
     }
 
+    async fn merge_octopus(
+        &self,
+        _request: Request<pb::MergeOctopusReq>,
+    ) -> Result<Response<pb::MergeOctopusResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
     async fn get_stats(
         &self,
         _request: Request<pb::GetStatsReq>,
@@ -646,6 +653,13 @@ impl Gardenbed for ManglingProxy {
         &self,
         _request: Request<pb::MergeReq>,
     ) -> Result<Response<pb::MergeResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn merge_octopus(
+        &self,
+        _request: Request<pb::MergeOctopusReq>,
+    ) -> Result<Response<pb::MergeOctopusResp>, Status> {
         Err(Status::unimplemented("not routed by this proxy"))
     }
 
