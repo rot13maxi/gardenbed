@@ -8,7 +8,7 @@
 //!
 //! Concurrency contract: WAL journaling lets any number of connections
 //! read the last committed snapshot without blocking a writer or each
-//! other, but SQLite still allows one writer at a time. This store
+//! other, but SQLite still allows only one writer at a time. This store
 //! therefore opens one dedicated write connection, guarded by a mutex and
 //! used for every mutation, plus a pool of reader connections (4 by
 //! default, [`SqliteMetadataStore::open_with_readers`]) checked out one
@@ -16,6 +16,8 @@
 //! last commit when the read began — the same data the single-connection
 //! design served, just without serializing readers behind a writer (or
 //! each other) in-process.
+
+use crate::StoreError;
 
 /// Generates a fresh 16-byte repository incarnation (see
 /// [`crate::traits::MetadataStore::repo_incarnation`]), using the operating
@@ -39,8 +41,6 @@ pub(crate) fn parse_incarnation(bytes: &[u8]) -> Result<[u8; 16], StoreError> {
         ))
     })
 }
-
-use crate::StoreError;
 use gardenbed_model::Changeset;
 use gardenbed_model::Id;
 use rusqlite::Connection;
@@ -82,6 +82,11 @@ CREATE TABLE IF NOT EXISTS git_raw_commit (
     cs   BLOB PRIMARY KEY REFERENCES changesets(id),
     data BLOB NOT NULL
 );
+CREATE TABLE IF NOT EXISTS git_raw_tree (
+    git_sha BLOB PRIMARY KEY CHECK(length(git_sha) = 20),
+    data    BLOB NOT NULL,
+    model   BLOB CHECK(length(model) IN (0, 32))
+);
 CREATE TABLE IF NOT EXISTS repo_incarnation (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     incarnation BLOB NOT NULL CHECK (length(incarnation) = 16)
@@ -94,6 +99,40 @@ pub(crate) const ZSTD_LEVEL: i32 = 3;
 /// Sanity bound on a decompressed raw commit (64 MiB): far above any real
 /// commit object, small enough to refuse a corrupt frame's huge claim.
 pub(crate) const MAX_RAW_COMMIT: usize = 64 * 1024 * 1024;
+
+/// zstd level for raw-tree frames — same fixed-for-determinism convention
+/// as raw-commit rows (D21).
+pub(crate) const ZSTD_RAW_TREE_LEVEL: i32 = 3;
+
+/// Sanity bound on a decompressed raw tree (256 MiB): far above any real
+/// tree object (the linux kernel's largest trees are a few hundred KiB),
+/// small enough to refuse a corrupt frame's huge claim.
+pub(crate) const MAX_RAW_TREE: usize = 256 * 1024 * 1024;
+
+/// `SHA-1("tree <len>\0" + data)` — git's object name for a tree. Raw-tree
+/// rows are content-addressed by this value (the ORIGINAL git tree SHA is
+/// the row key), so the store itself recomputes and checks it.
+pub(crate) fn git_tree_sha1(data: &[u8]) -> [u8; 20] {
+    use sha1::Digest as _;
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(b"tree ");
+    hasher.update(data.len().to_string().as_bytes());
+    hasher.update(b"\0");
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// Lowercase hex of a 20-byte SHA-1 — error-message formatting shared by
+/// the raw-tree paths.
+pub(crate) fn hex_sha(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
+}
 
 /// The SQLite (metadata) metadata store.
 ///
@@ -396,32 +435,6 @@ impl SqliteMetadataStore {
 }
 
 impl crate::traits::MetadataStore for SqliteMetadataStore {
-    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
-        // Read-then-insert in ONE immediate transaction: the write lock
-        // serializes concurrent first callers (including other processes
-        // on the same database), so exactly one racer inserts and both
-        // return the same stored bytes. The singleton CHECK (id = 1)
-        // makes a second insert a constraint error even if the
-        // transaction lock were somehow bypassed.
-        self.in_tx(|tx| {
-            if let Some(bytes) = tx
-                .prepare_cached("SELECT incarnation FROM repo_incarnation WHERE id = 1")
-                .map_err(db_err)?
-                .query_row(params![], |r| r.get::<_, Vec<u8>>(0))
-                .optional()
-                .map_err(db_err)?
-            {
-                return parse_incarnation(&bytes);
-            }
-            let fresh = random_incarnation()?;
-            tx.prepare_cached("INSERT INTO repo_incarnation(id, incarnation) VALUES(1, ?1)")
-                .map_err(db_err)?
-                .execute(params![fresh.as_slice()])
-                .map_err(db_err)?;
-            Ok(fresh)
-        })
-    }
-
     fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
         let canonical = cs.canonical_bytes().map_err(|e| {
             StoreError::Invalid(format!("changeset is not canonically encodable: {e}"))
@@ -477,6 +490,32 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .optional()
             .map_err(db_err)?;
         cs.map(|b| id_from_blob(&b)).transpose()
+    }
+
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        // Read-then-insert in ONE immediate transaction: the write lock
+        // serializes concurrent first callers (including other processes
+        // on the same database), so exactly one racer inserts and both
+        // return the same stored bytes. The singleton CHECK (id = 1)
+        // makes a second insert a constraint error even if the
+        // transaction lock were somehow bypassed.
+        self.in_tx(|tx| {
+            if let Some(bytes) = tx
+                .prepare_cached("SELECT incarnation FROM repo_incarnation WHERE id = 1")
+                .map_err(db_err)?
+                .query_row(params![], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(db_err)?
+            {
+                return parse_incarnation(&bytes);
+            }
+            let fresh = random_incarnation()?;
+            tx.prepare_cached("INSERT INTO repo_incarnation(id, incarnation) VALUES(1, ?1)")
+                .map_err(db_err)?
+                .execute(params![fresh.as_slice()])
+                .map_err(db_err)?;
+            Ok(fresh)
+        })
     }
 
     fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError> {
@@ -734,6 +773,112 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
                     .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
             })
             .transpose()
+    }
+
+    fn raw_tree(&self, git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        let conn = self.read_conn()?;
+        let frame: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT data FROM git_raw_tree WHERE git_sha = ?1",
+                params![git_tree_sha.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        frame
+            .map(|f| {
+                zstd::bulk::decompress(&f, MAX_RAW_TREE)
+                    .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))
+            })
+            .transpose()
+    }
+
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        let conn = self.read_conn()?;
+        let model: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT model FROM git_raw_tree WHERE git_sha = ?1",
+                params![git_tree_sha.as_slice()],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_err)?;
+        model
+            .map(|bytes| {
+                if bytes.is_empty() {
+                    Ok(None)
+                } else {
+                    id_from_blob(&bytes).map(Some)
+                }
+            })
+            .transpose()
+    }
+
+    fn put_raw_tree(
+        &self,
+        git_tree_sha: [u8; 20],
+        model_tree: Option<Id>,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        // Content-addressed by the key: the bytes must SHA-1 to it. This
+        // also makes a tampered row (wrong bytes under a captured key)
+        // impossible to write through the API — only a direct DB edit can
+        // produce one, and the export's per-tree SHA assertion catches it.
+        let actual = git_tree_sha1(bytes);
+        if actual != git_tree_sha {
+            return Err(StoreError::Invalid(format!(
+                "raw tree bytes SHA-1 to {}, not {}",
+                hex_sha(&actual),
+                hex_sha(&git_tree_sha)
+            )));
+        }
+        let frame = zstd::bulk::compress(bytes, ZSTD_RAW_TREE_LEVEL)
+            .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+        let model_payload: Vec<u8> = model_tree
+            .map(|id| id.as_bytes().to_vec())
+            .unwrap_or_default();
+        self.in_tx(|tx| {
+            // Compare decoded bytes, never frames: a level change must
+            // not fabricate a violation (same convention as raw commits).
+            let previous: Option<Vec<u8>> = tx
+                .query_row(
+                    "SELECT data FROM git_raw_tree WHERE git_sha = ?1",
+                    params![git_tree_sha.as_slice()],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_err)?;
+            match previous {
+                Some(frame_prev) => {
+                    let prev_bytes = zstd::bulk::decompress(&frame_prev, MAX_RAW_TREE)
+                        .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+                    if prev_bytes.as_slice() == bytes {
+                        // Same content: idempotent no-op. The stored
+                        // (first-seen) model association stays untouched —
+                        // one git tree can normalize to different model
+                        // trees across import contexts (legacy-Exec
+                        // frontier vs fresh-Regular; see the trait doc),
+                        // and the export resolves the model tree from
+                        // changeset context, never from this column.
+                        Ok(())
+                    } else {
+                        Err(StoreError::Invalid(format!(
+                            "raw tree {} already captured with different bytes — \
+                             content-addressed rows are immutable",
+                            hex_sha(&git_tree_sha)
+                        )))
+                    }
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO git_raw_tree(git_sha, data, model) VALUES(?1, ?2, ?3)",
+                        params![git_tree_sha.as_slice(), frame, model_payload],
+                    )
+                    .map_err(db_err)?;
+                    Ok(())
+                }
+            }
+        })
     }
 
     fn put_validated_changeset(

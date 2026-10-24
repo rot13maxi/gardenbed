@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS git_raw_commit (
     cs   bytea PRIMARY KEY REFERENCES changesets(id),
     data bytea NOT NULL
 );
+CREATE TABLE IF NOT EXISTS git_raw_tree (
+    git_sha bytea PRIMARY KEY CHECK(length(git_sha) = 20),
+    data    bytea NOT NULL,
+    model   bytea CHECK(length(model) IN (0, 32))
+);
 CREATE TABLE IF NOT EXISTS repo_incarnation (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     incarnation bytea NOT NULL CHECK (length(incarnation) = 16)
@@ -378,33 +383,6 @@ impl PostgresMetadataStore {
 }
 
 impl crate::traits::MetadataStore for PostgresMetadataStore {
-    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
-        // One statement: INSERT ... ON CONFLICT DO NOTHING then SELECT,
-        // inside a transaction so the pair is atomic. Replicas racing the
-        // first call converge: the unique singleton row means at most one
-        // insert wins; every caller reads the same stored bytes.
-        let pool = self.pool.clone();
-        self.driver.block_on(async move {
-            let mut conn = pool.get().await.map_err(pg_err)?;
-            let tx = conn.transaction().await.map_err(pg_err)?;
-            let fresh = crate::sqlite::random_incarnation()?;
-            tx.execute(
-                "INSERT INTO repo_incarnation(id, incarnation) VALUES(1, $1) \
-                 ON CONFLICT (id) DO NOTHING",
-                &[&&fresh[..]],
-            )
-            .await
-            .map_err(pg_err)?;
-            let row = tx
-                .query_one("SELECT incarnation FROM repo_incarnation WHERE id = 1", &[])
-                .await
-                .map_err(pg_err)?;
-            let bytes: Vec<u8> = row.get(0);
-            tx.commit().await.map_err(pg_err)?;
-            crate::sqlite::parse_incarnation(&bytes)
-        })
-    }
-
     fn put_changeset(&self, cs: &Changeset) -> Result<Id, StoreError> {
         let canonical = cs.canonical_bytes().map_err(|e| {
             StoreError::Invalid(format!("changeset is not canonically encodable: {e}"))
@@ -502,6 +480,33 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                 None => Ok(None),
                 Some(row) => id_from_bytea(row.get(0)).map(Some),
             }
+        })
+    }
+
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        // One statement: INSERT ... ON CONFLICT DO NOTHING then SELECT,
+        // inside a transaction so the pair is atomic. Replicas racing the
+        // first call converge: the unique singleton row means at most one
+        // insert wins; every caller reads the same stored bytes.
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            let fresh = crate::sqlite::random_incarnation()?;
+            tx.execute(
+                "INSERT INTO repo_incarnation(id, incarnation) VALUES(1, $1) \
+                 ON CONFLICT (id) DO NOTHING",
+                &[&&fresh[..]],
+            )
+            .await
+            .map_err(pg_err)?;
+            let row = tx
+                .query_one("SELECT incarnation FROM repo_incarnation WHERE id = 1", &[])
+                .await
+                .map_err(pg_err)?;
+            let bytes: Vec<u8> = row.get(0);
+            tx.commit().await.map_err(pg_err)?;
+            crate::sqlite::parse_incarnation(&bytes)
         })
     }
 
@@ -834,6 +839,125 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                         .map_err(|e| StoreError::Corrupt(format!("raw commit frame: {e}")))
                 })
                 .transpose()
+        })
+    }
+
+    fn raw_tree(&self, git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let conn = pool.get().await.map_err(pg_err)?;
+            let frame: Option<Vec<u8>> = conn
+                .query_opt(
+                    "SELECT data FROM git_raw_tree WHERE git_sha = $1",
+                    &[&git_tree_sha.to_vec()],
+                )
+                .await
+                .map_err(pg_err)?
+                .map(|row| row.get(0));
+            frame
+                .map(|f| {
+                    zstd::bulk::decompress(&f, crate::sqlite::MAX_RAW_TREE)
+                        .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))
+                })
+                .transpose()
+        })
+    }
+
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let conn = pool.get().await.map_err(pg_err)?;
+            let model: Option<Vec<u8>> = conn
+                .query_opt(
+                    "SELECT model FROM git_raw_tree WHERE git_sha = $1",
+                    &[&git_tree_sha.to_vec()],
+                )
+                .await
+                .map_err(pg_err)?
+                .map(|row| row.get(0));
+            model
+                .map(|bytes| {
+                    if bytes.is_empty() {
+                        Ok(None)
+                    } else {
+                        id_from_bytea(&bytes).map(Some)
+                    }
+                })
+                .transpose()
+        })
+    }
+
+    fn put_raw_tree(
+        &self,
+        git_tree_sha: [u8; 20],
+        model_tree: Option<Id>,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        // Content-addressed by the key (SQLite twin): the bytes must
+        // SHA-1 to it, so a tampered row cannot be written through the
+        // API — the export's per-tree SHA assertion catches direct edits.
+        let actual = crate::sqlite::git_tree_sha1(bytes);
+        if actual != git_tree_sha {
+            return Err(StoreError::Invalid(format!(
+                "raw tree bytes SHA-1 to {}, not {}",
+                crate::sqlite::hex_sha(&actual),
+                crate::sqlite::hex_sha(&git_tree_sha)
+            )));
+        }
+        // Own the bytes: the async block must be 'static (same shape as
+        // the other async trait methods in this file).
+        let bytes = bytes.to_vec();
+        let frame = zstd::bulk::compress(&bytes, crate::sqlite::ZSTD_RAW_TREE_LEVEL)
+            .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+        let model_payload: Vec<u8> = model_tree
+            .map(|id| id.as_bytes().to_vec())
+            .unwrap_or_default();
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            // Insert-first (the codebase's concurrent-idempotence shape,
+            // same as put_changeset): ON CONFLICT DO NOTHING claims the
+            // key, then the row is re-read and verified inside this
+            // transaction. Under READ COMMITTED the loser's insert is a
+            // no-op and the returned row is the winner's.
+            let inserted = tx
+                .execute(
+                    "INSERT INTO git_raw_tree(git_sha, data, model) VALUES($1, $2, $3) \
+                     ON CONFLICT (git_sha) DO NOTHING",
+                    &[&git_tree_sha.to_vec(), &frame, &model_payload],
+                )
+                .await
+                .map_err(pg_err)?;
+            if inserted == 0 {
+                let row = tx
+                    .query_one(
+                        "SELECT data FROM git_raw_tree WHERE git_sha = $1",
+                        &[&git_tree_sha.to_vec()],
+                    )
+                    .await
+                    .map_err(pg_err)?;
+                // Compare decoded bytes, never frames (SQLite twin). The
+                // stored (first-seen) model association stays untouched —
+                // one git tree can normalize to different model trees
+                // across import contexts (legacy-Exec frontier vs
+                // fresh-Regular; see the trait doc), and the export
+                // resolves the model tree from changeset context, never
+                // from the model column.
+                let prev_frame: Vec<u8> = row.get(0);
+                let prev_bytes =
+                    zstd::bulk::decompress(&prev_frame, crate::sqlite::MAX_RAW_TREE)
+                        .map_err(|e| StoreError::Corrupt(format!("raw tree frame: {e}")))?;
+                if prev_bytes.as_slice() != bytes {
+                    return Err(StoreError::Invalid(format!(
+                        "raw tree {} already captured with different bytes — \
+                         content-addressed rows are immutable",
+                        crate::sqlite::hex_sha(&git_tree_sha)
+                    )));
+                }
+            }
+            tx.commit().await.map_err(pg_err)?;
+            Ok(())
         })
     }
 }

@@ -10,13 +10,13 @@ Implementation status and completion of verification targets are separate.
 | Area | Current implementation and evidence |
 |---|---|
 | v0.1 core (M0–M8) | Canonical model, filesystem/SQLite storage, derived trees and ancestry, sparse working copies, commit/rebase/publish, Git import/export, blame, MCP. [Release record](release-0.1.md) records results and original-target deviations. |
-| Merge (M9/M10) | Server-side two-parent merge, `Merge` RPC, `bed merge`; differential tests in `crates/derive/tests/merge.rs` and integration suites in bed/server. Rename-aware merge and recursive multi-base resolution remain outside scope. |
+| Merge (M9/M10) | Rename-aware two-parent merge, recursive maximal-base resolution, and native octopus merges through `Merge`/`MergeOctopus` and `bed merge <TARGET>...`. Same-second/skewed-clock ancestry regressions, Git oracle rename/base fixtures, and server/client integration suites are covered in [merge behavior](merge-rename-octopus.md). |
 | Multi-repository serving (M11/M12) | Lazy repository lookup, bounded handles, URL repository selection, import/export/move tooling; `crates/server/tests/multi_repo.rs`. |
 | Garbage collection (M13) | Local offline-first mark/sweep, dry-run, min-age, force-mode write coordination; `crates/server/src/gc.rs` and `gc*` integration suites. Changeset and Git-mapping rows are retained. |
 | Blob chunking (M14) | GBLO2 above 1 MiB, FastCDC boundaries, verified whole-blob identity; `crates/store/tests/gblo2.rs`. Chunks are stored inside each blob envelope, without cross-version chunk deduplication. |
 | Offline commits (M15) | Local queue, crash recovery, explicit `bed sync`; `crates/bed/tests/offline.rs`. |
-| Local daemon (M16) | Shared cache isolated by upstream, repository, and persisted incarnation; authorized warm hits, replacement isolation, and safe passthrough for older servers. Watchers, daemon-first connection and fallback; [daemon guide](daemon.md), [isolation tests](daemon-cache-isolation.md). |
-| Native export and import fidelity (M17/M18) | Native pack writer, sparse raw-commit capture, verbatim export of signed/extra-header/non-UTF-8 commit metadata; `crates/git/tests/export.rs` and `fidelity.rs`. Raw-tree limitations and throughput verification remain open below. |
+| Local daemon (M16) | Shared cache isolated by upstream, repository, and persisted incarnation; authorized warm hits, replacement isolation, response-bound ABA-proofed write-through, and safe passthrough for older servers. Watchers, daemon-first connection and fallback; [daemon guide](daemon.md), [isolation tests](daemon-cache-isolation.md). |
+| Native export and import fidelity (M17/M18) | Native pack writer, sparse raw-commit capture, verbatim export of signed/extra-header/non-UTF-8 commit metadata; `crates/git/tests/export.rs` and `fidelity.rs`. Sparse raw-tree capture covers noncanonical modes, non-UTF-8 names and empty directories; matched throughput was measured on 2026-10-22 (limits below). |
 | Diff rendering (M19) | Recorded renames, exact-blob pairing, gitlink pointer hunks; `crates/bed/tests/render_patch.rs`. Similarity-based moved-and-edited pairing and combined merge diffs remain outside scope. |
 | Additional client features | Read-only snapshot FUSE mount; lane refs; stack rebase and already-applied twin recognition. See [CLI reference](cli.md). |
 | Authentication | Optional bearer tokens with per-repository read/write/admin roles; server/bed auth suites. Originally deferred in the plan, now implemented. |
@@ -31,12 +31,12 @@ not a fresh verification of the current checkout.
 
 ## Open implementation and verification work
 
-- **M18 throughput gate:** the ±20% kernel-segment import gate remains deferred
-  pending a meaningful quiet-host measurement. Raw-tree capture remains gated;
-  non-UTF-8 paths and pre-canonical tree modes still limit export. See
-  M18.5 in the [v0.2 plan](v0.2.md)
-  and [Git divergences](divergences.md). Do not infer full kernel SHA roundtrip
-  from sampled content fidelity or signed-commit support.
+- **M18 measured:** raw-tree fidelity passed code review and the matched
+  kernel-segment throughput threshold on 2026-10-22 (97.25% of control).
+  See the [measurement and limits](raw-tree-measurement-2026-10-22.md).
+  Fresh limited imports differ from the historical resumed-import workload;
+  neither the measurement nor hermetic fidelity tests establish a full-kernel
+  SHA roundtrip. Full-scale GC remains separate below.
 - **GC at full kernel scale:** the backlog sweep measured mark batching on a
   1.16M-live-id synthetic store; it did not re-measure the 10.36M-object kernel
   corpus. The original M13 kernel time/RSS target needs separate evidence; see
@@ -50,8 +50,8 @@ not a fresh verification of the current checkout.
   a structural follow-up (dogfood #26).
 - **Deferred scope:** regional cache tier, Windows, LFS, recursive submodules,
   history pruning, cross-version chunk deduplication, per-chunk blob streaming,
-  combined merge diffs, rename-aware merge, native octopus merge, and retiring
-  the `git diff-tree` similarity subprocess. The v0.3/later labels in
+  combined merge diffs, similarity-based moved-and-edited diff rendering, and
+  retiring the `git diff-tree` similarity subprocess. The v0.3/later labels in
   [v0.2 scope](v0.2.md#1-scope) are planning targets.
 - **Benchmark coverage:** selection/concurrency/queue-depth sweeps, multi-repo
   fan-out, interrupted provisioning comparisons, aggregate CI footprint, and

@@ -9,6 +9,15 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- Rename-aware merges across directories, recursive multi-base resolution,
+  and native octopus merges with `bed merge <TARGET>...`. Conflicts refuse
+  without publishing a partial merge. [Behavior and limits](docs/merge-rename-octopus.md)
+  document scoring, parent order, and older-server refusal.
+
+- Sparse raw-tree capture preserves imported noncanonical modes, non-UTF-8
+  names and empty directories during SHA-exact Git export; matched kernel
+  throughput measurements and migration boundaries are documented.
+
 - CI now includes blocking bounded fuzz smoke and Playwright, plus
   nightly/manual PostgreSQL/S3 schema, parity, and replica checks.
   FUSE verification is explicitly enabled on a provisioned self-hosted
@@ -243,12 +252,21 @@ tags, and the verification record for a release lives in
 
 ### Fixed
 
+- Merge-base selection now discards nonmaximal ancestors before timestamp
+  ordering, fixing incorrect bases when commits share a second or clocks
+  are skewed. Recursive virtual bases do not persist synthetic changesets.
+
 - Shared daemon caches now separate upstreams, repositories, and repository
   incarnations, preventing cross-repository and same-name replacement leaks.
   `RepoInfo` authorizes each scope; older servers use uncached passthrough.
   Identity persists atomically in SQLite/Postgres and is stable per in-memory
-  store instance. [Cache isolation](docs/daemon-cache-isolation.md) records the
-  lifecycle and verification.
+  store instance. Object responses carry the serving repository's
+  incarnation proof (`TreeResp`/`BlobChunk`), and a cache write requires
+  that proof to match the scope's identity — a same-URL load balancer or
+  forwarding proxy routing the identity probe and the object fetch to
+  different backends can no longer poison one repository's scope with
+  another's bytes. [Cache isolation](docs/daemon-cache-isolation.md) records
+  the lifecycle and verification.
 
 - PostgreSQL schema initialization now serializes concurrent first opens
   across replicas in one transaction, preventing duplicate catalog-key

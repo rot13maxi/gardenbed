@@ -948,6 +948,16 @@ impl Gardenbed for ProxyService {
         Ok(Response::new(resp.into_inner()))
     }
 
+    async fn merge_octopus(
+        &self,
+        request: Request<pb::MergeOctopusReq>,
+    ) -> Result<Response<pb::MergeOctopusResp>, Status> {
+        peer_uid_ok(&request)?;
+        let client = self.upstream.get().await?;
+        let resp = client.raw().clone().merge_octopus(forward(request)).await?;
+        Ok(Response::new(resp.into_inner()))
+    }
+
     async fn repo_info(
         &self,
         request: Request<pb::RepoInfoReq>,

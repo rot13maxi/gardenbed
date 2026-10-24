@@ -78,6 +78,13 @@ pub trait MetadataStore: Send + Sync {
     /// All refs as `(name, id)`, sorted by name.
     fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError>;
 
+    /// The repository's persistent incarnation identity: 16 opaque
+    /// bytes, minted once on first use and stored with the metadata —
+    /// stable for the database's lifetime (moves preserve it), fresh
+    /// for a new database (a replaced repository). Cache tiers scope
+    /// cached objects by it; see the daemon's cache isolation notes.
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError>;
+
     /// Compare-and-swap. `expected = None` means "the ref must not exist";
     /// `Some(id)` means "the ref must exist and point at `id`".
     ///
@@ -113,6 +120,72 @@ pub trait MetadataStore: Send + Sync {
     fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
         let _ = cs;
         Ok(None)
+    }
+    /// The verbatim bytes of the original git tree object keyed by its
+    /// original git tree SHA (v0.2 raw-tree capture; the M18.5 successor
+    /// to raw-commit capture). `None` when no row was captured (the tree
+    /// reconstructs byte-exactly from the model, or the store predates
+    /// raw-tree capture).
+    ///
+    /// The key is the **original git SHA-1** of the tree — never the
+    /// canonical model tree id: multiple distinct git trees (differing
+    /// pre-canonical modes, non-UTF-8 names) can normalize to one model
+    /// tree, and keying by model id would silently conflate them. The
+    /// model-tree association is carried by
+    /// [`MetadataStore::raw_tree_model_id`].
+    fn raw_tree(&self, _git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        Ok(None)
+    }
+
+    /// The canonical model tree id a captured raw tree (keyed by its
+    /// original git tree SHA, see [`MetadataStore::raw_tree`]) normalizes
+    /// to — the association recorded by the FIRST same-bytes put (see
+    /// [`MetadataStore::put_raw_tree`]: it is advisory; the same git
+    /// bytes can normalize differently across import contexts, and the
+    /// export resolves the model tree from the changeset context).
+    /// `None` when no row was captured, or when the first-seen
+    /// normalized model tree is empty (an empty normalized tree has no
+    /// model id).
+    fn raw_tree_model_id(&self, _git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        Ok(None)
+    }
+
+    /// Records one verbatim git tree object, keyed by its **original git
+    /// tree SHA** (see [`MetadataStore::raw_tree`] for why the git SHA is
+    /// the key), together with the canonical model tree id the tree
+    /// normalizes to (`None` for an empty normalized tree).
+    ///
+    /// Additive and content-addressed, like blob objects: rows may be
+    /// written **before** the ordinary validated-changeset transaction
+    /// that references them. A crash between the put and the ingest
+    /// leaves an orphan row — harmless by construction, since the key is
+    /// the git SHA of content the importer read from git, and a row is
+    /// only ever consumed when a captured commit's `tree` header names
+    /// its key.
+    ///
+    /// Immutability: the BYTES are immutable — re-putting the same git
+    /// SHA with different bytes is a [`StoreError::Invalid`] naming the
+    /// git SHA, and the bytes must SHA-1 to `git_tree_sha` (the row is
+    /// content-addressed by its key). The model association is
+    /// first-seen **advisory**: a re-put with identical bytes and a
+    /// different association is an idempotent no-op that leaves the
+    /// stored association untouched. One git tree can legitimately
+    /// normalize to different model trees in different import contexts
+    /// (a store upgraded across the owner-bit mode rule holds a legacy
+    /// `Exec` frontier; a fresh import of the same git bytes derives
+    /// `Regular`), and the export resolves the model tree from the
+    /// CHANGESER context, never from this column — so refusing a
+    /// differing association would reject valid histories, not protect
+    /// integrity.
+    fn put_raw_tree(
+        &self,
+        _git_tree_sha: [u8; 20],
+        _model_tree: Option<Id>,
+        _bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Db(
+            "raw-tree capture is unsupported by this metadata store".into(),
+        ))
     }
 
     /// Ids of stored changesets whose 32-byte id sorts in the half-open
@@ -248,27 +321,6 @@ pub trait MetadataStore: Send + Sync {
         }
         Ok(id)
     }
-
-    /// This repository's persistent **incarnation identity**: 16 opaque
-    /// bytes, generated once, atomically, on the first call, and stable
-    /// for the lifetime of the metadata database. A new database (a
-    /// re-initialized or replaced repository) gets a fresh incarnation;
-    /// the same database moved to a new directory keeps its identity —
-    /// so the pair `(repo name, incarnation)` distinguishes a replaced
-    /// repository from a moved one, which neither names nor content
-    /// hashes can do (content can repeat across replacements).
-    ///
-    /// The value is random, not derived from data: it must change on a
-    /// fresh database even when both old and new histories are empty or
-    /// identical, and it must not change when the same bytes are
-    /// re-ingested. Callers treat it as an opaque namespace id (the
-    /// daemon scopes its object cache by it); they never interpret it.
-    ///
-    /// Atomic under concurrency: two simultaneous first calls on
-    /// independent handles (processes, replicas) converge on one stored
-    /// value — the insert is a single SQL statement that at most one
-    /// racer wins, and the loser reads the winner's row.
-    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError>;
 }
 
 /// One derived-data cache row handed to [`MetadataStore::ingest_changeset`].

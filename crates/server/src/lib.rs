@@ -968,12 +968,16 @@ impl Repo {
         if self.is_ancestor(theirs, ours)? {
             return Ok((ours, true));
         }
-        let base = self.merge_base(ours, theirs)?.ok_or_else(|| {
-            ServerError::Invalid(format!(
+        // Recursive multi-base merge: every maximal common ancestor
+        // folds into one virtual base (git merge-recursive shape). A
+        // unique base short-circuits to the identical single-base
+        // walk, so non-criss-cross merges are byte-identical to v0.2.
+        if self.engine.merge_bases_all(ours, theirs)?.is_empty() {
+            return Err(ServerError::Invalid(format!(
                 "merge refused: {ours} and {theirs} share no common ancestor (unrelated histories cannot be merged)"
-            ))
-        })?;
-        let changes = match self.engine.merge_tree_changes(Some(base), ours, theirs)? {
+            )));
+        }
+        let changes = match self.engine.merge_tree_changes_recursive(ours, theirs)? {
             Ok(changes) => changes,
             Err(conflicts) => return Err(ServerError::MergeConflict(conflicts)),
         };
@@ -989,6 +993,236 @@ impl Repo {
         // blobs are already objects objects), derived rows, one txn.
         let id = self.create_changeset(&merged, &BTreeMap::new())?;
         Ok((id, false))
+    }
+
+    /// The octopus merge: folds `targets` into `ours` sequentially,
+    /// `git-merge-octopus` style. Returns `(merge_id, up_to_date)` —
+    /// `up_to_date` when every target was already an ancestor of the
+    /// accumulated head (nothing to merge, no changeset created).
+    ///
+    /// Semantics (matching `git-merge-octopus`, verified against git
+    /// 2.43 on this box):
+    /// - Each round merges the accumulated head's TREE with the next
+    ///   target's tree over their common ancestors — 3-way,
+    ///   rename-aware, multi-base-recursive (the same engine the
+    ///   two-way [`Repo::merge`] uses).
+    /// - A target that is already an ancestor of the accumulated head
+    ///   is SKIPPED: not a parent, no tree change ("Already up to
+    ///   date").
+    /// - When the first round is a fast-forward (ours is an ancestor
+    ///   of the target and nothing has merged yet), the target
+    ///   REPLACES ours as the accumulated head and as the first
+    ///   parent — ours itself is not a parent, exactly as git's
+    ///   "Fast-forwarding to:" round.
+    /// - ANY conflict in ANY round refuses the whole merge: git exits
+    ///   2 with "Automated merge did not work. Should not be doing an
+    ///   octopus." when the conflict is not in the last round, and 1
+    ///   (same refusal, no message) when it is — either way NO commit
+    ///   exists. The refusal error names the round, the target, and
+    ///   the conflicted paths.
+    /// - A target sharing no common ancestor with the accumulated
+    ///   head refuses the same way (git dies "Unable to find common
+    ///   commit").
+    ///
+    /// The final changeset's parents are `(first_parent, t1, t2, …)`
+    /// — ours (or the first-round fast-forward target), then every
+    /// merged target in order, skipping up-to-date ones. Determinism
+    /// and idempotency: the fold is a pure function of the targets'
+    /// trees; identical concurrent octopus merges create exactly one
+    /// changeset id (content addressing).
+    pub fn merge_octopus(
+        &self,
+        ours: Id,
+        targets: &[Id],
+        message: &str,
+        author: &gardenbed_model::Identity,
+        committer: &gardenbed_model::Identity,
+    ) -> Result<(Id, bool), ServerError> {
+        if targets.is_empty() {
+            return Err(ServerError::Invalid(
+                "octopus merge requires at least one target".into(),
+            ));
+        }
+        // All sides must exist (clear 404s before any derivation).
+        self.get_changeset(ours)?;
+        for &t in targets {
+            self.get_changeset(t)?;
+        }
+
+        // The accumulated merge result TREE (MRT) and the merge
+        // reference list (MRC): ours first, then each merged target.
+        // The round's 3-way merge is (common, MRT, target-tree).
+        let mut mrt = self.tree_of(ours)?;
+        let mut mrc: Vec<Id> = vec![ours];
+        let mut merged_any = false;
+        let mut non_ff = false;
+
+        for (i, &t) in targets.iter().enumerate() {
+            let round = i + 1;
+            let t_tree = self.tree_of(t)?;
+            // Up to date: the target is one of the accumulated
+            // references (or their ancestor) — skip, not a parent.
+            let mut up_to_date = false;
+            for &m in &mrc {
+                if self.is_ancestor(t, m)? {
+                    up_to_date = true;
+                    break;
+                }
+            }
+            if up_to_date {
+                continue;
+            }
+            // The merge bases of the target against the accumulated
+            // head (git: `git merge-base --all $SHA1 $MRC` with
+            // MRC's space-separated list — union of the pairwise
+            // common ancestors, filtered to maximal).
+            let bases = self.octopus_bases(&mrc, t)?;
+            if bases.is_empty() {
+                return Err(ServerError::Invalid(format!(
+                    "octopus merge refused: round {round} target {t} shares no common \
+                     ancestor with the accumulated head (unable to find common commit)"
+                )));
+            }
+            // First round fast-forward: ours (the only reference so
+            // far) IS the merge base — the target simply advances the
+            // accumulated head and replaces ours as first parent.
+            if !non_ff && bases.len() == 1 && bases[0] == mrc[0] && mrc.len() == 1 {
+                mrt = t_tree;
+                mrc = vec![t];
+                merged_any = true;
+                continue;
+            }
+            non_ff = true;
+            let changes = match self
+                .engine
+                .merge_tree_changes_over_trees(&bases, mrt, t_tree)?
+            {
+                Ok(changes) => changes,
+                Err(conflicts) => {
+                    // git's shape: refusal naming the round; no
+                    // commit exists either way.
+                    let last = round == targets.len();
+                    let mut msg = format!(
+                        "octopus merge refused (round {round}{}): ",
+                        if last { ", last" } else { "" }
+                    );
+                    msg.push_str(&conflicts.join(" "));
+                    return Err(ServerError::MergeConflict(vec![msg]));
+                }
+            };
+            // The fold's merged tree: the change list is relative to
+            // the accumulated tree (it is "ours" in the round), so
+            // applying it to MRT yields the round's result tree.
+            mrt = self.apply_tree_changes(mrt, &changes)?;
+            mrc.push(t);
+            merged_any = true;
+        }
+
+        if !merged_any {
+            return Ok((ours, true));
+        }
+
+        // The final octopus changeset: parents = MRC (ours or the
+        // first-round FF target, then each merged target), changes =
+        // MRT vs ours' tree.
+        let ours_tree = self.tree_of(ours)?;
+        let final_changes = self
+            .engine
+            .diff_trees(ours_tree, mrt)
+            .map_err(|e| ServerError::for_changeset(e, ours))?;
+        let octopus = gardenbed_model::Changeset {
+            parents: mrc,
+            changes: final_changes,
+            message: message.to_owned(),
+            author: author.clone(),
+            committer: committer.clone(),
+            signature: None,
+        };
+        let id = self.create_changeset(&octopus, &BTreeMap::new())?;
+        Ok((id, false))
+    }
+
+    /// The tree id of `cs` (None for an empty root tree).
+    fn tree_of(&self, cs: Id) -> Result<Option<Id>, ServerError> {
+        self.engine
+            .derive_tree(cs)
+            .map_err(|e| ServerError::for_changeset(e, cs))
+    }
+
+    /// Applies a change list to a raw TREE id (None = empty): the
+    /// octopus fold's round application.
+    fn apply_tree_changes(
+        &self,
+        base: Option<Id>,
+        changes: &[gardenbed_model::Change],
+    ) -> Result<Option<Id>, ServerError> {
+        let cs = gardenbed_model::Changeset {
+            parents: Vec::new(),
+            changes: changes.to_vec(),
+            message: "octopus fold".into(),
+            author: gardenbed_model::Identity {
+                name: "gardenbed".into(),
+                email: "octopus@fold".into(),
+                time_secs: 0,
+                tz_min: 0,
+            },
+            committer: gardenbed_model::Identity {
+                name: "gardenbed".into(),
+                email: "octopus@fold".into(),
+                time_secs: 0,
+                tz_min: 0,
+            },
+            signature: None,
+        };
+        self.engine
+            .apply_changeset_to_tree(base, &cs)
+            .map_err(ServerError::Store)
+    }
+
+    /// The merge bases of the target `t` against the accumulated
+    /// octopus head `refs` — git's multi-argument
+    /// `git merge-base --all $SHA1 $MRC` over the space-separated
+    /// reference list (git-merge-octopus.sh:72).
+    ///
+    /// This is NOT the intersection of each `(ref, t)` pairwise
+    /// maximal set: on `root→x; y=child(x); m1=child(y);
+    /// m2=child(x); t=child(y)` (octopus ours=m1, targets=[m2,t])
+    /// the pairwise maximals are `maximal(m1,t)={y}` and
+    /// `maximal(m2,t)={x}` — their intersection is empty, which
+    /// would refuse a merge git completes (git answers `y` and
+    /// produces parents `[m1,m2,t]`). Instead the result is the
+    /// maximal elements of `ancestors(t) ∩ (ancestors(ref) for some
+    /// ref in refs)`: candidates are gathered as the UNION of each
+    /// pair's full common-ancestor set, then any candidate that is a
+    /// proper ancestor of another candidate is dropped (the same
+    /// union+dominance shape as the engine's `fold_virtual_base`
+    /// accumulated-refs overlay). Empty only when some target
+    /// shares NO ancestor with the accumulated head — the refusal
+    /// git's octopus script reports.
+    fn octopus_bases(&self, refs: &[Id], t: Id) -> Result<Vec<Id>, ServerError> {
+        // Candidates: every common ancestor of (t, ref) for ANY ref.
+        let mut candidates: Vec<Id> = Vec::new();
+        for &m in refs {
+            let bases = self.engine.merge_bases_all(m, t)?;
+            for b in bases {
+                if !candidates.contains(&b) {
+                    candidates.push(b);
+                }
+            }
+        }
+        // Dominance filter: drop any candidate that is a proper
+        // ancestor of another candidate. What remains is maximal.
+        let mut dominated: Vec<Id> = Vec::new();
+        for (i, &c) in candidates.iter().enumerate() {
+            for (j, &d) in candidates.iter().enumerate() {
+                if i != j && self.engine.is_ancestor(c, d)? {
+                    dominated.push(c);
+                    break;
+                }
+            }
+        }
+        candidates.retain(|c| !dominated.contains(c));
+        Ok(candidates)
     }
 
     /// A snapshot of the request counters, sorted by name.
@@ -1784,6 +2018,44 @@ impl Gardenbed for GardenbedService {
             .ok_or_else(|| Status::invalid_argument("MergeReq carries no committer"))?;
         let (id, up_to_date) = repo.merge(cs_id, target, &req.message, &author, &committer)?;
         Ok(Response::new(pb::MergeResp {
+            id: id_to_bytes(id),
+            up_to_date,
+        }))
+    }
+
+    async fn merge_octopus(
+        &self,
+        request: Request<pb::MergeOctopusReq>,
+    ) -> Result<Response<pb::MergeOctopusResp>, Status> {
+        let (meta, _, req) = request.into_parts();
+        self.authorize(Self::token(&meta), &req.repo, auth::Role::Write)?;
+        let repo = self.repo_guard(&req.repo, "MergeOctopus")?;
+        let cs_id = Self::id(&req.cs_id, "cs_id")?;
+        let mut targets = Vec::with_capacity(req.targets.len());
+        for (i, t) in req.targets.iter().enumerate() {
+            let label: &'static str = match i {
+                0 => "targets[0]",
+                1 => "targets[1]",
+                _ => "targets[n]",
+            };
+            targets.push(Self::id(t, label)?);
+        }
+        if targets.len() < 2 {
+            return Err(Status::invalid_argument(
+                "MergeOctopusReq requires at least two targets (a one-target octopus is a Merge)",
+            ));
+        }
+        let author = req
+            .author
+            .map(Identity::from)
+            .ok_or_else(|| Status::invalid_argument("MergeOctopusReq carries no author"))?;
+        let committer = req
+            .committer
+            .map(Identity::from)
+            .ok_or_else(|| Status::invalid_argument("MergeOctopusReq carries no committer"))?;
+        let (id, up_to_date) =
+            repo.merge_octopus(cs_id, &targets, &req.message, &author, &committer)?;
+        Ok(Response::new(pb::MergeOctopusResp {
             id: id_to_bytes(id),
             up_to_date,
         }))
