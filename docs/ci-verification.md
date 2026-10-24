@@ -333,9 +333,9 @@ hand.
 
 What this gate deliberately does **not** claim:
 
-* The M18 ±20% kernel-segment import-throughput gate — still open (see
-  [status.md](status.md) "M18 throughput gate"); a measurement gate
-  needs a quiet host and a recorded baseline, not a workflow.
+* The M18 throughput measurement is separate from this workflow. The
+  [2026-10-22 report](raw-tree-measurement-2026-10-22.md) records the matched
+  quiet-host threshold and investigates the historical baseline difference.
 * GC at full kernel scale — the v0.2 M13.6 budget is explicit (on the
   10,360,644-object / 84 GiB kernel store: `gc --dry-run` < 60 min
   cold, RSS ≤ 1 GiB, zero live objects deleted; a post-GC re-import

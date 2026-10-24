@@ -45,6 +45,7 @@ use crate::graph::{Arena, Node, read_commit};
 use crate::gtree::{GEntry, GKind};
 use crate::oid::GitOid;
 use crate::options::ImportOptions;
+use crate::rawtree::RawTreeCapture;
 use crate::report::{ImportReport, RefRewind};
 use crate::resolve::{GitObjects, MAX_TREE_DEPTH, gitlink_blob_id};
 use crate::transform::repair_dir_to_file;
@@ -116,6 +117,9 @@ pub fn import_from_path(
     // The caller's engine is superseded by one over the counting wrapper:
     // derived trees then count toward `objects_written`.
     let engine = Engine::new(counting.clone(), metadata.clone());
+    // Raw-tree capture state (one memo for the whole run: subtrees
+    // shared across commits are decided once).
+    let mut raw_tree_capture = RawTreeCapture::new();
     let mut git_objects = GitObjects::new(&repo, counting.as_ref());
 
     let mut report = ImportReport::default();
@@ -200,9 +204,34 @@ pub fn import_from_path(
             };
             let reconstructed =
                 crate::commit::reconstruct_bytes(&raw, &raw.tree.to_hex(), &model_parent_hexes);
-            let raw_capture = if reconstructed == raw_bytes {
+            // Raw-tree capture (raw-tree fidelity): walk the commit's
+            // tree closure; divergent subtrees (pre-canonical modes,
+            // non-UTF-8 names) get verbatim rows keyed by their original
+            // git SHA, and a divergent ROOT forces raw-commit capture —
+            // the raw commit's `tree` header then carries the original
+            // root SHA the export needs. Rows land additively before the
+            // ingest transaction below (crash-orphan-safe: a row is only
+            // consumed when a captured commit's tree header names it).
+            let (root, written_trees) = engine.validated_tree_for_new_with_writes(&cs)?;
+            let (root_diverged, raw_tree_rows) = raw_tree_capture.capture_commit_tree(
+                &repo,
+                &engine,
+                raw.tree,
+                root,
+                metadata.as_ref(),
+                &sha_hex,
+            )?;
+            report.raw_trees_captured += raw_tree_rows as u64;
+            let raw_capture = if reconstructed == raw_bytes && !root_diverged {
                 None
             } else {
+                // Unreconstructable headers, or a divergent root tree
+                // (even one whose rows were memo-decided or already
+                // stored by an earlier commit — divergence is semantic,
+                // not a row count): the original commit bytes carry what
+                // the model cannot — extra headers, and the original
+                // root SHA in the `tree` header (which the export
+                // resolves through raw-tree rows).
                 Some(raw_bytes.as_slice())
             };
             // Batched ingest: the changeset row, the git mapping and the
@@ -219,7 +248,6 @@ pub fn import_from_path(
             for parent in &cs.parents {
                 engine.certify_history(*parent)?;
             }
-            let (root, written_trees) = engine.validated_tree_for_new_with_writes(&cs)?;
             let rows = engine.derived_rows_for_validated_tree(cs_id, &cs, root)?;
             // Same last-chance re-check as the server's CreateChangeset:
             // the import holds repo.lock only shared, so a --force gc can
@@ -582,7 +610,17 @@ fn build_changes(
                 }
             }
             None => {
-                if !git_objects.tree_entries(node.tree, sha_hex)?.is_empty() {
+                // Empty-diff root: the model derives an empty tree. That
+                // is only consistent with git when the root's FILE
+                // closure is empty — git's diff sees no blobs — which
+                // holds for the truly-empty tree AND for a tree of only
+                // empty directories (the model drops empty dirs, so its
+                // derivation is the same empty tree; the raw capture
+                // walk preserves the dirs for SHA-exact export). Any
+                // actual file entry with an empty diff is an
+                // inconsistency git cannot produce: refuse loudly.
+                let has_files = !git_objects.flatten_tree(node.tree, sha_hex)?.is_empty();
+                if has_files {
                     return Err(ImportError::Diff {
                         sha: sha_hex.to_owned(),
                         detail: "root commit produced no diff although its tree is not empty"
@@ -1117,14 +1155,29 @@ mod raw_fallback_tests {
     }
 
     /// Exotic file modes git's `canon_mode` collapses (e.g. `100675` ≡
-    /// `100644`) but Gardenbed's mode table distinguishes become a
-    /// mode-only Modify carrying the new mode and the unchanged blob.
+    /// `100644`: 0o675 has no owner exec bit) are a **no-op** under the
+    /// owner-bit mode rule — git itself reports no diff for the
+    /// transition. Modes the rule distinguishes (owner exec flips, e.g.
+    /// `100775` → `100644`) become a mode-only Modify carrying the new
+    /// mode and the unchanged blob.
     #[test]
-    fn exotic_modes_distinguished_by_the_model_become_modifies() {
+    fn exotic_modes_collapse_like_git_and_owner_exec_flips_modify() {
         let r = Repo::new();
         let b = r.blob(b"same\n");
-        let parent = r.tree(&[("100675", &b, "f")]); // exec bit set ⇒ Exec
-        let child = r.tree(&[("100644", &b, "f")]); // ⇒ Regular
+        // 100675 → 100644: no owner exec bit on either side ⇒ both
+        // Regular ⇒ zero-change changeset (git's own view).
+        let parent = r.tree(&[("100675", &b, "f")]);
+        let child = r.tree(&[("100644", &b, "f")]);
+        let changes = diff_trees(&r, &parent, &child, RAW_DIFF_LEAF_CAP).expect("diffs");
+        assert!(
+            changes.is_empty(),
+            "100675 → 100644 is a normalization no-op, got {changes:?}"
+        );
+
+        // 100775 (owner exec) → 100644: a genuine mode flip the model
+        // distinguishes — mode-only Modify, child's mode wins.
+        let parent = r.tree(&[("100775", &b, "f")]);
+        let child = r.tree(&[("100644", &b, "f")]);
         let changes = diff_trees(&r, &parent, &child, RAW_DIFF_LEAF_CAP).expect("diffs");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].op, Op::Modify);

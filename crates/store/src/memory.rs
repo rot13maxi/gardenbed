@@ -39,6 +39,10 @@ struct MemoryInner {
     /// Sparse raw-commit capture (v0.2 D21): changeset id → verbatim
     /// git commit object bytes.
     raw_commits: HashMap<Id, Vec<u8>>,
+    /// Sparse raw-tree capture (raw-tree fidelity): original git tree
+    /// SHA → (verbatim git tree bytes, canonical model tree id — `None`
+    /// for an empty normalized tree).
+    raw_trees: HashMap<[u8; 20], (Vec<u8>, Option<Id>)>,
 }
 
 /// An entirely in-memory store implementing both [`ObjectStore`] and
@@ -330,6 +334,50 @@ impl MetadataStore for MemoryStore {
 
     fn raw_commit(&self, cs: Id) -> Result<Option<Vec<u8>>, StoreError> {
         self.read(|s| s.raw_commits.get(&cs).cloned())
+    }
+
+    fn raw_tree(&self, git_tree_sha: [u8; 20]) -> Result<Option<Vec<u8>>, StoreError> {
+        self.read(|s| s.raw_trees.get(&git_tree_sha).map(|(b, _)| b.clone()))
+    }
+
+    fn raw_tree_model_id(&self, git_tree_sha: [u8; 20]) -> Result<Option<Option<Id>>, StoreError> {
+        self.read(|s| s.raw_trees.get(&git_tree_sha).map(|(_, m)| *m))
+    }
+
+    fn put_raw_tree(
+        &self,
+        git_tree_sha: [u8; 20],
+        model_tree: Option<Id>,
+        bytes: &[u8],
+    ) -> Result<(), StoreError> {
+        // Content-addressed by the key: the bytes must SHA-1 to it.
+        let actual = crate::sqlite::git_tree_sha1(bytes);
+        if actual != git_tree_sha {
+            return Err(StoreError::Invalid(format!(
+                "raw tree bytes SHA-1 to {}, not {}",
+                crate::sqlite::hex_sha(&actual),
+                crate::sqlite::hex_sha(&git_tree_sha)
+            )));
+        }
+        self.write(|s| match s.raw_trees.get(&git_tree_sha) {
+            // Identical bytes: idempotent no-op. The stored (first-seen)
+            // model association stays untouched — one git tree can
+            // normalize to different model trees across import contexts
+            // (legacy-Exec frontier vs fresh-Regular; see the trait doc),
+            // and the export resolves the model tree from changeset
+            // context, never from this column.
+            Some((existing, _)) if existing.as_slice() == bytes => Ok(()),
+            Some(_) => Err(StoreError::Invalid(format!(
+                "raw tree {} already captured with different bytes — \
+                 content-addressed rows are immutable",
+                crate::sqlite::hex_sha(&git_tree_sha)
+            ))),
+            None => {
+                s.raw_trees
+                    .insert(git_tree_sha, (bytes.to_vec(), model_tree));
+                Ok(())
+            }
+        })
     }
 
     fn recent_changesets(&self, limit: u32) -> Result<Vec<Id>, StoreError> {
