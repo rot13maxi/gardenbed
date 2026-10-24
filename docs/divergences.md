@@ -17,7 +17,7 @@ exports back with byte-identical commit SHAs (verified in
 **Retired by raw-commit capture (v0.2 D21).** The importer byte-compares
 each commit's original object bytes with what the model can reconstruct;
 a signature makes them differ, so the original bytes are captured verbatim
-in a sparse side table (`git_raw_commit`, keyed by original Git SHA) inside
+in a sparse side table (`git_raw_commit`, keyed by changeset id) inside
 the ingest transaction, and the export emits them as-is. The SHA is the
 original by definition — no re-signing, no id forking.
 
