@@ -390,8 +390,9 @@ fn classify_tracked(
         return Ok(ScanDelta::Clean);
     }
 
+    #[allow(unused_mut)]
     let observed = match observe(root, rel)? {
-        Some(observed) => {
+        Some(mut observed) => {
             // Windows cannot represent the exec bit, so a regular file's
             // observed mode inherits the tracked row's exec identity
             // instead of fabricating a mode divergence on every scan
@@ -815,6 +816,7 @@ mod tests {
 
     #[test]
     fn mode_change_counts_as_modified() {
+        #[cfg_attr(not(unix), allow(unused_variables))]
         let g = Garden::planted(&[("src/run.sh", b"#!/bin/sh\n")]);
         #[cfg(unix)]
         {

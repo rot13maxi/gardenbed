@@ -593,6 +593,7 @@ fn filetime_of(meta: &fs::Metadata) -> i128 {
 
 /// Restores `path`'s mtime (and checks the size round-trips).
 fn restore_mtime(path: &Path, mtime_ns: i128, size: u64) {
+    #[cfg(unix)]
     use std::time::{Duration, UNIX_EPOCH};
     assert_eq!(
         fs::symlink_metadata(path).expect("stat after lie").len(),

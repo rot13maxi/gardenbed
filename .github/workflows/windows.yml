@@ -1,15 +1,18 @@
 # The Windows portability gate.
 #
 # Scope, stated plainly: this workflow proves the workspace *compiles*
-# for Windows and that the platform-portable test subset *passes* there.
-# It is not a full runtime validation — the bed integration suite spawns
-# gardenbed-server/daemon binaries and exercises Unix-domain-socket
-# paths, FUSE mounts, and cross-device (/dev/shm) staging that are
-# Unix-only by design; those suites stay on the ubuntu CI lane. What this
-# lane guards is the portability seam itself: every crate must link for
-# x86_64-pc-windows-msvc, and the tests whose contracts are
-# platform-neutral (model, store formats, the platform crate's Windows
-# arms) must pass on a real Windows kernel.
+# for Windows and that a real Windows kernel *runs* the portable safety
+# surface — the platform crate's NT arms (handle-anchored stat, LockFileEx
+# locks, uid) and bed's cross-platform checkout-safety tests (recursive
+# removal without following links, failed-staging preservation, atomic
+# replace, the Windows path-aliasing guard).
+#
+# It is not the full integration suite: the bed/server integration tests
+# spawn gardenbed-server/daemon binaries over Unix-domain sockets, FUSE
+# mounts, and cross-device (/dev/shm) staging that are Unix-only by
+# design; those suites stay on the ubuntu CI lane, and the Unix-only
+# checkout_fs tests (cross-device staging, crash-child recovery, CLOEXEC)
+# are compiled only on Unix — not silently skipped on Windows.
 #
 # The msvc target (not gnu) is used: it is the toolchain real Windows
 # users build with, and the local cross-check lane (x86_64-pc-windows-gnu
@@ -19,7 +22,7 @@ name: windows
 
 on:
   push:
-    branches: [main]
+    branches: [main, "review/**"]
   pull_request:
 
 concurrency:
@@ -49,7 +52,7 @@ jobs:
       - run: cargo check --workspace --all-targets
 
   test:
-    name: test (portable subset)
+    name: test (portable + Windows runtime safety)
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -59,16 +62,20 @@ jobs:
           toolchain: "1.90.0"
           targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
-      # Platform-neutral contracts only: the object model's codec and
+      # Platform-neutral contracts: the object model's codec and
       # chunking math, the store's container formats, and the platform
       # crate's Windows arms themselves (handle-anchored stat, LockFileEx
-      # locks, uid). The bed/server/daemon integration suites need the
-      # Unix daemon/FUSE surfaces and stay on ubuntu.
-      #
-      # bed's library unit tests (treestate, ignore, revspec) are
-      # Unix-clean too, but `cargo test -p gardenbed --lib` on Windows
-      # pulls the daemon-sidecar test wiring; scoped until that seam has
-      # a Windows test story.
+      # locks, uid).
       - run: cargo test -p gardenbed-model
       - run: cargo test -p gardenbed-store
       - run: cargo test -p gardenbed-platform
+      # Windows runtime safety, on a real Windows kernel: the portable
+      # checkout_fs tests (recursive symlink removal, failed staging
+      # preserving the old leaf, atomic publication, the path-aliasing
+      # guard refusing CON / trailing-dot / ADS / .BED collisions before
+      # touching bytes) plus the bed lib unit tests that are
+      # platform-clean (treestate, ignore, revspec, sparse, status scan).
+      # Symlink tests require Developer Mode (enabled by default on
+      # GitHub windows runners); a runner without it fails loudly rather
+      # than skipping.
+      - run: cargo test -p gardenbed --lib

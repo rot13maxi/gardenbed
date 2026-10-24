@@ -701,9 +701,20 @@ fn remove_at(parent: &DirHandle, name: &str) -> Result<(), ClientError> {
     Ok(())
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Symlink creation that works on both platforms (Windows needs
+    /// Developer Mode for symlink_file; CI runners have it).
+    #[cfg(unix)]
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+    #[cfg(windows)]
+    fn symlink(target: impl AsRef<Path>, link: impl AsRef<Path>) {
+        std::os::windows::fs::symlink_dir(target, link).unwrap();
+    }
 
     #[test]
     fn recursive_removal_unlinks_symlinks_without_touching_their_targets() {
@@ -711,7 +722,7 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("f"), b"valuable").unwrap();
         std::fs::create_dir(root.path().join("d")).unwrap();
-        std::os::unix::fs::symlink(outside.path(), root.path().join("d/link")).unwrap();
+        symlink(outside.path(), root.path().join("d/link"));
         let disk = CheckoutFs::open(root.path(), outside.path()).unwrap();
         disk.remove("d").unwrap();
         assert!(!root.path().join("d").exists());
@@ -732,17 +743,45 @@ mod tests {
         assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"old");
         disk.write("f", b"new", Mode::Exec).unwrap();
         assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"new");
-        use std::os::unix::fs::PermissionsExt as _;
-        assert_eq!(
-            std::fs::metadata(root.path().join("f"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o755
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(root.path().join("f"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
         assert_eq!(std::fs::read_dir(&state).unwrap().count(), 0);
     }
+
+    #[test]
+    fn windows_path_aliasing_is_refused_before_any_file_is_touched() {
+        // The aliasing guard is cfg(windows); on Unix these names are
+        // ordinary and must keep working, so the assertion itself is
+        // platform-conditional. What stays cross-platform is that none
+        // of the refusals (when they happen) disturbs existing bytes.
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let disk = CheckoutFs::open(root.path(), state.path()).unwrap();
+        std::fs::write(root.path().join("f"), b"precious").unwrap();
+        for path in ["CON", "f.", "f ", "a\\b", "f:ads", ".BED"] {
+            let result = disk.write(path, b"aliased", Mode::Regular);
+            #[cfg(windows)]
+            assert!(result.is_err(), "{path} must be refused on Windows");
+            #[cfg(not(windows))]
+            let _ = result;
+        }
+        assert_eq!(std::fs::read(root.path().join("f")).unwrap(), b"precious");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
 
     fn cross_device_dirs() -> Option<(tempfile::TempDir, tempfile::TempDir)> {
         let root = tempfile::tempdir().unwrap();
@@ -856,7 +895,7 @@ mod tests {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "checkout_fs::tests::cross_device_stage_crash_child",
+                "checkout_fs::unix_tests::cross_device_stage_crash_child",
                 "--nocapture",
             ])
             .env("GARDENBED_STAGE_CRASH_ROOT", root.path())
