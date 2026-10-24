@@ -69,5 +69,6 @@ parsing the line — demo/run-v0.2.sh, the runbook — are unaffected).
 * Concurrent identical batches are idempotent. Competing associations preserve
   the first committed binding and report conflicts. PostgreSQL retries only
   SQLSTATE 40P01 (a known-aborted deadlocked transaction), at most eight
-  attempts; other errors propagate. Coordinate imports/exports when choosing
+  retries after the initial attempt (nine attempts total); other errors
+  propagate. Coordinate imports/exports when choosing
   between representation twins, and inspect the actual surviving mapping.

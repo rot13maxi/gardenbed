@@ -686,7 +686,7 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                 }
                 Err(BatchError::Deadlock) => {
                     return Err(StoreError::Db(
-                        "export mapping batch deadlocked 8 times".into(),
+                        "export mapping batch exceeded the deadlock retry limit".into(),
                     ));
                 }
                 Err(BatchError::Other(e)) => return Err(e),
