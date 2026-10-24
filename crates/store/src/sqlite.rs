@@ -582,6 +582,105 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
         })
     }
 
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, Id)],
+    ) -> Result<crate::traits::ExportMappingReport, StoreError> {
+        use crate::traits::{ExportMappingConflict, ExportMappingReport};
+        // Normalize before the transaction: a malformed sha is a caller
+        // bug (the export computed it), and failing before any write
+        // keeps the batch all-or-nothing by construction.
+        let mut normalized = Vec::with_capacity(pairs.len());
+        for (sha, cs) in pairs {
+            normalized.push((normalize_git_sha(sha)?, *cs));
+        }
+        // One immediate transaction for the whole batch: a crash leaves
+        // the batch entirely absent (every pair is idempotent, so a
+        // re-run repairs it) rather than partially recorded.
+        self.in_tx(|tx| {
+            let mut report = ExportMappingReport::default();
+            // `true` = insert; classification pass decides every pair
+            // before any insert lands, so a conflict never blocks the
+            // accepted pairs and the inserts are all-or-nothing.
+            // `seen_sha`/`seen_cs` carry accepted pairs across the batch:
+            // a later pair in the SAME batch that repeats an accepted
+            // sha or cs (a twin: identical git bytes, different cs) is
+            // refused against the earlier pair, never re-inserted —
+            // otherwise the UNIQUE constraints would fire mid-batch.
+            let mut insert: Vec<bool> = Vec::with_capacity(normalized.len());
+            let mut seen_sha: std::collections::HashMap<String, Id> =
+                std::collections::HashMap::new();
+            let mut seen_cs: std::collections::HashMap<Id, String> =
+                std::collections::HashMap::new();
+            for (sha, cs) in &normalized {
+                let by_sha: Option<Vec<u8>> = tx
+                    .prepare_cached("SELECT cs FROM git_map WHERE git_sha = ?1")
+                    .map_err(db_err)?
+                    .query_row(params![sha], |r| r.get(0))
+                    .optional()
+                    .map_err(db_err)?;
+                let by_cs: Option<String> = tx
+                    .prepare_cached("SELECT git_sha FROM git_map WHERE cs = ?1")
+                    .map_err(db_err)?
+                    .query_row(params![cs.as_bytes()], |r| r.get(0))
+                    .optional()
+                    .map_err(db_err)?;
+                // The in-batch view of already-accepted pairs: a later
+                // pair repeating an accepted sha or cs must classify
+                // against it (twin: same git bytes, different cs), not
+                // against the not-yet-written database row.
+                let by_sha: Option<Id> = match by_sha.map(|b| id_from_blob(&b)).transpose()? {
+                    Some(id) => Some(id),
+                    None => seen_sha.get(sha).copied(),
+                };
+                let by_cs = match by_cs {
+                    Some(s) => Some(s),
+                    None => seen_cs.get(cs).cloned(),
+                };
+                match (by_sha, by_cs) {
+                    (Some(existing_cs), Some(existing_sha))
+                        if existing_cs == *cs && existing_sha == *sha =>
+                    {
+                        report.unchanged += 1; // idempotent
+                        insert.push(false);
+                    }
+                    (None, None) => {
+                        // Fresh pair: neither side bound. The insert
+                        // happens in the second pass, after the whole
+                        // batch is classified.
+                        insert.push(true);
+                        seen_sha.insert(sha.clone(), *cs);
+                        seen_cs.insert(*cs, sha.clone());
+                    }
+                    (existing_cs, existing_sha) => {
+                        // Refused, never overwritten: a native changeset
+                        // whose git bytes collide with an imported twin's
+                        // (or vice versa) is reported, and the existing
+                        // (canonical, import-written) row survives.
+                        report.conflicts.push(ExportMappingConflict {
+                            git_sha: sha.clone(),
+                            cs: *cs,
+                            existing_cs_for_sha: existing_cs,
+                            existing_sha_for_cs: existing_sha,
+                        });
+                        insert.push(false);
+                    }
+                }
+            }
+            for (i, (sha, cs)) in normalized.iter().enumerate() {
+                if !insert[i] {
+                    continue;
+                }
+                tx.prepare_cached("INSERT INTO git_map(git_sha, cs) VALUES(?1, ?2)")
+                    .map_err(db_err)?
+                    .execute(params![sha, cs.as_bytes()])
+                    .map_err(db_err)?;
+                report.recorded += 1;
+            }
+            Ok(report)
+        })
+    }
+
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
         let conn = self.read_conn()?;

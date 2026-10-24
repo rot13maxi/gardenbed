@@ -154,7 +154,10 @@ fn native_merge_roundtrips_through_git() {
         &git_path,
         f.objects.clone(),
         f.metadata.clone(),
-        &ExportOptions { refs: vec![] },
+        &ExportOptions {
+            refs: vec![],
+            record_mappings: false,
+        },
     )
     .expect("export runs");
 

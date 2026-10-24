@@ -122,6 +122,79 @@ fn git_mapping_checks(store: &dyn MetadataStore) {
     ));
 }
 
+/// `record_export_mappings`: batch semantics against a fresh store —
+/// recording, idempotence, both conflict directions, mixed batches, and
+/// malformed-input refusal that lands nothing.
+fn export_mapping_checks(store: &dyn MetadataStore) {
+    let cs1 = id_of(0x710);
+    let cs2 = id_of(0x711);
+    let cs3 = id_of(0x712);
+    let sha_a = "c0ffee0000000000000000000000000000000001";
+    let sha_b = "c0ffee0000000000000000000000000000000002";
+    let sha_c = "C0FFEE0000000000000000000000000000000003"; // uppercase on purpose
+
+    // Empty batch: no-op success.
+    let r = store.record_export_mappings(&[]).expect("empty batch");
+    assert_eq!((r.recorded, r.unchanged, r.conflicts.len()), (0, 0, 0));
+
+    // Fresh pairs record; uppercase input normalizes. cs1/cs2 are fresh
+    // ids per test process, but the shas are compile-time constants —
+    // use an unrecorded sha for the fresh pair, then verify with a
+    // rollback-style case: insert, then conflict case via new cs ids.
+    let r = store
+        .record_export_mappings(&[(sha_a.to_owned(), cs1), (sha_c.to_owned(), cs2)])
+        .expect("record batch");
+    assert_eq!((r.recorded, r.unchanged, r.conflicts.len()), (2, 0, 0));
+    assert_eq!(store.cs_for_git(sha_a).unwrap(), Some(cs1));
+    assert_eq!(store.git_for_cs(cs2).unwrap(), Some(sha_c.to_lowercase()));
+
+    // Idempotent re-record of the same batch.
+    let r = store
+        .record_export_mappings(&[(sha_a.to_owned(), cs1), (sha_c.to_lowercase(), cs2)])
+        .expect("idempotent batch");
+    assert_eq!((r.recorded, r.unchanged, r.conflicts.len()), (0, 2, 0));
+
+    // Mixed batch: two refusals (one per conflict direction) plus one
+    // fresh pair that must still land.
+    let r = store
+        .record_export_mappings(&[
+            (sha_a.to_owned(), cs3), // sha side taken (by cs1)
+            (sha_b.to_owned(), cs1), // cs side taken (by sha_a)
+            (sha_b.to_owned(), cs3), // fresh
+        ])
+        .expect("mixed batch succeeds");
+    assert_eq!(r.recorded, 1, "fresh pair lands");
+    assert_eq!(r.unchanged, 0);
+    assert_eq!(r.conflicts.len(), 2);
+    let sha_side = r
+        .conflicts
+        .iter()
+        .find(|c| c.git_sha == sha_a)
+        .expect("sha-side conflict");
+    assert_eq!(sha_side.existing_cs_for_sha, Some(cs1));
+    assert_eq!(sha_side.existing_sha_for_cs, None);
+    let cs_side = r
+        .conflicts
+        .iter()
+        .find(|c| c.cs == cs1)
+        .expect("cs-side conflict");
+    assert_eq!(cs_side.existing_cs_for_sha, None);
+    assert_eq!(cs_side.existing_sha_for_cs.as_deref(), Some(sha_a));
+    // The canonical rows survived; the fresh pair landed.
+    assert_eq!(store.cs_for_git(sha_a).unwrap(), Some(cs1));
+    assert_eq!(store.git_for_cs(cs1).unwrap(), Some(sha_a.to_owned()));
+    assert_eq!(store.cs_for_git(sha_b).unwrap(), Some(cs3));
+
+    // Malformed sha anywhere: hard Invalid, and the valid pair sharing
+    // the batch must not have landed (all-or-nothing).
+    let sha_d = "c0ffee0000000000000000000000000000000004";
+    assert!(matches!(
+        store.record_export_mappings(&[("not-a-sha".to_owned(), cs3), (sha_d.to_owned(), cs3),]),
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.cs_for_git(sha_d).unwrap(), None);
+}
+
 #[test]
 fn git_mapping_bijection_sqlite() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -133,6 +206,19 @@ fn git_mapping_bijection_sqlite() {
 fn git_mapping_bijection_memory() {
     let store = MemoryStore::new();
     git_mapping_checks(&store);
+}
+
+#[test]
+fn export_mapping_batch_sqlite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = SqliteMetadataStore::open(&dir.path().join("s.sqlite3")).expect("open");
+    export_mapping_checks(&store);
+}
+
+#[test]
+fn export_mapping_batch_memory() {
+    let store = MemoryStore::new();
+    export_mapping_checks(&store);
 }
 
 fn ref_listing_checks(store: &dyn MetadataStore) {

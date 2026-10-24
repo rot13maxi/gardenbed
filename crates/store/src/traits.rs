@@ -102,6 +102,36 @@ pub trait MetadataStore: Send + Sync {
     /// The git SHA recorded for a changeset id, if any.
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError>;
 
+    /// Records mappings for a batch of exported commits at once (v0.2,
+    /// dogfood #26): each `(git sha hex, changeset id)` pair names git
+    /// commit bytes an export just wrote successfully.
+    ///
+    /// The export-side counterpart of the import path. Per pair,
+    /// mirroring [`MetadataStore::record_git_mapping`]:
+    ///
+    /// * already recorded exactly as requested → idempotent no-op
+    ///   (counted in [`ExportMappingReport::unchanged`]);
+    /// * the git sha already bound to a **different** changeset, or the
+    ///   changeset already bound to a **different** git sha → the pair is
+    ///   **refused, never overwritten**, and reported in
+    ///   [`ExportMappingReport::conflicts`] (the canonical, imported
+    ///   mapping is preserved; a native-vs-re-imported twin is exactly
+    ///   this shape);
+    /// * otherwise recorded, counted in [`ExportMappingReport::recorded`].
+    ///
+    /// Backends with real transactions land every accepted pair in ONE
+    /// transaction: a crash leaves the batch entirely absent (every pair
+    /// is idempotent, so a re-run repairs it) rather than partially
+    /// recorded. Refused pairs never block accepted ones — conflicts are
+    /// data, not errors, because the export itself already succeeded.
+    ///
+    /// A malformed git sha in the input is a hard error: the export
+    /// computed these shas itself, so malformed means a bug.
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, Id)],
+    ) -> Result<ExportMappingReport, StoreError>;
+
     /// The verbatim bytes of the original git commit object for a
     /// changeset, if captured at import (v0.2 D21). Only commits whose
     /// bytes the model cannot reconstruct (signatures, unmodeled
@@ -325,4 +355,70 @@ pub struct DerivedRow {
     pub cs: Id,
     /// The encoded payload.
     pub bytes: Vec<u8>,
+}
+
+/// The outcome of [`MetadataStore::record_export_mappings`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExportMappingReport {
+    /// Pairs newly recorded (idempotent re-records are counted as
+    /// `unchanged`, not here).
+    pub recorded: u64,
+    /// Pairs already recorded exactly as requested.
+    pub unchanged: u64,
+    /// Pairs refused because the bijection already binds the git sha or
+    /// the changeset to a different counterpart. Never overwritten.
+    pub conflicts: Vec<ExportMappingConflict>,
+}
+
+impl std::fmt::Display for ExportMappingReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} recorded, {} unchanged, {} conflict(s)",
+            self.recorded,
+            self.unchanged,
+            self.conflicts.len()
+        )
+    }
+}
+
+/// One refused pair from [`MetadataStore::record_export_mappings`]: the
+/// mapping as the export computed it, and what the store already holds
+/// on each conflicting side.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportMappingConflict {
+    /// The git sha the export computed for the changeset.
+    pub git_sha: String,
+    /// The changeset the export exported.
+    pub cs: Id,
+    /// What the store already binds on the sha side, if anything.
+    pub existing_cs_for_sha: Option<Id>,
+    /// What the store already binds on the changeset side, if anything.
+    pub existing_sha_for_cs: Option<String>,
+}
+
+impl std::fmt::Display for ExportMappingConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "git sha {} (changeset {}) not recorded: ",
+            self.git_sha,
+            self.cs.to_hex()
+        )?;
+        match (&self.existing_cs_for_sha, &self.existing_sha_for_cs) {
+            (Some(other_cs), _) => write!(
+                f,
+                "the sha is already mapped to changeset {} by import — \
+                 the canonical mapping is kept",
+                other_cs.to_hex()
+            ),
+            (None, Some(other_sha)) => write!(
+                f,
+                "the changeset is already mapped from git sha {} — \
+                 the canonical mapping is kept",
+                other_sha
+            ),
+            (None, None) => write!(f, "conflict"),
+        }
+    }
 }

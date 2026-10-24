@@ -121,6 +121,18 @@ pub enum ExportError {
     /// An underlying store failure (objects or metadata).
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// Persisting the export mapping rows into the metadata store failed
+    /// (`ExportOptions::record_mappings`). The git side (pack, idx, refs)
+    /// is already complete on disk — the export itself succeeded — and
+    /// every pair is idempotent, so re-running the same export repairs
+    /// the metadata side cleanly.
+    #[error(
+        "recording the export mapping: {detail} (the git side is complete; re-run the export to retry)"
+    )]
+    Mapping {
+        /// What went wrong.
+        detail: String,
+    },
     /// Anything else (I/O, defensive checks).
     #[error("{0}")]
     Other(String),

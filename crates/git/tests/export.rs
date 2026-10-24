@@ -527,6 +527,7 @@ fn export_honors_the_ref_glob() {
         metadata,
         &ExportOptions {
             refs: vec!["refs/heads/main".into()],
+            record_mappings: false,
         },
     )
     .expect("export of main only");

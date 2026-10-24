@@ -9,6 +9,11 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- Opt-in `export --record-mappings` records accepted Git/changeset mappings
+  transactionally and reports representation-twin conflicts without
+  rewriting canonical bindings; concurrent identical PostgreSQL batches
+  are idempotent with bounded known-deadlock retries.
+
 - Rename-aware merges across directories, recursive multi-base resolution,
   and native octopus merges with `bed merge <TARGET>...`. Conflicts refuse
   without publishing a partial merge. [Behavior and limits](docs/merge-rename-octopus.md)

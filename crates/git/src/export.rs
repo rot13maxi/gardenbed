@@ -75,6 +75,19 @@ pub struct ExportOptions {
     /// Glob patterns (`*`, `?`) matched against full ref names such as
     /// `refs/heads/main`; empty means every ref in the metadata.
     pub refs: Vec<String>,
+    /// Persist the computed `(git sha, changeset)` mapping rows into the
+    /// metadata store after the export succeeds (v0.2, dogfood #26).
+    /// Off by default: export is read-only unless this is set, so
+    /// existing callers (and the TSV `--mapping` path) are unchanged.
+    ///
+    /// Rows land only for commits whose bytes this export wrote
+    /// successfully (recorded after refs are written, all in one store
+    /// transaction per call). Pairs already recorded are idempotent
+    /// no-ops; pairs whose git sha or changeset is already bound to a
+    /// different counterpart (a native-vs-re-imported twin) are refused
+    /// and reported — never overwritten — so import-written mappings and
+    /// the incremental import frontier stay canonical.
+    pub record_mappings: bool,
 }
 
 /// What an export produced.
@@ -101,6 +114,12 @@ pub struct ExportReport {
     /// order. SHAs are computed by the export and asserted against the
     /// git mapping where one exists.
     pub commits: Vec<(Id, String)>,
+    /// Outcome of persisting the mapping rows into the metadata store
+    /// (`ExportOptions::record_mappings`). `None` when recording was not
+    /// requested. Conflicts here are NOT export failures: the pack, idx
+    /// and refs are already on disk, and the conflicting (canonical,
+    /// import-written) mapping was deliberately left untouched.
+    pub mappings: Option<gardenbed_store::ExportMappingReport>,
     /// Raw tree objects emitted verbatim from captured rows (git trees
     /// whose canonical render diverges: pre-canonical modes, non-UTF-8
     /// names). The bytes are the original git tree object bodies, so the
@@ -122,7 +141,11 @@ impl std::fmt::Display for ExportReport {
             self.blobs_exported,
             self.refs.len(),
             self.elapsed.as_secs_f64(),
-        )
+        )?;
+        if let Some(m) = &self.mappings {
+            write!(f, ", mappings: {m}")?;
+        }
+        Ok(())
     }
 }
 
@@ -515,6 +538,27 @@ pub fn export_to_path(
     );
     write_refs(git_dir, &tips, &commit_shas)?;
 
+    // ---- persist the mapping rows (v0.2, dogfood #26), only now that
+    //      the pack, idx and refs are all on disk: no row is ever
+    //      recorded for bytes the export did not successfully write.
+    //      Recording happens in one metadata transaction; a failure here
+    //      is a hard error (the git side is complete, the metadata is
+    //      not — the run is safely re-runnable, every pair idempotent),
+    //      while a *conflict* is data carried in the report, never an
+    //      error: the canonical import-written row wins by design.
+    let mappings = if opts.record_mappings {
+        let pairs: Vec<(String, Id)> = commits.iter().map(|(id, sha)| (sha.clone(), *id)).collect();
+        Some(
+            metadata
+                .record_export_mappings(&pairs)
+                .map_err(|e| ExportError::Mapping {
+                    detail: e.to_string(),
+                })?,
+        )
+    } else {
+        None
+    };
+
     let refs: Vec<(String, String)> = tips
         .iter()
         .map(|(name, tip)| {
@@ -536,6 +580,7 @@ pub fn export_to_path(
         raw_trees_emitted,
         refs,
         commits,
+        mappings,
         pack_path,
         elapsed: started.elapsed(),
     })
