@@ -36,7 +36,7 @@ pub mod stat;
 pub use lock::{
     LockError, lock_file_exclusive, lock_file_shared, try_lock_file_exclusive, try_lock_file_shared,
 };
-pub use stat::{FileId, Stat, fstat, readlinkat, statat, symlinkat, touch_mtime};
+pub use stat::{FileId, Stat, fstat, fsync_dir, readlinkat, statat, symlinkat, touch_mtime};
 
 /// The current process's numeric identity for per-user scratch paths.
 ///

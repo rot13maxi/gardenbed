@@ -510,7 +510,7 @@ fn read_file_bounded(path: &Path) -> Result<Option<Vec<u8>>, StoreError> {
 
 /// fsyncs a directory so entries created/renamed inside it are durable.
 fn fsync_dir(dir: &Path) -> Result<(), StoreError> {
-    File::open(dir).and_then(|d| d.sync_all()).map_err(io_err)
+    gardenbed_platform::fsync_dir(dir).map_err(io_err)
 }
 
 /// Sets a path's mtime (and atime) to now without opening it for write —
