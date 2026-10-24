@@ -17,6 +17,20 @@
 # The msvc target (not gnu) is used: it is the toolchain real Windows
 # users build with, and the local cross-check lane (x86_64-pc-windows-gnu
 # via mingw) cannot link msvc.
+#
+# Failure independence in the test job: the runtime gates are independent
+# artifacts, and a native run must surface every one of them, not just the
+# first failure (two runs in a row, the store suite hid platform, bed-lib,
+# TCP and export evidence behind the same os-error-5). Every test step
+# runs with `if: always()` guarded on the setup steps that must have
+# succeeded — checkout, toolchain, cache — so no gate is reported run
+# after its prerequisites failed. There is NO continue-on-error anywhere:
+# each failure keeps the job red (GitHub unions failed step outcomes into
+# the job conclusion). The server-dependent gates (TCP smoke, bed --lib's
+# integration-free runtime surface is independent of it, git export
+# smoke) additionally guard on the server build's success: they cannot
+# run without that binary, and a skipped-after-failed-build step shows as
+# skipped, never as passed.
 
 name: windows
 
@@ -56,35 +70,55 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - id: checkout
+        uses: actions/checkout@v4
+      - id: toolchain
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.90.0"
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@v2
-      # Platform-neutral contracts: the object model's codec and
-      # chunking math, the store's container formats, and the platform
-      # crate's Windows arms themselves (handle-anchored stat, LockFileEx
-      # locks, uid).
-      - run: cargo test -p gardenbed-model
-      - run: cargo test -p gardenbed-store
-      - run: cargo test -p gardenbed-platform
+      - id: cache
+        uses: Swatinem/rust-cache@v2
+      # Every runtime gate below runs whenever checkout+toolchain+cache
+      # succeeded (`success()` inside `always()`), regardless of whether
+      # the other gates failed — full evidence per run, red stays red.
+      - name: model tests
+        if: always() && steps.checkout.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.cache.outcome == 'success'
+        run: cargo test -p gardenbed-model
+      - name: store tests
+        if: always() && steps.checkout.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.cache.outcome == 'success'
+        run: cargo test -p gardenbed-store
+      - name: platform tests
+        if: always() && steps.checkout.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.cache.outcome == 'success'
+        run: cargo test -p gardenbed-platform
+      # The server binary is a prerequisite of the TCP smoke; its own
+      # build gate runs even when the test gates above failed, and the
+      # dependent gates below check its outcome.
+      - id: server-build
+        name: build gardenbed-server
+        if: always() && steps.checkout.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.cache.outcome == 'success'
+        run: cargo build -p gardenbed-server
       # The native Windows end-to-end smoke: the real `bed` binary talking
       # to a real `gardenbed-server` binary over TCP on 127.0.0.1 — clone,
       # sparse materialization, modify, commit, publish, and a fresh
       # re-clone of the published tip, with hand-checked bytes. The server
-      # binary must be built first (it is not a bin target of this package
-      # and `cargo test` alone never rebuilds it; the staleness guard in
-      # tests/common/mod.rs fails loudly on a missing or stale binary).
-      # Single-threaded: one server process, one deterministic lap.
-      - run: cargo build -p gardenbed-server
-      - run: cargo test -p gardenbed --test tcp_smoke -- --test-threads=1
+      # binary must exist first (not a bin target of this package; the
+      # staleness guard in tests/common/mod.rs fails loudly on a missing
+      # or stale binary). Single-threaded: one server, one deterministic
+      # lap. Only runs when the server build succeeded — otherwise it
+      # shows skipped, never passed.
+      - name: TCP end-to-end smoke
+        if: always() && steps.server-build.outcome == 'success'
+        run: cargo test -p gardenbed --test tcp_smoke -- --test-threads=1
       # Native git export smoke: the pack-writer's publish path fsyncs
       # the target directory (FlushFileBuffers needs a write-capable
       # handle on Windows — the exact access the store fsync needed).
       # git itself oracles the result (fsck --strict, SHA reproduction);
-      # git is on PATH on windows runners.
-      - run: cargo test -p gardenbed-git --test export_smoke
+      # git is on PATH on windows runners. Independent of the server
+      # binary; runs on any test-gate outcome.
+      - name: git export smoke
+        if: always() && steps.checkout.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.cache.outcome == 'success'
+        run: cargo test -p gardenbed-git --test export_smoke
       # Windows runtime safety, on a real Windows kernel: the portable
       # checkout_fs tests (recursive symlink removal, failed staging
       # preserving the old leaf, atomic publication, the path-aliasing
@@ -94,4 +128,6 @@ jobs:
       # Symlink tests require Developer Mode (enabled by default on
       # GitHub windows runners); a runner without it fails loudly rather
       # than skipping.
-      - run: cargo test -p gardenbed --lib
+      - name: bed lib + checkout safety
+        if: always() && steps.checkout.outcome == 'success' && steps.toolchain.outcome == 'success' && steps.cache.outcome == 'success'
+        run: cargo test -p gardenbed --lib
