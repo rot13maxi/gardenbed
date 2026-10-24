@@ -677,6 +677,179 @@ fn pg_ingest_concurrent_idempotence() {
     assert_eq!(store.cs_for_git(&sha).unwrap(), Some(cs));
     assert_eq!(store.git_for_cs(cs).unwrap(), Some(sha));
 }
+
+/// A raw tree body for `put_raw_tree` fixtures: valid tree bytes whose
+/// SHA-1 (with the `tree <len>\0` prefix) equals `key`, so the store's
+/// own row key discipline holds. The digest is computed the way git
+/// hashes tree objects (sha1(b"tree <len>\0" ++ body)).
+fn raw_tree_body(key: &mut [u8; 20], tag: &str, salt: u64, round: u8) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    let mut body: Vec<u8> = format!("100644 {tag}-{salt}-{round}\0").into_bytes();
+    body.extend_from_slice(&[0x22; 20]);
+    let mut h = Sha1::new();
+    h.update(format!("tree {}\0", body.len()));
+    h.update(&body);
+    *key = h.finalize().into();
+    body
+}
+
+#[test]
+fn pg_raw_tree_concurrent_idempotence() {
+    // PG-only test (the S3 half of `live()` is irrelevant to the raw-tree
+    // metadata race): gate on GARDENBED_TEST_PG_URL alone, the same
+    // contract as tests/postgres_schema.rs.
+    let pg_url = match std::env::var("GARDENBED_TEST_PG_URL") {
+        Ok(url) => url,
+        Err(_) => {
+            eprintln!(
+                "skipping parity tests: GARDENBED_TEST_PG_URL is not set \
+                 (see this file's header)"
+            );
+            return;
+        }
+    };
+    // INDEPENDENT pre-opened handles, exactly like separate replicas (or
+    // separate test processes) racing the same database — not Arc
+    // clones of one pool. Each opens its own pool and driver thread and
+    // performs a warmup read before the race, so the race measures the
+    // insert path, not connection setup.
+    let callers = 8;
+    let stores: Vec<Arc<PostgresMetadataStore>> = (0..callers)
+        .map(|_| {
+            let s = Arc::new(PostgresMetadataStore::open(&pg_url).expect("open handle"));
+            assert_eq!(
+                s.raw_tree([0u8; 20]).unwrap(),
+                None,
+                "warmup read through the fresh handle"
+            );
+            s
+        })
+        .collect();
+    let tag = format!("p{}", std::process::id());
+    let salt = run_salt();
+
+    // Fresh unique keys per round (nonce in the body ⇒ fresh SHA), the
+    // coordinator probe's shape: barrier-synchronized identical puts on
+    // independent handles. Under the old SELECT-then-INSERT shape all
+    // but the winner failed with a duplicate-key Db error (45/48 in
+    // the probe); the idempotency contract requires all to return Ok.
+    let model = id_of(0x6E7 ^ hash_tag(&tag));
+    for round in 0..3u8 {
+        let mut key = [0u8; 20];
+        let body = raw_tree_body(&mut key, &tag, salt, round);
+        let barrier = Arc::new(Barrier::new(callers));
+        let handles: Vec<_> = stores
+            .iter()
+            .map(|store| {
+                let store = Arc::clone(store);
+                let barrier = Arc::clone(&barrier);
+                let body = body.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    store.put_raw_tree(key, Some(model), &body)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("caller thread").expect(
+                "every concurrent identical put_raw_tree returns Ok — \
+                 the insert-first (ON CONFLICT DO NOTHING + verify) shape, \
+                 not SELECT-then-INSERT",
+            );
+        }
+        // The winning row is byte-exact and carries the association.
+        assert_eq!(stores[0].raw_tree(key).unwrap(), Some(body));
+        assert_eq!(stores[0].raw_tree_model_id(key).unwrap(), Some(Some(model)));
+    }
+
+    // Mixed-association barrier round: same key, same bytes, half the
+    // callers put a DIFFERENT model association. Same-bytes puts are all
+    // idempotent Ok (the association is first-seen advisory — one git
+    // tree can normalize differently across import contexts); the row's
+    // final association is whichever insert landed first, and the bytes
+    // are never overwritten. A Db error here would be the old
+    // duplicate-key bug.
+    {
+        let mut key = [0u8; 20];
+        let body = raw_tree_body(&mut key, &tag, salt, 0xB7);
+        let other_model = id_of(0x6E9 ^ hash_tag(&tag));
+        let barrier = Arc::new(Barrier::new(callers));
+        let handles: Vec<_> = stores
+            .iter()
+            .enumerate()
+            .map(|(i, store)| {
+                let store = Arc::clone(store);
+                let barrier = Arc::clone(&barrier);
+                let body = body.clone();
+                // Even callers put `model`, odd callers `other_model`.
+                let assoc = if i % 2 == 0 { model } else { other_model };
+                thread::spawn(move || {
+                    barrier.wait();
+                    store.put_raw_tree(key, Some(assoc), &body)
+                })
+            })
+            .collect();
+        let mut ok = 0;
+        for h in handles {
+            h.join().expect("caller thread").expect(
+                "every same-bytes put is idempotent Ok regardless of association — \
+                     a Db error here is the old duplicate-key bug",
+            );
+            ok += 1;
+        }
+        // All callers succeeded; the row's association is whichever
+        // insert landed first, and the bytes are unchanged.
+        assert_eq!(ok, callers, "every same-bytes mixed-association put is Ok");
+        let stored_assoc = stores[0]
+            .raw_tree_model_id(key)
+            .unwrap()
+            .expect("row exists");
+        assert!(
+            stored_assoc == Some(model) || stored_assoc == Some(other_model),
+            "the stored association is one of the racers': {stored_assoc:?}"
+        );
+        assert_eq!(
+            stores[0].raw_tree(key).unwrap(),
+            Some(body),
+            "winner's bytes unchanged by the losers"
+        );
+    }
+
+    let store = Arc::clone(&stores[0]);
+
+    // Reopen the database: the row survives as written (fresh handles,
+    // same store contract).
+    let reopened = PostgresMetadataStore::open(&pg_url).expect("reopen");
+    let mut key = [0u8; 20];
+    let body = raw_tree_body(&mut key, &tag, salt, 0);
+    assert_eq!(reopened.raw_tree(key).unwrap(), Some(body.clone()));
+
+    // Wrong bytes for an existing key refuse loudly, row untouched.
+    let mut tampered = body.clone();
+    tampered[0] ^= 0x01;
+    assert!(matches!(
+        store.put_raw_tree(key, Some(model), &tampered),
+        Err(StoreError::Invalid(_))
+    ));
+    assert_eq!(store.raw_tree(key).unwrap(), Some(body.clone()));
+
+    // Same bytes with a different association: idempotent Ok, first-seen
+    // association stays (advisory).
+    let other = id_of(0x6E8 ^ hash_tag(&tag));
+    store
+        .put_raw_tree(key, Some(other), &body)
+        .expect("same-bytes different-association put is an idempotent no-op");
+    assert_eq!(store.raw_tree_model_id(key).unwrap(), Some(Some(model)));
+
+    // An absent key reads as None (wrongkey direction).
+    let mut absent = [0u8; 20];
+    for (i, b) in absent.iter_mut().enumerate() {
+        *b = 0xA5 ^ salt.to_le_bytes()[i % 8] ^ (i as u8);
+    }
+    assert_eq!(store.raw_tree(absent).unwrap(), None);
+    assert_eq!(store.raw_tree_model_id(absent).unwrap(), None);
+}
+
 #[test]
 fn s3_object_parity() {
     let Some((_pg, store, _tag)) = live() else {

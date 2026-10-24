@@ -910,32 +910,48 @@ pub async fn rebase(state_dir: &Path, new_parent: &str) -> Result<String, Client
     ))
 }
 
-/// `bed merge <target> [-m MESSAGE] [--author …]` — merge a changeset or
-/// ref into the working copy's current changeset (the server-side
-/// two-parent merge, v0.2.md D9–D11), then move the working copy onto
-/// the merge changeset rebase-shaped.
+/// `bed merge <t1> [<t2> …] [-m MESSAGE] [--author …]` — merge one or
+/// more changesets or refs into the working copy's current changeset,
+/// then move the working copy onto the merge changeset rebase-shaped.
+///
+/// One target is the server-side two-parent merge (v0.2.md D9–D11);
+/// two or more targets select the octopus merge (the targets fold in
+/// order; ANY conflict in ANY round refuses — the error names the
+/// round and every conflicting path, and nothing is stored, the same
+/// contract the two-way merge keeps).
 ///
 /// The server returns the merge changeset's id, or refuses with
 /// `FAILED_PRECONDITION` naming every conflicting path — surfaced as
 /// [`ClientError::Rpc`], verbatim (resolution belongs in the working
-/// copy; nothing is stored on conflict). When the target is already an
-/// ancestor of the current changeset, the answer is up to date: the
-/// working copy stays where it is. On success the working copy treats
-/// the result like a `rebase`/`switch`: the sparse selection is
-/// re-planned and re-synced at the merged changeset, the config moves,
-/// and the heads stack is re-pointed from the old changeset to the
-/// merge.
+/// copy; nothing is stored on conflict). When every target is already
+/// an ancestor of the current changeset, the answer is up to date:
+/// the working copy stays where it is. On success the working copy
+/// treats the result like a `rebase`/`switch`: the sparse selection
+/// is re-planned and re-synced at the merged changeset, the config
+/// moves, and the heads stack is re-pointed from the old changeset to
+/// the merge.
 pub async fn merge(
     state_dir: &Path,
-    target: &str,
+    targets: &[String],
     message: Option<&str>,
     author: Option<&str>,
 ) -> Result<String, ClientError> {
+    if targets.is_empty() {
+        return Err(ClientError::ConfigInvalid(
+            "merge requires at least one target".into(),
+        ));
+    }
     let mut bed = WorkingCopy::open(state_dir)?;
-    let parsed = crate::revspec::CsOrRef::parse(target)?;
+    let mut parsed_targets = Vec::with_capacity(targets.len());
+    for t in targets {
+        parsed_targets.push(crate::revspec::CsOrRef::parse(t)?);
+    }
     let session = Session::open(&bed).await?;
     let current = session.resolve_current_cs(&bed, "merge").await?;
-    let theirs = session.resolve(&parsed, "merge").await?;
+    let mut theirs_ids = Vec::with_capacity(parsed_targets.len());
+    for p in &parsed_targets {
+        theirs_ids.push(session.resolve(p, "merge").await?);
+    }
 
     // Refuse a dirty working copy BEFORE the RPC: the merge changeset is
     // stored server-side the moment the server accepts it, so a client
@@ -958,9 +974,14 @@ pub async fn merge(
     }
     // The merge is the server's decision; conflicts come back as a
     // FAILED_PRECONDITION whose message lists every conflicting path.
+    let names = targets
+        .iter()
+        .map(|t| t.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     let message = message
         .map(|m| m.to_owned())
-        .unwrap_or_else(|| format!("merge {target}"));
+        .unwrap_or_else(|| format!("merge {names}"));
     let (name, email) = crate::commit::resolve_author(author)?;
     let (time_secs, tz_min) = crate::commit::now_stamp();
     let identity = gardenbed_model::Identity {
@@ -969,13 +990,35 @@ pub async fn merge(
         time_secs,
         tz_min,
     };
-    let (merged, up_to_date) = session
-        .merge(current, theirs, &message, &identity, &identity, "merge")
-        .await?;
+    let (merged, up_to_date) = match theirs_ids.len() {
+        1 => {
+            session
+                .merge(
+                    current,
+                    theirs_ids[0],
+                    &message,
+                    &identity,
+                    &identity,
+                    "merge",
+                )
+                .await?
+        }
+        _ => {
+            session
+                .merge_octopus(
+                    current,
+                    &theirs_ids,
+                    &message,
+                    &identity,
+                    &identity,
+                    "merge",
+                )
+                .await?
+        }
+    };
     if up_to_date {
         return Ok(format!(
-            "already up to date — {} is an ancestor of {}; nothing to merge\n",
-            theirs.short(),
+            "already up to date — every target is an ancestor of {}; nothing to merge\n",
             current.short(),
         ));
     }
@@ -1002,9 +1045,8 @@ pub async fn merge(
     bed.heads().repoint(current, merged)?;
 
     Ok(format!(
-        "merged {} into {} as {}\n\
+        "merged {names} into {} as {}\n\
          fetched {} tree(s), {} blob(s)\n{}{}\n",
-        theirs.short(),
         current.short(),
         merged.short(),
         stats.trees_fetched,

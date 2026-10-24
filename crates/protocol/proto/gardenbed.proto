@@ -333,6 +333,36 @@ message MergeResp {
   bool up_to_date = 2;
 }
 
+// The octopus merge: folds every `targets` changeset into `cs_id`
+// sequentially (git-merge-octopus semantics). Each round is a 3-way
+// merge of the accumulated result tree with the next target over
+// their common ancestors — rename-aware and multi-base-recursive, the
+// same engine Merge uses. Refuses (FAILED_PRECONDITION) on ANY
+// conflict in ANY round, naming the round and the conflicting paths;
+// nothing is stored on refusal. Targets already reachable from the
+// accumulated head are skipped (not parents). When the first round is
+// a fast-forward, the target replaces `cs_id` as the first parent —
+// `cs_id` itself is then not a parent, exactly as git does. When
+// every target is already reachable, the response is `up_to_date`
+// with `id = cs_id` and nothing is stored.
+message MergeOctopusReq {
+  string repo = 1;
+  bytes cs_id = 2;
+  // Two or more targets, merged in order.
+  repeated bytes targets = 3;
+  string message = 4;
+  // Author and committer identities, the same shape CreateChangeset
+  // and MergeReq carry.
+  IdentityMsg author = 5;
+  IdentityMsg committer = 6;
+}
+
+// The octopus merge changeset's id, or the current id when `up_to_date`.
+message MergeOctopusResp {
+  bytes id = 1;
+  bool up_to_date = 2;
+}
+
 // Fast-forwards a ref to `cs_id`: asserts IsAncestor(current ref value,
 // cs_id), then CAS-moves the ref (v0.1.md D5). Violating the ancestry
 // precondition fails with FAILED_PRECONDITION.
@@ -444,6 +474,11 @@ service Gardenbed {
   // FAILED_PRECONDITION errors listing every conflicting path; an
   // already-merged target answers `up_to_date`).
   rpc Merge(MergeReq) returns (MergeResp);
+
+  // Server-side octopus merge of every `targets` changeset into
+  // `cs_id`, folded sequentially (ANY conflict refuses with the round
+  // and paths; all targets already merged answers `up_to_date`).
+  rpc MergeOctopus(MergeOctopusReq) returns (MergeOctopusResp);
 
   // Per-repo request counters (debug/test infrastructure).
   rpc GetStats(GetStatsReq) returns (StatsResp);

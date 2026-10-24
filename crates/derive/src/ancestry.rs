@@ -404,44 +404,94 @@ fn ancestors_naive(metadata: &dyn MetadataStore, start: Id) -> Result<HashSet<Id
     Ok(visited)
 }
 
-/// The naive merge base: intersect both ancestor sets (one BFS per side)
-/// and pick deterministically — newest committer seconds, tie-broken by
+/// The naive merge base: the deterministic first of ALL maximal common
+/// ancestors ([`merge_bases_all_impl`], git's `merge-base --all`
+/// semantics) — newest committer seconds first, tie-broken by
 /// descending id bytes.
 ///
-/// `git merge-base` returns "the best common ancestor"; when several are
-/// equally best (criss-cross merges) git's choice is implementation-defined,
-/// so this deterministic rule is Gardenbed's documented answer. On v0.1
-/// histories (redundant merges over a linear mainline) the maximal common
-/// ancestor is unique and both agree exactly.
+/// Maximality is REQUIRED, not cosmetic: ranking the raw common set by
+/// timestamp can surface a dominated ancestor first (a same-second
+/// commit, or a skewed clock stamping an old commit newer than its
+/// descendant), and merging over a non-maximal base mis-anchors the
+/// 3-way walk (spurious conflicts on disjoint-line edits). DAG
+/// ancestry dominates timestamps: the candidate set is filtered to
+/// the maximal ones BEFORE the deterministic order picks one.
 ///
-/// Note the selection rule alone already determines the answer: a maximal
-/// filter (dropping common ancestors that are proper ancestors of another
-/// common one) can never reject the first candidate in the newest-first
-/// order — it is only ever tested against candidates kept *after* it — so
-/// the historical per-candidate ancestry scan was unobservable dead work
-/// (and O(candidates × history) besides). It is deliberately absent.
+/// `git merge-base` returns "the best common ancestor"; when several
+/// are equally best (criss-cross merges) git's choice is
+/// implementation-defined, so this deterministic rule is Gardenbed's
+/// documented answer. On histories with a unique maximal common
+/// ancestor both agree exactly.
 fn merge_base_naive_impl(
     metadata: &dyn MetadataStore,
     a: Id,
     b: Id,
 ) -> Result<Option<Id>, StoreError> {
+    Ok(merge_bases_all_impl(metadata, a, b)?.into_iter().next())
+}
+
+/// All maximal common ancestors of `a` and `b` — git's
+/// `merge-base --all`: every common ancestor that is not a proper
+/// ancestor of another common ancestor. Deterministically ordered
+/// (newest committer seconds first, then descending id bytes) so the
+/// recursive merge's virtual-base fold is replica-stable.
+///
+/// A criss-cross history yields two or more; anything with a unique
+/// best base yields exactly one. Empty when the histories are
+/// unrelated.
+fn merge_bases_all_impl(metadata: &dyn MetadataStore, a: Id, b: Id) -> Result<Vec<Id>, StoreError> {
     if a == b {
-        return Ok(Some(a));
+        return Ok(vec![a]);
     }
     let anc_a = ancestors_naive(metadata, a)?;
     let anc_b = ancestors_naive(metadata, b)?;
-    let mut candidates: Vec<(u64, Id)> = Vec::new();
-    for c in anc_a.intersection(&anc_b) {
-        let (cs, _) = metadata.get_changeset(*c)?.ok_or(StoreError::NotFound)?;
-        candidates.push((cs.committer.time_secs, *c));
+    let common: Vec<Id> = anc_a.intersection(&anc_b).copied().collect();
+    if common.is_empty() {
+        return Ok(Vec::new());
     }
-    // Newest committer seconds first, tie-broken by descending id bytes —
-    // the same deterministic order the historical maximal filter consumed.
-    candidates.sort_by(|x, y| {
+    // The maximal filter needs "x is a proper ancestor of y" over the
+    // common set only: precompute each common node's ancestors within
+    // the common set by walking parents (bounded by the common set —
+    // the walk cannot leave it, since every parent of a common node
+    // that is shared is itself common; a parent only one side has is
+    // not in the set and cannot make another common node ancestral).
+    let common_set: HashSet<Id> = common.iter().copied().collect();
+    let mut dominated: HashSet<Id> = HashSet::new();
+    for &c in &common {
+        // BFS from c's parents, staying inside the common set.
+        let mut seen: HashSet<Id> = HashSet::new();
+        let mut queue: Vec<Id> = Vec::new();
+        let (cs, _) = metadata.get_changeset(c)?.ok_or(StoreError::NotFound)?;
+        for p in &cs.parents {
+            if common_set.contains(p) {
+                queue.push(*p);
+            }
+        }
+        while let Some(x) = queue.pop() {
+            if !seen.insert(x) {
+                continue;
+            }
+            dominated.insert(x);
+            let (xs, _) = metadata.get_changeset(x)?.ok_or(StoreError::NotFound)?;
+            for p in &xs.parents {
+                if common_set.contains(p) && !seen.contains(p) {
+                    queue.push(*p);
+                }
+            }
+        }
+    }
+    let mut maximal: Vec<(u64, Id)> = Vec::new();
+    for c in common {
+        if !dominated.contains(&c) {
+            let (cs, _) = metadata.get_changeset(c)?.ok_or(StoreError::NotFound)?;
+            maximal.push((cs.committer.time_secs, c));
+        }
+    }
+    maximal.sort_by(|x, y| {
         y.0.cmp(&x.0)
             .then_with(|| y.1.as_bytes().cmp(x.1.as_bytes()))
     });
-    Ok(candidates.first().map(|&(_, c)| c))
+    Ok(maximal.into_iter().map(|(_, c)| c).collect())
 }
 
 // ------------------------------------------------------- accelerated walk
@@ -618,10 +668,23 @@ impl Engine {
         self.merge_base_naive(a, b)
     }
 
-    /// The naive merge base (common-ancestor intersection + maximal
-    /// filter); see the module docs for the tie-breaking rule.
+    /// The naive merge base: the deterministic first of the maximal
+    /// common ancestors; see [`Engine::merge_bases_all`] for the
+    /// ordering rule and why maximality must precede it.
     pub fn merge_base_naive(&self, a: Id, b: Id) -> Result<Option<Id>, StoreError> {
         merge_base_naive_impl(&*self.metadata, a, b)
+    }
+
+    /// All maximal common ancestors of `a` and `b` (git's
+    /// `merge-base --all`), deterministically ordered: newest
+    /// committer seconds first, then descending id bytes.
+    ///
+    /// This is the multi-base answer the recursive merge folds into a
+    /// virtual base; a unique best base yields one element and the
+    /// fold is the ordinary single-base merge. Unrelated histories
+    /// yield an empty vector.
+    pub fn merge_bases_all(&self, a: Id, b: Id) -> Result<Vec<Id>, StoreError> {
+        merge_bases_all_impl(&*self.metadata, a, b)
     }
 
     /// Eagerly derives what should exist as soon as a changeset is created

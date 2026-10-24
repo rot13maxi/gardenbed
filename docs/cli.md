@@ -400,20 +400,31 @@ bed rebase --stack main
 ### bed merge
 
 ```text
-Usage: bed merge [OPTIONS] <TARGET>
+Usage: bed merge [OPTIONS] <TARGET>...
 ```
 
-Merges `<TARGET>` (a `<cs-or-ref>`) into the current changeset
-(server-side two-parent merge, v0.2.md D9-D11). One new changeset is
-created with `parents = [current, target]` whose changes are the diff
-`tree(current) -> merged tree`; per-file content is merged with a
-three-way line merge over the merge base. Conflicts are hard errors
-listing every conflicting path. When `<TARGET>` is already an ancestor
-of the current changeset nothing is created.
+Merges one or more changesets or refs into the current changeset. A
+single target creates a two-parent merge with `parents = [current,
+target]`. Rename detection pairs moved files across directories, so an
+edit on the other branch follows the move. Multiple maximal common
+ancestors are folded into a recursive virtual base before the three-way
+content merge.
+
+Multiple targets use the separate `MergeOctopus` RPC and fold in order,
+creating one changeset with all remaining parents. Already-merged targets
+are skipped. A fast-forward in the first round replaces the current head
+in the parent list, matching Git's octopus behavior. An older server
+without this RPC refuses the operation; it cannot silently ignore extra
+targets. A conflict in any round names the paths and round and leaves the
+working copy and published refs unchanged. If every target is already
+merged, nothing is created.
+
+See [merge behavior and limits](merge-rename-octopus.md) for rename
+scoring, candidate limits, recursive bases, and conflict cases.
 
 | flag | meaning |
 |---|---|
-| `-m, --message <MSG>` | merge message (default: `merge <TARGET>`) |
+| `-m, --message <MSG>` | merge message (default: `merge <TARGET>…`) |
 | `--author <NAME-AND-EMAIL>` | author in `Name <email>` form (default: `GARDENBED_AUTHOR`, else committer identity) |
 | `--state-dir <DIR>` | local state directory (default `./.bed`) |
 

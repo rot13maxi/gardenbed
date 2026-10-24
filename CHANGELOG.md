@@ -9,6 +9,22 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- Rename-aware merges across directories, recursive multi-base resolution,
+  and native octopus merges with `bed merge <TARGET>...`. Conflicts refuse
+  without publishing a partial merge. [Behavior and limits](docs/merge-rename-octopus.md)
+  document scoring, parent order, and older-server refusal.
+
+- Sparse raw-tree capture preserves imported noncanonical modes, non-UTF-8
+  names and empty directories during SHA-exact Git export; matched kernel
+  throughput measurements and migration boundaries are documented.
+
+- CI now includes blocking bounded fuzz smoke and Playwright, plus
+  nightly/manual PostgreSQL/S3 schema, parity, and replica checks.
+  FUSE verification is explicitly enabled on a provisioned self-hosted
+  runner; a separate manual workflow supports the pinned kernel corpus.
+  [Verification coverage](docs/ci-verification.md) records prerequisites
+  and guards against skipped or zero-test passes.
+
 - **`gardenbed-ab suite`: a repeatable Gardenbed-vs-Git benchmark**.
   `gardenbed-ab suite --source <repo> --out <dir>` slices the newest N
   commits with a **real root** (a graft at the cut point, so the slice is
@@ -235,6 +251,14 @@ tags, and the verification record for a release lives in
 
 
 ### Fixed
+
+- Merge-base selection now discards nonmaximal ancestors before timestamp
+  ordering, fixing incorrect bases when commits share a second or clocks
+  are skewed. Recursive virtual bases do not persist synthetic changesets.
+
+- PostgreSQL schema initialization now serializes concurrent first opens
+  across replicas in one transaction, preventing duplicate catalog-key
+  failures on an empty database.
 
 - **`bed rebase` / `bed rebase --stack` recognize already-landed twins**
   (dogfood finding #23). When a lane's content was landed on `main` by

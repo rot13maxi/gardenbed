@@ -323,6 +323,53 @@ impl Session {
         }
     }
 
+    /// Server-side octopus merge of every `targets` changeset into
+    /// `cs`, folded sequentially (git-merge-octopus semantics). ANY
+    /// conflict in ANY round refuses — the error carries the round
+    /// and every conflicting path; nothing is stored. Targets already
+    /// reachable from the accumulated head are skipped. When every
+    /// target is already reachable, answers `(cs, true)`.
+    pub async fn merge_octopus(
+        &self,
+        cs: Id,
+        targets: &[Id],
+        message: &str,
+        author: &gardenbed_model::Identity,
+        committer: &gardenbed_model::Identity,
+        command: &'static str,
+    ) -> Result<(Id, bool), ClientError> {
+        match self
+            .client
+            .merge_octopus(&self.repo, cs, targets, message, author, committer)
+            .await
+        {
+            Ok(outcome) => Ok(outcome),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                Err(ClientError::MissingCs(cs))
+            }
+            // The octopus conflict contract mirrors the two-way one
+            // (D11): FAILED_PRECONDITION whose message starts with the
+            // octopus refusal and lists the paths.
+            Err(status)
+                if status.code() == tonic::Code::FailedPrecondition
+                    && status.message().starts_with("merge conflicts on:") =>
+            {
+                Err(ClientError::MergeConflict {
+                    paths: status
+                        .message()
+                        .trim_start_matches("merge conflicts on:")
+                        .trim()
+                        .to_owned(),
+                })
+            }
+            Err(status) => Err(ClientError::Rpc {
+                command,
+                code: status.code(),
+                message: status.message().to_owned(),
+            }),
+        }
+    }
+
     /// The first parent of `cs`, or `None` for a root changeset.
     pub async fn first_parent(
         &self,
