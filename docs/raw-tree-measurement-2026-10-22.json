@@ -1,0 +1,602 @@
+{
+  "primary": {
+    "control_cs": "9be22f2f1c6e03dc",
+    "treatment_cs": "b994428af4ef4c72",
+    "started_utc": "2026-10-22T15:45:24.338314+00:00",
+    "state": "measured",
+    "samples": [
+      {
+        "utc": "2026-10-22T15:45:24.338418+00:00",
+        "load": [
+          1.0400390625,
+          1.62060546875,
+          2.23193359375
+        ]
+      }
+    ],
+    "runs": [
+      {
+        "name": "final1000-1",
+        "limit": 1000,
+        "runner_exit": 0,
+        "results": [
+          {
+            "candidate_cs": "9be22f2f1c6e03dc",
+            "binary_sha256": "0d17f4cdd0a3b22fd98e965707cfc0748310002ad75568670650240a7316d7cc",
+            "label": "control",
+            "name": "control-1000-final1000-1",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-1000-final1000-1/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/control-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-1000-final1000-1/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "1000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:45:24.359968+00:00",
+            "wall_seconds": 43.550344944000244,
+            "exit": 0,
+            "load_before": [
+              1.0400390625,
+              1.62060546875,
+              2.23193359375
+            ],
+            "load_after": [
+              1.80078125,
+              1.7509765625,
+              2.2470703125
+            ],
+            "quiet": true,
+            "max_rss_kib": 2395748,
+            "commits_total": 1000,
+            "commits_new": 1000,
+            "commits_skipped": 0,
+            "report_seconds": 43.27,
+            "report_commits_per_second": 23,
+            "metadata_counts": {
+              "changesets": 1000,
+              "git_map": 1000,
+              "git_raw_commit": 245
+            }
+          },
+          {
+            "candidate_cs": "b994428af4ef4c72",
+            "binary_sha256": "bca39dcd0f0854e4203fd0d50ea5216b11c3d195a74cbf6e5edfb74769a6dac4",
+            "label": "treatment-fixed",
+            "name": "treatment-fixed-1000-final1000-1",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-1000-final1000-1/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/treatment-fixed-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-1000-final1000-1/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "1000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:46:07.943913+00:00",
+            "wall_seconds": 43.2882821559906,
+            "exit": 0,
+            "load_before": [
+              1.80078125,
+              1.7509765625,
+              2.2470703125
+            ],
+            "load_after": [
+              1.74755859375,
+              1.72705078125,
+              2.212890625
+            ],
+            "quiet": true,
+            "max_rss_kib": 2362740,
+            "commits_total": 1000,
+            "commits_new": 1000,
+            "commits_skipped": 0,
+            "report_seconds": 42.99,
+            "report_commits_per_second": 23,
+            "metadata_counts": {
+              "changesets": 1000,
+              "git_map": 1000,
+              "git_raw_commit": 245,
+              "git_raw_tree": 0
+            }
+          }
+        ]
+      },
+      {
+        "name": "final1000-2",
+        "limit": 1000,
+        "runner_exit": 0,
+        "results": [
+          {
+            "candidate_cs": "9be22f2f1c6e03dc",
+            "binary_sha256": "0d17f4cdd0a3b22fd98e965707cfc0748310002ad75568670650240a7316d7cc",
+            "label": "control",
+            "name": "control-1000-final1000-2",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-1000-final1000-2/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/control-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-1000-final1000-2/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "1000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:46:51.366175+00:00",
+            "wall_seconds": 40.34234166145325,
+            "exit": 0,
+            "load_before": [
+              1.74755859375,
+              1.72705078125,
+              2.212890625
+            ],
+            "load_after": [
+              1.7783203125,
+              1.73095703125,
+              2.19140625
+            ],
+            "quiet": true,
+            "max_rss_kib": 2401048,
+            "commits_total": 1000,
+            "commits_new": 1000,
+            "commits_skipped": 0,
+            "report_seconds": 40.07,
+            "report_commits_per_second": 25,
+            "metadata_counts": {
+              "changesets": 1000,
+              "git_map": 1000,
+              "git_raw_commit": 245
+            }
+          },
+          {
+            "candidate_cs": "b994428af4ef4c72",
+            "binary_sha256": "bca39dcd0f0854e4203fd0d50ea5216b11c3d195a74cbf6e5edfb74769a6dac4",
+            "label": "treatment-fixed",
+            "name": "treatment-fixed-1000-final1000-2",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-1000-final1000-2/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/treatment-fixed-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-1000-final1000-2/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "1000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:47:31.729605+00:00",
+            "wall_seconds": 40.58808660507202,
+            "exit": 0,
+            "load_before": [
+              1.7783203125,
+              1.73095703125,
+              2.19140625
+            ],
+            "load_after": [
+              1.70361328125,
+              1.71728515625,
+              2.16650390625
+            ],
+            "quiet": true,
+            "max_rss_kib": 2360012,
+            "commits_total": 1000,
+            "commits_new": 1000,
+            "commits_skipped": 0,
+            "report_seconds": 40.32,
+            "report_commits_per_second": 25,
+            "metadata_counts": {
+              "changesets": 1000,
+              "git_map": 1000,
+              "git_raw_commit": 245,
+              "git_raw_tree": 0
+            }
+          }
+        ]
+      },
+      {
+        "name": "final1000-3",
+        "limit": 1000,
+        "runner_exit": 0,
+        "results": [
+          {
+            "candidate_cs": "9be22f2f1c6e03dc",
+            "binary_sha256": "0d17f4cdd0a3b22fd98e965707cfc0748310002ad75568670650240a7316d7cc",
+            "label": "control",
+            "name": "control-1000-final1000-3",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-1000-final1000-3/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/control-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-1000-final1000-3/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "1000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:48:12.366550+00:00",
+            "wall_seconds": 40.18118238449097,
+            "exit": 0,
+            "load_before": [
+              1.70361328125,
+              1.71728515625,
+              2.16650390625
+            ],
+            "load_after": [
+              1.72412109375,
+              1.73388671875,
+              2.15478515625
+            ],
+            "quiet": true,
+            "max_rss_kib": 2400912,
+            "commits_total": 1000,
+            "commits_new": 1000,
+            "commits_skipped": 0,
+            "report_seconds": 39.92,
+            "report_commits_per_second": 25,
+            "metadata_counts": {
+              "changesets": 1000,
+              "git_map": 1000,
+              "git_raw_commit": 245
+            }
+          },
+          {
+            "candidate_cs": "b994428af4ef4c72",
+            "binary_sha256": "bca39dcd0f0854e4203fd0d50ea5216b11c3d195a74cbf6e5edfb74769a6dac4",
+            "label": "treatment-fixed",
+            "name": "treatment-fixed-1000-final1000-3",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-1000-final1000-3/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/treatment-fixed-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-1000-final1000-3/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "1000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:48:52.585756+00:00",
+            "wall_seconds": 43.68993425369263,
+            "exit": 0,
+            "load_before": [
+              1.72412109375,
+              1.73388671875,
+              2.15478515625
+            ],
+            "load_after": [
+              1.8154296875,
+              1.74267578125,
+              2.13623046875
+            ],
+            "quiet": true,
+            "max_rss_kib": 2359796,
+            "commits_total": 1000,
+            "commits_new": 1000,
+            "commits_skipped": 0,
+            "report_seconds": 43.39,
+            "report_commits_per_second": 23,
+            "metadata_counts": {
+              "changesets": 1000,
+              "git_map": 1000,
+              "git_raw_commit": 245,
+              "git_raw_tree": 0
+            }
+          }
+        ]
+      },
+      {
+        "name": "final5000-1",
+        "limit": 5000,
+        "runner_exit": 0,
+        "results": [
+          {
+            "candidate_cs": "9be22f2f1c6e03dc",
+            "binary_sha256": "0d17f4cdd0a3b22fd98e965707cfc0748310002ad75568670650240a7316d7cc",
+            "label": "control",
+            "name": "control-5000-final5000-1",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-5000-final5000-1/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/control-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/control-5000-final5000-1/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "5000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:49:36.329252+00:00",
+            "wall_seconds": 58.564183473587036,
+            "exit": 0,
+            "load_before": [
+              1.8154296875,
+              1.74267578125,
+              2.13623046875
+            ],
+            "load_after": [
+              1.52978515625,
+              1.677734375,
+              2.08837890625
+            ],
+            "quiet": true,
+            "max_rss_kib": 2542168,
+            "commits_total": 5000,
+            "commits_new": 5000,
+            "commits_skipped": 0,
+            "report_seconds": 58.18,
+            "report_commits_per_second": 86,
+            "metadata_counts": {
+              "changesets": 5000,
+              "git_map": 5000,
+              "git_raw_commit": 953
+            }
+          },
+          {
+            "candidate_cs": "b994428af4ef4c72",
+            "binary_sha256": "bca39dcd0f0854e4203fd0d50ea5216b11c3d195a74cbf6e5edfb74769a6dac4",
+            "label": "treatment-fixed",
+            "name": "treatment-fixed-5000-final5000-1",
+            "command": [
+              "/usr/bin/time",
+              "-v",
+              "-o",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-5000-final5000-1/time.txt",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/treatment-fixed-server",
+              "import",
+              "--from",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+              "--root",
+              "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/treatment-fixed-5000-final5000-1/store",
+              "--repo",
+              "kernel",
+              "--limit",
+              "5000",
+              "--renames",
+              "on",
+              "--ref",
+              "refs/heads/master"
+            ],
+            "fsync": "off",
+            "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+            "started_utc": "2026-10-22T15:50:34.920690+00:00",
+            "wall_seconds": 60.383129358291626,
+            "exit": 0,
+            "load_before": [
+              1.52978515625,
+              1.677734375,
+              2.08837890625
+            ],
+            "load_after": [
+              1.880859375,
+              1.74365234375,
+              2.083984375
+            ],
+            "quiet": true,
+            "max_rss_kib": 2560472,
+            "commits_total": 5000,
+            "commits_new": 5000,
+            "commits_skipped": 0,
+            "report_seconds": 60.0,
+            "report_commits_per_second": 83,
+            "metadata_counts": {
+              "changesets": 5000,
+              "git_map": 5000,
+              "git_raw_commit": 953,
+              "git_raw_tree": 0
+            }
+          }
+        ]
+      }
+    ],
+    "summary": {
+      "valid1000_pairs": 3,
+      "control_mean_commits_per_second": 24.372375627789395,
+      "treatment_mean_commits_per_second": 23.70319860514724,
+      "relative_ratio": 0.9725436275535176,
+      "relative_within20": true,
+      "historical278_absolute_within20": false,
+      "historical_baseline_work": "619487-commit resume; distinct from fresh snapshots; investigate matching semantics, never silently waive",
+      "overall_gate": "pending historical-baseline interpretation and report review"
+    }
+  },
+  "diagnostic": [
+    {
+      "candidate_cs": "0bf6b4a1069fe505",
+      "binary_sha256": "9b8e671bbd291527766bb07a95537dc88d68bb952d8f18f35f4d1bb3811ce52d",
+      "label": "diagnostic-control",
+      "name": "diagnostic-control-5000-phase1",
+      "command": [
+        "/usr/bin/time",
+        "-v",
+        "-o",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/diagnostic-control-5000-phase1/time.txt",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/diagnostic-control-server",
+        "import",
+        "--from",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+        "--root",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/diagnostic-control-5000-phase1/store",
+        "--repo",
+        "kernel",
+        "--limit",
+        "5000",
+        "--renames",
+        "on",
+        "--ref",
+        "refs/heads/master"
+      ],
+      "fsync": "off",
+      "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+      "started_utc": "2026-10-22T16:22:36.845391+00:00",
+      "wall_seconds": 60.85154438018799,
+      "exit": 0,
+      "load_before": [
+        3.6025390625,
+        3.1923828125,
+        2.78955078125
+      ],
+      "load_after": [
+        2.1953125,
+        2.8662109375,
+        2.701171875
+      ],
+      "quiet": true,
+      "max_rss_kib": 2544152,
+      "commits_total": 5000,
+      "commits_new": 5000,
+      "commits_skipped": 0,
+      "report_seconds": 60.43,
+      "report_commits_per_second": 83,
+      "metadata_counts": {
+        "changesets": 5000,
+        "git_map": 5000,
+        "git_raw_commit": 953
+      },
+      "identical_primary_git_map": true,
+      "identical_primary_changesets": true,
+      "phase": "graph_s=15.323461816 roots=15 root_s=28.126618258 nonroots=4985 nonroot_s=15.741476884 diff_s=1.046214570 steady_s=16.787691454 steady_rate=296.943746772 reachable_nodes=1485163 selected_nodes=5000"
+    },
+    {
+      "candidate_cs": "59a59f2330358627",
+      "binary_sha256": "6b32bb068ee57241376fac80a86763ede6a660aa2e708ec772fbef73aa36b717",
+      "label": "diagnostic-treatment",
+      "name": "diagnostic-treatment-5000-phase1",
+      "command": [
+        "/usr/bin/time",
+        "-v",
+        "-o",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/diagnostic-treatment-5000-phase1/time.txt",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/bin/diagnostic-treatment-server",
+        "import",
+        "--from",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/linux.git",
+        "--root",
+        "/home/user/code/gardenbed/.gardenbed-recovery/2026-10-21/throughput-campaign/diagnostic-treatment-5000-phase1/store",
+        "--repo",
+        "kernel",
+        "--limit",
+        "5000",
+        "--renames",
+        "on",
+        "--ref",
+        "refs/heads/master"
+      ],
+      "fsync": "off",
+      "source_tip": "0fcb05b72344f40806cbe810de8872f1698bf053",
+      "started_utc": "2026-10-22T16:23:38.259145+00:00",
+      "wall_seconds": 59.33331060409546,
+      "exit": 0,
+      "load_before": [
+        2.1953125,
+        2.8662109375,
+        2.701171875
+      ],
+      "load_after": [
+        2.01416015625,
+        2.693359375,
+        2.6513671875
+      ],
+      "quiet": true,
+      "max_rss_kib": 2559456,
+      "commits_total": 5000,
+      "commits_new": 5000,
+      "commits_skipped": 0,
+      "report_seconds": 58.94,
+      "report_commits_per_second": 85,
+      "metadata_counts": {
+        "changesets": 5000,
+        "git_map": 5000,
+        "git_raw_commit": 953,
+        "git_raw_tree": 0
+      },
+      "identical_primary_git_map": true,
+      "identical_primary_changesets": true,
+      "phase": "graph_s=15.258971557 roots=15 root_s=27.836765169 nonroots=4985 nonroot_s=14.658164753 diff_s=1.025202892 steady_s=15.683367645 steady_rate=317.852652111 reachable_nodes=1485163 selected_nodes=5000"
+    }
+  ],
+  "notes": "Matched final primary gate passes; absolute historical comparison fails for fresh workload. Separate phase diagnostics explain graph/root overhead and match primary canonical outputs. Pending independent report review."
+}

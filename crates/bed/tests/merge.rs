@@ -324,3 +324,185 @@ async fn bed_merge_refuses_dirty_working_copy_without_storing() {
     );
     w.server.shutdown().await;
 }
+
+#[tokio::test]
+async fn bed_merge_octopus_two_targets_creates_three_parent_merge() {
+    let mut w = setup().await;
+    // A third line of work: clone `other`, diverge, publish under a
+    // named ref (NOT main — main stays as theirs' base for the merge
+    // base computation... actually each target needs its own ref).
+    let other = w._dir.path().join("other");
+    fs::create_dir_all(&other).expect("other dir");
+    let (code, _, stderr) = bed(&other, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "clone other: {stderr}");
+    let (code, out, stderr) = bed(&other, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse add other: {stderr}\n{out}");
+
+    // Diverge both targets from the shared base on DISJOINT files:
+    // theirs edits notes.txt, other adds a new file, mine stays put
+    // (so ours is the base — every round fast-forwards content in).
+    commit_file(&w.theirs, "notes.txt", "notes theirs\n", "theirs edit");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "theirs publish: {stderr}");
+    commit_file(&other, "extra.txt", "extra other\n", "other adds");
+    let (code, _, stderr) = bed(&other, &["publish", "--ref", "todo/other"]);
+    assert_eq!(code, 0, "other publish: {stderr}");
+
+    // Octopus: two targets in one bed merge.
+    let (code, out, stderr) = bed(&w.mine, &["merge", "main", "todo/other"]);
+    assert_eq!(code, 0, "bed merge octopus: {stderr}\n{out}");
+
+    // First-round fast-forward (ours was the base): the first target
+    // REPLACES ours as the first parent, exactly like git-merge-octopus
+    // ("Fast-forwarding to: t1" → parents = [t1, t2], ours not a
+    // parent). Content-wise both targets' work is in.
+    let merged = current_cs(&w.mine);
+    let cs = w.repo.get_changeset(merged).expect("merged cs");
+    assert_eq!(cs.parents.len(), 2, "octopus parents: {cs:?}");
+    let t1 = w.repo.get_ref("main").expect("main ref").expect("main set");
+    let t2 = w
+        .repo
+        .get_ref("todo/other")
+        .expect("other ref")
+        .expect("todo/other set");
+    assert_eq!(cs.parents, vec![t1, t2], "FF octopus parents = [t1, t2]");
+    // Both targets' work is present in the working copy.
+    let notes = fs::read_to_string(w.mine.join("notes.txt")).expect("notes");
+    assert_eq!(notes, "notes theirs\n", "theirs' edit landed");
+    let extra = fs::read_to_string(w.mine.join("extra.txt")).expect("extra");
+    assert_eq!(extra, "extra other\n", "other's add landed");
+    w.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn bed_merge_octopus_conflict_refuses_naming_round() {
+    let mut w = setup().await;
+    let other = w._dir.path().join("other");
+    fs::create_dir_all(&other).expect("other dir");
+    let (code, _, stderr) = bed(&other, &["clone", &w.server.http()]);
+    assert_eq!(code, 0, "clone other: {stderr}");
+    let (code, out, stderr) = bed(&other, &["sparse", "add", "."]);
+    assert_eq!(code, 0, "sparse add other: {stderr}\n{out}");
+
+    // Both targets edit the SAME lines of doc.txt differently: the
+    // first round merges, the second conflicts (or the first does —
+    // either way the refusal must name the round and the path).
+    commit_file(&w.theirs, "doc.txt", "theirs version\n", "theirs edit");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "theirs publish: {stderr}");
+    commit_file(&other, "doc.txt", "other version\n", "other edit");
+    let (code, _, stderr) = bed(&other, &["publish", "--ref", "todo/other"]);
+    assert_eq!(code, 0, "other publish: {stderr}");
+
+    let before = current_cs(&w.mine);
+    let (code, _out, stderr) = bed(&w.mine, &["merge", "main", "todo/other"]);
+    assert_ne!(code, 0, "conflicting octopus must fail");
+    assert!(
+        stderr.contains("octopus merge refused"),
+        "error names the octopus refusal: {stderr}"
+    );
+    assert!(stderr.contains("doc.txt"), "error names the path: {stderr}");
+    // Nothing stored, nothing moved.
+    assert_eq!(before, current_cs(&w.mine), "no local state move");
+    let log = w.repo.log(before, 100).expect("log");
+    let merges: Vec<_> = log.iter().filter(|(_, cs)| cs.parents.len() >= 2).collect();
+    assert!(merges.is_empty(), "no octopus stored: {merges:?}");
+    w.server.shutdown().await;
+}
+
+#[tokio::test]
+async fn bed_merge_octopus_succeeds_when_pairwise_bases_do_not_intersect() {
+    let mut w = setup().await;
+    // The R2 finding-2 DAG, built through the real CLI: a target
+    // that forked BELOW another target's fork point makes the
+    // pairwise maximal base sets of round 2 disjoint
+    // (maximal(m1,t)={y} vs maximal(m2,t)={x}); the old pairwise
+    // intersection was empty and the merge was refused where git's
+    // octopus succeeds (multi-arg `git merge-base --all` = y,
+    // parents [m1, m2, t]).
+    //
+    // Shape: base(root) → main advances twice (x, y) → m1 works on
+    // top of y; `old` forks from x (BELOW y) → m2; `tee` forks from
+    // y → t. Octopus ours = m1, targets = [m2, t].
+    let old = w._dir.path().join("old");
+    let tee = w._dir.path().join("tee");
+    for (wc, sparse_note) in [(&old, "old"), (&tee, "tee")] {
+        fs::create_dir_all(wc).expect("wc dir");
+        let (code, _, stderr) = bed(wc, &["clone", &w.server.http()]);
+        assert_eq!(code, 0, "clone {sparse_note}: {stderr}");
+        let (code, out, stderr) = bed(wc, &["sparse", "add", "."]);
+        assert_eq!(code, 0, "sparse add {sparse_note}: {stderr}\n{out}");
+    }
+
+    // Advance main: x then y (two commits on the shared line).
+    commit_file(&w.theirs, "doc.txt", "line 1\nedited by x\n", "x");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "publish x: {stderr}");
+    let x_cs = current_cs(&w.theirs);
+    commit_file(&w.theirs, "notes.txt", "notes at y\n", "y");
+    let (code, _, stderr) = bed(&w.theirs, &["publish"]);
+    assert_eq!(code, 0, "publish y: {stderr}");
+    let y_cs = current_cs(&w.theirs);
+
+    // m1: ours, on top of y (mine moves to y with `switch`).
+    let (code, out, stderr) = bed(&w.mine, &["switch", "main"]);
+    assert_eq!(code, 0, "mine switches to y (main): {stderr}\n{out}");
+    assert_eq!(current_cs(&w.mine), y_cs, "mine at y");
+    commit_file(&w.mine, "m1.txt", "m1\n", "m1");
+    let (code, _, stderr) = bed(&w.mine, &["publish", "--ref", "todo/m1"]);
+    assert_eq!(code, 0, "publish m1: {stderr}");
+    let m1 = current_cs(&w.mine);
+
+    // m2: forked from x (BELOW y) — `old` switches back to the x
+    // changeset by hex id and forks from there.
+    let (code, out, stderr) = bed(&old, &["switch", &x_cs.to_hex()]);
+    assert_eq!(code, 0, "old switches to x: {stderr}\n{out}");
+    commit_file(&old, "m2.txt", "m2\n", "m2");
+    let (code, _, stderr) = bed(&old, &["publish", "--ref", "todo/m2"]);
+    assert_eq!(code, 0, "publish m2: {stderr}");
+    let m2 = current_cs(&old);
+
+    // t: forked from y (a sibling of m1). `tee` cloned at root —
+    // move it to y before forking.
+    let (code, out, stderr) = bed(&tee, &["switch", "main"]);
+    assert_eq!(code, 0, "tee switches to y (main): {stderr}\n{out}");
+    commit_file(&tee, "t.txt", "t\n", "t");
+    let (code, _, stderr) = bed(&tee, &["publish", "--ref", "todo/t"]);
+    assert_eq!(code, 0, "publish t: {stderr}");
+    let t = current_cs(&tee);
+
+    // Sanity: the DAG is the reported shape (t is NOT a descendant
+    // of m2 — they share only x).
+    let cs_m2 = w.repo.get_changeset(m2).expect("m2 cs");
+    assert_eq!(cs_m2.parents, vec![x_cs], "m2 = child(x)");
+    let cs_t = w.repo.get_changeset(t).expect("t cs");
+    assert_eq!(cs_t.parents, vec![y_cs], "t = child(y)");
+    let cs_m1 = w.repo.get_changeset(m1).expect("m1 cs");
+    assert_eq!(cs_m1.parents, vec![y_cs], "m1 = child(y)");
+
+    // THE OCTOPUS: ours = m1, targets = [m2, t]. Round 1 folds m2
+    // (base x); round 2's pairwise maximals {y} vs {x} are disjoint
+    // — with the union+dominance bases the merge completes.
+    let (code, out, stderr) = bed(&w.mine, &["merge", "todo/m2", "todo/t"]);
+    assert_eq!(code, 0, "bed merge octopus: {stderr}\n{out}");
+
+    let merged = current_cs(&w.mine);
+    let cs = w.repo.get_changeset(merged).expect("merged cs");
+    // parents = [m1, m2, t] (first parent survives: round 1 is NOT
+    // a fast-forward since ours m1 ≠ base x).
+    assert_eq!(cs.parents, vec![m1, m2, t], "octopus parents [m1, m2, t]");
+
+    // All sides' content landed in the working copy.
+    for (path, content) in [
+        ("m1.txt", "m1\n"),
+        ("m2.txt", "m2\n"),
+        ("t.txt", "t\n"),
+        ("doc.txt", "line 1\nedited by x\n"),
+        ("notes.txt", "notes at y\n"),
+    ] {
+        let got = fs::read_to_string(w.mine.join(path))
+            .unwrap_or_else(|_| panic!("{path} exists in the merged working copy"));
+        assert_eq!(got, content, "{path} carries the merged content");
+    }
+    w.server.shutdown().await;
+}

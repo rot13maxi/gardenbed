@@ -143,14 +143,16 @@ pub enum Command {
         force: bool,
     },
 
-    /// Merge a changeset or ref into the current changeset (the
-    /// server-side two-parent merge). Conflicts abort listing every
-    /// conflicting path; nothing is stored until they are resolved in
-    /// the working copy.
+    /// Merge changesets or refs into the current changeset. One
+    /// target is the server-side two-parent merge; two or more
+    /// targets select the octopus merge (targets folded in order,
+    /// refused on any conflict in any round; nothing stored on
+    /// refusal).
     Merge {
-        /// The other parent: changeset id or ref.
-        target: String,
-        /// The merge changeset's message (default: `merge <target>`).
+        /// The other parent(s): changeset ids or refs.
+        #[arg(value_name = "TARGET", num_args = 1..)]
+        targets: Vec<String>,
+        /// The merge changeset's message (default: `merge <t1> <t2> …`).
         #[arg(short = 'm', long, value_name = "MESSAGE")]
         message: Option<String>,
         /// Author as one `Name <email>` identity (default: the
