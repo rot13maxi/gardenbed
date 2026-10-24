@@ -529,6 +529,35 @@ impl GardenbedClient {
         Ok((wire_id(&resp.id, "MergeResp.id")?, resp.up_to_date))
     }
 
+    /// Server-side octopus merge of every `targets` changeset into
+    /// `cs_id`, folded sequentially (git-merge-octopus semantics).
+    /// ANY conflict in ANY round aborts with `FAILED_PRECONDITION`
+    /// naming the round and the conflicting paths; nothing is stored.
+    /// Targets already reachable from the accumulated head are
+    /// skipped. When every target is already reachable, answers
+    /// `up_to_date` with `id = cs_id`. Returns `(id, up_to_date)`.
+    pub async fn merge_octopus(
+        &self,
+        repo: &str,
+        cs_id: model::Id,
+        targets: &[model::Id],
+        message: &str,
+        author: &model::Identity,
+        committer: &model::Identity,
+    ) -> Result<(model::Id, bool), Status> {
+        let req = pb::MergeOctopusReq {
+            repo: repo.to_owned(),
+            cs_id: id_to_bytes(cs_id),
+            targets: targets.iter().map(|&t| id_to_bytes(t)).collect(),
+            message: message.to_owned(),
+            author: Some(pb::IdentityMsg::from(author)),
+            committer: Some(pb::IdentityMsg::from(committer)),
+        };
+        let mut inner = self.inner.clone();
+        let resp = inner.merge_octopus(self.request(req)).await?.into_inner();
+        Ok((wire_id(&resp.id, "MergeOctopusResp.id")?, resp.up_to_date))
+    }
+
     /// Per-repo request counters (debug/test infrastructure).
     pub async fn get_stats(&self, repo: &str) -> Result<BTreeMap<String, u64>, Status> {
         let req = pb::GetStatsReq {

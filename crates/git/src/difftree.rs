@@ -244,8 +244,13 @@ pub fn parse_batch(
     // `None` until the first id token: an entry before any id is malformed.
     let mut current: Option<GitOid> = None;
     while let Some(tok) = tokens.next() {
-        let text = std::str::from_utf8(tok).map_err(|_| diff_parse("token is not UTF-8"))?;
-        if let Some(oid) = GitOid::from_hex(text) {
+        // Id tokens are ASCII hex; anything non-UTF-8 is a path token
+        // (git emits raw bytes for non-UTF-8 names, which the model
+        // holds lossily — raw fidelity preserves the bytes). The id
+        // probe on the lossy decode is exact: a non-UTF-8 token can
+        // never be 40 ASCII hex characters.
+        let text = String::from_utf8_lossy(tok);
+        if let Some(oid) = GitOid::from_hex(&text) {
             // A commit id begins a record. Empty-diff commits contribute
             // exactly this (an empty record list).
             if map.insert(oid, Vec::new()).is_some() {
@@ -263,7 +268,7 @@ pub fn parse_batch(
         let Some(oid) = current else {
             return Err(diff_parse("diff entry appears before any commit id"));
         };
-        let status = DiffStatus::from_token(text)
+        let status = DiffStatus::from_token(&text)
             .ok_or_else(|| diff_parse(format!("unsupported diff status {text:?}")))?;
         let record = match status {
             DiffStatus::Rename | DiffStatus::Copy => {
@@ -275,8 +280,8 @@ pub fn parse_batch(
                     .ok_or_else(|| diff_parse("rename entry is missing its destination path"))?;
                 DiffRecord {
                     status,
-                    path: utf8(dst, "rename destination")?,
-                    src: Some(utf8(src, "rename source")?),
+                    path: lossy(dst),
+                    src: Some(lossy(src)),
                 }
             }
             _ => {
@@ -285,7 +290,7 @@ pub fn parse_batch(
                 })?;
                 DiffRecord {
                     status,
-                    path: utf8(path, "path")?,
+                    path: lossy(path),
                     src: None,
                 }
             }
@@ -295,10 +300,13 @@ pub fn parse_batch(
     Ok(map)
 }
 
-fn utf8(tok: &[u8], what: &str) -> Result<String, ImportError> {
-    std::str::from_utf8(tok)
-        .map(str::to_owned)
-        .map_err(|_| diff_parse(format!("{what} is not UTF-8")))
+/// Decodes a path token the way the model holds names: lossily. Raw
+/// bytes survive through raw-tree capture; the diff classification only
+/// needs the model's (lossy) path. Rename pairing ambiguity from the
+/// lossy decode is impossible: git emits each rename's source and
+/// destination as consecutive tokens of the same record.
+fn lossy(tok: &[u8]) -> String {
+    String::from_utf8_lossy(tok).into_owned()
 }
 
 fn diff_parse(detail: impl std::fmt::Display) -> ImportError {
