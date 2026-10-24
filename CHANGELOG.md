@@ -9,6 +9,11 @@ tags, and the verification record for a release lives in
 
 ### Added
 
+- Rename-aware merges across directories, recursive multi-base resolution,
+  and native octopus merges with `bed merge <TARGET>...`. Conflicts refuse
+  without publishing a partial merge. [Behavior and limits](docs/merge-rename-octopus.md)
+  document scoring, parent order, and older-server refusal.
+
 - Sparse raw-tree capture preserves imported noncanonical modes, non-UTF-8
   names and empty directories during SHA-exact Git export; matched kernel
   throughput measurements and migration boundaries are documented.
@@ -246,6 +251,10 @@ tags, and the verification record for a release lives in
 
 
 ### Fixed
+
+- Merge-base selection now discards nonmaximal ancestors before timestamp
+  ordering, fixing incorrect bases when commits share a second or clocks
+  are skewed. Recursive virtual bases do not persist synthetic changesets.
 
 - PostgreSQL schema initialization now serializes concurrent first opens
   across replicas in one transaction, preventing duplicate catalog-key

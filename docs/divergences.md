@@ -261,151 +261,51 @@ that retargets one prints the `-Subproject commit <old>` /
 `+Subproject commit <new>` hunk; a path switching from a regular file
 to a gitlink prints only `old mode`/`new mode`.
 
-## 8. Merge is rename-blind (v0.2.md D9)
+## 8. Rename-aware merges — bounded candidate detection
 
-**What:** the merge walk pairs entries by path only. A rename on one
-side is indistinguishable from a delete+add pair, so rename/rename
-(both sides rename the same file to different destinations) merges as
-two independent add/add pairs — each new path conflicts only when the
-file's content also changed on both sides; rename/delete merges as
-delete (one side) vs modify (the other, at the old path), a
-modify/delete conflict naming the *original* path. Git's
-`merge-ort` detects the renames and reports rename/rename or
-rename/delete conflicts at both endpoints.
+The former rename-blind merge divergence is retired. The engine collects
+added/deleted candidates from a pruned tree diff, pairs exact blobs first,
+then uses byte-weighted span similarity with a 50% threshold. Pairing is
+across directory boundaries. Rename/rename and rename/delete conflicts name
+the relevant endpoints; edits at a renamed source merge into the destination.
+The 21-case Git-oracle matrix in `crates/derive/tests/merge_rename.rs`
+covers these shapes, binary content, ties and path/directory collisions.
 
-**Repro:**
+**Remaining limits:** detection has a cap of 1,000 candidates per side.
+Above the cap candidates remain unpaired, so rename-blind behavior can
+reappear. Symlinks and gitlinks are not scored rename candidates. Similarity
+and tie-breaking are the documented Gardenbed algorithm, not a promise of
+identical rename choices for every possible Git configuration or history.
+See [merge behavior and bounds](merge-rename-octopus.md).
 
-```sh
-git init rr && cd rr && git config user.email a@b.c && git config user.name A
-echo x > f && git add f && git commit -qm base
-git checkout -qb o && git mv f one && git commit -qm "ours renames f->one"
-git checkout -q main && git checkout -qb t && git mv f two && git commit -qm "theirs renames f->two"
-git merge-tree --write-tree o t   # git: rename/rename conflict at one, two, f
-```
+The locality regression compares ordinary in-place edits with 20 and 60
+unchanged directories. Independent calibrated measurement counted three tree
+reads for both the control and the fixed candidate (the previous candidate
+required 87). This verifies the changed-path behavior of that fixture, not a
+blanket bound on every multi-base or rename-heavy merge.
 
-Gardenbed merges this cleanly (`one` and `two` both appear; the two
-adds touch different paths), where git refuses.
+## 9. Recursive maximal merge bases — deterministic bounded folding
 
-**Cost:** a rename/rename or rename/delete merge can silently succeed
-where git would stop for review; blame stays correct either way —
-renames are recorded as `Op::Rename` with `src_path`, and blame follows
-`src_path` down the first-parent chain regardless of how the merge was
-classified. The content merge itself never mixes up files: it only ever
-pairs a path with itself across the three trees.
+The server merge path now folds all maximal common ancestors into a virtual
+base before merging the tips. It no longer chooses one criss-cross base by
+timestamp. The single-base convenience APIs still return a deterministic
+candidate, after discarding ancestors dominated by another common ancestor:
+newest committer timestamp, then descending id bytes. Same-second and skewed
+clock tests guard that ancestry takes precedence over timestamps.
 
-**Why not fixed:** rename detection at merge time needs a similarity
-heuristic over candidate (deleted, added) pairs on each side — the same
-machinery git's `-M` uses, deliberately absent from the model so far
-(v0.1.md D8 imports renames only because git reports them). The
-divergence is documented as the v0.2 boundary: renames must be resolved
-by hand (rename on one side + edit on the other merges correctly as
-modify at the surviving path).
+The recursive fold tracks accumulated references without persisting synthetic
+changesets. Conflicts leave changeset metadata untouched; intermediate
+content-addressed derived trees may remain as orphan-safe cache data. Inner
+base conflicts drop the conflicting virtual-base paths so the outer merge
+can surface the disagreement. Depth is capped at 16; exceeding it refuses
+loudly. These are explicit bounds and resolution rules, not universal parity
+with every Git merge strategy. Tests in `merge_recursive.rs` cover nested
+bases and the no-persist conflict guard.
 
-## 9. Criss-cross merge bases pick a deterministic tie-break, not git's
-
-**What:** when the two merge candidates have multiple equally-good
-merge bases (a criss-cross history), git's `merge-base` picks one
-implementation-defined candidate; gardenbed's `merge_base` resolves the
-tie deterministically — newest committer timestamp first, then
-descending id bytes — and the merge then runs against exactly that base.
-
-**Repro:**
-
-```sh
-git init cc && cd cc && git config user.email a@b.c && git config user.name A
-echo base > f && git add f && git commit -qm base
-git checkout -qb a && echo A > f && git commit -qam a
-git checkout -qb b main && echo B > f && git commit -qam b
-git checkout -q a && git merge -q -m ab b 2>/dev/null || true
-git checkout -q b && git merge -q -m ba a 2>/dev/null || true
-# `a` and `b` now have two merge bases (the two cross-merges)
-git merge-base a b   # git picks one; gardenbed may pick the other
-```
-
-**Cost:** a criss-cross merge can differ from git's in *which* hunks
-count as "ours changed" vs "theirs changed" around the differing base
-region — occasionally flipping a clean merge to a conflict (or the
-reverse) relative to git's choice. Both answers are defensible; only
-one is ours, and it is stable across runs, replicas and rebuilds.
-
-**Why not fixed:** "recursive merge" (merging the bases first, as
-`merge-ort` does) multiplies conflict surfaces and can invent
-intermediate trees that exist in neither history; the v0.2 spec (D10)
-chose the deterministic single-base rule knowingly. The tie-break
-order is part of the merge contract and tested for stability.
-
-## 8. Merge is rename-blind (v0.2.md D9)
-
-**What:** the merge walk pairs entries by path only. A rename on one
-side is indistinguishable from a delete+add pair, so rename/rename
-(both sides rename the same file to different destinations) merges as
-two independent add/add pairs — each new path conflicts only when the
-file's content also changed on both sides; rename/delete merges as
-delete (one side) vs modify (the other, at the old path), a
-modify/delete conflict naming the *original* path. Git's
-`merge-ort` detects the renames and reports rename/rename or
-rename/delete conflicts at both endpoints.
-
-**Repro:**
-
-```sh
-git init rr && cd rr && git config user.email a@b.c && git config user.name A
-echo x > f && git add f && git commit -qm base
-git checkout -qb o && git mv f one && git commit -qm "ours renames f->one"
-git checkout -q main && git checkout -qb t && git mv f two && git commit -qm "theirs renames f->two"
-git merge-tree --write-tree o t   # git: rename/rename conflict at one, two, f
-```
-
-Gardenbed merges this cleanly (`one` and `two` both appear; the two
-adds touch different paths), where git refuses.
-
-**Cost:** a rename/rename or rename/delete merge can silently succeed
-where git would stop for review; blame stays correct either way —
-renames are recorded as `Op::Rename` with `src_path`, and blame follows
-`src_path` down the first-parent chain regardless of how the merge was
-classified. The content merge itself never mixes up files: it only ever
-pairs a path with itself across the three trees.
-
-**Why not fixed:** rename detection at merge time needs a similarity
-heuristic over candidate (deleted, added) pairs on each side — the same
-machinery git's `-M` uses, deliberately absent from the model so far
-(v0.1.md D8 imports renames only because git reports them). The
-divergence is documented as the v0.2 boundary: renames must be resolved
-by hand (rename on one side + edit on the other merges correctly as
-modify at the surviving path).
-
-## 9. Criss-cross merge bases pick a deterministic tie-break, not git's
-
-**What:** when the two merge candidates have multiple equally-good
-merge bases (a criss-cross history), git's `merge-base` picks one
-implementation-defined candidate; gardenbed's `merge_base` resolves the
-tie deterministically — newest committer timestamp first, then
-descending id bytes — and the merge then runs against exactly that base.
-
-**Repro:**
-
-```sh
-git init cc && cd cc && git config user.email a@b.c && git config user.name A
-echo base > f && git add f && git commit -qm base
-git checkout -qb a && echo A > f && git commit -qam a
-git checkout -qb b main && echo B > f && git commit -qam b
-git checkout -q a && git merge -q -m ab b 2>/dev/null || true
-git checkout -q b && git merge -q -m ba a 2>/dev/null || true
-# `a` and `b` now have two merge bases (the two cross-merges)
-git merge-base a b   # git picks one; gardenbed may pick the other
-```
-
-**Cost:** a criss-cross merge can differ from git's in *which* hunks
-count as "ours changed" vs "theirs changed" around the differing base
-region — occasionally flipping a clean merge to a conflict (or the
-reverse) relative to git's choice. Both answers are defensible; only
-one is ours, and it is stable across runs, replicas and rebuilds.
-
-**Why not fixed:** "recursive merge" (merging the bases first, as
-`merge-ort` does) multiplies conflict surfaces and can invent
-intermediate trees that exist in neither history; the v0.2 spec (D10)
-chose the deterministic single-base rule knowingly. The tie-break
-order is part of the merge contract and tested for stability.
+Native octopus merges use the maximal elements of the union of pairwise
+common-ancestor sets for each accumulated round. The server and CLI regression
+for disjoint pairwise maximal sets matches Git's clean merge and parent order;
+a conflict refuses the whole operation without publishing a partial merge.
 
 ## Explicitly *not* divergences
 
