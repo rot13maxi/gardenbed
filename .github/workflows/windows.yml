@@ -79,6 +79,12 @@ jobs:
       # Single-threaded: one server process, one deterministic lap.
       - run: cargo build -p gardenbed-server
       - run: cargo test -p gardenbed --test tcp_smoke -- --test-threads=1
+      # Native git export smoke: the pack-writer's publish path fsyncs
+      # the target directory (FlushFileBuffers needs a write-capable
+      # handle on Windows — the exact access the store fsync needed).
+      # git itself oracles the result (fsck --strict, SHA reproduction);
+      # git is on PATH on windows runners.
+      - run: cargo test -p gardenbed-git --test export_smoke
       # Windows runtime safety, on a real Windows kernel: the portable
       # checkout_fs tests (recursive symlink removal, failed staging
       # preserving the old leaf, atomic publication, the path-aliasing

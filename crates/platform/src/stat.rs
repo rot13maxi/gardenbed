@@ -65,11 +65,17 @@ pub fn touch_mtime(path: &std::path::Path) -> std::io::Result<()> {
 
 /// fsyncs a directory so entries created/renamed inside it are durable.
 ///
-/// Unix: `fsync` on a directory fd. Windows: plain `File::open(dir)`
-/// is refused with `ERROR_ACCESS_DENIED` — a directory handle must be
-/// opened with `FILE_FLAG_BACKUP_SEMANTICS` first, after which
-/// `FlushFileBuffers` (via `sync_all`) is the durability equivalent
-/// (the same contract as checkout_fs_primitives::fsync_dir).
+/// Unix: `fsync` on a directory fd. Windows: two requirements, both
+/// from CreateFileW/FlushFileBuffers semantics —
+///
+/// * a directory handle needs `FILE_FLAG_BACKUP_SEMANTICS` (a plain
+///   open is `ERROR_ACCESS_DENIED`), and
+/// * `FlushFileBuffers` (what `sync_all` issues) requires an access
+///   mask including `GENERIC_WRITE`, per the Win32 contract: "The
+///   handle must have the GENERIC_WRITE access right."
+///
+/// The write access is scoped to this transient sync handle only; no
+/// other (read-anchored) directory handle in the codebase is widened.
 pub fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -81,6 +87,7 @@ pub fn fsync_dir(dir: &std::path::Path) -> std::io::Result<()> {
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
         std::fs::OpenOptions::new()
             .read(true)
+            .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             .open(dir)?
             .sync_all()
