@@ -314,6 +314,12 @@ impl MetadataStore for CountingMetadata {
     ) -> Result<Option<String>, gardenbed_store::StoreError> {
         self.inner.git_for_cs(id)
     }
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, gardenbed_model::Id)],
+    ) -> Result<gardenbed_store::ExportMappingReport, gardenbed_store::StoreError> {
+        self.inner.record_export_mappings(pairs)
+    }
     fn derived_put(
         &self,
         kind: &str,

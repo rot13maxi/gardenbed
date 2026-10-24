@@ -759,7 +759,9 @@ Exports the changeset graph into a real git repository (a native
 SHA-1 pack + `.idx`, written directly — no git subprocess). Every
 computed commit SHA is asserted against the store's git-mapping row.
 The changeset→git mapping rides in the report; `--mapping FILE` writes
-it as TSV for verification.
+it as TSV for verification. `--record-mappings` additionally persists accepted
+pairs to metadata; [mapping semantics](export-mappings.md) cover conflicts,
+concurrency and retry boundaries.
 
 | flag | meaning |
 |---|---|
@@ -769,6 +771,7 @@ it as TSV for verification.
 | `--ref <REFS>` | only export refs matching this glob (e.g. `refs/heads/*`); repeatable, empty means every ref in the metadata store |
 | `--storage <FILE>` | storage configuration for the scaled backends; takes precedence over `--root` (`GARDENBED_STORAGE` is the env fallback) |
 | `--mapping <MAPPING>` | write one `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by changeset id, to this file |
+| `--record-mappings` | opt in to transactional recording of accepted Git/changeset pairs after the Git export completes; conflicts are reported without overwriting canonical bindings (default off) |
 
 ```sh
 gardenbed-server export --root /tmp/gardenbed --repo myrepo --into /tmp/export.git \

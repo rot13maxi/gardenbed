@@ -659,6 +659,71 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
         })
     }
 
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, Id)],
+    ) -> Result<crate::traits::ExportMappingReport, StoreError> {
+        // Normalize before connecting: malformed shas are caller bugs and
+        // must not land any pair.
+        let mut normalized = Vec::with_capacity(pairs.len());
+        for (sha, cs) in pairs {
+            normalized.push((normalize_git_sha(sha)?, *cs));
+        }
+        let query: Vec<(String, Vec<u8>, Id)> = normalized
+            .iter()
+            .map(|(sha, cs)| (sha.clone(), cs.as_bytes().to_vec(), *cs))
+            .collect();
+        let pool = self.pool.clone();
+        // Bounded retry on deadlock ONLY, in sync code so the backoff is
+        // a plain thread sleep (the tokio `time` feature is not a store
+        // dependency, and blocking the driver runtime's one thread is
+        // exactly what a backoff here wants: the whole store serializes
+        // on that runtime anyway). The sha-sorted insert order inside one
+        // attempt orders the git_map_pkey locks (sha), but the second
+        // unique index (git_map_cs_key on cs) is locked in pair order —
+        // two batches like [(s1,c1),(s2,c2)] vs [(s0,c2),(s3,c1)] take
+        // c1→c2 and c2→c1 — so single-key sorting CANNOT structurally
+        // exclude all deadlocks. Retrying a deadlocked transaction is
+        // safe where blind retries are not: a deadlock aborts the whole
+        // transaction (nothing landed, the outcome is KNOWN to be "no
+        // rows from this attempt"), and every pair is idempotent, so a
+        // re-run re-classifies from committed rows. Any other error
+        // propagates untouched: only 40P01 retries, at most 8 times.
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let pool = pool.clone();
+            let query = query.clone();
+            let outcome = self.driver.block_on(async move {
+                let mut conn = pool.get().await.map_err(pg_err)?;
+                let tx = conn.transaction().await.map_err(pg_err)?;
+                match record_batch_tx(&tx, &query).await {
+                    Ok(report) => match tx.commit().await {
+                        Ok(()) => Ok(report),
+                        Err(e) => Err(BatchError::Other(pg_err(e))),
+                    },
+                    Err(e) => Err(e),
+                }
+            });
+            match outcome {
+                Ok(report) => return Ok(report),
+                Err(BatchError::Deadlock) if attempt <= 8 => {
+                    // Roll back (the dropped tx aborted; nothing landed)
+                    // and retry the whole idempotent batch; the backoff
+                    // staggers this batch against its (unknown)
+                    // deadlock partner.
+                    std::thread::sleep(std::time::Duration::from_millis(5 * u64::from(attempt)));
+                    continue;
+                }
+                Err(BatchError::Deadlock) => {
+                    return Err(StoreError::Db(
+                        "export mapping batch exceeded the deadlock retry limit".into(),
+                    ));
+                }
+                Err(BatchError::Other(e)) => return Err(e),
+            }
+        }
+    }
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
         let pool = self.pool.clone();
@@ -1000,4 +1065,153 @@ fn id_from_bytea(bytes: &[u8]) -> Result<Id, StoreError> {
 
 fn pg_err(e: impl std::fmt::Display) -> StoreError {
     StoreError::Db(e.to_string())
+}
+
+/// Why a batch attempt ended early: a deadlock (retryable — the whole
+/// transaction was aborted, nothing landed) or a real error.
+enum BatchError {
+    Deadlock,
+    Other(StoreError),
+}
+
+impl From<StoreError> for BatchError {
+    fn from(e: StoreError) -> Self {
+        BatchError::Other(e)
+    }
+}
+
+/// True only for PostgreSQL's deadlock-detected SQLSTATE (40P01). Any
+/// other error keeps its cause and propagates untouched.
+fn is_pg_deadlock(e: &tokio_postgres::Error) -> bool {
+    e.code().map(|c| c.code() == "40P01").unwrap_or(false)
+}
+
+/// One attempt of the export-mapping batch, inside the caller's
+/// transaction. Classification is unchanged (SELECT both sides +
+/// in-batch `seen` maps — first-in-batch twin winner); inserts are
+/// claim-first `INSERT … ON CONFLICT DO NOTHING` in sha-sorted order.
+/// A zero-row insert means a concurrent writer (identical batch,
+/// ordinary `record_git_mapping`, or ingest) claimed the row between
+/// the SELECT and the INSERT: re-verify both sides then — exact pair →
+/// `unchanged` (a concurrent identical call, the single-pair
+/// idempotence contract), anything else → a reported conflict (first
+/// canonical winner survives; never an error, never an overwrite).
+async fn record_batch_tx(
+    tx: &tokio_postgres::Transaction<'_>,
+    query: &[(String, Vec<u8>, Id)],
+) -> Result<crate::traits::ExportMappingReport, BatchError> {
+    use crate::traits::{ExportMappingConflict, ExportMappingReport};
+    let other = |e: tokio_postgres::Error| {
+        if is_pg_deadlock(&e) {
+            BatchError::Deadlock
+        } else {
+            BatchError::Other(pg_err(e))
+        }
+    };
+    let mut report = ExportMappingReport::default();
+    let mut insert: Vec<bool> = Vec::with_capacity(query.len());
+    // In-batch view of already-accepted pairs: a later pair repeating an
+    // accepted sha or cs (a twin: same git bytes, different cs)
+    // classifies against it, never re-inserts — otherwise the UNIQUE
+    // constraints would fire mid-batch.
+    let mut seen_sha: std::collections::HashMap<String, Id> = std::collections::HashMap::new();
+    let mut seen_cs: std::collections::HashMap<Id, String> = std::collections::HashMap::new();
+    for (sha, cs_bytes, cs) in query {
+        let by_sha: Option<Id> = match tx
+            .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[sha])
+            .await
+            .map_err(other)?
+        {
+            Some(row) => Some(id_from_bytea(row.get(0)).map_err(BatchError::Other)?),
+            None => seen_sha.get(sha).copied(),
+        };
+        let by_cs: Option<String> = match tx
+            .query_opt("SELECT git_sha FROM git_map WHERE cs = $1", &[cs_bytes])
+            .await
+            .map_err(other)?
+        {
+            Some(row) => Some(row.get(0)),
+            None => seen_cs.get(cs).cloned(),
+        };
+        match (by_sha, by_cs) {
+            (Some(existing_cs), Some(existing_sha))
+                if existing_cs == *cs && existing_sha == *sha =>
+            {
+                report.unchanged += 1; // idempotent
+                insert.push(false);
+            }
+            (None, None) => {
+                // Fresh pair: neither side bound. The insert happens in
+                // the second pass, after the whole batch is classified.
+                insert.push(true);
+                seen_sha.insert(sha.clone(), *cs);
+                seen_cs.insert(*cs, sha.clone());
+            }
+            (existing_cs, existing_sha) => {
+                // Refused, never overwritten (twin semantics; the
+                // import-written canonical row survives).
+                report.conflicts.push(ExportMappingConflict {
+                    git_sha: sha.clone(),
+                    cs: *cs,
+                    existing_cs_for_sha: existing_cs,
+                    existing_sha_for_cs: existing_sha,
+                });
+                insert.push(false);
+            }
+        }
+    }
+    // Sha-sorted insert order: it orders the git_map_pkey locks, which
+    // shrinks (but cannot eliminate — the cs unique index locks in pair
+    // order) the deadlock window; the caller's bounded 40P01 retry
+    // covers the remainder.
+    let mut order: Vec<usize> = (0..query.len()).filter(|&i| insert[i]).collect();
+    order.sort_by(|&a, &b| query[a].0.cmp(&query[b].0));
+    for i in order {
+        let (sha, cs_bytes, cs) = &query[i];
+        let rows = tx
+            .execute(
+                "INSERT INTO git_map(git_sha, cs) VALUES($1, $2) \
+                 ON CONFLICT DO NOTHING",
+                &[sha, cs_bytes],
+            )
+            .await
+            .map_err(other)?;
+        if rows == 1 {
+            report.recorded += 1;
+            continue;
+        }
+        // Lost the race: verify what the concurrent winner left.
+        let by_sha = tx
+            .query_opt("SELECT cs FROM git_map WHERE git_sha = $1", &[sha])
+            .await
+            .map_err(other)?;
+        let by_cs = tx
+            .query_opt("SELECT git_sha FROM git_map WHERE cs = $1", &[cs_bytes])
+            .await
+            .map_err(other)?;
+        match (by_sha, by_cs) {
+            (Some(row), Some(existing_sha))
+                if row.get::<_, Vec<u8>>(0) == *cs_bytes
+                    && existing_sha.get::<_, String>(0) == *sha =>
+            {
+                // A concurrent identical writer recorded exactly this
+                // pair — idempotent Ok, same as the single-pair path.
+                report.unchanged += 1;
+            }
+            (row, existing_sha) => {
+                // A concurrent different writer owns the row now (twin
+                // or overlap): refused, never overwritten.
+                report.conflicts.push(ExportMappingConflict {
+                    git_sha: sha.clone(),
+                    cs: *cs,
+                    existing_cs_for_sha: match row {
+                        Some(r) => Some(id_from_bytea(r.get(0)).map_err(BatchError::Other)?),
+                        None => None,
+                    },
+                    existing_sha_for_cs: existing_sha.map(|r| r.get::<_, String>(0)),
+                });
+            }
+        }
+    }
+    Ok(report)
 }

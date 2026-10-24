@@ -56,10 +56,11 @@ the bed publish and export already happened and the push is rejected.
 
 What can be checked mechanically, and what cannot:
 
-- `git_map` rows are written by **import** only. Export computes git SHAs but
-  records none, so a bed-native landing tip — and the state git is left in by
-  the previous landing's export+push — has no row.
-- The GitHub remote belongs to the bare mirror `/home/user/code/gardenbed`,
+- Import records `git_map` rows. Export is mapping-read-only by default;
+  `--record-mappings` records accepted pairs after the Git output completes.
+  A native tip refused as a representation twin can still have no row; keep
+  the exported mapping TSV and landing record as the fallback.
+- The GitHub remote belongs to the Git consumer `/home/user/code/gardenbed`,
   not to the chain checkout (`/home/user/bed-land` is a bed working copy with
   no `.git`), so every git command here runs with `-C <mirror>`.
 
@@ -67,16 +68,19 @@ So the chain keeps a **recorded landing tip**: `LANDED_BED_TIP` and
 `LANDED_GIT_SHA`, taken from §1.3's export report and mapping row at the end of
 the previous landing (the landing note is the record; the mapping TSV is the
 machine copy). The check compares `origin/main` against that recorded SHA. A
-mapping row for bed `main` exists only when `main` came from an import, and in
-that case its row is the authority instead.
+mapping row for bed `main` can come from import or an accepted
+`--record-mappings` export; when present, that row is the authority.
 
 ```sh
 ROOT=/home/user/gardenbed/arb            # canonical bed root (repo "default")
-MIRROR=/home/user/code/gardenbed         # bare mirror; origin lives here
+MIRROR=/home/user/code/gardenbed         # Git consumer; origin lives here
 
-# The twin of bed main, when main itself was imported (exact ref join; `cs`
-# is a BLOB, so the hex comparison is case-folded).
-MAIN_TWIN=$(sqlite3 "$ROOT/metadata.sqlite3" \
+# The mapped twin of bed main (import or accepted export recording).
+# Resolve modern/default and legacy layouts without creating a missing DB.
+DB="$ROOT/default/metadata.sqlite3"
+test -f "$DB" || DB="$ROOT/metadata.sqlite3"
+test -f "$DB" || { echo "FAIL: metadata DB not found"; exit 1; }
+MAIN_TWIN=$(sqlite3 -readonly "$DB" \
     "select g.git_sha from refs r join git_map g on g.cs = r.cs
       where r.name = 'refs/heads/main';")
 
@@ -112,8 +116,8 @@ as fresh as its last fetch.
 **Record the landing tip at the end of every chain** (§1.3 exports it, §1.4
 verifies the mapping row against the mirror): storing `(bed tip, git sha)` in
 the landing note is what makes the next pre-publish check possible without
-importing the mirror back. If the record is lost, either re-import the mirror
-(which writes `git_map` rows for the exported tip) or reconstruct the SHA from
+importing the mirror back. Accepted export recording also persists the pair.
+If neither a row nor a landing record is available, reconstruct the SHA from
 the exported repository with `git rev-parse main`.
 
 ### 1.2 Advance bed `main` — `bed publish`, plain CAS form
@@ -253,20 +257,32 @@ server can also move `main` on a `--ref` publish).
 ### 1.3 `export` — bed metadata → git
 
 ```sh
+set -eu
+MIRROR=/home/user/code/gardenbed
+EXPORT="$(mktemp -d)/repo.git"          # a fresh bare export target
+mkdir -p /home/user/land-mappings
 gardenbed-server export --root /home/user/gardenbed/arb --repo default \
-    --into /home/user/code/gardenbed --mapping /home/user/land-mappings/landing.map
-# 3 commits (0 signed dropped), 5 blobs, 2 ref(s), 0.01s
-git -C /home/user/code/gardenbed fsck --strict
+    --into "$EXPORT" --ref refs/heads/main --record-mappings \
+    --mapping /home/user/land-mappings/landing.map
+git -C "$EXPORT" fsck --strict
+git -C "$EXPORT" merge-base --is-ancestor \
+    "$(git -C "$MIRROR" rev-parse main)" refs/heads/main
+if test "$(git -C "$MIRROR" rev-parse --is-bare-repository)" = true; then
+    git -C "$MIRROR" fetch "$EXPORT" refs/heads/main:refs/heads/main
+else
+    test "$(git -C "$MIRROR" branch --show-current)" = main
+    git -C "$MIRROR" fetch "$EXPORT" refs/heads/main
+    git -C "$MIRROR" merge --ff-only FETCH_HEAD
+fi
 ```
 
-Export writes **every ref in the metadata store** unless `--ref <glob>` narrows
-it (the ref selection in `export_to_path`, `crates/git/src/export.rs`; the sample line's `2 ref(s)` is
-`main` plus a lane ref). That is why the publish in §1.2 comes first: the
-exported `refs/heads/main` is whatever bed `main` is at export time. Export
-before publishing and the mirror's `main` still points at the previous landing,
-so the push carries stale history (verified on a scratch root: export before
-publish left the exported `main` at the older tip; a re-export after publish
-carried the new one).
+
+Export writes every ref unless `--ref` narrows it; the example exports main
+only. Publish first so the exported `refs/heads/main` is the just-published
+bed tip. The fresh bare target isolates Git output from any consumer checkout;
+the ancestry check and fast-forward update preserve its existing history.
+`--record-mappings` writes accepted metadata pairs; inspect conflict warnings,
+and retain the TSV/landing record for refused native representation twins.
 
 Same #14 rule: the report line is the success signal, and export must not be
 piped through exit-swallowing filters. The mapping TSV is the changeset↔SHA
@@ -282,26 +298,24 @@ is not bare (worktree at …)`); this sweep adds the remedy text
 into a fresh non-bare clone exits 1 with the refusal and leaves the worktree
 untouched (pack, refs, index and status all unchanged). So:
 
-- Destination is the bare mirror (§1.4): nothing to reset. Verify at the ref
-  level, through the mapping: the row whose first column is the just-published
-  bed changeset id must have the git SHA that `git -C <mirror> rev-parse main`
-  reports (§1.4). A 64-hex bed id and a 40-hex git SHA are different values and
-  never compare directly. `git status --porcelain` does not apply (git exits
-  128, "this operation must be run in a work tree").
-- Destination is a non-bare consumer checkout: the export is refused outright;
-  if an older binary let it through, `git -C <worktree> reset --hard main &&
-  git -C <worktree> clean -fd` immediately after, and check `git status
-  --porcelain` is empty before it pushes. Only there does a worktree exist to
-  check.
+- A bare Git consumer can fetch the exported main ref directly, without
+  forcing. It has no working tree to reset.
+- A non-bare consumer must fetch and fast-forward its checked-out main as in
+  §1.3. Direct export into it is refused. A conflicting dirty file makes the
+  fast-forward refuse; preserve that work and resolve the conflict rather than
+  resetting or cleaning it away.
+- In either case compare the TSV's Git SHA to the consumer's main ref (§1.4).
+  A 64-hex bed id and a 40-hex Git SHA are different identifiers.
 
 ### 1.4 Verify the mirror's ref
 
-The GitHub mirror is the bare repository `/home/user/code/gardenbed`
-(`origin = git@github.com:rot13maxi/gardenbed.git`). The historical failure was
-in a **non-bare** mirror: after `export` advanced its ref, its index still
-described the previous checkout, so the next `git push` would have carried
-deletions. A bare mirror has no index or worktree, so the correct verification
-is ref-level:
+The GitHub consumer is `/home/user/code/gardenbed`
+(`origin = git@github.com:rot13maxi/gardenbed.git`). It may be bare or have a
+working tree; check `rev-parse --is-bare-repository` rather than assuming.
+Direct export into a non-bare consumer is refused. The scratch-export and
+fast-forward procedure above updates its index/worktree coherently while
+preserving unrelated dirty files. Verify its main ref against the exported
+mapping in either layout:
 
 ```sh
 # main's bed changeset id as published in §1.2 (short id is enough: prefix match)
@@ -572,7 +586,7 @@ env -u GARDENBED_AUTHOR -u GARDENBED_FSYNC <cargo-gated command>
 |---|---|
 | Canonical bed server | `http://127.0.0.1:9418`, root `/home/user/gardenbed/arb` |
 | Bed repository name | `default` (v0.1 root layout: one repository at the root) |
-| Git mirror (GitHub downstream) | `/home/user/code/gardenbed` (bare; `origin` = `git@github.com:rot13maxi/gardenbed.git`) |
+| Git mirror (GitHub downstream) | `/home/user/code/gardenbed` (Git consumer; inspect bare/worktree layout; `origin` = `git@github.com:rot13maxi/gardenbed.git`) |
 | Chain checkout | `/home/user/bed-land` (stable path, outside `/tmp` — #18) |
 | Lane checkouts | `/home/user/bed-lanes/<lane>`, one per lane owner |
 | Deployed binaries | `~/.local/bin/{bed,gardenbed-server,gardenbed-daemon,gardenbed-web,gardenbed-mcp}` |

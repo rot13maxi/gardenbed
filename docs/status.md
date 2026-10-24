@@ -17,6 +17,7 @@ Implementation status and completion of verification targets are separate.
 | Offline commits (M15) | Local queue, crash recovery, explicit `bed sync`; `crates/bed/tests/offline.rs`. |
 | Local daemon (M16) | Shared cache isolated by upstream, repository, and persisted incarnation; authorized warm hits, replacement isolation, response-bound ABA-proofed write-through, and safe passthrough for older servers. Watchers, daemon-first connection and fallback; [daemon guide](daemon.md), [isolation tests](daemon-cache-isolation.md). |
 | Native export and import fidelity (M17/M18) | Native pack writer, sparse raw-commit capture, verbatim export of signed/extra-header/non-UTF-8 commit metadata; `crates/git/tests/export.rs` and `fidelity.rs`. Sparse raw-tree capture covers noncanonical modes, non-UTF-8 names and empty directories; matched throughput was measured on 2026-10-22 (limits below). |
+| Export mapping bookkeeping | Opt-in `export --record-mappings` persists accepted pairs transactionally; representation-twin conflicts preserve the existing binding. [Semantics and limits](export-mappings.md). |
 | Diff rendering (M19) | Recorded renames, exact-blob pairing, gitlink pointer hunks; `crates/bed/tests/render_patch.rs`. Similarity-based moved-and-edited pairing and combined merge diffs remain outside scope. |
 | Additional client features | Read-only snapshot FUSE mount; lane refs; stack rebase and already-applied twin recognition. See [CLI reference](cli.md). |
 | Authentication | Optional bearer tokens with per-repository read/write/admin roles; server/bed auth suites. Originally deferred in the plan, now implemented. |
@@ -45,9 +46,6 @@ not a fresh verification of the current checkout.
   window and a resumability kill window race counter polling; deterministic
   server-side synchronization is the recorded fix direction. See
   [DOGFOOD.md](DOGFOOD.md).
-- **Git/bed divergence bookkeeping:** runbook preflight checks are implemented;
-  making export persist Git mappings to remove manual tip bookkeeping remains
-  a structural follow-up (dogfood #26).
 - **Deferred scope:** regional cache tier, Windows, LFS, recursive submodules,
   history pruning, cross-version chunk deduplication, per-chunk blob streaming,
   combined merge diffs, similarity-based moved-and-edited diff rendering, and

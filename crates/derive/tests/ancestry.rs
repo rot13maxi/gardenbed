@@ -319,6 +319,12 @@ impl MetadataStore for FailingMetadata {
     fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
         self.inner.git_for_cs(cs)
     }
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, Id)],
+    ) -> Result<gardenbed_store::ExportMappingReport, StoreError> {
+        self.inner.record_export_mappings(pairs)
+    }
     fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
         self.inner.derived_put(kind, cs, bytes)
     }

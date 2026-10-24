@@ -1715,6 +1715,7 @@ fn legacy_exec_frontier_and_fresh_regular_import_coexist() {
         let exported = b._dir.path().join("legacy-upgrade-fresh-export.git");
         let opts = gardenbed_git::ExportOptions {
             refs: vec!["refs/heads/other".into()],
+            record_mappings: false,
         };
         let roundtrip = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
             .expect("the fresh branch exports SHA-exact");
@@ -1735,6 +1736,7 @@ fn legacy_exec_frontier_and_fresh_regular_import_coexist() {
         let exported = b._dir.path().join("legacy-upgrade-main-export.git");
         let opts = gardenbed_git::ExportOptions {
             refs: vec!["refs/heads/main".into()],
+            record_mappings: false,
         };
         let err = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
             .expect_err("the legacy main history must refuse loudly, not silently diverge");
@@ -1866,6 +1868,7 @@ fn fresh_regular_import_then_legacy_exec_frontier_coexist() {
         let exported = b._dir.path().join("fresh-then-legacy-export.git");
         let opts = gardenbed_git::ExportOptions {
             refs: vec!["refs/heads/other".into()],
+            record_mappings: false,
         };
         let roundtrip = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
             .expect("the fresh branch still exports SHA-exact");
@@ -1966,6 +1969,7 @@ fn single_batch_import_of_legacy_and_fresh_frontiers() {
         let exported = b._dir.path().join("single-batch-export.git");
         let opts = gardenbed_git::ExportOptions {
             refs: vec!["refs/heads/other".into()],
+            record_mappings: false,
         };
         let roundtrip = gardenbed_git::export_to_path(&exported, objects, metadata, &opts)
             .expect("the fresh branch exports SHA-exact");
@@ -2032,6 +2036,7 @@ fn single_batch_import_of_legacy_and_fresh_frontiers() {
         let exported2 = b._dir.path().join("single-batch-native-export.git");
         let opts = gardenbed_git::ExportOptions {
             refs: vec!["refs/heads/other".into()],
+            record_mappings: false,
         };
         let roundtrip2 = gardenbed_git::export_to_path(&exported2, objects, metadata, &opts)
             .expect("native child on the fresh branch exports");

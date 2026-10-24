@@ -244,6 +244,82 @@ impl MetadataStore for MemoryStore {
         )
     }
 
+    fn record_export_mappings(
+        &self,
+        pairs: &[(String, Id)],
+    ) -> Result<crate::traits::ExportMappingReport, StoreError> {
+        use crate::traits::{ExportMappingConflict, ExportMappingReport};
+        // Normalize before the write lock: malformed shas are caller
+        // bugs and must not land any pair.
+        let mut normalized = Vec::with_capacity(pairs.len());
+        for (sha, cs) in pairs {
+            normalized.push((normalize_git_sha(sha)?, *cs));
+        }
+        // One write-lock critical section = one atomic batch (the RwLock
+        // is this backend's transaction): classification completes before
+        // any insert, so conflicts never block accepted pairs, and a crash
+        // leaves the batch absent (pairs are idempotent; a re-run repairs).
+        self.write(|s| {
+            let mut report = ExportMappingReport::default();
+            let mut insert: Vec<bool> = Vec::with_capacity(normalized.len());
+            // In-batch view of already-accepted pairs: a later pair
+            // repeating an accepted sha or cs (a twin: same git bytes,
+            // different cs) classifies against it, never re-inserts.
+            let mut seen_sha: std::collections::HashMap<String, Id> =
+                std::collections::HashMap::new();
+            let mut seen_cs: std::collections::HashMap<Id, String> =
+                std::collections::HashMap::new();
+            for (sha, cs) in &normalized {
+                let by_sha = s
+                    .git_by_sha
+                    .get(sha)
+                    .copied()
+                    .or_else(|| seen_sha.get(sha).copied());
+                let by_cs = s
+                    .git_by_cs
+                    .get(cs)
+                    .cloned()
+                    .or_else(|| seen_cs.get(cs).cloned());
+                match (by_sha, by_cs) {
+                    (Some(existing_cs), Some(existing_sha))
+                        if existing_cs == *cs && existing_sha == *sha =>
+                    {
+                        report.unchanged += 1; // idempotent
+                        insert.push(false);
+                    }
+                    (None, None) => {
+                        // Fresh pair: neither side bound. The insert
+                        // happens in the second pass, after the whole
+                        // batch is classified.
+                        insert.push(true);
+                        seen_sha.insert(sha.clone(), *cs);
+                        seen_cs.insert(*cs, sha.clone());
+                    }
+                    (existing_cs, existing_sha) => {
+                        // Refused, never overwritten (twin semantics,
+                        // mirroring record_git_mapping's bijection).
+                        report.conflicts.push(ExportMappingConflict {
+                            git_sha: sha.clone(),
+                            cs: *cs,
+                            existing_cs_for_sha: existing_cs,
+                            existing_sha_for_cs: existing_sha,
+                        });
+                        insert.push(false);
+                    }
+                }
+            }
+            for (i, (sha, cs)) in normalized.iter().enumerate() {
+                if !insert[i] {
+                    continue;
+                }
+                s.git_by_sha.insert(sha.clone(), *cs);
+                s.git_by_cs.insert(*cs, sha.clone());
+                report.recorded += 1;
+            }
+            Ok(report)
+        })
+    }
+
     fn cs_for_git(&self, git_sha_hex: &str) -> Result<Option<Id>, StoreError> {
         let sha = normalize_git_sha(git_sha_hex)?;
         self.read(|s| s.git_by_sha.get(&sha).copied())

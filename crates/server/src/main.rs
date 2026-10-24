@@ -173,6 +173,15 @@ enum Command {
         /// commit, sorted by changeset id, to this file.
         #[arg(long)]
         mapping: Option<PathBuf>,
+        /// Persist the computed changeset↔git-SHA mapping rows into the
+        /// metadata store after a successful export (dogfood #26: removes
+        /// manual landing-tip bookkeeping). Never overwrites: a pair whose
+        /// sha or changeset is already bound differently (a native vs
+        /// re-imported twin) is refused with a warning, and the
+        /// import-written canonical mapping survives. Idempotent: pairs
+        /// already recorded are left as they are.
+        #[arg(long)]
+        record_mappings: bool,
     },
     /// Rename a repository under the server root.
     Move {
@@ -302,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             into,
             refs,
             mapping,
+            record_mappings,
         }) => {
             // Same pre-open refusal as import: no stores, no side effects.
             if storage.is_none() && root.is_none() && env_storage().is_none() {
@@ -314,7 +324,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let selection = resolve_storage(storage.as_deref(), root.as_deref());
             match selection {
                 StorageSelection::Root(root) => {
-                    if let Err(e) = run_export(&root, repo.as_deref(), &into, refs, mapping) {
+                    if let Err(e) = run_export(
+                        &root,
+                        repo.as_deref(),
+                        &into,
+                        refs,
+                        mapping,
+                        record_mappings,
+                    ) {
                         eprintln!("error: export failed: {e}");
                         std::process::exit(1);
                     }
@@ -328,7 +345,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         std::process::exit(2);
                     }
                     let selection = resolve_storage(storage.as_deref(), root.as_deref());
-                    if let Err(e) = run_export_scaled(selection, &into, refs, mapping) {
+                    if let Err(e) =
+                        run_export_scaled(selection, &into, refs, mapping, record_mappings)
+                    {
                         eprintln!("error: export failed: {e}");
                         std::process::exit(1);
                     }
@@ -408,13 +427,15 @@ fn open_repo(selection: &StorageSelection) -> Result<Repo, Box<dyn std::error::E
 /// One-shot git export from the named repository's local stores into the
 /// git repository at `into` (git_bridge's `git fast-import` writer).
 /// Prints the report; optionally writes the changeset→git-SHA mapping as
-/// TSV.
+/// TSV; optionally persists the mapping rows into the metadata store
+/// (`--record-mappings`, dogfood #26).
 fn run_export(
     root: &Path,
     repo: Option<&str>,
     into: &Path,
     refs: Vec<String>,
     mapping: Option<PathBuf>,
+    record_mappings: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use gardenbed_store::{FsObjectStore, SqliteMetadataStore};
 
@@ -429,27 +450,56 @@ fn run_export(
     let layout = gardenbed_server::resolve_layout(&dir);
     let objects = Arc::new(FsObjectStore::open(&layout.objects)?);
     let metadata = Arc::new(SqliteMetadataStore::open(&layout.metadata)?);
-    let opts = gardenbed_git::ExportOptions { refs };
+    let opts = gardenbed_git::ExportOptions {
+        refs,
+        record_mappings,
+    };
     let report = gardenbed_git::export_to_path(into, objects, metadata, &opts)?;
-    if let Some(path) = mapping {
-        use std::io::Write as _;
-        // Sorted by changeset id so the file is deterministic and diffable.
-        let mut rows: Vec<(String, &String)> = report
-            .commits
-            .iter()
-            .map(|(id, sha)| (id.to_hex(), sha))
-            .collect();
-        rows.sort();
-        let f = std::fs::File::create(&path)
-            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        let mut f = std::io::BufWriter::new(f);
-        for (cs, sha) in rows {
-            writeln!(f, "{cs}\t{sha}")?;
-        }
-        f.flush()?;
-    }
+    write_mapping_tsv(&report, mapping.as_deref())?;
+    report_conflicts(&report);
     println!("{report}");
     Ok(())
+}
+
+/// Writes the TSV side-file (`--mapping`), when requested: one
+/// `<64-hex changeset id>\t<git sha>` line per exported commit, sorted by
+/// changeset id (deterministic and diffable).
+fn write_mapping_tsv(
+    report: &gardenbed_git::ExportReport,
+    path: Option<&Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    use std::io::Write as _;
+    let mut rows: Vec<(String, &String)> = report
+        .commits
+        .iter()
+        .map(|(id, sha)| (id.to_hex(), sha))
+        .collect();
+    rows.sort();
+    let f = std::fs::File::create(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    let mut f = std::io::BufWriter::new(f);
+    for (cs, sha) in rows {
+        writeln!(f, "{cs}\t{sha}")?;
+    }
+    f.flush()?;
+    Ok(())
+}
+
+/// Prints every mapping conflict on stderr with a `warning:` prefix: the
+/// report line alone only carries the count, while each refusal names the
+/// sha, the changeset, and the surviving canonical row — the operator
+/// needs the identities to decide whether a re-union is required
+/// (dogfood #26/#23 class).
+fn report_conflicts(report: &gardenbed_git::ExportReport) {
+    let Some(mappings) = &report.mappings else {
+        return;
+    };
+    for conflict in &mappings.conflicts {
+        eprintln!("warning: export mapping conflict: {conflict}");
+    }
 }
 
 /// One-shot git import into the stores behind `selection`.
@@ -646,28 +696,18 @@ fn run_export_scaled(
     into: &Path,
     refs: Vec<String>,
     mapping: Option<PathBuf>,
+    record_mappings: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = open_repo(&selection)?;
     let objects = repo.objects_handle();
     let metadata = repo.metadata_handle();
-    let opts = gardenbed_git::ExportOptions { refs };
+    let opts = gardenbed_git::ExportOptions {
+        refs,
+        record_mappings,
+    };
     let report = gardenbed_git::export_to_path(into, objects, metadata, &opts)?;
-    if let Some(path) = mapping {
-        use std::io::Write as _;
-        let mut rows: Vec<(String, &String)> = report
-            .commits
-            .iter()
-            .map(|(id, sha)| (id.to_hex(), sha))
-            .collect();
-        rows.sort();
-        let f = std::fs::File::create(&path)
-            .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        let mut f = std::io::BufWriter::new(f);
-        for (cs, sha) in rows {
-            writeln!(f, "{cs}\t{sha}")?;
-        }
-        f.flush()?;
-    }
+    write_mapping_tsv(&report, mapping.as_deref())?;
+    report_conflicts(&report);
     println!("{report}");
     Ok(())
 }

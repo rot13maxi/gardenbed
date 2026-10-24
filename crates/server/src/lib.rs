@@ -2116,7 +2116,7 @@ fn fixture_changeset(repo: &Repo, parents: Vec<Id>, message: &str) -> Id {
 #[cfg(test)]
 mod revspec_tests {
     use super::*;
-    use gardenbed_store::MemoryStore;
+    use gardenbed_store::{ExportMappingReport, MemoryStore};
 
     fn id(tag: u8) -> Id {
         Id::from_bytes([tag; 32])
@@ -2156,6 +2156,12 @@ mod revspec_tests {
         }
         fn git_for_cs(&self, cs: Id) -> Result<Option<String>, StoreError> {
             self.inner.git_for_cs(cs)
+        }
+        fn record_export_mappings(
+            &self,
+            pairs: &[(String, Id)],
+        ) -> Result<ExportMappingReport, StoreError> {
+            self.inner.record_export_mappings(pairs)
         }
         fn derived_put(&self, kind: &str, cs: Id, bytes: &[u8]) -> Result<(), StoreError> {
             self.inner.derived_put(kind, cs, bytes)
