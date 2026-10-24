@@ -152,8 +152,10 @@ pub struct ProxyService {
 /// How one repository's objects may be served from the cache.
 enum Scope {
     /// Membership is proven for this (origin, repo, incarnation): serve
-    /// from the scope's store, write fetched objects through.
-    Cached(Arc<FsObjectStore>),
+    /// from the scope's store, write fetched objects through — and the
+    /// incarnation is the binding target: a fetched response may only be
+    /// written through when its serving-repository proof matches it.
+    Cached(Arc<FsObjectStore>, [u8; 16]),
     /// The upstream predates `RepoInfo` (UNIMPLEMENTED): no membership
     /// proof can exist, so the cache is bypassed entirely — every fetch
     /// reads the origin, and no bytes are written through under an
@@ -264,7 +266,7 @@ impl ProxyService {
         let key = self.scope_key(repo, incarnation);
         let mut scopes = self.scopes.lock().expect("scope map");
         if let Some(store) = scopes.get(&key) {
-            return Ok(Scope::Cached(store.clone()));
+            return Ok(Scope::Cached(store.clone(), incarnation));
         }
         // Bound the map: drop a arbitrary entry once over the cap.
         // Eviction is safe — a later request re-opens the same directory
@@ -283,7 +285,7 @@ impl ProxyService {
             ))
         })?);
         scopes.insert(key, store.clone());
-        Ok(Scope::Cached(store))
+        Ok(Scope::Cached(store, incarnation))
     }
 
     /// Parses a 32-byte content address off the wire.
@@ -349,7 +351,7 @@ impl ProxyService {
         auth: AuthValue,
     ) -> Result<pb::TreeResp, Status> {
         let scope = self.scope(repo, &auth).await?;
-        let Scope::Cached(store) = scope else {
+        let Scope::Cached(store, incarnation) = scope else {
             // Passthrough (old upstream): the origin alone answers.
             let client = self.upstream.get().await?.with_auth_value(auth);
             let tree = match client.get_tree(repo, id).await {
@@ -414,8 +416,8 @@ impl ProxyService {
                 .map_err(|_| Status::internal("cached tree cannot be re-encoded"));
         }
         let client = self.upstream.get().await?.with_auth_value(auth);
-        let tree = match client.get_tree(repo, id).await {
-            Ok(tree) => tree,
+        let (tree, proof) = match client.get_tree_verified(repo, id).await {
+            Ok(pair) => pair,
             Err(status) => {
                 if transport_dead(&status) {
                     self.upstream.reset().await;
@@ -426,9 +428,15 @@ impl ProxyService {
         let bytes = tree
             .canonical_bytes()
             .map_err(|_| Status::internal("upstream tree cannot be canonically encoded"))?;
-        store
-            .put_tree(id, &bytes)
-            .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
+        // The ABA guard (see `blob_stream`): write through only when
+        // the repository that served these entries proves it is the
+        // scope's incarnation. An unproven fetch still serves — never
+        // cached under a scope it may not belong to.
+        if proof == Some(incarnation) {
+            store
+                .put_tree(id, &bytes)
+                .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
+        }
         pb::TreeResp::try_from(&tree)
             .map_err(|_| Status::internal("upstream tree cannot be re-encoded"))
     }
@@ -448,7 +456,7 @@ impl ProxyService {
         auth: AuthValue,
     ) -> Result<BoxStream<pb::BlobChunk>, Status> {
         let scope = self.scope(&repo, &auth).await?;
-        let Scope::Cached(store) = scope else {
+        let Scope::Cached(store, incarnation) = scope else {
             // Passthrough (old upstream): the origin alone answers, and
             // nothing is written through.
             let content = self.fetch_blob_from_origin(&repo, id, auth).await?;
@@ -464,10 +472,22 @@ impl ProxyService {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(chunked(content));
         }
-        let content = self.fetch_blob_from_origin(&repo, id, auth).await?;
-        store
-            .put_blob(&content)
-            .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
+        let (content, proof) = self
+            .fetch_blob_verified_from_origin(&repo, id, auth)
+            .await?;
+        // The ABA guard: the bytes may only enter the scope's cache
+        // when the repository that SERVED them proves it is the same
+        // incarnation whose scope this is. A same-URL proxy or load
+        // balancer can route this fetch to a different backend than
+        // the identity probe that resolved the scope; a mismatched (or
+        // absent, from a mixed-version pool) proof means the fetch is
+        // unproven — serve it, but write nothing through. Fail closed:
+        // the next caller re-fetches from whichever backend answers.
+        if proof == Some(incarnation) {
+            store
+                .put_blob(&content)
+                .map_err(|e| Status::internal(format!("shared cache write failed: {e}")))?;
+        }
         Ok(chunked(content))
     }
 
@@ -479,6 +499,24 @@ impl ProxyService {
         id: Id,
         auth: AuthValue,
     ) -> Result<Vec<u8>, Status> {
+        Ok(self
+            .fetch_blob_verified_from_origin(repo, id, auth)
+            .await?
+            .0)
+    }
+
+    /// [`fetch_blob_from_origin`] plus the serving-repository
+    /// incarnation proof carried on the blob chunks: every chunk a
+    /// proof-bearing server sends repeats the same 16 bytes, so the
+    /// first chunk decides — `None` when the stream carries no proof
+    /// at all (empty stream aside, which the content-address check
+    /// rejects anyway).
+    async fn fetch_blob_verified_from_origin(
+        &self,
+        repo: &str,
+        id: Id,
+        auth: AuthValue,
+    ) -> Result<(Vec<u8>, Option<[u8; 16]>), Status> {
         let client = self.upstream.get().await?.with_auth_value(auth);
         let mut stream = match client.get_blob(repo, id).await {
             Ok(stream) => stream,
@@ -490,6 +528,7 @@ impl ProxyService {
             }
         };
         let mut content = Vec::new();
+        let mut proof: Option<Option<[u8; 16]>> = None;
         use tokio_stream::StreamExt as _;
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -501,6 +540,10 @@ impl ProxyService {
                     return Err(status);
                 }
             };
+            let chunk_proof = wire_incarnation(&chunk.incarnation, "BlobChunk.incarnation");
+            if proof.is_none() {
+                proof = Some(chunk_proof?);
+            }
             content.extend_from_slice(&chunk.data);
         }
         if gardenbed_model::blob_id(&content) != id {
@@ -509,8 +552,21 @@ impl ProxyService {
                 id.to_hex()
             )));
         }
-        Ok(content)
+        Ok((content, proof.flatten()))
     }
+}
+
+/// Parses an incarnation proof off the wire: absent (a server
+/// predating the field) is `None`; anything else must be exactly
+/// 16 bytes.
+fn wire_incarnation(bytes: &[u8], what: &'static str) -> Result<Option<[u8; 16]>, Status> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    bytes
+        .try_into()
+        .map(Some)
+        .map_err(|_| Status::data_loss(format!("malformed response from server: {what}")))
 }
 
 /// The blob chunk size the daemon re-emits, matching the server's
@@ -523,9 +579,14 @@ const BLOB_CHUNK_LEN: usize = 1 << 16;
 /// pieces — the same shape the server streams.
 fn chunked(content: Vec<u8>) -> BoxStream<pb::BlobChunk> {
     let chunks: Vec<Vec<u8>> = content.chunks(BLOB_CHUNK_LEN).map(<[u8]>::to_vec).collect();
-    Box::pin(tokio_stream::iter(
-        chunks.into_iter().map(|data| Ok(pb::BlobChunk { data })),
-    ))
+    Box::pin(tokio_stream::iter(chunks.into_iter().map(|data| {
+        Ok(pb::BlobChunk {
+            data,
+            // Downstream consumers of the daemon have no scope duty —
+            // the daemon is the caching tier, not a proof bearer.
+            incarnation: Vec::new(),
+        })
+    })))
 }
 
 /// True when a tonic status means the daemon's cached upstream channel is

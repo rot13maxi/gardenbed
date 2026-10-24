@@ -191,6 +191,30 @@ impl GardenbedClient {
         wire_to_model(model::Tree::try_from(resp), "TreeResp")
     }
 
+    /// Fetch a tree's entries by id, together with the serving
+    /// repository's incarnation proof (when the server stamps one —
+    /// `None` from servers predating the field). The daemon binds
+    /// cache writes to the incarnation it resolved for its scope: a
+    /// response served by a different repository incarnation (a
+    /// same-URL load balancer or forwarding proxy splitting an
+    /// identity probe from the object fetch) carries a different
+    /// proof and must not be written through.
+    pub async fn get_tree_verified(
+        &self,
+        repo: &str,
+        id: model::Id,
+    ) -> Result<(model::Tree, Option<[u8; 16]>), Status> {
+        let req = pb::GetTreeReq {
+            repo: repo.to_owned(),
+            id: id_to_bytes(id),
+        };
+        let mut inner = self.inner.clone();
+        let resp = inner.get_tree(self.request(req)).await?.into_inner();
+        let proof = wire_incarnation(&resp.incarnation, "TreeResp.incarnation")?;
+        let tree = wire_to_model(model::Tree::try_from(resp), "TreeResp")?;
+        Ok((tree, proof))
+    }
+
     /// Stream one blob's raw (uncompressed) content, chunk by chunk.
     pub async fn get_blob(
         &self,
@@ -537,6 +561,19 @@ impl GardenbedClient {
 /// status (the server sent something that is not a content address).
 fn wire_id(bytes: &[u8], what: &'static str) -> Result<model::Id, Status> {
     id_from_bytes(bytes).map_err(|_| malformed_response(what))
+}
+
+/// Converts an incarnation proof off the wire: empty (a server
+/// predating the field) is `None`; anything else must be exactly
+/// 16 bytes.
+fn wire_incarnation(bytes: &[u8], what: &'static str) -> Result<Option<[u8; 16]>, Status> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    bytes
+        .try_into()
+        .map(Some)
+        .map_err(|_| malformed_response(what))
 }
 
 /// Maps a wire→model conversion failure to a data-loss status: a conforming

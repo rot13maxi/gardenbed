@@ -119,11 +119,23 @@ message TreeResp {
   // Sender's order is preserved on the wire; the canonical form (which
   // defines the tree's id) is strictly ascending by name bytes.
   repeated TreeEntry entries = 1;
+  // The serving repository's incarnation, stamped by the server that
+  // actually answered. A cache (the daemon) uses it to prove the bytes
+  // belong to the repository incarnation whose scope it resolved —
+  // binding the response to the handle that served it, not to whichever
+  // peer a load balancer routed an identity probe to. Absent on
+  // responses from servers predating the field.
+  bytes incarnation = 2;
 }
 
 // One chunk of a streamed blob body (GetBlob).
 message BlobChunk {
   bytes data = 1;
+  // The serving repository's incarnation, stamped on every chunk by the
+  // server that actually answered. Same proof duty as TreeResp's field;
+  // carried per chunk because GetBlob is server-streaming (no response
+  // headers message). Servers predating the field omit it.
+  bytes incarnation = 2;
 }
 
 // One frame of a PutBlob upload. gRPC client-streaming has no unary request

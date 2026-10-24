@@ -360,7 +360,14 @@ impl TryFrom<&model::Tree> for pb::TreeResp {
             .iter()
             .map(pb::TreeEntry::try_from)
             .collect::<Result<Vec<_>, ConversionError>>()?;
-        Ok(pb::TreeResp { entries })
+        Ok(pb::TreeResp {
+            entries,
+            // The proof is stamped by the serving server, not derived
+            // from the model: an initializer from a model tree has no
+            // incarnation to carry (the daemon re-emits cached trees
+            // without one — its own cache is already scope-proven).
+            incarnation: Vec::new(),
+        })
     }
 }
 

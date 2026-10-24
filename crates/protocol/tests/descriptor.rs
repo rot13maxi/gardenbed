@@ -45,6 +45,7 @@ const RPCS: &[(&str, bool, bool)] = &[
     ("Publish", false, false),
     ("Merge", false, false),
     ("GetStats", false, false),
+    ("RepoInfo", false, false),
 ];
 
 fn fds() -> &'static FileDescriptorSet {
@@ -207,6 +208,7 @@ fn rpc_input_output_types_match_the_spec() {
         ("Publish", "PublishReq", "PublishResp"),
         ("Merge", "MergeReq", "MergeResp"),
         ("GetStats", "GetStatsReq", "StatsResp"),
+        ("RepoInfo", "RepoInfoReq", "RepoInfoResp"),
     ];
     for m in service().method.iter() {
         let name = m.name.as_deref().unwrap_or_default();

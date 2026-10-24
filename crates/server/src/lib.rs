@@ -1430,7 +1430,17 @@ impl Gardenbed for GardenbedService {
         };
         let resp = pb::TreeResp::try_from(&tree)
             .map_err(|e| Status::internal(format!("stored tree {id} has no wire form: {e}")))?;
-        Ok(Response::new(resp))
+        // Stamp the serving repository's incarnation: the proof a
+        // caching downstream (the daemon) uses to bind these bytes to
+        // this handle's identity, not to whichever peer routed an
+        // identity probe.
+        let incarnation = repo
+            .incarnation()
+            .map_err(|e| Status::internal(format!("cannot read repo incarnation: {e}")))?;
+        Ok(Response::new(pb::TreeResp {
+            incarnation: incarnation.to_vec(),
+            ..resp
+        }))
     }
 
     async fn get_blob(
@@ -1447,8 +1457,17 @@ impl Gardenbed for GardenbedService {
         };
         // Own the chunks up front: the stream must be 'static and the blob
         // is already fully in memory anyway.
+        let incarnation = repo
+            .incarnation()
+            .map_err(|e| Status::internal(format!("cannot read repo incarnation: {e}")))?
+            .to_vec();
         let chunks: Vec<Vec<u8>> = content.chunks(BLOB_CHUNK_LEN).map(<[u8]>::to_vec).collect();
-        let items = chunks.into_iter().map(|data| Ok(pb::BlobChunk { data }));
+        let items = chunks.into_iter().map(move |data| {
+            Ok(pb::BlobChunk {
+                data,
+                incarnation: incarnation.clone(),
+            })
+        });
         Ok(Response::new(Box::pin(iter(items))))
     }
 

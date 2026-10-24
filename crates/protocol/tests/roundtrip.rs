@@ -706,11 +706,13 @@ fn tz_offsets_zigzag_on_the_wire() {
 fn pb_and_proto_are_the_same_namespace() {
     let msg = pb2::BlobChunk {
         data: b"xyz".to_vec(),
+        ..Default::default()
     };
     assert_eq!(
         msg,
         pb::BlobChunk {
-            data: b"xyz".to_vec()
+            data: b"xyz".to_vec(),
+            ..Default::default()
         }
     );
     assert_eq!(
