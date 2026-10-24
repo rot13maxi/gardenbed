@@ -8,6 +8,7 @@ license.workspace = true
 gardenbed-model.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+sha1 = "0.10"
 # Portable mtime refresh (utimensat on Unix, SetFileTime on Windows) and
 # cross-platform file identity — the rustix fs feature is Unix-only.
 gardenbed-platform = { path = "../platform" }
