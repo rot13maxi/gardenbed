@@ -431,3 +431,435 @@ async fn daemon_aba_same_url_content_poisoning_is_denied() {
     server_b.shutdown().await;
     proxy_task.abort();
 }
+
+/// A proof-mangling proxy: forwards a real server's `GetBlob` stream
+/// but rewrites the chunks' incarnation fields per `mode`. Used to
+/// pin the daemon's multi-chunk proof validation:
+/// - `AbsentEverywhere`: strips proofs from all chunks (old server) —
+///   unproven, never cached.
+/// - `MixedAbsentLater`: proof on the first chunk, absent afterwards —
+///   inconsistent, the whole stream unproven, never cached.
+/// - `MixedDifferentLater`: A's proof first, a different 16 bytes
+///   later — inconsistent, never cached.
+/// - `MalformedLater`: a valid proof first, a 15-byte field on a later
+///   chunk — DataLoss error, the fetch fails.
+/// - `Valid`: proofs repeated identically — proven, cached (warm hit).
+enum MangleMode {
+    AbsentEverywhere,
+    MixedAbsentLater,
+    MixedDifferentLater,
+    MalformedLater,
+    Valid,
+}
+
+struct ManglingProxy {
+    backend: RawClient<tonic::transport::Channel>,
+    mode: MangleMode,
+}
+
+#[tonic::async_trait]
+impl Gardenbed for ManglingProxy {
+    async fn repo_info(
+        &self,
+        request: Request<pb::RepoInfoReq>,
+    ) -> Result<Response<pb::RepoInfoResp>, Status> {
+        let mut backend = self.backend.clone();
+        Ok(backend.repo_info(forward_auth(&request)).await?)
+    }
+
+    async fn get_tree(
+        &self,
+        request: Request<pb::GetTreeReq>,
+    ) -> Result<Response<pb::TreeResp>, Status> {
+        let mut backend = self.backend.clone();
+        Ok(backend.get_tree(forward_auth(&request)).await?)
+    }
+
+    type GetBlobStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::BlobChunk, Status>> + Send>>;
+
+    async fn get_blob(
+        &self,
+        request: Request<pb::GetBlobReq>,
+    ) -> Result<Response<Self::GetBlobStream>, Status> {
+        let mut backend = self.backend.clone();
+        let mut stream = backend
+            .get_blob(forward_auth(&request))
+            .await?
+            .into_inner();
+        let mode = match self.mode {
+            MangleMode::AbsentEverywhere => 0,
+            MangleMode::MixedAbsentLater => 1,
+            MangleMode::MixedDifferentLater => 2,
+            MangleMode::MalformedLater => 3,
+            MangleMode::Valid => 4,
+        };
+        let items = {
+            use tokio_stream::StreamExt as _;
+            let mut chunks = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                chunks.push(chunk?);
+            }
+            let items: Vec<Result<pb::BlobChunk, Status>> = chunks
+                .into_iter()
+                .enumerate()
+                .map(|(i, mut chunk)| {
+                    let first = i == 0;
+                    chunk.incarnation = match (mode, first) {
+                        (0, _) => Vec::new(),
+                        (1, true) => chunk.incarnation.clone(),
+                        (1, false) => Vec::new(),
+                        (2, true) => chunk.incarnation.clone(),
+                        (2, false) => vec![0xABu8; 16],
+                        (3, true) => chunk.incarnation.clone(),
+                        (3, false) => vec![0xCDu8; 15],
+                        _ => chunk.incarnation.clone(),
+                    };
+                    Ok(chunk)
+                })
+                .collect();
+            tokio_stream::iter(items)
+        };
+        Ok(Response::new(Box::pin(items)))
+    }
+
+    type ListRefsStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::RefEntry, Status>> + Send>,
+    >;
+
+    async fn list_refs(
+        &self,
+        request: Request<pb::ListRefsReq>,
+    ) -> Result<Response<Self::ListRefsStream>, Status> {
+        let mut backend = self.backend.clone();
+        let stream = backend
+            .list_refs(forward_auth(&request))
+            .await?
+            .into_inner();
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn root_tree(
+        &self,
+        _request: Request<pb::GetChangesetReq>,
+    ) -> Result<Response<pb::RootTreeResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn get_changeset(
+        &self,
+        _request: Request<pb::GetChangesetReq>,
+    ) -> Result<Response<pb::ChangesetMsg>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn put_blob(
+        &self,
+        _request: Request<tonic::Streaming<pb::PutBlobChunk>>,
+    ) -> Result<Response<pb::PutBlobResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn create_changeset(
+        &self,
+        _request: Request<pb::CreateChangesetReq>,
+    ) -> Result<Response<pb::CreateChangesetResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn merge_base(
+        &self,
+        _request: Request<pb::MergeBaseReq>,
+    ) -> Result<Response<pb::MergeBaseResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn is_ancestor(
+        &self,
+        _request: Request<pb::IsAncestorReq>,
+    ) -> Result<Response<pb::IsAncestorResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    type DiffStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::ChangeMsg, Status>> + Send>,
+    >;
+
+    async fn diff(
+        &self,
+        _request: Request<pb::DiffReq>,
+    ) -> Result<Response<Self::DiffStream>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    type LogStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::ChangesetSummary, Status>> + Send>,
+    >;
+
+    async fn log(
+        &self,
+        _request: Request<pb::LogReq>,
+    ) -> Result<Response<Self::LogStream>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    type BlameStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::BlameRange, Status>> + Send>,
+    >;
+
+    async fn blame(
+        &self,
+        _request: Request<pb::BlameReq>,
+    ) -> Result<Response<Self::BlameStream>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn get_ref(
+        &self,
+        _request: Request<pb::GetRefReq>,
+    ) -> Result<Response<pb::GetRefResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn cas_ref(
+        &self,
+        _request: Request<pb::CasRefReq>,
+    ) -> Result<Response<pb::CasResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn rebase(
+        &self,
+        _request: Request<pb::RebaseReq>,
+    ) -> Result<Response<pb::RebaseResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn publish(
+        &self,
+        _request: Request<pb::PublishReq>,
+    ) -> Result<Response<pb::PublishResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn merge(
+        &self,
+        _request: Request<pb::MergeReq>,
+    ) -> Result<Response<pb::MergeResp>, Status> {
+        Err(Status::unimplemented("not routed by this proxy"))
+    }
+
+    async fn get_stats(
+        &self,
+        request: Request<pb::GetStatsReq>,
+    ) -> Result<Response<pb::StatsResp>, Status> {
+        let mut backend = self.backend.clone();
+        Ok(backend.get_stats(forward_auth(&request)).await?)
+    }
+}
+
+/// Spawns the mangling proxy on an ephemeral port; returns its URL
+/// and the join handle.
+async fn spawn_mangling_proxy(
+    backend_url: String,
+    mode: MangleMode,
+) -> (String, tokio::task::JoinHandle<()>) {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<String>();
+    let task = tokio::spawn(async move {
+        let proxy = ManglingProxy {
+            backend: RawClient::connect(backend_url).await.expect("dial backend"),
+            mode,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let _ = ready_tx.send(format!("http://{addr}"));
+        TonicServer::builder()
+            .add_service(GardenbedServer::new(proxy))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .expect("serve");
+    });
+    (ready_rx.await.expect("proxy url"), task)
+}
+
+/// The multi-chunk proof validation contract: only a stream whose
+/// every chunk repeats the SAME proof authorizes a cache write. A
+/// multi-chunk blob (well over the server's 64 KiB chunk size) is
+/// fetched through each mangling mode; the malformed mode fails
+/// DataLoss, the absent/mixed modes serve but leave the cache cold
+/// (a second fetch re-fetches from the origin), and the valid mode
+/// warms (a second fetch is a cache hit: zero origin object fetch).
+#[tokio::test]
+async fn daemon_blob_proof_validation_covers_every_chunk() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("server");
+    fs::create_dir_all(&root).expect("server dir");
+
+    // One history with a multi-chunk blob: the generator's big-blob
+    // knob emits files of exactly `big_blob_bytes`, well over the
+    // server's 64 KiB chunk size. Any blob of the history works — the
+    // daemon fetches by id — so pick one that spans several chunks.
+    let history = generate(
+        60,
+        &GenOptions {
+            big_blob_bytes: Some(4 * 65536),
+            ..GenOptions::default()
+        },
+    );
+    common::ingest(&history, &root.join("alpha"));
+    let (blob, content) = history
+        .blob_contents
+        .iter()
+        .find(|(_, content)| content.len() > 3 * 65536)
+        .map(|(id, content)| (*id, content.clone()))
+        .expect("the big-blob knob produced a multi-chunk blob");
+
+    let mut server = Server::spawn(&root).await;
+    let server_url = server.http();
+
+    // Ground truth: the real server's stream carries proofs on every
+    // chunk (the contract the mangling modes then break).
+    {
+        let direct = GardenbedClient::connect(&server_url).await.expect("direct client");
+        let mut stream = direct.get_blob("alpha", blob).await.expect("direct get_blob");
+        let mut chunks = 0;
+        let mut proofs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.expect("direct chunk");
+            chunks += 1;
+            assert_eq!(
+                chunk.incarnation.len(),
+                16,
+                "the real server stamps a 16-byte proof on every chunk"
+            );
+            proofs.insert(chunk.incarnation);
+        }
+        assert!(chunks > 1, "the blob streams as multiple chunks");
+        assert_eq!(proofs.len(), 1, "all chunks repeat the same proof");
+    }
+
+    // The daemon's cache-hit counter rides its GetStats under
+    // "daemon.cache_hits" — read it through the same client.
+
+
+    // Absent everywhere (old-server shape): serves, cache stays cold.
+    {
+        let (proxy_url, _task) =
+            spawn_mangling_proxy(server_url.clone(), MangleMode::AbsentEverywhere).await;
+        let daemon_root = dir.path().join("d-absent");
+        let mut daemon = Daemon::spawn(&daemon_root, &proxy_url).await;
+        let client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+            .await
+            .expect("client");
+        for _round in 0..2 {
+            let mut stream = client.get_blob("alpha", blob).await.expect("serves");
+            let mut served = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                served.extend_from_slice(&chunk.expect("chunk").data);
+            }
+            assert_eq!(served, content, "both rounds serve real bytes");
+        }
+        assert_eq!(
+            *client.get_stats("alpha").await.unwrap().get("daemon.cache_hits").unwrap(),
+            0,
+            "absent proofs never warm the cache"
+        );
+        daemon.kill().await;
+    }
+
+    // Mixed: proof on the first chunk only — inconsistent, never cached.
+    {
+        let (proxy_url, _task) =
+            spawn_mangling_proxy(server_url.clone(), MangleMode::MixedAbsentLater).await;
+        let daemon_root = dir.path().join("d-mixed-absent");
+        let mut daemon = Daemon::spawn(&daemon_root, &proxy_url).await;
+        let client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+            .await
+            .expect("client");
+        for _round in 0..2 {
+            let mut stream = client.get_blob("alpha", blob).await.expect("serves");
+            while let Some(chunk) = stream.next().await {
+                let _ = chunk.expect("chunk");
+            }
+        }
+        assert_eq!(
+            *client.get_stats("alpha").await.unwrap().get("daemon.cache_hits").unwrap(),
+            0,
+            "an earlier matching chunk never authorizes a mixed stream"
+        );
+        daemon.kill().await;
+    }
+
+    // Mixed: differing proof on later chunks — inconsistent, never cached.
+    {
+        let (proxy_url, _task) =
+            spawn_mangling_proxy(server_url.clone(), MangleMode::MixedDifferentLater).await;
+        let daemon_root = dir.path().join("d-mixed-diff");
+        let mut daemon = Daemon::spawn(&daemon_root, &proxy_url).await;
+        let client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+            .await
+            .expect("client");
+        for _round in 0..2 {
+            let mut stream = client.get_blob("alpha", blob).await.expect("serves");
+            while let Some(chunk) = stream.next().await {
+                let _ = chunk.expect("chunk");
+            }
+        }
+        assert_eq!(
+            *client.get_stats("alpha").await.unwrap().get("daemon.cache_hits").unwrap(),
+            0,
+            "differing later proofs make the whole stream unproven"
+        );
+        daemon.kill().await;
+    }
+
+    // Malformed proof length on a later chunk: the fetch fails
+    // DataLoss (never partially cached, never served).
+    {
+        let (proxy_url, _task) =
+            spawn_mangling_proxy(server_url.clone(), MangleMode::MalformedLater).await;
+        let daemon_root = dir.path().join("d-malformed");
+        let mut daemon = Daemon::spawn(&daemon_root, &proxy_url).await;
+        let client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+            .await
+            .expect("client");
+        let err = client
+            .get_blob("alpha", blob)
+            .await
+            .expect_err("a malformed proof fails the fetch");
+        assert_eq!(err.code(), tonic::Code::DataLoss, "{err}");
+        daemon.kill().await;
+    }
+
+    // Valid: identical proofs on every chunk — proven, warms the
+    // cache (second fetch is a cache hit, zero origin object fetch).
+    {
+        let (proxy_url, _task) = spawn_mangling_proxy(server_url.clone(), MangleMode::Valid).await;
+        let daemon_root = dir.path().join("d-valid");
+        let mut daemon = Daemon::spawn(&daemon_root, &proxy_url).await;
+        let client = GardenbedClient::connect(&format!("unix://{}", daemon.socket.display()))
+            .await
+            .expect("client");
+        let mut stream = client.get_blob("alpha", blob).await.expect("serves");
+        while let Some(chunk) = stream.next().await {
+            let _ = chunk.expect("chunk");
+        }
+        let mut stream = client.get_blob("alpha", blob).await.expect("serves");
+        while let Some(chunk) = stream.next().await {
+            let _ = chunk.expect("chunk");
+        }
+        assert_eq!(
+            *client
+                .get_stats("alpha")
+                .await
+                .unwrap()
+                .get("daemon.cache_hits")
+                .unwrap(),
+            1,
+            "consistent proofs warm the cache: the second fetch is a hit"
+        );
+        daemon.kill().await;
+    }
+
+    server.shutdown().await;
+}

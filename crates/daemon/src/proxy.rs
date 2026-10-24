@@ -506,11 +506,15 @@ impl ProxyService {
     }
 
     /// [`fetch_blob_from_origin`] plus the serving-repository
-    /// incarnation proof carried on the blob chunks: every chunk a
-    /// proof-bearing server sends repeats the same 16 bytes, so the
-    /// first chunk decides — `None` when the stream carries no proof
-    /// at all (empty stream aside, which the content-address check
-    /// rejects anyway).
+    /// incarnation proof carried on the blob chunks. Every chunk is
+    /// validated: the stream proves the fetch only when some chunk
+    /// carried a proof and all observed proofs agree (a proof-bearing
+    /// server repeats the same 16 bytes on every chunk). Malformed
+    /// lengths fail DataLoss; absent-then-present, present-then-absent,
+    /// or differing proofs mark the WHOLE stream unproven — an earlier
+    /// matching chunk never authorizes a cache write for bytes a later
+    /// chunk may disown. An empty stream stays unproven (and fails the
+    /// content-address check below).
     async fn fetch_blob_verified_from_origin(
         &self,
         repo: &str,
@@ -528,7 +532,21 @@ impl ProxyService {
             }
         };
         let mut content = Vec::new();
-        let mut proof: Option<Option<[u8; 16]>> = None;
+        // The proof state machine. Every chunk is validated; the
+        // stream is proven only when SOME chunk carried a proof and
+        // every proof observed is the same 16 bytes:
+        // - `None` so far, chunk without proof → still unproven (old
+        //   server, or a mixed-version pool).
+        // - `None` so far, chunk with proof → adopt it.
+        // - proof observed, chunk repeating it → stays proven.
+        // - proof observed, chunk differing or absent → INCONSISTENT:
+        //   the stream can no longer prove which repository served
+        //   any of it; the whole fetch is unproven (never a partial
+        //   match), and a malformed proof length is a DataLoss error.
+        // An empty stream stays unproven (the content-address check
+        // below rejects it anyway).
+        let mut proof: Option<[u8; 16]> = None;
+        let mut inconsistent = false;
         use tokio_stream::StreamExt as _;
         while let Some(chunk) = stream.next().await {
             let chunk = match chunk {
@@ -540,9 +558,14 @@ impl ProxyService {
                     return Err(status);
                 }
             };
-            let chunk_proof = wire_incarnation(&chunk.incarnation, "BlobChunk.incarnation");
-            if proof.is_none() {
-                proof = Some(chunk_proof?);
+            match wire_incarnation(&chunk.incarnation, "BlobChunk.incarnation")? {
+                Some(chunk_proof) => match proof {
+                    None if !inconsistent => proof = Some(chunk_proof),
+                    Some(existing) if existing == chunk_proof => {}
+                    _ => inconsistent = true,
+                },
+                None if proof.is_none() => {}
+                None => inconsistent = true,
             }
             content.extend_from_slice(&chunk.data);
         }
@@ -552,7 +575,10 @@ impl ProxyService {
                 id.to_hex()
             )));
         }
-        Ok((content, proof.flatten()))
+        if inconsistent {
+            proof = None;
+        }
+        Ok((content, proof))
     }
 }
 
