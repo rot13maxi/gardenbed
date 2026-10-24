@@ -69,6 +69,16 @@ jobs:
       - run: cargo test -p gardenbed-model
       - run: cargo test -p gardenbed-store
       - run: cargo test -p gardenbed-platform
+      # The native Windows end-to-end smoke: the real `bed` binary talking
+      # to a real `gardenbed-server` binary over TCP on 127.0.0.1 — clone,
+      # sparse materialization, modify, commit, publish, and a fresh
+      # re-clone of the published tip, with hand-checked bytes. The server
+      # binary must be built first (it is not a bin target of this package
+      # and `cargo test` alone never rebuilds it; the staleness guard in
+      # tests/common/mod.rs fails loudly on a missing or stale binary).
+      # Single-threaded: one server process, one deterministic lap.
+      - run: cargo build -p gardenbed-server
+      - run: cargo test -p gardenbed --test tcp_smoke -- --test-threads=1
       # Windows runtime safety, on a real Windows kernel: the portable
       # checkout_fs tests (recursive symlink removal, failed staging
       # preserving the old leaf, atomic publication, the path-aliasing
