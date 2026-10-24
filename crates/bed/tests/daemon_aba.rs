@@ -490,10 +490,7 @@ impl Gardenbed for ManglingProxy {
         request: Request<pb::GetBlobReq>,
     ) -> Result<Response<Self::GetBlobStream>, Status> {
         let mut backend = self.backend.clone();
-        let mut stream = backend
-            .get_blob(forward_auth(&request))
-            .await?
-            .into_inner();
+        let mut stream = backend.get_blob(forward_auth(&request)).await?.into_inner();
         let mode = match self.mode {
             MangleMode::AbsentEverywhere => 0,
             MangleMode::MixedAbsentLater => 1,
@@ -530,9 +527,8 @@ impl Gardenbed for ManglingProxy {
         Ok(Response::new(Box::pin(items)))
     }
 
-    type ListRefsStream = std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<pb::RefEntry, Status>> + Send>,
-    >;
+    type ListRefsStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::RefEntry, Status>> + Send>>;
 
     async fn list_refs(
         &self,
@@ -588,9 +584,8 @@ impl Gardenbed for ManglingProxy {
         Err(Status::unimplemented("not routed by this proxy"))
     }
 
-    type DiffStream = std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<pb::ChangeMsg, Status>> + Send>,
-    >;
+    type DiffStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::ChangeMsg, Status>> + Send>>;
 
     async fn diff(
         &self,
@@ -610,9 +605,8 @@ impl Gardenbed for ManglingProxy {
         Err(Status::unimplemented("not routed by this proxy"))
     }
 
-    type BlameStream = std::pin::Pin<
-        Box<dyn tokio_stream::Stream<Item = Result<pb::BlameRange, Status>> + Send>,
-    >;
+    type BlameStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::BlameRange, Status>> + Send>>;
 
     async fn blame(
         &self,
@@ -684,7 +678,9 @@ async fn spawn_mangling_proxy(
             backend: RawClient::connect(backend_url).await.expect("dial backend"),
             mode,
         };
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let _ = ready_tx.send(format!("http://{addr}"));
         TonicServer::builder()
@@ -734,8 +730,13 @@ async fn daemon_blob_proof_validation_covers_every_chunk() {
     // Ground truth: the real server's stream carries proofs on every
     // chunk (the contract the mangling modes then break).
     {
-        let direct = GardenbedClient::connect(&server_url).await.expect("direct client");
-        let mut stream = direct.get_blob("alpha", blob).await.expect("direct get_blob");
+        let direct = GardenbedClient::connect(&server_url)
+            .await
+            .expect("direct client");
+        let mut stream = direct
+            .get_blob("alpha", blob)
+            .await
+            .expect("direct get_blob");
         let mut chunks = 0;
         let mut proofs: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         while let Some(chunk) = stream.next().await {
@@ -755,7 +756,6 @@ async fn daemon_blob_proof_validation_covers_every_chunk() {
     // The daemon's cache-hit counter rides its GetStats under
     // "daemon.cache_hits" — read it through the same client.
 
-
     // Absent everywhere (old-server shape): serves, cache stays cold.
     {
         let (proxy_url, _task) =
@@ -774,7 +774,12 @@ async fn daemon_blob_proof_validation_covers_every_chunk() {
             assert_eq!(served, content, "both rounds serve real bytes");
         }
         assert_eq!(
-            *client.get_stats("alpha").await.unwrap().get("daemon.cache_hits").unwrap(),
+            *client
+                .get_stats("alpha")
+                .await
+                .unwrap()
+                .get("daemon.cache_hits")
+                .unwrap(),
             0,
             "absent proofs never warm the cache"
         );
@@ -797,7 +802,12 @@ async fn daemon_blob_proof_validation_covers_every_chunk() {
             }
         }
         assert_eq!(
-            *client.get_stats("alpha").await.unwrap().get("daemon.cache_hits").unwrap(),
+            *client
+                .get_stats("alpha")
+                .await
+                .unwrap()
+                .get("daemon.cache_hits")
+                .unwrap(),
             0,
             "an earlier matching chunk never authorizes a mixed stream"
         );
@@ -820,7 +830,12 @@ async fn daemon_blob_proof_validation_covers_every_chunk() {
             }
         }
         assert_eq!(
-            *client.get_stats("alpha").await.unwrap().get("daemon.cache_hits").unwrap(),
+            *client
+                .get_stats("alpha")
+                .await
+                .unwrap()
+                .get("daemon.cache_hits")
+                .unwrap(),
             0,
             "differing later proofs make the whole stream unproven"
         );
