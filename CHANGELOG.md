@@ -256,6 +256,18 @@ tags, and the verification record for a release lives in
   ordering, fixing incorrect bases when commits share a second or clocks
   are skewed. Recursive virtual bases do not persist synthetic changesets.
 
+- Shared daemon caches now separate upstreams, repositories, and repository
+  incarnations, preventing cross-repository and same-name replacement leaks.
+  `RepoInfo` authorizes each scope; older servers use uncached passthrough.
+  Identity persists atomically in SQLite/Postgres and is stable per in-memory
+  store instance. Object responses carry the serving repository's
+  incarnation proof (`TreeResp`/`BlobChunk`), and a cache write requires
+  that proof to match the scope's identity — a same-URL load balancer or
+  forwarding proxy routing the identity probe and the object fetch to
+  different backends can no longer poison one repository's scope with
+  another's bytes. [Cache isolation](docs/daemon-cache-isolation.md) records
+  the lifecycle and verification.
+
 - PostgreSQL schema initialization now serializes concurrent first opens
   across replicas in one transaction, preventing duplicate catalog-key
   failures on an empty database.

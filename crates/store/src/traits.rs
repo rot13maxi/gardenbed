@@ -78,6 +78,13 @@ pub trait MetadataStore: Send + Sync {
     /// All refs as `(name, id)`, sorted by name.
     fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError>;
 
+    /// The repository's persistent incarnation identity: 16 opaque
+    /// bytes, minted once on first use and stored with the metadata —
+    /// stable for the database's lifetime (moves preserve it), fresh
+    /// for a new database (a replaced repository). Cache tiers scope
+    /// cached objects by it; see the daemon's cache isolation notes.
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError>;
+
     /// Compare-and-swap. `expected = None` means "the ref must not exist";
     /// `Some(id)` means "the ref must exist and point at `id`".
     ///

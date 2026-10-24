@@ -79,6 +79,10 @@ CREATE TABLE IF NOT EXISTS git_raw_tree (
     data    bytea NOT NULL,
     model   bytea CHECK(length(model) IN (0, 32))
 );
+CREATE TABLE IF NOT EXISTS repo_incarnation (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    incarnation bytea NOT NULL CHECK (length(incarnation) = 16)
+);
 ";
 
 /// Schema amendments applied after SCHEMA on every open
@@ -476,6 +480,33 @@ impl crate::traits::MetadataStore for PostgresMetadataStore {
                 None => Ok(None),
                 Some(row) => id_from_bytea(row.get(0)).map(Some),
             }
+        })
+    }
+
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        // One statement: INSERT ... ON CONFLICT DO NOTHING then SELECT,
+        // inside a transaction so the pair is atomic. Replicas racing the
+        // first call converge: the unique singleton row means at most one
+        // insert wins; every caller reads the same stored bytes.
+        let pool = self.pool.clone();
+        self.driver.block_on(async move {
+            let mut conn = pool.get().await.map_err(pg_err)?;
+            let tx = conn.transaction().await.map_err(pg_err)?;
+            let fresh = crate::sqlite::random_incarnation()?;
+            tx.execute(
+                "INSERT INTO repo_incarnation(id, incarnation) VALUES(1, $1) \
+                 ON CONFLICT (id) DO NOTHING",
+                &[&&fresh[..]],
+            )
+            .await
+            .map_err(pg_err)?;
+            let row = tx
+                .query_one("SELECT incarnation FROM repo_incarnation WHERE id = 1", &[])
+                .await
+                .map_err(pg_err)?;
+            let bytes: Vec<u8> = row.get(0);
+            tx.commit().await.map_err(pg_err)?;
+            crate::sqlite::parse_incarnation(&bytes)
         })
     }
 

@@ -18,6 +18,29 @@
 //! each other) in-process.
 
 use crate::StoreError;
+
+/// Generates a fresh 16-byte repository incarnation (see
+/// [`crate::traits::MetadataStore::repo_incarnation`]), using the operating
+/// system random generator through `getrandom` on supported platforms.
+/// Failure is propagated; there is no predictable fallback identity.
+pub(crate) fn random_incarnation() -> Result<[u8; 16], StoreError> {
+    let mut buf = [0u8; 16];
+    getrandom::fill(&mut buf)
+        .map_err(|e| StoreError::Db(format!("cannot generate repo incarnation: {e}")))?;
+    Ok(buf)
+}
+
+/// Parses a stored incarnation blob, refusing lengths other than 16 (a
+/// hand-edited row must not silently re-key the daemon's cache
+/// namespaces onto a colliding value).
+pub(crate) fn parse_incarnation(bytes: &[u8]) -> Result<[u8; 16], StoreError> {
+    bytes.try_into().map_err(|_| {
+        StoreError::Corrupt(format!(
+            "repo_incarnation row holds {} bytes (expected 16)",
+            bytes.len()
+        ))
+    })
+}
 use gardenbed_model::Changeset;
 use gardenbed_model::Id;
 use rusqlite::Connection;
@@ -63,6 +86,10 @@ CREATE TABLE IF NOT EXISTS git_raw_tree (
     git_sha BLOB PRIMARY KEY CHECK(length(git_sha) = 20),
     data    BLOB NOT NULL,
     model   BLOB CHECK(length(model) IN (0, 32))
+);
+CREATE TABLE IF NOT EXISTS repo_incarnation (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    incarnation BLOB NOT NULL CHECK (length(incarnation) = 16)
 );
 ";
 
@@ -463,6 +490,32 @@ impl crate::traits::MetadataStore for SqliteMetadataStore {
             .optional()
             .map_err(db_err)?;
         cs.map(|b| id_from_blob(&b)).transpose()
+    }
+
+    fn repo_incarnation(&self) -> Result<[u8; 16], StoreError> {
+        // Read-then-insert in ONE immediate transaction: the write lock
+        // serializes concurrent first callers (including other processes
+        // on the same database), so exactly one racer inserts and both
+        // return the same stored bytes. The singleton CHECK (id = 1)
+        // makes a second insert a constraint error even if the
+        // transaction lock were somehow bypassed.
+        self.in_tx(|tx| {
+            if let Some(bytes) = tx
+                .prepare_cached("SELECT incarnation FROM repo_incarnation WHERE id = 1")
+                .map_err(db_err)?
+                .query_row(params![], |r| r.get::<_, Vec<u8>>(0))
+                .optional()
+                .map_err(db_err)?
+            {
+                return parse_incarnation(&bytes);
+            }
+            let fresh = random_incarnation()?;
+            tx.prepare_cached("INSERT INTO repo_incarnation(id, incarnation) VALUES(1, ?1)")
+                .map_err(db_err)?
+                .execute(params![fresh.as_slice()])
+                .map_err(db_err)?;
+            Ok(fresh)
+        })
     }
 
     fn list_refs(&self) -> Result<Vec<(String, Id)>, StoreError> {
